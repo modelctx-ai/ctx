@@ -95,14 +95,9 @@ function reviver(_key: string, value: unknown): unknown {
 }
 
 function bodyOf(entry: NewEntry): Body {
-  switch (entry.type) {
-    case 'message':
-      return { message: entry.message };
-    case 'event':
-      return { kind: entry.kind, text: entry.text, data: entry.data };
-    case 'summary':
-      return { text: entry.text, covers: entry.covers };
-  }
+  if (entry.type === 'message') return { message: entry.message };
+  if (entry.type === 'event') return { kind: entry.kind, text: entry.text, data: entry.data };
+  return { text: entry.text, covers: entry.covers };
 }
 
 function decode(row: Row): ContextEntry {
@@ -199,7 +194,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteContextSto
             draft.meta !== undefined ? JSON.stringify(draft.meta) : null,
           );
           if (result.changes === 0) continue;
-          written.push({ ...draft, id: entryId, thread, at, seq: Number(result.lastInsertRowid) } as ContextEntry);
+          written.push({ ...draft, id: entryId, thread, at, seq: Number(result.lastInsertRowid) });
         }
         return written;
       });

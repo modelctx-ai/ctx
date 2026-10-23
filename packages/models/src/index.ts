@@ -56,7 +56,7 @@ const ANTHROPIC_DEFAULT_BASE = 'https://api.anthropic.com/v1';
 function anthropicBase(url: string | undefined): string {
   const base = trimBase(url);
   if (!base) return ANTHROPIC_DEFAULT_BASE;
-  return /\/v1$/.test(base) ? base : `${base}/v1`;
+  return base.endsWith('/v1') ? base : `${base}/v1`;
 }
 
 export const anthropic: ModelFactory = (spec) => {

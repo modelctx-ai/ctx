@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer, request, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { after, before, describe, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import {
@@ -12,6 +11,7 @@ import {
   userEntry,
   type ModelMessage,
 } from '@modelctx-ai/ctx';
+import { afterAll, beforeAll, describe, test } from 'vite-plus/test';
 
 import {
   createGatewayHandler,
@@ -93,7 +93,7 @@ describe('gateway', () => {
     { role: 'assistant', content: '带了' },
   ];
 
-  before(async () => {
+  beforeAll(async () => {
     await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
     upstreamUrl = `http://127.0.0.1:${(upstream.address() as AddressInfo).port}/v1`;
     gateway = await startGateway({
@@ -103,7 +103,7 @@ describe('gateway', () => {
     });
   });
 
-  after(async () => {
+  afterAll(async () => {
     await gateway.close();
     upstream.close();
   });
@@ -301,6 +301,15 @@ describe('gateway', () => {
   });
 });
 
+function picture(url: string): ChatMessage {
+  return { role: 'user', content: [{ type: 'image_url', image_url: { url } }] };
+}
+
+/** 断言用：字符串原样，其它（null、分段）按 JSON 写出来。 */
+function contentText(message: ChatMessage): string {
+  return typeof message.content === 'string' ? message.content : JSON.stringify(message.content);
+}
+
 describe('rewrite', () => {
   test('全文最后一条已经是这句用户话时，不重复带', async () => {
     const rewrite = replaceHistory(() => [{ role: 'user', content: '今天呢' }]);
@@ -328,7 +337,9 @@ describe('rewrite', () => {
       ],
     });
     assert.deepEqual(
-      out.messages.map((message) => `${message.role}${message.tool_calls ? '(tool_calls)' : ''}:${message.content}`),
+      out.messages.map(
+        (message) => `${message.role}${message.tool_calls ? '(tool_calls)' : ''}:${contentText(message)}`,
+      ),
       [
         'system:你是助手',
         'user:早先的话',
@@ -345,10 +356,6 @@ describe('rewrite', () => {
     const rewrite = replaceHistory(() => [
       { role: 'user', content: [{ type: 'image', image: new URL('https://example.com/a.png') }] },
     ]);
-    const picture = (url: string): ChatMessage => ({
-      role: 'user',
-      content: [{ type: 'image_url', image_url: { url } }],
-    });
     const other = await rewrite({ messages: [picture('https://example.com/b.png')] });
     assert.deepEqual(other.messages, [picture('https://example.com/a.png'), picture('https://example.com/b.png')]);
     const same = await rewrite({
@@ -378,7 +385,7 @@ describe('rewrite', () => {
       ],
     });
     assert.deepEqual(
-      out.messages.map((message) => `${message.role}:${message.content}`),
+      out.messages.map((message) => `${message.role}:${contentText(message)}`),
       ['assistant:在呢', 'user:看一下测试', 'assistant:好', 'user:继续'],
     );
   });

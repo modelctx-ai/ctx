@@ -1,13 +1,14 @@
 /**
- * 存储契约测试。自己实现 `ContextStore` 时，用同一套用例验证行为一致：
+ * 存储契约测试。自己实现 `ContextStore` 时，用同一套用例验证行为一致。
+ * 不绑定测试框架：把所用框架的 `describe`、`test` 传进来（Vitest、`node:test`、Jest、Bun 都行），断言用 `node:assert/strict`：
  *
  * ```ts
+ * import { describe, test } from 'vitest'; // 或 'node:test'
  * import { describeStoreContract } from '@modelctx-ai/ctx/testing';
- * describeStoreContract('my-store', ({ now }) => createMyStore({ now }));
+ * describeStoreContract('my-store', ({ now }) => createMyStore({ now }), { describe, test });
  * ```
  */
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
 
 import type { ModelMessage } from 'ai';
 
@@ -15,6 +16,15 @@ import { assistantEntry, eventEntry, messageEntry, userEntry, type ContextEntry 
 import type { ContextStore } from './store.ts';
 
 export type StoreFactory = (options: { readonly now: () => number }) => ContextStore | Promise<ContextStore>;
+
+/**
+ * 契约测试用到的最小测试框架接口。Vitest、`node:test`、Jest、Bun 的 `describe` / `test` 都满足，
+ * 失败靠抛异常报告，返回值不看。
+ */
+export interface ContractTestApi {
+  readonly describe: (name: string, fn: () => void) => unknown;
+  readonly test: (name: string, fn: () => Promise<void>) => unknown;
+}
 
 function texts(entries: readonly ContextEntry[]): string[] {
   return entries.map((entry) => {
@@ -41,7 +51,7 @@ function partsOf(entry: ContextEntry | undefined): Loose[] {
   return entry.message.content as unknown as Loose[];
 }
 
-export function describeStoreContract(name: string, factory: StoreFactory): void {
+export function describeStoreContract(name: string, factory: StoreFactory, { describe, test }: ContractTestApi): void {
   describe(`ContextStore contract: ${name}`, () => {
     test('按 (at, seq) 排序，导入的旧记录插回原来的位置', async () => {
       let clock = 1_000;
@@ -121,7 +131,7 @@ export function describeStoreContract(name: string, factory: StoreFactory): void
       assert.deepEqual(first?.meta, { step: 1 });
       assert.deepEqual(first?.type === 'message' && first.message, call);
       const part = second?.type === 'message' && Array.isArray(second.message.content) && second.message.content[0];
-      assert.equal(part && part.type === 'image' && String(part.image), 'https://example.com/a.png');
+      assert.equal(part && part.type === 'image' && hrefOf(part.image), 'https://example.com/a.png');
       assert.deepEqual(third?.type === 'event' && [third.kind, third.text, third.data], [
         'reminder',
         '喝水',
@@ -172,7 +182,7 @@ export function describeStoreContract(name: string, factory: StoreFactory): void
       const store = await factory({ now: Date.now });
       await store.append('a', [userEntry('x')]);
       await store.append('b', [userEntry('y'), userEntry('z')]);
-      assert.deepEqual((await store.threads()).sort(), ['a', 'b']);
+      assert.deepEqual((await store.threads()).toSorted(), ['a', 'b']);
       assert.equal(await store.clear('b'), 2);
       assert.deepEqual(await store.threads(), ['a']);
       assert.equal(await store.clear('missing'), 0);

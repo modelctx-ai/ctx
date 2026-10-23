@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
+
+import { describe, test } from 'vite-plus/test';
 
 import { collectFacts, defineSource, renderFacts } from './sources.ts';
 
@@ -37,6 +38,6 @@ describe('context sources', () => {
       facts.map((fact) => fact.text),
       ['还在'],
     );
-    assert.deepEqual(failed.sort(), ['boom', 'slow']);
+    assert.deepEqual(failed.toSorted(), ['boom', 'slow']);
   });
 });

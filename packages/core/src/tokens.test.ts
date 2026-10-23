@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
 
 import { APICallError } from 'ai';
+import { describe, test } from 'vite-plus/test';
 
 import { describeError, redact } from './errors.ts';
 import { estimateTextTokens, estimateTokens } from './tokens.ts';

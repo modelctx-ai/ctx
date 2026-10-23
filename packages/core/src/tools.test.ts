@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
 
 import { tool } from 'ai';
 import { z } from 'zod';
+import { describe, test } from 'vite-plus/test';
 
 import { createToolRegistry } from './tools.ts';
 

@@ -14,6 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Vitest 5 要求 Node ^22.18 || ^24.11，22.x / 24.x 取的是最新补丁版本
         node: [22.x, 24.x]
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +28,7 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
+      # 格式（Oxfmt）、lint（Oxlint）和类型检查（tsgolint，TS 7）一次跑完
+      - run: pnpm exec vp check --deny-warnings
       - run: pnpm test
-      - run: pnpm format:check
       - run: pnpm build

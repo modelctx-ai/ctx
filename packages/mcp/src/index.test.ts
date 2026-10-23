@@ -3,11 +3,11 @@ import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { createToolRegistry, tool, type ToolRegistry, type ToolSet } from '@modelctx-ai/ctx';
 import { z } from 'zod';
+import { describe, test } from 'vite-plus/test';
 
 import { createMcpHub, namespaced, type McpConnector } from './index.ts';
 
@@ -70,7 +70,7 @@ describe('mcp hub', () => {
       },
     );
     assert.equal(statuses.find((status) => status.name === 'off')?.state, 'disabled');
-    assert.deepEqual(Object.keys(hub.tools()).sort(), ['local__read_file', 'web__search']);
+    assert.deepEqual(Object.keys(hub.tools()).toSorted(), ['local__read_file', 'web__search']);
 
     const registry = createToolRegistry().add('local_only', fake('x'));
     assert.equal(hub.registerInto(registry), 2);
@@ -81,7 +81,7 @@ describe('mcp hub', () => {
     assert.equal(hub.registerInto(registry), 2, '重复注册会替换，不报重名');
 
     await hub.close();
-    assert.deepEqual(closed.sort(), ['local', 'web']);
+    assert.deepEqual(closed.toSorted(), ['local', 'web']);
     assert.deepEqual(hub.tools(), {});
   });
 
@@ -113,13 +113,13 @@ describe('mcp hub', () => {
       { name: 'resources', state: 'failed', error: 'Server does not support tools' },
       { name: 'web', state: 'connected', tools: ['web__search'] },
     ]);
-    assert.deepEqual(opened.sort(), ['resources', 'web']);
+    assert.deepEqual(opened.toSorted(), ['resources', 'web']);
     assert.deepEqual(closed, ['resources']);
 
     await hub.connect();
-    assert.deepEqual(opened.sort(), ['resources', 'resources', 'web'], '失败的下次再试，连上的不再连');
+    assert.deepEqual(opened.toSorted(), ['resources', 'resources', 'web'], '失败的下次再试，连上的不再连');
     await hub.close();
-    assert.deepEqual(closed.sort(), ['resources', 'resources', 'web']);
+    assert.deepEqual(closed.toSorted(), ['resources', 'resources', 'web']);
   });
 
   test('超过时限的服务器记为失败并关掉连接，别的服务器照常', async () => {
@@ -203,7 +203,7 @@ describe('mcp hub', () => {
     assert.deepEqual(describedTools(one), ['local@local:l']);
     assert.equal(two.size, 0);
 
-    let release = () => {};
+    let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
@@ -266,7 +266,8 @@ describe('mcp hub', () => {
       const [status] = await hub.connect();
       assert.deepEqual(status, { name: 'echo', state: 'connected', tools: ['echo__echo', 'echo__shout'] });
       const execute = hub.tools()['echo__echo']?.execute as
-        ((input: unknown, options: { toolCallId: string; messages: [] }) => Promise<unknown>) | undefined;
+        | ((input: unknown, options: { toolCallId: string; messages: [] }) => Promise<unknown>)
+        | undefined;
       const output = await execute?.({ text: '在吗' }, { toolCallId: 'c1', messages: [] });
       assert.deepEqual(output, { content: [{ type: 'text', text: '回声：在吗' }], isError: false });
     } finally {

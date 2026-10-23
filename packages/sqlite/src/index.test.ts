@@ -3,14 +3,14 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { describe, test } from 'node:test';
 
 import { eventEntry, messageEntry, userEntry, type JsonValue, type ModelMessage } from '@modelctx-ai/ctx';
 import { describeStoreContract } from '@modelctx-ai/ctx/testing';
+import { describe, test } from 'vite-plus/test';
 
 import { createSqliteStore } from './index.ts';
 
-describeStoreContract('sqlite', ({ now }) => createSqliteStore({ path: ':memory:', now }));
+describeStoreContract('sqlite', ({ now }) => createSqliteStore({ path: ':memory:', now }), { describe, test });
 
 describe('sqlite store', () => {
   test('关掉重开，条目和顺序都还在', async () => {

@@ -187,6 +187,30 @@ function isEmptyContent(content: UserContent): boolean {
   return typeof content === 'string' ? content.trim() === '' : content.length === 0;
 }
 
+function settings(model: LanguageModel, call: GenerateOptions, prepared: PreparedCall) {
+  return {
+    model,
+    ...(prepared.instructions ? { instructions: prepared.instructions } : {}),
+    messages: prepared.messages,
+    ...(prepared.tools ? { tools: prepared.tools } : {}),
+    stopWhen: stepCountIs(call.maxSteps ?? (prepared.tools ? 5 : 1)),
+    ...(call.temperature !== undefined ? { temperature: call.temperature } : {}),
+    ...(call.maxOutputTokens !== undefined ? { maxOutputTokens: call.maxOutputTokens } : {}),
+    ...(call.topP !== undefined ? { topP: call.topP } : {}),
+    ...(call.seed !== undefined ? { seed: call.seed } : {}),
+    ...(call.stopSequences !== undefined ? { stopSequences: call.stopSequences } : {}),
+    ...(call.maxRetries !== undefined ? { maxRetries: call.maxRetries } : {}),
+    ...(call.timeoutMs !== undefined ? { timeout: call.timeoutMs } : {}),
+    ...(call.headers !== undefined ? { headers: call.headers } : {}),
+    ...(call.providerOptions !== undefined ? { providerOptions: call.providerOptions } : {}),
+    ...(call.signal ? { abortSignal: call.signal } : {}),
+  };
+}
+
+function responseEntries(messages: readonly ModelMessage[]): NewEntry[] {
+  return messages.map((message) => messageEntry(message, { source: 'model' }));
+}
+
 export function createContext(options: ContextOptions): Context {
   const { store, thread } = options;
   const logger = options.logger ?? silentLogger;
@@ -265,26 +289,6 @@ export function createContext(options: ContextOptions): Context {
     return model;
   }
 
-  function settings(model: LanguageModel, call: GenerateOptions, prepared: PreparedCall) {
-    return {
-      model,
-      ...(prepared.instructions ? { instructions: prepared.instructions } : {}),
-      messages: prepared.messages,
-      ...(prepared.tools ? { tools: prepared.tools } : {}),
-      stopWhen: stepCountIs(call.maxSteps ?? (prepared.tools ? 5 : 1)),
-      ...(call.temperature !== undefined ? { temperature: call.temperature } : {}),
-      ...(call.maxOutputTokens !== undefined ? { maxOutputTokens: call.maxOutputTokens } : {}),
-      ...(call.topP !== undefined ? { topP: call.topP } : {}),
-      ...(call.seed !== undefined ? { seed: call.seed } : {}),
-      ...(call.stopSequences !== undefined ? { stopSequences: call.stopSequences } : {}),
-      ...(call.maxRetries !== undefined ? { maxRetries: call.maxRetries } : {}),
-      ...(call.timeoutMs !== undefined ? { timeout: call.timeoutMs } : {}),
-      ...(call.headers !== undefined ? { headers: call.headers } : {}),
-      ...(call.providerOptions !== undefined ? { providerOptions: call.providerOptions } : {}),
-      ...(call.signal ? { abortSignal: call.signal } : {}),
-    };
-  }
-
   /** 记录时先把用户这句写进日志，再组装（组装读到的历史里已经有它）。调用方先确认有模型再来。 */
   async function begin(call: GenerateOptions): Promise<{ prepared: PreparedCall; recorded: ContextEntry[] }> {
     const record = call.record !== false;
@@ -295,10 +299,6 @@ export function createContext(options: ContextOptions): Context {
     }
     const prepared = await prepare(record ? { ...call, input: undefined } : call);
     return { prepared, recorded };
-  }
-
-  function responseEntries(messages: readonly ModelMessage[]): NewEntry[] {
-    return messages.map((message) => messageEntry(message, { source: 'model' }));
   }
 
   async function generate(call: GenerateOptions = {}): Promise<GenerateResult> {

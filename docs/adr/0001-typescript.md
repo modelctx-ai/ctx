@@ -34,7 +34,7 @@ ctx 和 yoyo 都用 TypeScript，运行在 Node 上。
 
 1. dsh-pet 是 TypeScript（宿主、Electron、React）。yoyo 的 `@yoyo/dsh-pet` 按它的 `openapi.yaml` 写类型；要确认某个接口的真实行为，直接读它的源码。
 2. AI SDK 和 MCP 的参考 SDK 都以 TypeScript 为主。ctx 直接建在 AI SDK 上：服务商、工具循环、流式都用现成的，ctx 只管上下文这一层。
-3. Node 22.18 起默认去掉类型注解直接运行 `.ts`。yoyo 不构建、不打包，`node src/main.ts` 跑的就是源码；`node --test` 也直接跑 `.ts` 测试。只有要发 npm 的 ctx 构建 `dist/`。
+3. Node 22.18 起默认去掉类型注解直接运行 `.ts`。yoyo 不构建、不打包，`node src/main.ts` 跑的就是源码。只有要发 npm 的 ctx 构建 `dist/`。
 4. 三个仓库一套类型系统。yoyo 类型检查时用的就是 ctx 发布的 `.d.ts`，ctx 改了接口，yoyo 在编译期就报错。
 5. 需要的本机能力 Node 都内置，ctx 和 yoyo 没有原生依赖。
 
@@ -44,18 +44,23 @@ ctx 和 yoyo 都用 TypeScript，运行在 Node 上。
 - 直接运行 `.ts` 只支持能擦掉的语法：不能用 `enum`、`namespace`、构造函数参数属性、`import x = require()`。
 - 绑定 Node：开发要 Node ≥22.18；使用时 ctx-sqlite 要 Node ≥22.13（`node:sqlite`），其余包要 Node ≥22（AI SDK 7 的要求）。核心包的主入口不用 `node:` 模块，给别的运行时留着余地。
 - `node:sqlite` 在 Node 22 上仍是实验特性，会打印 ExperimentalWarning。存储藏在 `ContextStore` 接口后面，可以换。
-- TypeScript 7 的原生编译器还没有稳定的编译器 API，tsdown 也较新，升级时要一起验证。库开着 `isolatedDeclarations`，声明文件不依赖编译器 API 生成（见下）。
+- TypeScript 7 的原生编译器还没有稳定的编译器 API，Vite+（内含 tsdown、tsgolint）也较新，升级时要一起验证。库开着 `isolatedDeclarations`，声明文件不依赖编译器 API 生成（见下）。
 - yoyo 要求本机装了 Node。它是个人工具，dsh-pet 的独立模式本来也跑在 Node 上。
 
 ## 工具链
 
-| 工具                              | 用途                                                                                                          |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| TypeScript 7（原生 `tsc`）        | 只做类型检查（`noEmit`）。`pnpm typecheck` 一次检查全部包的源码和测试                                         |
-| tsdown                            | 构建库：ESM + `.d.ts`，每个包一个 `tsdown.config.ts`。开了 `isolatedDeclarations` 时用 Oxc 逐文件生成 `.d.ts` |
-| `node:test`、`node:assert/strict` | 测试，直接跑 `.ts`，不引测试框架                                                                              |
-| pnpm                              | workspace、锁文件、`workspace:` 协议，发布时改写版本范围；版本由 `packageManager` 固定                        |
-| prettier                          | 单引号、行宽 120、尾逗号                                                                                      |
+工具链统一用 [Vite+](https://viteplus.dev/)（npm 包 `vite-plus`，命令 `vp`）。它把下面几样打包成一个开发依赖，配置写在 `vite.config.ts`：根目录放 test、lint、fmt，各包放自己的 `pack`。
+
+| 工具                                      | 用途                                                                                                                                                                     |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| TypeScript 7                              | 只做类型检查（`noEmit`）。由 `vp check` 经 tsgolint（TS 7 原生编译器）完成，读各文件所属的 tsconfig；`pnpm typecheck` 一次检查全部包的源码、测试和配置。`tsc` 仍可单独跑 |
+| `vp pack`（tsdown）                       | 构建库：ESM + `.d.ts`，每个包的 `vite.config.ts` 里一个 `pack` 块。开了 `isolatedDeclarations` 时用 Oxc 逐文件生成 `.d.ts`                                               |
+| `vp test`（Vitest）、`node:assert/strict` | 测试直接跑 `.ts` 源码；测试 API 从 `vite-plus/test` 引，断言仍用 `node:assert/strict`                                                                                    |
+| `vp lint`（Oxlint）                       | correctness 报错、suspicious 警告，开着带类型信息的规则；CI 里警告也算失败                                                                                               |
+| `vp fmt`（Oxfmt）                         | 与 prettier 兼容的格式化：单引号、行宽 120、尾逗号                                                                                                                       |
+| pnpm                                      | workspace、锁文件、`workspace:` 协议，发布时改写版本范围；版本由 `packageManager` 固定                                                                                   |
+
+Vite+ 里面向 Web 应用的部分（`vp dev`、`vp build`、`vp preview`）这里用不上：ctx 只有库，没有页面。
 
 ## 编译选项
 

@@ -382,12 +382,17 @@ sequenceDiagram
 实现 `ContextStore`，再用核心包的契约测试验证行为和内置存储一致。工厂要用传进来的 `now` 作为缺省的 `at`。
 
 ```ts
-// pg-store.test.ts，用 node --test 运行
+// pg-store.test.ts。describe、test 从你用的测试框架取：vitest、node:test、Jest、Bun 都行
+import { describe, test } from 'vitest';
+
 import { describeStoreContract } from '@modelctx-ai/ctx/testing';
 
 import { createPgStore } from './pg-store.ts';
 
-describeStoreContract('pg', ({ now }) => createPgStore({ url: 'postgres://localhost/ctx_test', now }));
+describeStoreContract('pg', ({ now }) => createPgStore({ url: 'postgres://localhost/ctx_test', now }), {
+  describe,
+  test,
+});
 ```
 
 | 用例         | 要求                                                                                                                                                   |
@@ -443,7 +448,7 @@ export const projection: ProjectionOptions = {
 | 约束                             | 落在哪                                                                                                                                                                                                                  |
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 核心包只依赖 `ai`                | `@modelctx-ai/ctx` 的 dependencies 只有 `ai`（`zod` 是 `ai` 要的 peer）。主入口不用 `node:` 模块，只用 `crypto.randomUUID`、`setTimeout`、`AbortSignal` 这类标准全局对象                                                |
-| Node 专属的东西放在适配包        | `node:sqlite` 在 ctx-sqlite；`node:http`、`node:crypto`、`node:stream` 在 ctx-gateway；stdio 子进程在 ctx-mcp；`node:test` 在 `@modelctx-ai/ctx/testing` 子路径                                                         |
+| Node 专属的东西放在适配包        | `node:sqlite` 在 ctx-sqlite；`node:http`、`node:crypto`、`node:stream` 在 ctx-gateway；stdio 子进程在 ctx-mcp；`node:assert` 在 `@modelctx-ai/ctx/testing` 子路径（测试框架由调用方传入）                               |
 | 适配包把核心包当 peer dependency | ctx-sqlite、ctx-mcp、ctx-gateway 的 `peerDependencies` 是 `@modelctx-ai/ctx`；ctx-models 不依赖核心包，把 `ai` 当 peer。应用里只有一份核心包、一份 `ai`，`ContextStore`、`ToolRegistry`、`LanguageModel` 都是同一个类型 |
 | AI SDK 的工具函数从核心包拿      | `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`stepCountIs` 和 `ModelMessage`、`LanguageModel`、`ToolSet` 等类型从 `@modelctx-ai/ctx` 转出，应用不用单独依赖 `ai`                                                   |
 | 只追加                           | 条目写入后不改；压缩是追加摘要；只有 `clear(thread)` 删除                                                                                                                                                               |

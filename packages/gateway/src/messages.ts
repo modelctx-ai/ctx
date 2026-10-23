@@ -87,13 +87,22 @@ function imagePart(data: unknown, mediaType: string | undefined): ChatContentPar
   return inline === undefined ? undefined : { type: 'image_url', image_url: { url: urlOf(inline, mediaType) } };
 }
 
+/** 标量转成文字；null、undefined 和函数之类转不出有意义文字的给空串，对象交给调用方。 */
+function scalarText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  return '';
+}
+
 function outputText(output: unknown): string {
-  if (!output || typeof output !== 'object') return String(output ?? '');
+  if (!output || typeof output !== 'object') return scalarText(output);
   const typed = output as { type?: string; value?: unknown; reason?: string };
   switch (typed.type) {
     case 'text':
     case 'error-text':
-      return String(typed.value ?? '');
+      return typeof typed.value === 'object' && typed.value !== null
+        ? JSON.stringify(typed.value)
+        : scalarText(typed.value);
     case 'json':
     case 'error-json':
       return JSON.stringify(typed.value);

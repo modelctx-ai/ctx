@@ -67,6 +67,6 @@ await context.compact(); // 历史够长时把较早的部分压成一条摘要
 | `describeError`、`redact`                                                                                          | 给日志和界面用的错误摘要；去密钥                                                                                                |
 | `compareCursor`、`cursorOf`、`textOf`、`latestSummary`                                                             | 游标和消息的工具函数                                                                                                            |
 | `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`stepCountIs`，`ModelMessage`、`LanguageModel`、`ToolSet` 等类型 | 从 `ai` 转出，应用不用单独依赖 `ai`                                                                                             |
-| `@modelctx-ai/ctx/testing` 的 `describeStoreContract(name, factory)`                                               | 自定义存储的契约测试，用 `node --test` 运行                                                                                     |
+| `@modelctx-ai/ctx/testing` 的 `describeStoreContract(name, factory, { describe, test })`                           | 自定义存储的契约测试；`describe`、`test` 由调用方传入，Vitest、`node:test`、Jest、Bun 都能跑，不依赖测试框架                    |
 
 细节见[架构](https://github.com/modelctx-ai/ctx/blob/main/docs/architecture.md)和[上下文模型](https://github.com/modelctx-ai/ctx/blob/main/docs/adr/0003-context-model.md)。

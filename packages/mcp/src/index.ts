@@ -113,7 +113,7 @@ export function connectorFor(clientName = 'ctx'): McpConnector {
       ...(options.signal ? { initializationOptions: { signal: options.signal } } : {}),
     });
     return {
-      tools: async () => (await client.tools()) as ToolSet,
+      tools: async () => await client.tools(),
       close: () => client.close(),
     };
   };

@@ -35,7 +35,7 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsdown"
+    "build": "vp pack"
   },
   "dependencies": {
     "@ai-sdk/mcp": "^2.0.83"

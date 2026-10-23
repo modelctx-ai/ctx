@@ -34,7 +34,7 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsdown"
+    "build": "vp pack"
   },
   "peerDependencies": {
     "@modelctx-ai/ctx": "workspace:^"

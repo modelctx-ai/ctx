@@ -2,7 +2,6 @@ import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { Readable } from 'node:stream';
-import type { ReadableStream as NodeReadableStream } from 'node:stream/web';
 
 import type { ChatCompletionRequest } from './messages.ts';
 import type { Rewrite } from './rewrite.ts';
@@ -199,7 +198,7 @@ export function createGatewayHandler(
         res.end();
         return;
       }
-      const stream = Readable.fromWeb(response.body as unknown as NodeReadableStream);
+      const stream = Readable.fromWeb(response.body);
       stream.on('error', (error) => {
         // 调用方自己断开时上游请求被中止，这不算出错。
         if (controller.signal.aborted) {

@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
 import { tool } from 'ai';
 import { convertArrayToReadableStream, MockLanguageModelV4 } from 'ai/test';
 import { z } from 'zod';
+import { describe, test } from 'vite-plus/test';
 
 import { createContext } from './context.ts';
 import {
@@ -62,10 +62,19 @@ function wrapStore(base: ContextStore, before: (entries: readonly NewEntry[]) =>
 
 function shapeOf(entries: readonly ContextEntry[]): string[] {
   return entries.map((entry) => {
-    if (entry.type !== 'message') return `${entry.type}`;
+    if (entry.type !== 'message') return entry.type;
     const { content } = entry.message;
     if (typeof content === 'string') return `${entry.message.role}:${content}`;
     return `${entry.message.role}:${content.map((part) => part.type).join('+')}`;
+  });
+}
+
+/** 每次一个新模型：流一开始就报 401。 */
+function failingModel(): MockLanguageModelV4 {
+  return new MockLanguageModelV4({
+    doStream: async () => {
+      throw new Error('401 Unauthorized');
+    },
   });
 }
 
@@ -174,12 +183,6 @@ describe('createContext', () => {
   });
 
   test('stream 出错时 recorded 只有用户这句；onError 只在给了回调或 logger 时接管', async () => {
-    const failing = () =>
-      new MockLanguageModelV4({
-        doStream: async () => {
-          throw new Error('401 Unauthorized');
-        },
-      });
     const printed: unknown[] = [];
     const original = console.error;
     console.error = (...args: unknown[]) => {
@@ -190,14 +193,14 @@ describe('createContext', () => {
       const logged = createContext({
         store: createMemoryStore(),
         thread: 't',
-        model: failing(),
+        model: failingModel(),
         logger: { warn: (message) => warned.push(message) },
       });
       const first = await logged.stream({ input: '在吗', maxRetries: 0 });
       assert.deepEqual(shapeOf(await first.recorded), ['user:在吗']);
       assert.deepEqual(warned, ['stream failed']);
 
-      const plain = createContext({ store: createMemoryStore(), thread: 't', model: failing() });
+      const plain = createContext({ store: createMemoryStore(), thread: 't', model: failingModel() });
       const seen: unknown[] = [];
       const second = await plain.stream({ input: '在吗', maxRetries: 0, onError: (error) => seen.push(error) });
       await second.recorded;
@@ -314,7 +317,7 @@ describe('createContext', () => {
 
     const view = await context.view();
     assert.equal(view.messages.length, 5);
-    assert.match(String(view.messages[0]?.content), /主人每天下午喝水/);
+    assert.match(JSON.stringify(view.messages[0]?.content), /主人每天下午喝水/);
     assert.equal(view.messages[1]?.content, '问题8');
 
     await context.append(userEntry('新的一句'));
