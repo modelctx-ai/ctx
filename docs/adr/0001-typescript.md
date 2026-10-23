@@ -42,7 +42,7 @@ ctx 和 yoyo 都用 TypeScript，运行在 Node 上。
 
 - 类型只在编译期有效。配置文件、HTTP 响应、数据库里读出来的行要在运行时校验（yoyo 的配置用 zod）。
 - 直接运行 `.ts` 只支持能擦掉的语法：不能用 `enum`、`namespace`、构造函数参数属性、`import x = require()`。
-- 绑定 Node：开发要 Node ≥22.18，ctx-sqlite 和 ctx-gateway 要 Node ≥22.13。核心包的主入口不用 `node:` 模块，给别的运行时留着余地。
+- 绑定 Node：开发要 Node ≥22.18；使用时 ctx-sqlite 要 Node ≥22.13（`node:sqlite`），其余包要 Node ≥22（AI SDK 7 的要求）。核心包的主入口不用 `node:` 模块，给别的运行时留着余地。
 - `node:sqlite` 在 Node 22 上仍是实验特性，会打印 ExperimentalWarning。存储藏在 `ContextStore` 接口后面，可以换。
 - TypeScript 7 的原生编译器还没有稳定的编译器 API，tsdown 也较新，升级时要一起验证。库开着 `isolatedDeclarations`，声明文件不依赖编译器 API 生成（见下）。
 - yoyo 要求本机装了 Node。它是个人工具，dsh-pet 的独立模式本来也跑在 Node 上。

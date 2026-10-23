@@ -54,13 +54,14 @@ sequenceDiagram
   participant Store as ContextStore
   participant Src as 上下文来源
   participant SDK as AI SDK
-  App->>Ctx: generate(instructions, input)
-  Ctx->>Store: append 用户这句
+  App->>Ctx: generate(instructions, input, inputKey)
+  Note over Ctx: 没有模型就报错，什么都不写
+  Ctx->>Store: append 用户这句（inputKey 作幂等键）
   Ctx->>Src: collect（并行，单个超时 2 秒）
   Src-->>Ctx: 事实
   Ctx->>Store: list（从最近一条摘要读起）
   Store-->>Ctx: 条目
-  Note over Ctx: project 得到历史消息<br/>事实追加到指令后面<br/>按 tools 挑工具
+  Note over Ctx: project 得到历史消息<br/>事实、投影出的 system 消息接到指令后面<br/>按 tools 挑工具
   Ctx->>SDK: generateText（instructions、messages、tools、stopWhen）
   SDK-->>Ctx: text、responseMessages
   Ctx->>Store: append 回复、工具调用和结果
@@ -69,16 +70,16 @@ sequenceDiagram
 
 `Context` 的方法：
 
-| 方法                 | 作用                                                           |
-| -------------------- | -------------------------------------------------------------- |
-| `append(...entries)` | 追加条目，返回真正写入的那些                                   |
-| `entries(options?)`  | 读原始条目，参数同 `ContextStore.list`                         |
-| `view({ window? })`  | 当前交给模型的历史：最近一条摘要和它之后的条目，按投影规则渲染 |
-| `facts(signal?)`     | 收集一次事实                                                   |
-| `prepare(options)`   | 组装指令、消息和工具，不调用模型                               |
-| `generate(options)`  | `prepare` → `generateText` → 记录                              |
-| `stream(options)`    | `prepare` → `streamText`，流结束后记录                         |
-| `compact(options)`   | 把较早的历史压成一条摘要                                       |
+| 方法                 | 作用                                                                |
+| -------------------- | ------------------------------------------------------------------- |
+| `append(...entries)` | 追加条目，返回真正写入的那些                                        |
+| `entries(options?)`  | 读原始条目，参数同 `ContextStore.list`                              |
+| `view({ window? })`  | 当前交给模型的历史：最近一条摘要和它之后的条目，按投影规则渲染      |
+| `facts(signal?)`     | 收集一次事实                                                        |
+| `prepare(options)`   | 组装指令、消息和工具，不调用模型                                    |
+| `generate(options)`  | `prepare` → `generateText` → 记录                                   |
+| `stream(options)`    | `prepare` → `streamText`，流结束后记录；返回 `{ result, recorded }` |
+| `compact(options)`   | 把较早的历史压成一条摘要                                            |
 
 ## 条目
 
@@ -103,12 +104,12 @@ sequenceDiagram
 
 ## 存储
 
-| 方法                                   | 行为                                                                                           |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `append(thread, entries)`              | 追加。`id` 重复或同线程 `key` 重复的条目静默跳过；返回真正写入的条目（已带 `id`、`seq`、`at`） |
-| `list(thread, { after, last, types })` | 按 `(at, seq)` 从旧到新。`after` 不含该位置；`last` 取最后 N 条，仍从旧到新；三者可以组合      |
-| `clear(thread)`                        | 删掉整个线程，返回条数                                                                         |
-| `threads()`                            | 有内容的线程                                                                                   |
+| 方法                                   | 行为                                                                                                                          |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `append(thread, entries)`              | 追加。`id` 重复或同线程 `key` 重复的条目静默跳过；返回真正写入的条目（已带 `id`、`seq`、`at`）                                |
+| `list(thread, { after, last, types })` | 按 `(at, seq)` 从旧到新。`after` 不含该位置；`last` 取最后 N 条，仍从旧到新，小数向下取整，不是有限正数时返回空；三者可以组合 |
+| `clear(thread)`                        | 删掉整个线程，返回条数                                                                                                        |
+| `threads()`                            | 有内容的线程                                                                                                                  |
 
 实现有 `createMemoryStore()`（核心包，进程内）和 `createSqliteStore()`（ctx-sqlite）。条目只追加；除了 `clear`，没有删除和修改。
 
@@ -145,9 +146,11 @@ sequenceDiagram
 
 不设 `window` 就不裁剪：最近一条摘要之后的历史全部带上。
 
+投影照常输出 `system` 消息（例如摘要渲染成 `system`）；组装调用时 `prepare` 把它们从消息里拿出来，接到指令后面（见[调用](#调用)）。
+
 结果 `Projection`：`messages`；`items`，每条带 `upTo`（覆盖到的最后一个条目的游标）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`summary` 生效的摘要条目。
 
-缺省的 token 估算不依赖分词器：中日韩文字一个字约 1 token，其他字符约 4 个 1 token，每条消息另加 4，图片、文件每个按 256。只用于预算和裁剪，不用于计费。
+缺省的 token 估算不依赖分词器：中日韩文字一个字约 1 token，其他字符约 4 个 1 token，每条消息另加 4，图片、文件每个按 256（工具结果里的也一样，不去数 base64）。只用于预算和裁剪，不用于计费。
 
 ## 调用
 
@@ -156,10 +159,11 @@ sequenceDiagram
 1. 收集事实（`facts: false` 跳过）。
 2. 读视图：只读最近一条摘要和它之后的条目，再投影。`window` 可以覆盖投影里的窗口设置。
 3. 指令：`instructions` 是字符串时，事实追加在后面，用空行隔开；是函数时把事实传进去，由函数决定怎么写。
-4. 消息：视图 + `input`（这一轮用户说的话）+ `prompt`（最后一条临时用户消息；可以是函数，拿到事实）。
-5. 工具：`tools` 缺省是注册表里全部；`false` 不给；名字列表或 `(info) => boolean` 筛选。
+4. 投影里的 `system` 消息（摘要、事件规则或 `message` 钩子渲染成的，以及存成消息条目的）不放进 `messages`，文字按顺序接在指令最后，同样用空行隔开。
+5. 消息：视图 + `input`（这一轮用户说的话）+ `prompt`（最后一条临时用户消息；可以是函数，拿到事实）。
+6. 工具：`tools` 缺省是注册表里全部；`false` 不给；名字列表或 `(info) => boolean` 筛选。
 
-`instructions` 和 `prompt` 只要有一个是函数，事实就不再自动追加到指令后面。
+`instructions` 和 `prompt` 只要有一个是函数，事实就不再自动追加到指令后面；投影出的 `system` 消息照样接上。
 
 ```ts
 import { readFile } from 'node:fs/promises';
@@ -203,14 +207,16 @@ console.log(text);
 
 ### 记录
 
-|          | `record: true`（缺省）                                                       | `record: false`                                            |
+| 情况     | `record: true`（缺省）                                                       | `record: false`                                            |
 | -------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `input`  | 调用模型之前写入日志，组装时已经在视图里                                     | 只放进这一次的消息                                         |
+| `input`  | 调用模型之前写入日志，组装时已经在视图里；`inputKey` 是它的幂等键            | 只放进这一次的消息                                         |
 | 模型产出 | `responseMessages` 全部写入：助手消息、工具调用和工具结果，`source: 'model'` | 不写。从 `result.messages` 拿，由应用决定什么时候 `append` |
-| 模型报错 | `input` 已经在日志里，没有回复                                               | 日志不变                                                   |
+| 模型报错 | `input` 已经在日志里，没有回复；用同一个 `inputKey` 重试，这句不会再记一遍   | 日志不变                                                   |
+| 没有模型 | 直接报错，什么都不写                                                         | 直接报错                                                   |
 
 - `generate` 返回 `{ text, messages, recorded, raw }`：`recorded` 是这次真正写进日志的条目，`raw` 是 `generateText` 的原始结果。
-- `await context.stream()` 得到 AI SDK 的 `StreamTextResult`。回复在流结束时写入，写完调 `onRecorded(entries)`；流要读完（或调 `consumeStream()`）才会结束。写日志失败只告警；流出错交给 `onError`，没给就告警。
+- `await context.stream()` 得到 `{ result, recorded }`。`result` 是 AI SDK 的 `StreamTextResult`；`recorded` 在回复写进日志以后给出这次写入的全部条目（含先写的用户这句）：流出错或中止时只有用户这句，`record: false` 时是 `[]`，只在写日志失败时 reject（同时告警）。读 `recorded` 和读 `result.text` 一样会让流跑完。
+- 流出错时调 `onError`；没给 `onError`、上下文也没配 `logger` 时沿用 AI SDK 的缺省处理（`console.error`），配了 `logger` 就记一条告警。
 - `prompt` 和事实从不写日志。
 - `createContext({ source })`：经这个上下文追加、又没写 `source` 的条目（包括自动记录的 `input`）记成它。
 
@@ -235,9 +241,9 @@ await context.append(eventEntry('whisper', { text }));
 
 1. 取完整视图（不裁剪）：当前摘要 + 之后的消息。
 2. 最近 `keep`（缺省 12）条原样保留。切点往前挪，保留的部分不以工具结果开头。
-3. 切点之前不到 `minimum`（缺省 8）条就不压缩，返回 `null`。
-4. 把旧摘要和切点之前的消息转成纯文本记录，用 `instructions`（缺省是内置的压缩指令）、`temperature: 0`、`maxOutputTokens`（缺省 1024）调一次模型。`model` 缺省用上下文的模型。
-5. 追加一条 `summary`，`covers` 是最后一条被压缩消息的 `upTo`。
+3. 切点之前没有消息，或者不到 `minimum`（缺省 8）条，就不压缩、不调模型，返回 `null`。
+4. 把旧摘要和切点之前的消息转成纯文本记录（图片、文件只写占位，例如 `[image image/png]`，不带数据），用 `instructions`（缺省是内置的压缩指令）、`temperature: 0`、`maxOutputTokens`（缺省 1024）调一次模型。`model` 缺省用上下文的模型。
+5. 摘要被 `maxOutputTokens` 截断（`finishReason` 是 `length`）时不写，告警并返回 `null`；否则追加一条 `summary`，`covers` 是最后一条被压缩消息的 `upTo`。
 
 新摘要已经包含旧摘要，所以只有最新的一条生效；之后 `view()` 从它读起。什么时候压缩由应用决定（例如定时、超过阈值），ctx 不自动压缩。
 
@@ -292,9 +298,11 @@ await hub.close();
 
 - 工具名只能是 `[a-zA-Z0-9_-]`，最长 64（各家接口的共同限制）。重名报错，`{ replace: true }` 覆盖。`source` 缺省 `local`，`removeSource(source)` 整批移除。
 - `createMcpHub(servers)` 收常见的 `mcpServers` 写法：有 `command` 走 stdio（`env` 只写额外的变量，`PATH`、`HOME` 等自动带上），有 `url` 走 Streamable HTTP，`type: 'sse'` 走 SSE。
-- `connect()` 并行连接，从不因为单个服务器抛错：失败记为 `failed` 和错误信息，`enabled: false` 记为 `disabled`。再调一次 `connect()` 会重试没连上的，已连上的不动。
-- 工具名缺省加服务器前缀 `<server>__<tool>`，非法字符换成 `_`，截到 64；`namespace: false` 保留原名。`include`、`exclude` 用服务器上的原名。
-- `registerInto(registry)` 写进注册表，来源 `mcp:<server>`；重复调用先删掉该服务器的旧工具再写，不报重名。
+- `connect()` 并行连接，从不因为单个服务器抛错：失败记为 `failed` 和错误信息，`enabled: false` 记为 `disabled`；`status()` 按配置顺序。再调一次 `connect()` 会重试没连上的，已连上的不动。
+- 每台服务器连接加列工具最多等 `timeoutMs`：服务器配置里的优先，其次 hub 的，缺省 15 秒；`0` 或 `Infinity` 不限时。超时记为失败。连上以后任何一步失败都关掉连接，stdio 服务器的进程跟着结束。
+- 工具名缺省加服务器前缀 `<server>__<tool>`，非法字符换成 `_`，截到 64；`namespace: false` 保留原名。`include`、`exclude` 用服务器上的原名。改名后重名的按配置顺序留第一个，后面的原名记进那台服务器状态的 `skipped`。
+- `registerInto(registry)` 写进注册表，来源 `mcp:<server>`；重复调用先删掉这个 hub 之前写的工具再写。注册表里已有别的来源的同名工具时不替换，跳过并告警；返回实际写入的条数。
+- `close()` 断开全部连接、清空状态，并从写过的每个注册表里删掉这些工具。
 - MCP 工具和本地工具一样走 AI SDK 的多步工具循环，调用和结果作为消息写进日志。
 
 ## 网关
@@ -310,39 +318,44 @@ sequenceDiagram
   Client->>GW: POST /v1/chat/completions（本机令牌、截断的历史、这一句）
   GW->>Ctx: view()
   Ctx-->>GW: 完整上下文
-  Note over GW: 保留调用方的 system，<br/>历史换成完整上下文，<br/>最后带上这一句
+  Note over GW: 保留调用方的 system，<br/>历史换成完整上下文，<br/>接上从这一句起的尾巴
   GW->>Up: POST /chat/completions（真密钥）
   Up-->>GW: SSE
   GW-->>Client: SSE，边收边转
 ```
 
-| 请求                                                                   | 处理                                          |
-| ---------------------------------------------------------------------- | --------------------------------------------- |
-| 路径不在 `basePath`（缺省 `/v1`）下                                    | 404                                           |
-| 设了 `accessToken`，`Authorization: Bearer` 没带或不对（常量时间比较） | 401                                           |
-| 请求体超过 `maxBodyBytes`（缺省 4 MiB）                                | 413                                           |
-| `POST <basePath>/chat/completions`，设了 `rewrite`                     | 解析 JSON（坏 JSON 回 400）→ `rewrite` → 转发 |
-| 其他                                                                   | 原样转发：方法、路径、查询串、请求体          |
-| 上游连不上                                                             | 502                                           |
+按顺序检查：
 
+| 请求                                                                                        | 处理                                                                          |
+| ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `Host` 不在 `allowedHosts` 里                                                               | 403                                                                           |
+| 带 `Origin` 头，又不在 `allowedOrigins` 里（缺省一个都不放）                                | 403                                                                           |
+| 路径不在 `basePath`（缺省 `/v1`；`''` 或 `/` 挂在根上）下                                   | 404                                                                           |
+| 设了 `accessToken`，`Authorization: Bearer` 没带或不对（`Bearer` 不分大小写，常量时间比较） | 401                                                                           |
+| 请求体超过 `maxBodyBytes`（缺省 4 MiB）                                                     | 413                                                                           |
+| `POST <basePath>/chat/completions`，设了 `rewrite`                                          | 请求体不是 JSON，或不是带 `messages` 数组的对象：400；否则 `rewrite` 以后转发 |
+| 其他                                                                                        | 原样转发：方法、路径、查询串、请求体                                          |
+| 上游连不上                                                                                  | 502                                                                           |
+
+- `startGateway` 缺省只认监听地址的 `Host`（`host:port`，不分大小写），挡 DNS rebinding；监听本机时 `localhost`、`127.0.0.1`、`[::1]` 加端口都认。`createGatewayHandler` 不知道端口，没给 `allowedHosts` 就不查 `Host`，`Origin` 照查。浏览器网页发来的请求带 `Origin`，缺省一律拒绝。
 - 只转发调用方的 `content-type`、`accept`，加上 `upstream.headers`；有 `upstream.apiKey` 时设 `Authorization: Bearer <apiKey>`。调用方的令牌不会到上游，上游的密钥不会到调用方。
-- 响应的状态码和头原样转回（去掉逐跳头和 `content-encoding`、`content-length`），正文边收边转，SSE 不缓冲。调用方断开时取消上游请求。
-- 错误正文是 OpenAI 的形状：`{ "error": { "message", "type" } }`，401 的 `type` 是 `authentication_error`，其余是 `gateway_error`。
+- 响应的状态码和头原样转回（去掉逐跳头和 `content-encoding`、`content-length`），正文边收边转，SSE 不缓冲。调用方中途断开时取消上游请求，不算出错。
+- 错误正文是 OpenAI 的形状：`{ "error": { "message", "type" } }`，`type` 是 `authentication_error`（401）、`permission_error`（403）或 `gateway_error`。
 - 缺省只听 `127.0.0.1`、随机端口。`createGatewayHandler(options)` 返回 `(req, res) => Promise<void>`，可以挂到已有的 HTTP 服务上。
 
-`replaceHistory(history, { keepSystem })` 生成改写函数：保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `toChatMessages(await history())`（去掉其中的 `system`），最后带上调用方的最后一句用户话；如果完整历史的最后一条已经是同一句，就不重复带。`withContext(context)` 就是 `replaceHistory(async () => (await context.view()).messages)`。
+`replaceHistory(history, { keepSystem })` 生成改写函数：保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `toChatMessages(await history())`（去掉其中的 `system`），再接上调用方从最后一句用户话起的尾巴：这句话，以及它之后的工具调用、工具结果和预填的助手话。完整历史的最后一条和这句用户话内容完全相同（图片也比）时，这句不重复带。`withContext(context)` 就是 `replaceHistory(async () => (await context.view()).messages)`。
 
 网关只读上下文，不写日志。调用方自己保存的问答要另外并进上下文，例如 yoyo 每拍把 dsh-pet 的对话记忆按幂等键导入（见 [ADR 0003](adr/0003-context-model.md)）。
 
 `toChatMessages()` 的转换：
 
-| AI SDK                      | OpenAI Chat Completions                                                                                                                          |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `system`                    | `system`                                                                                                                                         |
-| `user` 文字                 | `text` 段（纯字符串保持字符串）                                                                                                                  |
-| `user` 图片、`image/*` 文件 | `image_url`：URL 原样；base64 和二进制转 data URL。服务商侧的文件引用和其他分段丢掉                                                              |
-| `assistant` 文字、工具调用  | `content` + `tool_calls`（`arguments` 是 JSON 字符串）；只有工具调用时 `content: null`。推理和服务商执行的工具调用丢掉，什么都不剩的消息整条丢掉 |
-| `tool` 工具结果             | 每个结果一条 `{ role: 'tool', tool_call_id, content }`：文字原样，JSON 序列化，拒绝执行写明原因                                                  |
+| AI SDK                                | OpenAI Chat Completions                                                                                                                                                                            |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `system`                              | `system`                                                                                                                                                                                           |
+| `user` 文字                           | `text` 段（纯字符串保持字符串）                                                                                                                                                                    |
+| `user` 图片、`image` / `image/*` 文件 | `image_url`：URL 原样；base64 和二进制转 data URL（类型只写到 `image` 或带 `*` 时用 `image/png`）。AI SDK v7 带标签的 `{ type: 'data' }`、`{ type: 'url' }` 也认；服务商侧的文件引用和其他分段丢掉 |
+| `assistant` 文字、工具调用            | `content` + `tool_calls`（`arguments` 是 JSON 字符串）；只有工具调用时 `content: null`。推理和服务商执行的工具调用丢掉，什么都不剩的消息整条丢掉                                                   |
+| `tool` 工具结果                       | 每个结果一条 `{ role: 'tool', tool_call_id, content }`：文字原样，JSON 序列化，拒绝执行写明原因                                                                                                    |
 
 ## 错误和日志
 
@@ -352,17 +365,17 @@ sequenceDiagram
 
 ## 扩展点
 
-| 扩展点                 | 接口                | 做法                                                                                                    |
-| ---------------------- | ------------------- | ------------------------------------------------------------------------------------------------------- |
-| 存储                   | `ContextStore`      | 实现四个方法，跑 `describeStoreContract`                                                                |
-| 模型服务商             | `ModelFactory`      | `createModelRegistry().register(name, factory)`；或者直接给 `createContext` 任何 AI SDK `LanguageModel` |
-| 事件渲染               | `EventRule`         | `projection.events[kind]`                                                                               |
-| 摘要、消息、token 估算 | `ProjectionOptions` | `summary`、`message`、`window.estimate`                                                                 |
-| 上下文来源             | `ContextSource`     | `defineSource(name, collect)`                                                                           |
-| 工具                   | AI SDK `Tool`       | `registry.add(name, tool(...), { source, tags })`                                                       |
-| MCP 连接               | `McpConnector`      | `createMcpHub(servers, { connector })`，测试时换成假的                                                  |
-| 网关改写               | `Rewrite`           | `(request) => request`，转发前任意改写                                                                  |
-| 日志                   | `Logger`            | `{ warn, debug? }`                                                                                      |
+| 扩展点                 | 接口                | 做法                                                                                                     |
+| ---------------------- | ------------------- | -------------------------------------------------------------------------------------------------------- |
+| 存储                   | `ContextStore`      | 实现四个方法，跑 `describeStoreContract`                                                                 |
+| 模型服务商             | `ModelFactory`      | `createModelRegistry().register(name, factory)`；或者直接给 `createContext` 任何 AI SDK `LanguageModel`  |
+| 事件渲染               | `EventRule`         | `projection.events[kind]`                                                                                |
+| 摘要、消息、token 估算 | `ProjectionOptions` | `summary`、`message`、`window.estimate`                                                                  |
+| 上下文来源             | `ContextSource`     | `defineSource(name, collect)`                                                                            |
+| 工具                   | AI SDK `Tool`       | `registry.add(name, tool(...), { source, tags })`                                                        |
+| MCP 连接               | `McpConnector`      | `createMcpHub(servers, { connector })`；连接器收到 `{ signal }`，超时或 `close()` 时中止。测试时换成假的 |
+| 网关改写               | `Rewrite`           | `(request) => request`，转发前任意改写                                                                   |
+| 日志                   | `Logger`            | `{ warn, debug? }`                                                                                       |
 
 ### 自定义存储
 
@@ -377,14 +390,16 @@ import { createPgStore } from './pg-store.ts';
 describeStoreContract('pg', ({ now }) => createPgStore({ url: 'postgres://localhost/ctx_test', now }));
 ```
 
-| 用例     | 要求                                                                                                            |
-| -------- | --------------------------------------------------------------------------------------------------------------- |
-| 排序     | 按 `(at, seq)`；带旧 `at` 导入的条目排回原来的位置                                                              |
-| 同一时刻 | 按写入先后                                                                                                      |
-| 去重     | 同线程重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按线程隔离                                        |
-| 查询     | `after`、`last`、`types` 可以组合；`last: 0` 返回空                                                             |
-| 往返     | 消息分段（含工具调用的对象入参、图片 `URL`）、事件 `data`、摘要 `covers`、`source`、`meta` 原样读回；`seq` 递增 |
-| 线程     | `clear` 返回删掉的条数；`threads()` 只列有内容的线程                                                            |
+| 用例         | 要求                                                                                                                                                   |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 排序         | 按 `(at, seq)`；带旧 `at` 导入的条目排回原来的位置                                                                                                     |
+| 同一时刻     | 按写入先后                                                                                                                                             |
+| 去重         | 同线程重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按线程隔离                                                                               |
+| 查询         | `after`、`last`、`types` 可以组合；`last` 向下取整，`0`、负数、`NaN`、`Infinity` 返回空                                                                |
+| 往返         | 消息分段（含工具调用的对象入参、图片 `URL`）、事件 `data`、摘要 `covers`、`source`、`meta` 原样读回；`seq` 递增                                        |
+| 二进制和 URL | `Buffer`、`ArrayBuffer`、带标签的 `{ type: 'data' }` 读回来字节不变（容器可以换成 `Uint8Array`）；`URL`（包括 `{ type: 'url' }` 里的）读回来还是 `URL` |
+| 像标记的数据 | 事件 `data` 里 `{ $url }`、`{ $bytes }` 这类普通对象原样读回                                                                                           |
+| 线程         | `clear` 返回删掉的条数；`threads()` 只列有内容的线程                                                                                                   |
 
 ### 模型服务商
 
@@ -417,7 +432,8 @@ export const projection: ProjectionOptions = {
       render: ([event]) => (event?.text ? { role: 'user', content: `[提醒] ${event.text}` } : null),
     },
   },
-  summary: (entry) => ({ role: 'user', content: `前情提要：\n${entry.text}` }),
+  // 渲染成 system 时，调用会把它从消息里拿出来，接到指令后面
+  summary: (entry) => ({ role: 'system', content: `前情提要：\n${entry.text}` }),
   window: { maxTokens: 16_000 },
 };
 ```
@@ -432,5 +448,5 @@ export const projection: ProjectionOptions = {
 | AI SDK 的工具函数从核心包拿      | `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`stepCountIs` 和 `ModelMessage`、`LanguageModel`、`ToolSet` 等类型从 `@modelctx-ai/ctx` 转出，应用不用单独依赖 `ai`                                                   |
 | 只追加                           | 条目写入后不改；压缩是追加摘要；只有 `clear(thread)` 删除                                                                                                                                                               |
 | 存储和渲染分开                   | 存储只存原始条目，怎么交给模型由投影决定；改规则不用迁移数据，对旧条目同样生效                                                                                                                                          |
-| 局部失败不打断调用               | 来源出错或超时跳过；MCP 服务器连不上只记状态；流式回复写日志失败只告警                                                                                                                                                  |
+| 局部失败不打断调用               | 来源出错或超时跳过；MCP 服务器连不上或超时只记状态；流式回复写日志失败只告警（`recorded` reject）                                                                                                                       |
 | 函数加接口                       | 公开 API 是函数（`createX()` / `startX()` 工厂和 `project()` 这类纯函数）和接口，没有要继承或 `new` 的类                                                                                                                |

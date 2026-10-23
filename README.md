@@ -8,7 +8,7 @@ LLM 应用的上下文管理框架。每个线程一份只追加的上下文日�
 | [`@modelctx-ai/ctx-sqlite`](packages/sqlite)   | 基于 `node:sqlite` 的 `ContextStore`，可以和应用共用一个库                                                                    | Node ≥22.13                       |
 | [`@modelctx-ai/ctx-models`](packages/models)   | 按配置创建 `LanguageModel`：内置 `openai-compatible`、`anthropic`，可注册更多服务商                                           | Node ≥22                          |
 | [`@modelctx-ai/ctx-mcp`](packages/mcp)         | 按常见的 `mcpServers` 配置连接 MCP 服务器（stdio、Streamable HTTP、SSE），工具写进注册表                                      | Node ≥22                          |
-| [`@modelctx-ai/ctx-gateway`](packages/gateway) | 本机 OpenAI 兼容网关：转发 `chat/completions`，把调用方带来的历史换成 ctx 的上下文                                            | Node ≥22.13                       |
+| [`@modelctx-ai/ctx-gateway`](packages/gateway) | 本机 OpenAI 兼容网关：转发 `chat/completions`，把调用方带来的历史换成 ctx 的上下文                                            | Node ≥22                          |
 
 还没有发布到 npm，现在的用法见[在其他仓库里使用](#在其他仓库里使用)。
 
@@ -111,6 +111,7 @@ const gateway = await startGateway({
   upstream: { baseUrl: 'https://api.deepseek.com/v1', apiKey: process.env.DEEPSEEK_API_KEY },
   rewrite: withContext(context),
   accessToken, // 客户端带 Authorization: Bearer <accessToken>；真密钥只留在这个进程里
+  // 缺省只认本机地址的 Host，带 Origin 的浏览器请求一律 403；要放行网页用 allowedOrigins
 });
 
 console.log(gateway.baseUrl); // http://127.0.0.1:<随机端口>/v1

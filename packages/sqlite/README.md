@@ -50,7 +50,8 @@ shared.close(); // 不关应用的库
 | `<prefix>meta`    | 结构版本 `schema`                                                                                                                                                                |
 
 - 重复的 `id`、同线程重复的 `key` 由 `INSERT OR IGNORE` 跳过。
-- JSON 编码保留 `Uint8Array`（存成 `{"$bytes": "<base64>"}`）和 `URL`（`{"$url": "<href>"}`），读回来还原。
+- 二进制和 URL 在序列化之前换成带标记的对象：`Uint8Array`、`Buffer`、`ArrayBuffer` 和其他 TypedArray 存成 `{"\u0000ctx": "bytes", "base64": "…"}`，`URL` 存成 `{"\u0000ctx": "url", "href": "…"}`。读回来二进制都是 `Uint8Array`，URL 还是 `URL`。
+- 只有恰好是这个形状的对象才会还原；`{ $url }`、`{ $bytes }` 这类普通对象原样读回。有循环引用的条目写入时报错。
 - 通过核心包的存储契约测试 `describeStoreContract`。
 
 ## 导出
