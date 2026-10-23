@@ -49,35 +49,55 @@ interface Body {
 
 const SCHEMA_VERSION = '1';
 
-/** JSON 存不了二进制和 URL，存成带标记的对象，读回来再还原。 */
-function replacer(_key: string, value: unknown): unknown {
-  if (value instanceof Uint8Array) return { $bytes: Buffer.from(value).toString('base64') };
-  if (value instanceof URL) return { $url: value.href };
-  return value;
+/** 编码标记用的键，正常数据里不会出现。 */
+const TAG = '\u0000ctx';
+
+function base64(view: ArrayBufferView | ArrayBuffer): string {
+  const bytes = view instanceof ArrayBuffer ? new Uint8Array(view) : view;
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
 }
 
+/**
+ * JSON 存不了二进制和 URL，先把它们换成带 `TAG` 的对象再序列化。必须在 `JSON.stringify` 之前做：
+ * 它会先调 `toJSON`，Buffer 和 URL 到了 replacer 里已经变了样。
+ */
+function encode(value: unknown, parents: Set<object> = new Set()): unknown {
+  if (value instanceof URL) return { [TAG]: 'url', href: value.href };
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return { [TAG]: 'bytes', base64: base64(value) };
+  if (value === null || typeof value !== 'object' || typeof (value as { toJSON?: unknown }).toJSON === 'function') {
+    return value;
+  }
+  if (parents.has(value)) throw new TypeError('Cannot store a circular structure.');
+  parents.add(value);
+  try {
+    if (Array.isArray(value)) return value.map((item) => encode(item, parents));
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) out[key] = encode(item, parents);
+    return out;
+  } finally {
+    parents.delete(value);
+  }
+}
+
+/** 只认恰好是编码结果的对象；别的对象（包括 `{ $url }`、`{ $bytes }` 这种）原样返回。 */
 function reviver(_key: string, value: unknown): unknown {
-  if (value && typeof value === 'object' && !Array.isArray(value)) {
-    const keys = Object.keys(value);
-    if (keys.length === 1 && typeof (value as { $bytes?: unknown }).$bytes === 'string') {
-      return new Uint8Array(Buffer.from((value as { $bytes: string }).$bytes, 'base64'));
-    }
-    if (keys.length === 1 && typeof (value as { $url?: unknown }).$url === 'string') {
-      return new URL((value as { $url: string }).$url);
-    }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const tagged = value as Record<string, unknown>;
+  const keys = Object.keys(tagged);
+  if (keys.length !== 2 || !keys.includes(TAG)) return value;
+  if (tagged[TAG] === 'bytes' && typeof tagged['base64'] === 'string') {
+    return new Uint8Array(Buffer.from(tagged['base64'], 'base64'));
+  }
+  if (tagged[TAG] === 'url' && typeof tagged['href'] === 'string' && URL.canParse(tagged['href'])) {
+    return new URL(tagged['href']);
   }
   return value;
 }
 
 function bodyOf(entry: NewEntry): Body {
-  switch (entry.type) {
-    case 'message':
-      return { message: entry.message };
-    case 'event':
-      return { kind: entry.kind, text: entry.text, data: entry.data };
-    case 'summary':
-      return { text: entry.text, covers: entry.covers };
-  }
+  if (entry.type === 'message') return { message: entry.message };
+  if (entry.type === 'event') return { kind: entry.kind, text: entry.text, data: entry.data };
+  return { text: entry.text, covers: entry.covers };
 }
 
 function decode(row: Row): ContextEntry {
@@ -105,6 +125,7 @@ function decode(row: Row): ContextEntry {
 /**
  * 基于 `node:sqlite` 的存储。所有条目在一张表里，按线程、时间、写入序号建索引。
  * 写入用 SAVEPOINT，所以和应用共用一个库、处在应用自己的事务里也能用。
+ * 消息里的二进制（Uint8Array、Buffer、ArrayBuffer、其他 TypedArray）读回来都是 Uint8Array，URL 读回来还是 URL。
  */
 export function createSqliteStore(options: SqliteStoreOptions): SqliteContextStore {
   const prefix = options.prefix ?? 'ctx_';
@@ -169,11 +190,11 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteContextSto
             draft.type,
             draft.key ?? null,
             draft.source ?? null,
-            JSON.stringify(bodyOf(draft), replacer),
+            JSON.stringify(encode(bodyOf(draft))),
             draft.meta !== undefined ? JSON.stringify(draft.meta) : null,
           );
           if (result.changes === 0) continue;
-          written.push({ ...draft, id: entryId, thread, at, seq: Number(result.lastInsertRowid) } as ContextEntry);
+          written.push({ ...draft, id: entryId, thread, at, seq: Number(result.lastInsertRowid) });
         }
         return written;
       });
@@ -192,9 +213,11 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteContextSto
       }
       let sql = `SELECT * FROM ${table} WHERE ${where.join(' AND ')}`;
       if (listOptions.last !== undefined) {
-        if (listOptions.last <= 0) return [];
+        // 和内存存储一样：小数向下取整，不是有限正数时返回空。
+        const last = Number.isFinite(listOptions.last) ? Math.floor(listOptions.last) : 0;
+        if (last <= 0) return [];
         sql = `SELECT * FROM (${sql} ORDER BY at DESC, seq DESC LIMIT ?) ORDER BY at, seq`;
-        params.push(listOptions.last);
+        params.push(last);
       } else {
         sql += ' ORDER BY at, seq';
       }

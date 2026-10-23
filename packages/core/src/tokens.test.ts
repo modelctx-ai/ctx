@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
 
 import { APICallError } from 'ai';
+import { describe, test } from 'vite-plus/test';
 
 import { describeError, redact } from './errors.ts';
 import { estimateTextTokens, estimateTokens } from './tokens.ts';
@@ -23,6 +23,29 @@ describe('tokens', () => {
       ],
     });
     assert.equal(withImage, 4 + 2 + 256);
+  });
+
+  test('工具结果里的图片、文件按附件定额算，不去数 base64', () => {
+    const data = Buffer.alloc(30_000, 7).toString('base64');
+    const tokens = estimateTokens({
+      role: 'tool',
+      content: [
+        {
+          type: 'tool-result',
+          toolCallId: 'c1',
+          toolName: 'screenshot',
+          output: {
+            type: 'content',
+            value: [
+              { type: 'text', text: '截好了' },
+              { type: 'file', mediaType: 'image/png', data: { type: 'data', data } },
+              { type: 'image-data', data, mediaType: 'image/png' },
+            ],
+          },
+        },
+      ],
+    });
+    assert.equal(tokens, 4 + estimateTextTokens('screenshot') + 3 + 2 * 256);
   });
 });
 

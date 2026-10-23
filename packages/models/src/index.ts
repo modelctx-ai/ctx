@@ -7,7 +7,10 @@ export interface ModelSpec {
   /** 服务商协议，缺省 `openai-compatible`。 */
   readonly provider?: string;
   readonly model: string;
-  /** 接口根地址。openai-compatible 写到 `/v1` 为止；anthropic 不写就用官方地址。 */
+  /**
+   * 接口根地址。openai-compatible 写到 `/v1` 为止；anthropic 写服务根（例如 `https://api.deepseek.com/anthropic`），
+   * 不以 `/v1` 结尾时自动补上，不写就用官方地址（不读 `ANTHROPIC_BASE_URL`）。
+   */
   readonly baseUrl?: string;
   readonly apiKey?: string;
   readonly headers?: Readonly<Record<string, string>>;
@@ -47,11 +50,20 @@ export const openAICompatible: ModelFactory = (spec) => {
   return provider.chatModel(spec.model);
 };
 
+const ANTHROPIC_DEFAULT_BASE = 'https://api.anthropic.com/v1';
+
+/** 和 dsh-pet 一样：baseUrl 是服务根，请求打到 `<baseUrl>/v1/messages`。 */
+function anthropicBase(url: string | undefined): string {
+  const base = trimBase(url);
+  if (!base) return ANTHROPIC_DEFAULT_BASE;
+  return base.endsWith('/v1') ? base : `${base}/v1`;
+}
+
 export const anthropic: ModelFactory = (spec) => {
-  const baseURL = trimBase(spec.baseUrl);
   const headers = headersOf(spec);
+  // 总是显式给地址，环境里的 ANTHROPIC_BASE_URL 不会悄悄把请求改到别处。
   const provider = createAnthropic({
-    ...(baseURL ? { baseURL } : {}),
+    baseURL: anthropicBase(spec.baseUrl),
     ...(spec.apiKey ? { apiKey: spec.apiKey } : {}),
     ...(headers ? { headers } : {}),
   });

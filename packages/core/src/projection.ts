@@ -121,7 +121,7 @@ function windowed(
  */
 export function project(entries: readonly ContextEntry[], options: ProjectionOptions = {}): Projection {
   const estimate = options.window?.estimate ?? estimateTokens;
-  const sorted = [...entries].sort(compareCursor);
+  const sorted = entries.toSorted(compareCursor);
   const summary = latestSummary(sorted);
   const visible = sorted.filter(
     (entry) => entry.type !== 'summary' && (!summary || compareCursor(entry, summary.covers) > 0),

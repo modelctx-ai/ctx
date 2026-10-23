@@ -3,7 +3,7 @@ import { compareCursor, type ContextEntry, type Cursor, type EntryType, type New
 export interface ListOptions {
   /** 只要这个位置之后（不含）的条目。 */
   readonly after?: Cursor;
-  /** 只要最后 N 条，仍按从旧到新返回。 */
+  /** 只要最后 N 条，仍按从旧到新返回。小数向下取整，不是有限正数时返回空。 */
   readonly last?: number;
   /** 只要这些类型。 */
   readonly types?: readonly EntryType[];
@@ -45,7 +45,10 @@ export function filterEntries(entries: readonly ContextEntry[], options: ListOpt
     if (options?.types && !options.types.includes(entry.type)) return false;
     return true;
   });
-  if (options?.last !== undefined) out = options.last > 0 ? out.slice(-options.last) : [];
+  if (options?.last !== undefined) {
+    const last = Number.isFinite(options.last) ? Math.floor(options.last) : 0;
+    out = last > 0 ? out.slice(-last) : [];
+  }
   return out;
 }
 

@@ -19,7 +19,7 @@
   "type": "module",
   "sideEffects": false,
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "exports": {
     ".": {
@@ -42,7 +42,7 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsdown"
+    "build": "vp pack"
   },
   "dependencies": {
     "ai": "^7.0.150"

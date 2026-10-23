@@ -1,2 +1,14 @@
 packages:
   - packages/*
+
+# Vite+ 的约定布局（与 `vp migrate` 生成的一致）：vite 指到 Vite+ 自带的核心，Vitest 的 vite peer 由它提供。
+catalog:
+  vite: npm:@voidzero-dev/vite-plus-core@1.4.0
+  vite-plus: 1.4.0
+overrides:
+  vite@*: 'catalog:'
+peerDependencyRules:
+  allowAny:
+    - vite
+  allowedVersions:
+    vite: '*'
