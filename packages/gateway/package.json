@@ -1,0 +1,48 @@
+{
+  "name": "@modelctx-ai/ctx-gateway",
+  "version": "0.1.0",
+  "description": "OpenAI 兼容的本机网关：转发聊天请求，把调用方带来的历史换成 ctx 管理的上下文。",
+  "keywords": [
+    "ai",
+    "openai-compatible",
+    "proxy",
+    "context"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/gateway"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsdown"
+  },
+  "peerDependencies": {
+    "@modelctx-ai/ctx": "workspace:^"
+  },
+  "devDependencies": {
+    "@modelctx-ai/ctx": "workspace:^",
+    "ai": "^7.0.150",
+    "zod": "^4.6.7"
+  }
+}

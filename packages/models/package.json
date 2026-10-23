@@ -1,0 +1,51 @@
+{
+  "name": "@modelctx-ai/ctx-models",
+  "version": "0.1.0",
+  "description": "按配置创建 Vercel AI SDK 语言模型：内置 openai-compatible 与 anthropic，可注册更多服务商。",
+  "keywords": [
+    "ai",
+    "ai-sdk",
+    "llm",
+    "provider"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/models"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsdown"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.87",
+    "@ai-sdk/openai-compatible": "^3.0.77"
+  },
+  "peerDependencies": {
+    "ai": "^7.0.150"
+  },
+  "devDependencies": {
+    "ai": "^7.0.150",
+    "zod": "^4.6.7"
+  }
+}

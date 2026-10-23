@@ -1,0 +1,45 @@
+{
+  "name": "@modelctx-ai/ctx-sqlite",
+  "version": "0.1.0",
+  "description": "ctx 的 SQLite 存储，基于 Node 自带的 node:sqlite，不需要原生依赖。",
+  "keywords": [
+    "ai",
+    "context",
+    "sqlite"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/sqlite"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsdown"
+  },
+  "peerDependencies": {
+    "@modelctx-ai/ctx": "workspace:^"
+  },
+  "devDependencies": {
+    "@modelctx-ai/ctx": "workspace:^"
+  }
+}

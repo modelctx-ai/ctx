@@ -1,0 +1,56 @@
+{
+  "name": "@modelctx-ai/ctx",
+  "version": "0.1.0",
+  "description": "上下文管理核心：追加式上下文日志、投影成模型消息、上下文来源、工具注册，以及基于 Vercel AI SDK 的模型调用。",
+  "keywords": [
+    "ai",
+    "llm",
+    "context",
+    "context-engineering",
+    "ai-sdk",
+    "mcp"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/core"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "@modelctx-ai/source": "./src/testing.ts",
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsdown"
+  },
+  "dependencies": {
+    "ai": "^7.0.150"
+  },
+  "peerDependencies": {
+    "zod": "^3.25.76 || ^4.1.8"
+  },
+  "devDependencies": {
+    "zod": "^4.6.7"
+  }
+}

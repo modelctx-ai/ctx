@@ -1,0 +1,51 @@
+{
+  "name": "@modelctx-ai/ctx-mcp",
+  "version": "0.1.0",
+  "description": "把 MCP 服务器接成 ctx 工具：沿用常见的 mcpServers 配置写法，支持 stdio、HTTP 与 SSE。",
+  "keywords": [
+    "ai",
+    "mcp",
+    "model-context-protocol",
+    "tools"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/mcp"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsdown"
+  },
+  "dependencies": {
+    "@ai-sdk/mcp": "^2.0.83"
+  },
+  "peerDependencies": {
+    "@modelctx-ai/ctx": "workspace:^"
+  },
+  "devDependencies": {
+    "@modelctx-ai/ctx": "workspace:^",
+    "ai": "^7.0.150",
+    "zod": "^4.6.7"
+  }
+}
