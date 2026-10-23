@@ -36,6 +36,47 @@ describe('models', () => {
     }
   });
 
+  test('anthropic 的 baseUrl 是服务根，补上 /v1；不写就用官方地址，不读 ANTHROPIC_BASE_URL', async () => {
+    const seen: { url: string; key: string | null }[] = [];
+    const original = globalThis.fetch;
+    const env = process.env['ANTHROPIC_BASE_URL'];
+    process.env['ANTHROPIC_BASE_URL'] = 'https://elsewhere.example/v1';
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      seen.push({ url: String(input), key: new Headers(init?.headers).get('x-api-key') });
+      return new Response(
+        JSON.stringify({
+          id: 'msg_1',
+          type: 'message',
+          role: 'assistant',
+          model: 'claude-test',
+          content: [{ type: 'text', text: '在的' }],
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    try {
+      const ask = async (baseUrl?: string) => {
+        const spec = { provider: 'anthropic', apiKey: 'sk-ant', model: 'claude-test' };
+        const model = createModel(baseUrl === undefined ? spec : { ...spec, baseUrl });
+        const { text } = await generateText({ model, prompt: '在吗', maxRetries: 0, maxOutputTokens: 64 });
+        assert.equal(text, '在的');
+        return seen.at(-1)?.url;
+      };
+      assert.equal(await ask('https://api.deepseek.com/anthropic'), 'https://api.deepseek.com/anthropic/v1/messages');
+      assert.equal(await ask('https://api.anthropic.com/v1/'), 'https://api.anthropic.com/v1/messages');
+      assert.equal(await ask('https://api.anthropic.com'), 'https://api.anthropic.com/v1/messages');
+      assert.equal(await ask(), 'https://api.anthropic.com/v1/messages');
+      assert.equal(seen.at(-1)?.key, 'sk-ant');
+    } finally {
+      globalThis.fetch = original;
+      if (env === undefined) delete process.env['ANTHROPIC_BASE_URL'];
+      else process.env['ANTHROPIC_BASE_URL'] = env;
+    }
+  });
+
   test('可以注册别的服务商，未知服务商报清楚的错', () => {
     const mock = new MockLanguageModelV4();
     const registry = createModelRegistry().register('mock', () => mock);

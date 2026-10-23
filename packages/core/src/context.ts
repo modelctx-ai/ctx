@@ -4,6 +4,7 @@ import {
   streamText,
   type LanguageModel,
   type ModelMessage,
+  type ToolResultPart,
   type ToolSet,
   type UserContent,
 } from 'ai';
@@ -42,7 +43,7 @@ export interface PrepareOptions {
   readonly instructions?: FactAware<string>;
   /** 放在最后的临时用户消息，不写进日志。 */
   readonly prompt?: FactAware<UserContent>;
-  /** 这一轮用户新说的话。`generate` 记录时会先写进日志。 */
+  /** 这一轮用户新说的话。`generate`、`stream` 记录时会先写进日志。 */
   readonly input?: UserContent;
   /** 从工具注册表里挑哪些交给模型。缺省：注册表里的全部。 */
   readonly tools?: ToolFilter;
@@ -54,6 +55,7 @@ export interface PrepareOptions {
 }
 
 export interface PreparedCall {
+  /** 投影里的 system 消息不放进 `messages`，文字按顺序接在这里的最后。 */
   readonly instructions?: string;
   readonly messages: ModelMessage[];
   readonly tools?: ToolSet;
@@ -80,6 +82,11 @@ export interface CallSettings {
 export interface GenerateOptions extends PrepareOptions, CallSettings {
   /** 把 `input` 和模型回复写进日志，缺省写。 */
   readonly record?: boolean;
+  /**
+   * 用户这句（`input`）的幂等键。记录时这句在调用模型之前就写进日志，模型调用失败它也留着；
+   * 失败后用同一个键重试，就不会再记一遍。
+   */
+  readonly inputKey?: string;
 }
 
 export interface GenerateResult {
@@ -92,8 +99,17 @@ export interface GenerateResult {
 }
 
 export interface StreamOptions extends GenerateOptions {
-  readonly onRecorded?: (entries: readonly ContextEntry[]) => void;
+  /** 流出错时调用。不给、上下文也没有 logger 时，沿用 AI SDK 的缺省处理（console.error）。 */
   readonly onError?: (error: unknown) => void;
+}
+
+export interface ContextStream {
+  readonly result: StreamTextResult;
+  /**
+   * 回复写进日志以后，给出这次写入的全部条目（含先写的用户这句）：流出错或中止时只有用户这句，
+   * `record: false` 时是 []。只在写日志失败时 reject。和 `result.text` 一样，读它会让流跑完。
+   */
+  readonly recorded: Promise<readonly ContextEntry[]>;
 }
 
 export interface CompactOptions {
@@ -120,7 +136,7 @@ export interface Context {
   /** 组装一次调用需要的指令、消息和工具，不调用模型。 */
   prepare(options?: PrepareOptions): Promise<PreparedCall>;
   generate(options?: GenerateOptions): Promise<GenerateResult>;
-  stream(options?: StreamOptions): Promise<StreamTextResult>;
+  stream(options?: StreamOptions): Promise<ContextStream>;
   /** 把较早的历史压成一条摘要。历史不够长时返回 null。 */
   compact(options?: CompactOptions): Promise<SummaryEntry | null>;
 }
@@ -130,6 +146,20 @@ const DEFAULT_SUMMARY_INSTRUCTIONS =
   'without it. Keep facts, decisions, commitments, open questions, preferences, names and numbers. ' +
   'Do not invent anything. Use the language of the conversation. Output only the summary.';
 
+/** 图片、文件只写一个占位，例如 `[file image/png]`，数据不进摘要的输入。 */
+function placeholder(part: { readonly type: string; readonly mediaType?: unknown }): string {
+  const kind = part.type.startsWith('image') ? 'image' : 'file';
+  return typeof part.mediaType === 'string' && part.mediaType ? `[${kind} ${part.mediaType}]` : `[${kind}]`;
+}
+
+function outputText(output: ToolResultPart['output']): string {
+  if (output.type !== 'content' || !Array.isArray(output.value)) return JSON.stringify(output);
+  return output.value
+    .map((part) => (part.type === 'text' ? part.text : part.type === 'custom' ? '' : placeholder(part)))
+    .filter(Boolean)
+    .join(' ');
+}
+
 function transcript(messages: readonly ModelMessage[]): string {
   const lines: string[] = [];
   for (const message of messages) {
@@ -137,15 +167,20 @@ function transcript(messages: readonly ModelMessage[]): string {
       lines.push(`${message.role}: ${message.content}`);
       continue;
     }
-    const text = textOf(message);
+    const attachments = message.content.filter((part) => part.type === 'image' || part.type === 'file');
+    const text = [textOf(message), ...attachments.map(placeholder)].filter(Boolean).join(' ');
     if (text) lines.push(`${message.role}: ${text}`);
     for (const part of message.content) {
       if (part.type === 'tool-call')
         lines.push(`${message.role} called ${part.toolName}(${JSON.stringify(part.input)})`);
-      if (part.type === 'tool-result') lines.push(`${part.toolName} returned ${JSON.stringify(part.output)}`);
+      if (part.type === 'tool-result') lines.push(`${part.toolName} returned ${outputText(part.output)}`);
     }
   }
   return lines.join('\n');
+}
+
+function messageOf(error: unknown): unknown {
+  return error instanceof Error ? error.message : error;
 }
 
 function isEmptyContent(content: UserContent): boolean {
@@ -185,8 +220,7 @@ export function createContext(options: ContextOptions): Context {
       thread,
       ...(signal ? { signal } : {}),
       ...(options.sourceTimeoutMs !== undefined ? { timeoutMs: options.sourceTimeoutMs } : {}),
-      onError: (source, error) =>
-        logger.warn(`context source "${source}" failed`, { error: error instanceof Error ? error.message : error }),
+      onError: (source, error) => logger.warn(`context source "${source}" failed`, { error: messageOf(error) }),
     });
   }
 
@@ -200,7 +234,17 @@ export function createContext(options: ContextOptions): Context {
       instructions = [instructions, renderFacts(collected)].filter((part) => part && part.trim()).join('\n\n');
     }
 
-    const messages = [...projected.messages];
+    // AI SDK 不收 messages 里的 system 消息：按出现的顺序把文字接到指令后面。
+    const messages: ModelMessage[] = [];
+    const system: string[] = [];
+    for (const message of projected.messages) {
+      if (message.role === 'system') system.push(textOf(message));
+      else messages.push(message);
+    }
+    if (system.length > 0) {
+      instructions = [instructions, ...system].filter((part) => part && part.trim()).join('\n\n');
+    }
+
     if (call.input !== undefined && !isEmptyContent(call.input)) messages.push({ role: 'user', content: call.input });
     const prompt = typeof call.prompt === 'function' ? call.prompt(collected) : call.prompt;
     if (prompt !== undefined && !isEmptyContent(prompt)) messages.push({ role: 'user', content: prompt });
@@ -215,9 +259,13 @@ export function createContext(options: ContextOptions): Context {
     };
   }
 
-  function settings(call: CallSettings, prepared: PreparedCall, signal: AbortSignal | undefined) {
+  function modelFor(call: CallSettings): LanguageModel {
     const model = call.model ?? options.model;
     if (!model) throw new Error('No language model: pass `model` to createContext() or to the call.');
+    return model;
+  }
+
+  function settings(model: LanguageModel, call: GenerateOptions, prepared: PreparedCall) {
     return {
       model,
       ...(prepared.instructions ? { instructions: prepared.instructions } : {}),
@@ -233,16 +281,17 @@ export function createContext(options: ContextOptions): Context {
       ...(call.timeoutMs !== undefined ? { timeout: call.timeoutMs } : {}),
       ...(call.headers !== undefined ? { headers: call.headers } : {}),
       ...(call.providerOptions !== undefined ? { providerOptions: call.providerOptions } : {}),
-      ...(signal ? { abortSignal: signal } : {}),
+      ...(call.signal ? { abortSignal: call.signal } : {}),
     };
   }
 
-  /** 记录时先把用户这句写进日志，再组装（组装读到的历史里已经有它）。 */
+  /** 记录时先把用户这句写进日志，再组装（组装读到的历史里已经有它）。调用方先确认有模型再来。 */
   async function begin(call: GenerateOptions): Promise<{ prepared: PreparedCall; recorded: ContextEntry[] }> {
     const record = call.record !== false;
     const recorded: ContextEntry[] = [];
     if (record && call.input !== undefined && !isEmptyContent(call.input)) {
-      recorded.push(...(await append(userEntry(call.input))));
+      const keyed = call.inputKey !== undefined ? { key: call.inputKey } : undefined;
+      recorded.push(...(await append(userEntry(call.input, keyed))));
     }
     const prepared = await prepare(record ? { ...call, input: undefined } : call);
     return { prepared, recorded };
@@ -253,31 +302,62 @@ export function createContext(options: ContextOptions): Context {
   }
 
   async function generate(call: GenerateOptions = {}): Promise<GenerateResult> {
+    const model = modelFor(call);
     const { prepared, recorded } = await begin(call);
-    const raw = await generateText(settings(call, prepared, call.signal));
+    const raw = await generateText(settings(model, call, prepared));
     const messages: ModelMessage[] = [...raw.responseMessages];
     if (call.record !== false && messages.length > 0) recorded.push(...(await append(...responseEntries(messages))));
     return { text: raw.text, messages, recorded, raw };
   }
 
-  async function stream(call: StreamOptions = {}): Promise<StreamTextResult> {
-    const { prepared } = await begin(call);
-    return streamText({
-      ...settings(call, prepared, call.signal),
+  async function stream(call: StreamOptions = {}): Promise<ContextStream> {
+    const model = modelFor(call);
+    const { prepared, recorded: input } = await begin(call);
+    // 只有调用方给了 onError、或上下文配了 logger 才接管，否则保留 AI SDK 的缺省（console.error）。
+    const report =
+      call.onError ??
+      (options.logger ? (error: unknown) => logger.warn('stream failed', { error: messageOf(error) }) : undefined);
+    const onError = report ? { onError: ({ error }: { error: unknown }) => report(error) } : {};
+    if (call.record === false) {
+      return { result: streamText({ ...settings(model, call, prepared), ...onError }), recorded: Promise.resolve([]) };
+    }
+
+    const recorded = Promise.withResolvers<readonly ContextEntry[]>();
+    // 没人等 recorded 时，写日志失败也不能变成未处理的 rejection。
+    recorded.promise.catch(() => {});
+    let ending = false;
+    const result = streamText({
+      ...settings(model, call, prepared),
+      ...onError,
       onEnd: async (event) => {
-        if (call.record === false || event.responseMessages.length === 0) return;
+        ending = true;
         try {
-          const written = await append(...responseEntries(event.responseMessages));
-          call.onRecorded?.(written);
+          const messages = event.responseMessages;
+          const written = messages.length > 0 ? await append(...responseEntries(messages)) : [];
+          recorded.resolve([...input, ...written]);
         } catch (error) {
-          logger.warn('failed to record streamed response', { error: error instanceof Error ? error.message : error });
+          logger.warn('failed to record streamed response', { error: messageOf(error) });
+          recorded.reject(error);
         }
       },
-      onError: ({ error }) => {
-        if (call.onError) call.onError(error);
-        else logger.warn('stream failed', { error: error instanceof Error ? error.message : error });
+      onAbort: () => {
+        if (!ending) recorded.resolve(input);
       },
     });
+    let watched = false;
+    return {
+      result,
+      get recorded() {
+        if (!watched) {
+          watched = true;
+          // 出错或没有输出时 AI SDK 不调 onEnd，只让结果的 promise reject；读它也会让流跑完。
+          result.finishReason.then(undefined, () => {
+            if (!ending) recorded.resolve(input);
+          });
+        }
+        return recorded.promise;
+      },
+    };
   }
 
   async function compact(compactOptions: CompactOptions = {}): Promise<SummaryEntry | null> {
@@ -289,18 +369,24 @@ export function createContext(options: ContextOptions): Context {
     let cut = rest.length - (compactOptions.keep ?? 12);
     // 不把工具结果和它的调用切到两边。
     while (cut > 0 && rest[cut]?.message.role === 'tool') cut -= 1;
-    if (cut < (compactOptions.minimum ?? 8)) return null;
+    if (cut <= 0 || cut < (compactOptions.minimum ?? 8)) return null;
 
     const older = rest.slice(0, cut);
-    const { text } = await generateText({
+    const maxOutputTokens = compactOptions.maxOutputTokens ?? 1024;
+    const { text, finishReason } = await generateText({
       model,
       instructions: compactOptions.instructions ?? DEFAULT_SUMMARY_INSTRUCTIONS,
       prompt: transcript([...pinned, ...older].map((item) => item.message)),
       temperature: 0,
-      maxOutputTokens: compactOptions.maxOutputTokens ?? 1024,
+      maxOutputTokens,
       ...(compactOptions.timeoutMs !== undefined ? { timeout: compactOptions.timeoutMs } : {}),
       ...(compactOptions.signal ? { abortSignal: compactOptions.signal } : {}),
     });
+    // 被 maxOutputTokens 截断的摘要会丢事实，宁可这次不压缩。
+    if (finishReason === 'length') {
+      logger.warn('summary hit maxOutputTokens; history not compacted', { maxOutputTokens });
+      return null;
+    }
     const summary = text.trim();
     if (!summary) return null;
     const [entry] = await append({ type: 'summary', text: summary, covers: older.at(-1)!.upTo, source: 'model' });

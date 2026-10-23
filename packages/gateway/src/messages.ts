@@ -41,9 +41,35 @@ function base64(data: Uint8Array | ArrayBuffer): string {
 
 type InlineData = string | Uint8Array | ArrayBuffer | URL;
 
-/** 服务商侧的文件引用（上传后的 id）对方不认，只转内联数据和地址。 */
-function isInline(data: unknown): data is InlineData {
-  return typeof data === 'string' || data instanceof Uint8Array || data instanceof ArrayBuffer || data instanceof URL;
+/**
+ * 取出能内联的数据：裸数据、URL，或者 AI SDK v7 带标签的 `{ type: 'data' }`、`{ type: 'url' }`。
+ * 服务商侧的文件引用（上传后的 id）对方不认，返回 undefined。
+ */
+function inlineOf(data: unknown): InlineData | undefined {
+  if (typeof data === 'string' || data instanceof Uint8Array || data instanceof ArrayBuffer || data instanceof URL) {
+    return data;
+  }
+  if (!data || typeof data !== 'object') return undefined;
+  const tagged = data as { type?: unknown; data?: unknown; url?: unknown };
+  if (tagged.type === 'data') {
+    const inner = tagged.data;
+    return typeof inner === 'string' || inner instanceof Uint8Array || inner instanceof ArrayBuffer ? inner : undefined;
+  }
+  if (tagged.type === 'url') {
+    if (tagged.url instanceof URL) return tagged.url;
+    if (typeof tagged.url === 'string' && URL.canParse(tagged.url)) return new URL(tagged.url);
+  }
+  return undefined;
+}
+
+function isImage(mediaType: string | undefined): boolean {
+  const type = mediaType?.toLowerCase();
+  return type === 'image' || type?.startsWith('image/') === true;
+}
+
+/** data URL 里的类型：`image`、`image/*` 这种只到大类的写法用 image/png。 */
+function imageType(mediaType: string | undefined): string {
+  return mediaType && /^image\/[^*\s]+$/i.test(mediaType) ? mediaType : 'image/png';
 }
 
 /** AI SDK 的图片/文件数据转成 OpenAI 能收的地址：URL 原样，二进制和 base64 变成 data URL。 */
@@ -51,9 +77,14 @@ function urlOf(data: InlineData, mediaType: string | undefined): string {
   if (data instanceof URL) return data.href;
   if (typeof data === 'string') {
     if (/^(https?:|data:)/i.test(data)) return data;
-    return `data:${mediaType ?? 'image/png'};base64,${data}`;
+    return `data:${imageType(mediaType)};base64,${data}`;
   }
-  return `data:${mediaType ?? 'image/png'};base64,${base64(data)}`;
+  return `data:${imageType(mediaType)};base64,${base64(data)}`;
+}
+
+function imagePart(data: unknown, mediaType: string | undefined): ChatContentPart | undefined {
+  const inline = inlineOf(data);
+  return inline === undefined ? undefined : { type: 'image_url', image_url: { url: urlOf(inline, mediaType) } };
 }
 
 function outputText(output: unknown): string {
@@ -94,12 +125,17 @@ export function toChatMessages(messages: readonly ModelMessage[]): ChatMessage[]
         }
         const parts: ChatContentPart[] = [];
         for (const part of message.content) {
-          if (part.type === 'text') parts.push({ type: 'text', text: part.text });
-          else if (part.type === 'image' && isInline(part.image)) {
-            parts.push({ type: 'image_url', image_url: { url: urlOf(part.image, part.mediaType) } });
-          } else if (part.type === 'file' && part.mediaType.startsWith('image/') && isInline(part.data)) {
-            parts.push({ type: 'image_url', image_url: { url: urlOf(part.data, part.mediaType) } });
+          if (part.type === 'text') {
+            parts.push({ type: 'text', text: part.text });
+            continue;
           }
+          const image =
+            part.type === 'image'
+              ? imagePart(part.image, part.mediaType)
+              : part.type === 'file' && isImage(part.mediaType)
+                ? imagePart(part.data, part.mediaType)
+                : undefined;
+          if (image) parts.push(image);
         }
         if (parts.length > 0) out.push({ role: 'user', content: parts });
         break;
