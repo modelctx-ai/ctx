@@ -1,0 +1,53 @@
+{
+  "name": "@modelctx-ai/ctx-protocol",
+  "version": "0.2.0",
+  "description": "ctx 的协议层：会话、上下文、工具、执行环境、harness、编排六个协议的接口、JSON 形状、纯函数和契约测试，不含实现。",
+  "keywords": [
+    "ai",
+    "llm",
+    "agent",
+    "context",
+    "protocol",
+    "ai-sdk"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/protocol"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "@modelctx-ai/source": "./src/testing.ts",
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "vp pack"
+  },
+  "peerDependencies": {
+    "ai": "^7"
+  },
+  "devDependencies": {
+    "ai": "^7.0.150"
+  }
+}

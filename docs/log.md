@@ -2,6 +2,9 @@
 
 ## 2026-10-25
 
+- **新增** `packages/protocol`（`@modelctx-ai/ctx-protocol` 0.2.0）：六个协议的接口、JSON 形状、纯函数和 `/testing` 契约测试（`describeSessionStoreContract`、`describeExecutorContract`、`describeToolRegistryContract`）。
+- **更新** [协议层](protocol.md)：签名按代码定稿。和草案相比：`AgentSpec.tools` 改成能序列化的 `ToolSelection`（函数筛选只留在进程内的 `ToolFilter`）；`WindowOptions` 不再带 `estimate`；`StopReason` 去掉 `hook_denied`、加 `max_tokens`，`RunResult` 加 `error`，出错也照常返回；`RunStatus` 的 `idle` 改成 `completed`；`append` 的原子性写清楚了去重时其余照写；`ToolRegistry` 加 `get`；`ToolOutput` 的内容块定成 `text` / `file`，给了和 AI SDK 互转的函数；补契约测试一节。
+- **更新** [概念](concepts.md)：术语表补 `CTX_EVENTS`、`StopReason` 的取值。
 - **定位**：ctx 从「给 yoyo 用的上下文管理库」改成「面向 agent 原生程序的上下文与运行框架」：协议层、实现层、实践三层。README、索引按此重写。
 - **新增** [概念](concepts.md)：七个组件、术语、和 Anthropic 公开实践（Managed Agents、上下文工程、长程 harness、工具设计、Agent SDK）的对应、设计约束。
 - **新增** [协议层](protocol.md)：`SessionStore`、`ContextBuilder`、`ToolRegistry`、`Executor`、`Harness`、`Orchestrator` 的签名草案、框架事件 `ctx.*`、托管矩阵、HTTP 线上形态。

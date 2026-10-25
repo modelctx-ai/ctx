@@ -81,6 +81,12 @@ importers:
         specifier: ^4.6.7
         version: 4.6.7
 
+  packages/protocol:
+    devDependencies:
+      ai:
+        specifier: ^7.0.150
+        version: 7.0.150(zod@4.6.7)
+
   packages/sqlite:
     devDependencies:
       '@modelctx-ai/ctx':

@@ -38,18 +38,18 @@ flowchart LR
 
 ## 术语
 
-| 术语                          | 说明                                                                                                                                                                                       |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 会话 `session`                | 日志的名字，字符串，例如 `user:42`、`pet:main`。原来叫 `thread`，见 [ADR 0004](adr/0004-protocol-and-implementation.md)                                                                    |
-| 条目 `Entry`                  | 日志里的一条：`message`（AI SDK 消息原样）、`event`（应用或框架的事件）、`summary`（压缩点）。写入后不改                                                                                   |
-| 游标 `Cursor`                 | `{ at, seq }`：逻辑时间加存储分配的写入序号                                                                                                                                                |
-| 事实 `Fact`                   | 来源在调用那一刻取到的文字，只用于这一次，不写日志                                                                                                                                         |
-| 投影 `Projection`             | 把条目渲染成这一次交给模型的消息                                                                                                                                                           |
-| 事件 `kind`                   | 事件的类型名，`{domain}.{action}` 写法。框架保留 `ctx.` 前缀（`ctx.run.started`、`ctx.run.ended`、`ctx.compacted`、`ctx.error`），应用自定其余。事件缺省对模型不可见，投影规则决定怎么渲染 |
-| 一轮 `run`                    | harness 的一次运行：一个输入进去，若干次模型调用和工具调用，一个 `stopReason` 出来。`runId` 标识它                                                                                         |
-| 工具调用 `ToolCall`           | `{ id, name, input }`；结果 `ToolOutput` 是文字、JSON、内容块或错误                                                                                                                        |
-| 执行上下文 `ExecutionContext` | 一次工具调用附带的环境：会话、`runId`、取消信号                                                                                                                                            |
-| 钩子 `Hooks`                  | harness 在调模型前后、执行工具前后给应用的切入点；权限确认是「执行工具前」的一个钩子                                                                                                       |
+| 术语                          | 说明                                                                                                                                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 会话 `session`                | 日志的名字，字符串，例如 `user:42`、`pet:main`。原来叫 `thread`，见 [ADR 0004](adr/0004-protocol-and-implementation.md)                                                                                       |
+| 条目 `Entry`                  | 日志里的一条：`message`（AI SDK 消息原样）、`event`（应用或框架的事件）、`summary`（压缩点）。写入后不改                                                                                                      |
+| 游标 `Cursor`                 | `{ at, seq }`：逻辑时间加存储分配的写入序号                                                                                                                                                                   |
+| 事实 `Fact`                   | 来源在调用那一刻取到的文字，只用于这一次，不写日志                                                                                                                                                            |
+| 投影 `Projection`             | 把条目渲染成这一次交给模型的消息                                                                                                                                                                              |
+| 事件 `kind`                   | 事件的类型名，`{domain}.{action}` 写法。框架保留 `ctx.` 前缀（`ctx.run.started`、`ctx.run.ended`、`ctx.compacted`、`ctx.error`，常量 `CTX_EVENTS`），应用自定其余。事件缺省对模型不可见，投影规则决定怎么渲染 |
+| 一轮 `run`                    | harness 的一次运行：一个输入进去，若干次模型调用和工具调用，一个 `stopReason`（`end_turn`、`max_steps`、`max_tokens`、`aborted`、`error`）出来。`runId` 标识它                                                |
+| 工具调用 `ToolCall`           | `{ id, name, input }`；结果 `ToolOutput` 是文字、JSON、内容块或错误，和 AI SDK 的工具结果互转                                                                                                                 |
+| 执行上下文 `ExecutionContext` | 一次工具调用附带的环境：会话、`runId`、取消信号                                                                                                                                                               |
+| 钩子 `Hooks`                  | harness 在调模型前后、执行工具前后给应用的切入点；权限确认是「执行工具前」的一个钩子                                                                                                                          |
 
 ## 和 Anthropic 公开实践的对应
 
