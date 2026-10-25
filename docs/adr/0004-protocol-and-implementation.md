@@ -94,8 +94,8 @@ TypeScript 里用接口和工厂函数表达，不用类继承：协议是 `inte
 | `@modelctx-ai/ctx-sqlite`   | 实现 | `node:sqlite` 的 `SessionStore`                                                                                                                                   | `ctx-protocol`                        |
 | `@modelctx-ai/ctx-models`   | 实现 | 按配置造 `LanguageModel`                                                                                                                                          | `ai`、服务商 SDK                      |
 | `@modelctx-ai/ctx-mcp`      | 实现 | MCP 服务器作为 `Executor`，工具写进 `ToolRegistry`                                                                                                                | `ctx-protocol`、`@ai-sdk/mcp`         |
-| `@modelctx-ai/ctx-exec`     | 实现 | 本机子进程 `Executor`：跑命令行，工作目录、环境变量白名单、超时                                                                                                   | `ctx-protocol`、`node:child_process`  |
-| `@modelctx-ai/ctx-remote`   | 实现 | `SessionStore`、`Executor`、`Harness` 的 HTTP 服务端和客户端                                                                                                      | `ctx-protocol`、`node:http`（服务端） |
+| `@modelctx-ai/ctx-exec`     | 实现 | 本机子进程 `Executor`：跑命令行、读写工作目录里的文件，环境变量白名单、超时、输出截断                                                                             | `ctx-protocol`、`node:child_process`  |
+| `@modelctx-ai/ctx-remote`   | 实现 | `SessionStore`、`Executor`、`Harness`、`Orchestrator` 的 HTTP 服务端和客户端                                                                                      | `ctx-protocol`、`node:http`（服务端） |
 | `@modelctx-ai/ctx-gateway`  | 实现 | OpenAI 兼容网关：把调用方的历史换成会话的上下文                                                                                                                   | `ctx-protocol`                        |
 
 依赖只朝一个方向：协议 ← 实现 ← 实践。实现包之间不互相依赖；测试里需要一个会话存储时用 `@modelctx-ai/ctx` 的内存存储（devDependency）。

@@ -15,7 +15,7 @@
 | `@modelctx-ai/ctx-models`   | 按配置建模型                                                                                    | 带进服务商 SDK（`@ai-sdk/openai-compatible`、`@ai-sdk/anthropic`）；自己传 `LanguageModel` 的应用用不到 |
 | `@modelctx-ai/ctx-mcp`      | MCP 服务器作为执行环境                                                                          | 带进 `@ai-sdk/mcp`，要起子进程                                                                          |
 | `@modelctx-ai/ctx-exec`     | 本机子进程执行环境                                                                              | 要 `node:child_process`；不跑命令的应用用不到                                                           |
-| `@modelctx-ai/ctx-remote`   | 会话存储、执行环境、harness 的 HTTP 服务端和客户端                                              | 服务端要 `node:http`；进程内用法用不到                                                                  |
+| `@modelctx-ai/ctx-remote`   | 会话存储、执行环境、harness、编排器的 HTTP 服务端和客户端                                       | 服务端要 `node:http`；进程内用法用不到                                                                  |
 | `@modelctx-ai/ctx-gateway`  | OpenAI 兼容网关                                                                                 | 本机 HTTP 服务；只有要接 OpenAI 协议客户端的应用才用                                                    |
 
 没选一个包加子路径（`@modelctx-ai/ctx/sqlite`）：适配器的依赖要么所有人都装上，要么变成可选的 peer 让使用方自己补；各部分对 Node 版本的要求也不一样。

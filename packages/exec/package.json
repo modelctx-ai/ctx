@@ -1,0 +1,47 @@
+{
+  "name": "@modelctx-ai/ctx-exec",
+  "version": "0.2.0",
+  "description": "ctx 的本机子进程执行环境：跑命令行、读写工作目录里的文件；工作目录、环境变量白名单、超时、输出截断。",
+  "keywords": [
+    "ai",
+    "agent",
+    "executor",
+    "shell",
+    "child-process"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/exec"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "vp pack"
+  },
+  "peerDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^"
+  },
+  "devDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^"
+  }
+}

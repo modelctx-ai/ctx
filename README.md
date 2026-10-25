@@ -19,8 +19,8 @@
 | [`@modelctx-ai/ctx-sqlite`](packages/sqlite)     | 基于 `node:sqlite` 的 `SessionStore`，可以和应用共用一个库                                                                  | Node ≥22.13                       |
 | [`@modelctx-ai/ctx-models`](packages/models)     | 按配置创建 `LanguageModel`：内置 `openai-compatible`、`anthropic`，可注册更多服务商                                         | Node ≥22                          |
 | [`@modelctx-ai/ctx-mcp`](packages/mcp)           | MCP 服务器作为执行环境：按常见的 `mcpServers` 配置连接（stdio、Streamable HTTP、SSE），工具写进注册表                       | Node ≥22                          |
-| [`@modelctx-ai/ctx-exec`](packages/exec)         | 本机子进程执行环境：跑命令行，工作目录、环境变量白名单、超时                                                                | Node ≥22                          |
-| [`@modelctx-ai/ctx-remote`](packages/remote)     | 会话存储、执行环境、harness 的 HTTP 服务端和客户端：把组件放到进程边界另一侧                                                | 客户端任何运行时；服务端 Node ≥22 |
+| [`@modelctx-ai/ctx-exec`](packages/exec)         | 本机子进程执行环境：跑命令行、读写工作目录里的文件，环境变量白名单、超时、输出截断                                          | Node ≥22                          |
+| [`@modelctx-ai/ctx-remote`](packages/remote)     | 会话存储、执行环境、harness、编排器的 HTTP 服务端和客户端：把组件放到进程边界另一侧                                         | 客户端任何运行时；服务端 Node ≥22 |
 | [`@modelctx-ai/ctx-gateway`](packages/gateway)   | 本机 OpenAI 兼容网关：转发 `chat/completions`，把调用方带来的历史换成 ctx 的上下文                                          | Node ≥22                          |
 
 还没有发布到 npm，现在的用法见[在其他仓库里使用](#在其他仓库里使用)。设计见[概念](docs/concepts.md)和[协议层](docs/protocol.md)。

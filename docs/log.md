@@ -2,6 +2,10 @@
 
 ## 2026-10-25
 
+- **新增** `packages/exec`（`@modelctx-ai/ctx-exec` 0.2.0）：本机子进程 `Executor`。`run_command` 在工作目录里用 shell 跑命令，`read_file`、`write_file`、`list_dir` 只碰工作目录里面（拒绝 `..` 和指出去的符号链接）；环境变量白名单、超时和取消时杀整个进程组、输出截断并注明截掉多少、`allow` 审批；`commands` 把固定命令包成专门的工具。结果是带 `<exit_code>`、`<stdout>`、`<stderr>` 的文字，非零退出码不算错误。
+- **新增** `packages/remote`（`@modelctx-ai/ctx-remote` 0.2.0）：协议的 HTTP 形态。服务端 `/server` 的 `startRemote`、`createRemoteHandler` 挂会话存储、执行环境、harness、编排器，安全缺省照网关；客户端只用 `fetch`：`createRemoteSessionStore`（含 `watch`）、`createRemoteExecutor`、`createRemoteHarness`（含 `stream`）、`createRemoteOrchestrator`。四个协议的契约测试都在远程客户端上跑过，另有三服务端到端一例。
+- **更新** [协议层](protocol.md)：「线上形态」按实现定稿：编排器移到 `/orchestrator` 下，和 harness 的 `/runs` 分开；加 `DELETE /runs/:runId`（`signal` 跨边界）、`GET /orchestrator/runs/:id?wait=` 长轮询、`POST /orchestrator/recover`、`GET /executors`；编排器事件用 NDJSON 不用 SSE。「托管矩阵」写实际的 API 名，去掉「（计划）」。[概念](concepts.md)里 worker 拉取改成「之后加」。
+
 - **实现**：`@modelctx-ai/ctx` 改成协议的进程内参考实现，五个实现包升到 0.2.0。核心包把协议包当 peer，删掉重复的条目、存储接口、投影、来源、token 估算、工具类型，改为从协议包导入并原样再导出；新增 `createFunctionExecutor`、`createContextBuilder`（`factsPlacement: 'prompt'` 给提示缓存留不变的 system 前缀）、`createHarness`、`createOrchestrator`；`createToolRegistry` 实现协议的 `ToolRegistry`，加 `addTool`、`toolSet`、`toToolSet`；`createContext` 改成组合门面，`generate` 走 harness，结果加 `runId`、`stopReason`，日志里多了 `ctx.run.*`；`compact` 另记 `ctx.compacted`。`thread` → `session`、`ContextStore` → `SessionStore`、`threads()` → `sessions()`，旧名留作弃用别名。
 - **实现**：ctx-sqlite、ctx-mcp、ctx-gateway 只依赖协议包。sqlite 的列改名 `session`，加轮询的 `watch`；mcp 的 hub 本身是一个 `Executor`（名字缺省 `mcp`），`registerInto` 写 `ToolDefinition`；gateway 的 `withContext` 也收 `(builder, session)`。
 - **新增** 协议包的 `describeHarnessContract`、`describeOrchestratorContract`（工厂收一份模型剧本），核心包的 `/testing` 加 `createScriptedModel`。

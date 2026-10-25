@@ -345,7 +345,7 @@ interface Harness {
 - `Hooks` 是 harness 实现的构造参数，不在 `RunRequest` 里：它们是函数，不能跨边界。
 - 权限确认是 `beforeTool` 的一种实现：返回 `{ allow: false }` 时工具结果是一条错误，模型会看到原因，这一轮继续。
 - 参考实现基于 AI SDK 的 `generateText` / `streamText`：把选中的 `ToolDefinition` 包成 AI SDK 工具，`execute` 转给执行环境。
-- 远端 harness：`POST /runs` 收 `RunRequest`（模型是名字），回 `RunResult`；`stream` 是同一个路径的 NDJSON。
+- 远端 harness（`ctx-remote`）：`POST /runs` 收去掉 `signal` 的 `RunRequest`（模型是名字），回 `RunResult`；`stream` 是 `POST /runs?stream=1` 的 NDJSON。`signal` 中止时客户端发 `DELETE /runs/:runId`，同一个请求照常回 `stopReason: aborted`；客户端断开时服务端也中止这一轮。
 
 ## 编排 `Orchestrator`
 
@@ -379,7 +379,7 @@ interface Orchestrator {
 - `completed` 是跑完了；`failed` 是 `stopReason: error` 或 harness 抛错；`cancelled` 是被 `cancel` 或 `signal` 取消。
 - 参考实现是进程内队列：每个会话一条队列，一个 harness。
 - yoyo 的常驻循环和导演是一个应用级的编排器：定时、让路、收件箱。它应当实现这个协议，而不是另一套。
-- 远端编排器：`POST /runs`、`GET /runs/:id`、`DELETE /runs/:id`、`GET /events`（SSE）。
+- 远端编排器（`ctx-remote`）：路径放在 `/orchestrator` 下，和 harness 的 `/runs` 分开：`POST /orchestrator/runs`、`GET /orchestrator/runs/:id`（`?wait=` 长轮询，结束后带 `result`，客户端的 `done` 靠它）、`DELETE /orchestrator/runs/:id`、`POST /orchestrator/recover`、`GET /orchestrator/events`（NDJSON）。
 
 ## 契约测试
 
@@ -399,33 +399,43 @@ harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptSte
 
 每个组件三种形态。「进程内」是 `@modelctx-ai/ctx` 和各适配包；「本机另一进程 / 远端」靠 `ctx-remote` 的 HTTP 服务端和客户端，或者别人按协议实现的服务。
 
-| 组件     | 进程内                          | 另一进程 / 远端                                                                 | 第三方托管                         |
-| -------- | ------------------------------- | ------------------------------------------------------------------------------- | ---------------------------------- |
-| 会话     | 内存、SQLite                    | `ctx-remote`：`serveSessionStore` / `createRemoteSessionStore`                  | 实现 `SessionStore` 的任何存储服务 |
-| 上下文   | 投影 + 来源                     | 跟着 harness 走；也可单独成服务                                                 | —                                  |
-| 工具     | 注册表                          | 跟着 harness 走                                                                 | —                                  |
-| 执行环境 | 函数、子进程（`ctx-exec`）、MCP | `ctx-remote`：`serveExecutor` / `createRemoteExecutor`；worker 拉取模式（计划） | 容器平台、Managed Agents 的沙箱    |
-| Harness  | AI SDK 循环                     | `ctx-remote`：`serveHarness` / `createRemoteHarness`                            | Managed Agents（计划）             |
-| 编排     | 进程内队列                      | 同上（计划）                                                                    | 任何任务队列                       |
-| 模型     | AI SDK                          | 名字 → 远端 harness 自己造                                                      | 各服务商                           |
+| 组件     | 进程内                          | 另一进程 / 远端                                                                              | 第三方托管                         |
+| -------- | ------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------- |
+| 会话     | 内存、SQLite                    | `ctx-remote`：服务端挂 `store` / `createRemoteSessionStore`（含 `watch`）                    | 实现 `SessionStore` 的任何存储服务 |
+| 上下文   | 投影 + 来源                     | 跟着 harness 走；也可单独成服务                                                              | —                                  |
+| 工具     | 注册表                          | 跟着 harness 走；远端执行环境的 `tools()` 报定义，加进本地注册表                             | —                                  |
+| 执行环境 | 函数、子进程（`ctx-exec`）、MCP | `ctx-remote`：服务端挂 `executors` / `createRemoteExecutor`；worker 拉取模式之后加           | 容器平台、Managed Agents 的沙箱    |
+| Harness  | AI SDK 循环                     | `ctx-remote`：服务端挂 `harness` / `createRemoteHarness`（含 `stream`）                      | Managed Agents（之后）             |
+| 编排     | 进程内队列                      | `ctx-remote`：服务端挂 `orchestrator` / `createRemoteOrchestrator`（含 `recover`、`events`） | 任何任务队列                       |
+| 模型     | AI SDK                          | 名字 → 远端 harness 自己造                                                                   | 各服务商                           |
+
+服务端是 `@modelctx-ai/ctx-remote/server` 的 `startRemote(options)` 或 `createRemoteHandler(options)`：给了哪些组件就挂哪些路径，一个服务可以同时挂几样。
 
 一个典型的分布式部署：编排器在本机，harness 是一个服务，会话在托管的数据库，执行环境是公有云上的容器或本机的一个子进程，模型是任何服务商。每一侧都只认协议。
 
 ## 线上形态
 
-`ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON；鉴权用 `Authorization: Bearer <token>`，缺省只听本机。路径按组件分组：
+`ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON（每行一个值，出错时最后一行是 `{ error }`）；错误正文是 `{ error: ErrorInfo }`，客户端转成带 `status` 的 `Error`。鉴权用 `Authorization: Bearer <token>`，缺省只听本机，Host 只认监听地址，带 `Origin` 的请求缺省 403。消息里的二进制和 `URL` 编码成带标记的对象（`{"\u0000ctx": "bytes", "base64"}`、`{"\u0000ctx": "url", "href"}`），两头还原。路径按组件分组，可以整体挂在一个前缀下：
 
-| 组件     | 方法                           | 路径                                                               |
-| -------- | ------------------------------ | ------------------------------------------------------------------ |
-| 会话     | `append`                       | `POST /sessions/:session/entries`                                  |
-|          | `list`                         | `GET /sessions/:session/entries?after.at=&after.seq=&last=&types=` |
-|          | `watch`                        | `GET /sessions/:session/entries/stream`                            |
-|          | `clear`                        | `DELETE /sessions/:session`                                        |
-|          | `sessions`                     | `GET /sessions`                                                    |
-| 执行环境 | `tools`                        | `GET /executors/:name/tools`                                       |
-|          | `execute`                      | `POST /executors/:name/execute`                                    |
-| Harness  | `run`                          | `POST /runs`                                                       |
-|          | `stream`                       | `POST /runs?stream=1`（NDJSON）                                    |
-| 编排     | `submit` / `status` / `cancel` | `POST /runs`、`GET /runs/:id`、`DELETE /runs/:id`                  |
+| 组件     | 方法              | 路径                                                               | 请求体 → 响应                                                       |
+| -------- | ----------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------- |
+| 会话     | `append`          | `POST /sessions/:session/entries`                                  | `{ entries }` → `{ entries }`                                       |
+|          | `list`            | `GET /sessions/:session/entries?after.at=&after.seq=&last=&types=` | → `{ entries }`；`types` 逗号分隔                                   |
+|          | `watch`           | `GET /sessions/:session/entries/stream?after.at=&after.seq=`       | → NDJSON `Entry`；存储没有 `watch` 时服务端轮询 `list`              |
+|          | `clear`           | `DELETE /sessions/:session`                                        | → `{ deleted }`                                                     |
+|          | `sessions`        | `GET /sessions`                                                    | → `{ sessions }`                                                    |
+| 执行环境 | （列出名字）      | `GET /executors`                                                   | → `{ executors }`                                                   |
+|          | `tools`           | `GET /executors/:name/tools`                                       | → `{ tools }`                                                       |
+|          | `execute`         | `POST /executors/:name/execute`                                    | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止 |
+| Harness  | `run`             | `POST /runs`                                                       | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`     |
+|          | `stream`          | `POST /runs?stream=1`                                              | 同上 → NDJSON `RunEvent`；断开即中止                                |
+|          | 取消（`signal`）  | `DELETE /runs/:runId`                                              | → `{ cancelled }`                                                   |
+| 编排     | `submit`          | `POST /orchestrator/runs`                                          | 同 `POST /runs` → `{ runId, session }`                              |
+|          | `status` / `done` | `GET /orchestrator/runs/:runId?wait=<ms>`                          | → `{ runId, status, result?, error? }`；`wait` 是长轮询             |
+|          | `cancel`          | `DELETE /orchestrator/runs/:runId`                                 | → `{ cancelled }`                                                   |
+|          | `recover`         | `POST /orchestrator/recover`                                       | → `{ recovered }`                                                   |
+|          | `events`          | `GET /orchestrator/events`                                         | → NDJSON `OrchestratorEvent`                                        |
+
+编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 
 WebSocket 传输、执行环境的 worker 拉取模式在之后加，协议不变。
