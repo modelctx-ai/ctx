@@ -1,4 +1,33 @@
-# 架构
+# 架构：进程内参考实现
+
+ctx 分三层：协议（`@modelctx-ai/ctx-protocol`，只有接口）、实现（`@modelctx-ai/ctx` 和 `ctx-*`）、实践（yoyo）。组件和协议的说明见[概念](concepts.md)和[协议层](protocol.md)。本文写的是实现层里进程内的那一份：`@modelctx-ai/ctx` 的会话存储、投影、来源、工具、harness，以及 sqlite、models、mcp、gateway 四个适配包。
+
+```mermaid
+flowchart TB
+  subgraph protocol["协议  @modelctx-ai/ctx-protocol"]
+    p1["SessionStore"]
+    p2["ContextBuilder"]
+    p3["ToolRegistry · Executor"]
+    p4["Harness · Orchestrator"]
+  end
+  subgraph impl["实现"]
+    core["@modelctx-ai/ctx<br/>内存存储、投影、来源、注册表、函数执行器、AI SDK harness、进程内编排器、createContext()"]
+    sqlite["ctx-sqlite"]
+    mcp["ctx-mcp"]
+    exec["ctx-exec"]
+    remote["ctx-remote"]
+    gateway["ctx-gateway"]
+    models["ctx-models"]
+  end
+  subgraph practice["实践"]
+    yoyo["modelctx-ai/yoyo"]
+  end
+  impl --> protocol
+  practice --> impl
+  practice --> protocol
+```
+
+> 术语：日志的名字叫会话 `session`，原来叫 `thread`。下文的 `thread` 在实现阶段统一改名，见 [ADR 0004](adr/0004-protocol-and-implementation.md)。
 
 ## 概念
 

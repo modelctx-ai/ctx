@@ -1,16 +1,29 @@
 # ctx
 
-LLM 应用的上下文管理框架。每个线程一份只追加的上下文日志，每次调用模型前把日志投影成 AI SDK 的消息；上下文来源、工具和 MCP 也在这一层接好。基于 Vercel AI SDK v7（`ai@7`）。
+面向 agent 原生程序的上下文与运行框架，for programs as yet unthought of。
 
-| 包                                             | 作用                                                                                                                          | 运行环境                          |
-| ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| [`@modelctx-ai/ctx`](packages/core)            | 上下文日志、`ContextStore` 接口和内存存储、投影、上下文来源、工具注册表、`createContext()`；`/testing` 子路径导出存储契约测试 | Node ≥22；主入口不用 `node:` 模块 |
-| [`@modelctx-ai/ctx-sqlite`](packages/sqlite)   | 基于 `node:sqlite` 的 `ContextStore`，可以和应用共用一个库                                                                    | Node ≥22.13                       |
-| [`@modelctx-ai/ctx-models`](packages/models)   | 按配置创建 `LanguageModel`：内置 `openai-compatible`、`anthropic`，可注册更多服务商                                           | Node ≥22                          |
-| [`@modelctx-ai/ctx-mcp`](packages/mcp)         | 按常见的 `mcpServers` 配置连接 MCP 服务器（stdio、Streamable HTTP、SSE），工具写进注册表                                      | Node ≥22                          |
-| [`@modelctx-ai/ctx-gateway`](packages/gateway) | 本机 OpenAI 兼容网关：转发 `chat/completions`，把调用方带来的历史换成 ctx 的上下文                                            | Node ≥22                          |
+一个 agent 被拆成七个组件：会话（只追加的事件日志）、上下文（每次调用从日志算出来交给模型的东西）、工具、执行环境、harness（跑一轮的循环）、编排（什么时候跑哪个会话）、模型。每个组件一个协议，组件之间只通过协议交互：任何一个都能单独替换，也能放在任何地方托管。harness 可以是一个服务，经 HTTP 驱使别处的执行环境；执行环境可以是容器，也可以只是本机的一个进程；会话可以在内存、SQLite 或第三方存储；编排可以是本机一个循环，也可以在云端。模型经 Vercel AI SDK v7 接任何服务商。
 
-还没有发布到 npm，现在的用法见[在其他仓库里使用](#在其他仓库里使用)。
+仓库分三层：
+
+| 层   | 在哪                                                    | 内容                                                  |
+| ---- | ------------------------------------------------------- | ----------------------------------------------------- |
+| 协议 | [`@modelctx-ai/ctx-protocol`](packages/protocol)        | 六个协议的接口、JSON 形状、纯函数、契约测试。只有定义 |
+| 实现 | `@modelctx-ai/ctx` 和 `ctx-*`                           | 每个协议至少一份参考实现，按依赖和托管形态分包        |
+| 实践 | [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo) | 用这些实现组合出来的程序：一个常驻的桌宠导演          |
+
+| 包                                               | 作用                                                                                                                        | 运行环境                          |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
+| [`@modelctx-ai/ctx-protocol`](packages/protocol) | `SessionStore`、`ContextBuilder`、`ToolRegistry`、`Executor`、`Harness`、`Orchestrator`；`/testing` 导出契约测试            | 任何 JS 运行时                    |
+| [`@modelctx-ai/ctx`](packages/core)              | 进程内参考实现：内存会话存储、投影和来源、工具注册表、函数执行环境、基于 AI SDK 的 harness、进程内编排器、`createContext()` | Node ≥22；主入口不用 `node:` 模块 |
+| [`@modelctx-ai/ctx-sqlite`](packages/sqlite)     | 基于 `node:sqlite` 的 `SessionStore`，可以和应用共用一个库                                                                  | Node ≥22.13                       |
+| [`@modelctx-ai/ctx-models`](packages/models)     | 按配置创建 `LanguageModel`：内置 `openai-compatible`、`anthropic`，可注册更多服务商                                         | Node ≥22                          |
+| [`@modelctx-ai/ctx-mcp`](packages/mcp)           | MCP 服务器作为执行环境：按常见的 `mcpServers` 配置连接（stdio、Streamable HTTP、SSE），工具写进注册表                       | Node ≥22                          |
+| [`@modelctx-ai/ctx-exec`](packages/exec)         | 本机子进程执行环境：跑命令行，工作目录、环境变量白名单、超时                                                                | Node ≥22                          |
+| [`@modelctx-ai/ctx-remote`](packages/remote)     | 会话存储、执行环境、harness 的 HTTP 服务端和客户端：把组件放到进程边界另一侧                                                | 客户端任何运行时；服务端 Node ≥22 |
+| [`@modelctx-ai/ctx-gateway`](packages/gateway)   | 本机 OpenAI 兼容网关：转发 `chat/completions`，把调用方带来的历史换成 ctx 的上下文                                          | Node ≥22                          |
+
+还没有发布到 npm，现在的用法见[在其他仓库里使用](#在其他仓库里使用)。设计见[概念](docs/concepts.md)和[协议层](docs/protocol.md)。
 
 ## 快速开始
 
@@ -117,7 +130,7 @@ const gateway = await startGateway({
 console.log(gateway.baseUrl); // http://127.0.0.1:<随机端口>/v1
 ```
 
-概念、投影规则、记录和压缩的细节见[架构](docs/architecture.md)。
+上面三段都是进程内的用法：`createContext()` 把会话存储、上下文组装、工具、执行环境和 harness 组合成一个对象。要把其中任何一个换掉或放到别处，按协议给另一份实现，见[协议层](docs/protocol.md)；投影规则、记录和压缩的细节见[架构](docs/architecture.md)。
 
 ## 在其他仓库里使用
 
@@ -134,9 +147,12 @@ console.log(gateway.baseUrl); // http://127.0.0.1:<随机端口>/v1
 ```yaml
 overrides:
   '@modelctx-ai/ctx': link:../ctx/packages/core
+  '@modelctx-ai/ctx-exec': link:../ctx/packages/exec
   '@modelctx-ai/ctx-gateway': link:../ctx/packages/gateway
   '@modelctx-ai/ctx-mcp': link:../ctx/packages/mcp
   '@modelctx-ai/ctx-models': link:../ctx/packages/models
+  '@modelctx-ai/ctx-protocol': link:../ctx/packages/protocol
+  '@modelctx-ai/ctx-remote': link:../ctx/packages/remote
   '@modelctx-ai/ctx-sqlite': link:../ctx/packages/sqlite
 ```
 
@@ -164,14 +180,14 @@ overrides:
 
 ## 要求
 
-| 场景 | 要求                                                                                                                             |
-| ---- | -------------------------------------------------------------------------------------------------------------------------------- |
-| 开发 | Node ≥22.18（直接运行 `.ts`）；pnpm 10，版本由 `packageManager` 固定                                                             |
-| 使用 | Node 版本见包表；peer dependency：`zod`（核心包）、`ai@^7`（ctx-models）、`@modelctx-ai/ctx`（ctx-sqlite、ctx-mcp、ctx-gateway） |
+| 场景 | 要求                                                                                                                |
+| ---- | ------------------------------------------------------------------------------------------------------------------- |
+| 开发 | Node ≥22.18（直接运行 `.ts`）；pnpm 10，版本由 `packageManager` 固定                                                |
+| 使用 | Node 版本见包表；peer dependency：`zod`（核心包）、`ai@^7`（ctx-models）、`@modelctx-ai/ctx-protocol`（其余实现包） |
 
 ## 文档
 
-[docs/index.md](docs/index.md)：架构、三个仓库的关系、决策记录。
+[docs/index.md](docs/index.md)：概念、协议层、参考实现的架构、实践、决策记录。
 
 ## 许可
 
