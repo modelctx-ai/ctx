@@ -12,7 +12,10 @@ import assert from 'node:assert/strict';
 
 import type { ModelMessage } from 'ai';
 
+import type { AgentSpec, Harness, RunEvent, RunRequest } from './harness.ts';
+import type { Orchestrator, OrchestratorEvent } from './orchestrator.ts';
 import {
+  CTX_EVENTS,
   assistantEntry,
   cursorOf,
   eventEntry,
@@ -23,6 +26,7 @@ import {
   type SessionStore,
 } from './session.ts';
 import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type ToolRegistry } from './tools.ts';
+import type { JsonObject } from './types.ts';
 
 /**
  * 契约测试用到的最小测试框架接口。Vitest、`node:test`、Jest、Bun 的 `describe` / `test` 都满足，
@@ -493,6 +497,349 @@ export function describeToolRegistryContract(
       }
       assert.deepEqual(names({ sources: ['mcp:fs'], tags: ['read'] }), ['fs__read_file']);
       assert.deepEqual(names(false), []);
+    });
+  });
+}
+
+// ---- Harness ----
+
+/**
+ * 契约测试给模型的剧本：每调一次模型按顺序取下一步。`text` 回一段文字并停下；`tool-call` 调用回显工具
+ * （名字由实现方填，就是 fixture 的 `echo`）；`error` 让这次模型调用抛出带这段信息的错误。
+ */
+export type ModelScriptStep =
+  | { readonly type: 'text'; readonly text: string }
+  | { readonly type: 'tool-call'; readonly id: string; readonly input: JsonObject }
+  | { readonly type: 'error'; readonly message: string };
+
+export interface ModelScript {
+  readonly script: readonly ModelScriptStep[];
+}
+
+export interface HarnessFixture {
+  readonly harness: Harness;
+  /** harness 写日志用的存储，用例从这里读日志。 */
+  readonly store: SessionStore;
+  /** 一个能跑的 agent：模型按剧本回答（流式和非流式都要支持），工具里有回显工具。 */
+  readonly agent: AgentSpec;
+}
+
+/** 每个用例调一次，拿到一个空的存储和按这份剧本回答的模型。 */
+export type HarnessFactory = (setup: ModelScript) => HarnessFixture | Promise<HarnessFixture>;
+
+function kinds(entries: readonly Entry[]): string[] {
+  return entries.map((entry) => {
+    if (entry.type === 'event') return entry.kind;
+    if (entry.type === 'message') return entry.message.role;
+    return entry.type;
+  });
+}
+
+function eventData(entries: readonly Entry[], kind: string): Record<string, unknown>[] {
+  return entries.flatMap((entry) =>
+    entry.type === 'event' && entry.kind === kind ? [(entry.data ?? {}) as Record<string, unknown>] : [],
+  );
+}
+
+/** 模型出错的用例不要重试，免得剧本被多取几步。 */
+function noRetry(agent: AgentSpec): AgentSpec {
+  return { ...agent, settings: { ...agent.settings, maxRetries: 0 } };
+}
+
+function randomMarker(): string {
+  return `echo-${Math.random().toString(36).slice(2)}`;
+}
+
+export function describeHarnessContract(
+  name: string,
+  factory: HarnessFactory,
+  { describe, test }: ContractTestApi,
+): void {
+  describe(`Harness contract: ${name}`, () => {
+    test('一轮：ctx.run.started → 输入 → 回复 → ctx.run.ended，recorded 就是写进日志的', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '在的' }] });
+      const result = await harness.run({ session: 's', agent, input: '在吗', runId: 'run-1' });
+      assert.equal(result.runId, 'run-1');
+      assert.equal(result.text, '在的');
+      assert.equal(result.stopReason, 'end_turn');
+      assert.equal(result.error, undefined);
+      assert.ok(result.messages.length > 0, '有模型产出的消息');
+      const log = await store.list('s');
+      assert.deepEqual(kinds(log), [CTX_EVENTS.runStarted, 'user', 'assistant', CTX_EVENTS.runEnded]);
+      const [started] = eventData(log, CTX_EVENTS.runStarted);
+      assert.equal(started?.['runId'], 'run-1');
+      assert.equal(typeof (started?.['agent'] as Record<string, unknown> | undefined)?.['model'], 'string');
+      assert.equal(eventData(log, CTX_EVENTS.runEnded)[0]?.['stopReason'], 'end_turn');
+      assert.deepEqual(
+        result.recorded.map((entry) => entry.id),
+        log.map((entry) => entry.id),
+      );
+      assert.ok(roundTrips(eventData(log, CTX_EVENTS.runStarted)), 'ctx.run.started 的 data 能序列化');
+    });
+
+    test('不给 runId 时生成一个，两轮不同', async () => {
+      const { harness, agent } = await factory({
+        script: [
+          { type: 'text', text: '一' },
+          { type: 'text', text: '二' },
+        ],
+      });
+      const first = await harness.run({ session: 's', agent, input: '1' });
+      const second = await harness.run({ session: 's', agent, input: '2' });
+      assert.equal(typeof first.runId, 'string');
+      assert.ok(first.runId.length > 0);
+      assert.notEqual(first.runId, second.runId);
+    });
+
+    test('工具调用交给执行环境，结果回到模型，调用和结果都记下', async () => {
+      const text = randomMarker();
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'tool-call', id: 'call-1', input: { text } },
+          { type: 'text', text: '好了' },
+        ],
+      });
+      const result = await harness.run({ session: 's', agent, input: '回显一下' });
+      assert.equal(result.text, '好了');
+      assert.equal(result.stopReason, 'end_turn');
+      const log = await store.list('s');
+      assert.deepEqual(kinds(log), [
+        CTX_EVENTS.runStarted,
+        'user',
+        'assistant',
+        'tool',
+        'assistant',
+        CTX_EVENTS.runEnded,
+      ]);
+      const tool = log.find((entry) => entry.type === 'message' && entry.message.role === 'tool');
+      assert.ok(JSON.stringify(tool).includes(text), '工具结果里有回显的输入');
+    });
+
+    test('模型出错：run 照常返回 stopReason error 和 error，日志里有 ctx.run.ended', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'error', message: 'model exploded' }] });
+      const result = await harness.run({ session: 's', agent: noRetry(agent), input: '在吗' });
+      assert.equal(result.stopReason, 'error');
+      assert.match(result.error?.message ?? '', /model exploded/);
+      const log = await store.list('s');
+      assert.equal(kinds(log).at(-1), CTX_EVENTS.runEnded);
+      assert.equal(eventData(log, CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
+      assert.deepEqual(
+        eventData(log, CTX_EVENTS.runStarted).map((data) => data['runId']),
+        eventData(log, CTX_EVENTS.runEnded).map((data) => data['runId']),
+        'started 和 ended 成对',
+      );
+    });
+
+    test('inputKey：失败后用同一个键重试，输入只记一次', async () => {
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'error', message: 'network down' },
+          { type: 'text', text: '三点了' },
+        ],
+      });
+      const request: RunRequest = { session: 's', agent: noRetry(agent), input: '几点了？', inputKey: 'turn-1' };
+      assert.equal((await harness.run(request)).stopReason, 'error');
+      const retry = await harness.run(request);
+      assert.equal(retry.stopReason, 'end_turn');
+      assert.equal(retry.text, '三点了');
+      const log = await store.list('s');
+      assert.equal(kinds(log).filter((kind) => kind === 'user').length, 1);
+      assert.ok(!retry.recorded.some((entry) => entry.type === 'message' && entry.message.role === 'user'));
+    });
+
+    test('record: false 一条都不写，输入照样交给模型', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      const result = await harness.run({ session: 's', agent, input: '不记', record: false });
+      assert.equal(result.text, '好');
+      assert.deepEqual(result.recorded, []);
+      assert.deepEqual(await store.list('s'), []);
+    });
+
+    test('signal 已中止：返回 stopReason aborted，写 ctx.run.ended', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '不该说' }] });
+      const result = await harness.run({ session: 's', agent, input: '在吗', signal: AbortSignal.abort() });
+      assert.equal(result.stopReason, 'aborted');
+      assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'aborted');
+    });
+
+    test('stream（有时）：run.started 在最前、run.ended 在最后，工具事件在两次模型调用之间', async () => {
+      const text = randomMarker();
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'tool-call', id: 'call-1', input: { text } },
+          { type: 'text', text: '好了' },
+        ],
+      });
+      if (!harness.stream) return;
+      const events: RunEvent[] = [];
+      for await (const event of harness.stream({ session: 's', agent, input: '回显一下' })) events.push(event);
+      const types = events.map((event) => event.type);
+      assert.equal(types[0], 'run.started');
+      assert.equal(types.at(-1), 'run.ended');
+      assert.ok(
+        events.every((event) => event.runId === events[0]!.runId),
+        '同一个 runId',
+      );
+      const at = (type: RunEvent['type'], from = 0) => types.indexOf(type, from);
+      assert.ok(at('model.started') > 0);
+      assert.ok(at('tool.called') > at('model.started'));
+      assert.ok(at('tool.returned') > at('tool.called'));
+      assert.ok(at('model.started', at('tool.returned')) > at('tool.returned'), '工具结果之后再调一次模型');
+      const deltas = events.flatMap((event) => (event.type === 'text.delta' ? [event.text] : []));
+      assert.equal(deltas.join(''), '好了');
+      const returned = events.find((event) => event.type === 'tool.returned');
+      assert.ok(JSON.stringify(returned).includes(text), 'tool.returned 带着回显的输入');
+      const ended = events.at(-1);
+      assert.equal(ended?.type === 'run.ended' && ended.result.stopReason, 'end_turn');
+      assert.equal(kinds(await store.list('s')).at(-1), CTX_EVENTS.runEnded);
+    });
+
+    test('stream（有时）：模型出错时先给 error 再给 run.ended，不抛', async () => {
+      const { harness, agent } = await factory({ script: [{ type: 'error', message: 'model exploded' }] });
+      if (!harness.stream) return;
+      const types: string[] = [];
+      for await (const event of harness.stream({ session: 's', agent: noRetry(agent), input: '在吗' })) {
+        types.push(event.type);
+        if (event.type === 'run.ended') assert.equal(event.result.stopReason, 'error');
+      }
+      assert.deepEqual(types.slice(-2), ['error', 'run.ended']);
+    });
+  });
+}
+
+// ---- Orchestrator ----
+
+export interface OrchestratorFixture {
+  readonly orchestrator: Orchestrator;
+  /** 编排器底下的 harness 写日志用的存储。 */
+  readonly store: SessionStore;
+  /** 一个能跑的 agent，模型按剧本回答。 */
+  readonly agent: AgentSpec;
+}
+
+/** 每个用例调一次，拿到一个空的存储和按这份剧本回答的模型。用例结束时会调 `close`。 */
+export type OrchestratorFactory = (setup: ModelScript) => OrchestratorFixture | Promise<OrchestratorFixture>;
+
+async function withOrchestrator(
+  factory: OrchestratorFactory,
+  setup: ModelScript,
+  fn: (fixture: OrchestratorFixture) => Promise<void>,
+): Promise<void> {
+  const fixture = await factory(setup);
+  try {
+    await fn(fixture);
+  } finally {
+    await fixture.orchestrator.close();
+  }
+}
+
+/** 剧本：按顺序回答 `回答0`、`回答1`…… */
+function answers(count: number): ModelScript {
+  return { script: Array.from({ length: count }, (_, i) => ({ type: 'text', text: `回答${i}` }) as const) };
+}
+
+export function describeOrchestratorContract(
+  name: string,
+  factory: OrchestratorFactory,
+  { describe, test }: ContractTestApi,
+): void {
+  describe(`Orchestrator contract: ${name}`, () => {
+    test('submit 返回句柄，跑完后 status 是 completed', async () => {
+      await withOrchestrator(factory, answers(1), async ({ orchestrator, agent }) => {
+        const handle = await orchestrator.submit({ session: 's', agent, input: '在吗', runId: 'run-1' });
+        assert.equal(handle.runId, 'run-1');
+        assert.equal(handle.session, 's');
+        const result = await handle.done;
+        assert.equal(result.runId, 'run-1');
+        assert.equal(result.stopReason, 'end_turn');
+        assert.equal(await orchestrator.status('run-1'), 'completed');
+        assert.equal(await orchestrator.status('missing'), undefined);
+      });
+    });
+
+    test('同一会话串行：后一轮的 ctx.run.started 在前一轮的 ctx.run.ended 之后', async () => {
+      await withOrchestrator(factory, answers(3), async ({ orchestrator, store, agent }) => {
+        const handles = await Promise.all(
+          ['一', '二', '三'].map((input) => orchestrator.submit({ session: 's', agent, input })),
+        );
+        await Promise.all(handles.map((handle) => handle.done));
+        const order = (await store.list('s')).flatMap((entry) =>
+          entry.type === 'event' && (entry.kind === CTX_EVENTS.runStarted || entry.kind === CTX_EVENTS.runEnded)
+            ? [
+                `${entry.kind === CTX_EVENTS.runStarted ? 'start' : 'end'}:${(entry.data as JsonObject)['runId'] as string}`,
+              ]
+            : [],
+        );
+        assert.deepEqual(
+          order,
+          handles.flatMap((handle) => [`start:${handle.runId}`, `end:${handle.runId}`]),
+        );
+      });
+    });
+
+    test('cancel 排队中的一轮：不跑，done 给出 aborted，status 是 cancelled', async () => {
+      await withOrchestrator(factory, answers(2), async ({ orchestrator, store, agent }) => {
+        const first = await orchestrator.submit({ session: 's', agent, input: '一' });
+        const second = await orchestrator.submit({ session: 's', agent, input: '二' });
+        assert.equal(await orchestrator.cancel(second.runId), true);
+        assert.equal((await second.done).stopReason, 'aborted');
+        assert.equal(await orchestrator.status(second.runId), 'cancelled');
+        assert.equal((await first.done).stopReason, 'end_turn');
+        assert.equal(await orchestrator.cancel(first.runId), false, '跑完的取消不了');
+        assert.equal(await orchestrator.cancel('missing'), false);
+        const started = eventData(await store.list('s'), CTX_EVENTS.runStarted).map((data) => data['runId']);
+        assert.deepEqual(started, [first.runId]);
+      });
+    });
+
+    test('events（有时）：给出 queued → running → completed', async () => {
+      await withOrchestrator(factory, answers(1), async ({ orchestrator, agent }) => {
+        if (!orchestrator.events) return;
+        const controller = new AbortController();
+        const seen: OrchestratorEvent[] = [];
+        const reading = (async () => {
+          for await (const event of orchestrator.events!({ signal: controller.signal })) {
+            seen.push(event);
+            if (event.type === 'run.completed') controller.abort();
+          }
+        })();
+        // 让订阅先挂上。
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        const handle = await orchestrator.submit({ session: 's', agent, input: '在吗' });
+        await handle.done;
+        await reading;
+        assert.deepEqual(
+          seen.filter((event) => event.runId === handle.runId).map((event) => event.type),
+          ['run.queued', 'run.running', 'run.completed'],
+        );
+      });
+    });
+
+    test('recover（有时）：给有 started 没有 ended 的运行补 ctx.run.ended（error），再调一次不重复', async () => {
+      await withOrchestrator(factory, answers(0), async ({ orchestrator, store }) => {
+        if (!orchestrator.recover) return;
+        await store.append('crashed', [
+          eventEntry(CTX_EVENTS.runStarted, { data: { runId: 'lost', agent: { model: 'm' } } }),
+          userEntry('在吗'),
+        ]);
+        await store.append('fine', [
+          eventEntry(CTX_EVENTS.runStarted, { data: { runId: 'ok', agent: { model: 'm' } } }),
+          eventEntry(CTX_EVENTS.runEnded, { data: { runId: 'ok', stopReason: 'end_turn' } }),
+        ]);
+        assert.deepEqual(await orchestrator.recover(), [{ session: 'crashed', runId: 'lost' }]);
+        const ended = eventData(await store.list('crashed'), CTX_EVENTS.runEnded);
+        assert.deepEqual(
+          ended.map((data) => [data['runId'], data['stopReason']]),
+          [['lost', 'error']],
+        );
+        assert.deepEqual(await orchestrator.recover(), []);
+      });
+    });
+
+    test('close 之后不收新运行', async () => {
+      const { orchestrator, agent } = await factory(answers(0));
+      await orchestrator.close();
+      await assert.rejects(Promise.resolve().then(() => orchestrator.submit({ session: 's', agent, input: '在吗' })));
     });
   });
 }

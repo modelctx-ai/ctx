@@ -33,6 +33,9 @@ importers:
         specifier: ^7.0.150
         version: 7.0.150(zod@4.6.7)
     devDependencies:
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
       zod:
         specifier: ^4.6.7
         version: 4.6.7
@@ -42,6 +45,9 @@ importers:
       '@modelctx-ai/ctx':
         specifier: workspace:^
         version: link:../core
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
       ai:
         specifier: ^7.0.150
         version: 7.0.150(zod@4.6.7)
@@ -58,6 +64,9 @@ importers:
       '@modelctx-ai/ctx':
         specifier: workspace:^
         version: link:../core
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
       ai:
         specifier: ^7.0.150
         version: 7.0.150(zod@4.6.7)
@@ -89,9 +98,9 @@ importers:
 
   packages/sqlite:
     devDependencies:
-      '@modelctx-ai/ctx':
+      '@modelctx-ai/ctx-protocol':
         specifier: workspace:^
-        version: link:../core
+        version: link:../protocol
 
 packages:
 

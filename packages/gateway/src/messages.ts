@@ -1,4 +1,6 @@
-import type { ModelMessage } from '@modelctx-ai/ctx';
+import type { MessageEntry } from '@modelctx-ai/ctx-protocol';
+
+type ModelMessage = MessageEntry['message'];
 
 /** OpenAI Chat Completions 消息里网关会碰到的部分，其余字段原样透传。 */
 export type ChatContentPart =

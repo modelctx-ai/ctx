@@ -2,6 +2,11 @@
 
 ## 2026-10-25
 
+- **实现**：`@modelctx-ai/ctx` 改成协议的进程内参考实现，五个实现包升到 0.2.0。核心包把协议包当 peer，删掉重复的条目、存储接口、投影、来源、token 估算、工具类型，改为从协议包导入并原样再导出；新增 `createFunctionExecutor`、`createContextBuilder`（`factsPlacement: 'prompt'` 给提示缓存留不变的 system 前缀）、`createHarness`、`createOrchestrator`；`createToolRegistry` 实现协议的 `ToolRegistry`，加 `addTool`、`toolSet`、`toToolSet`；`createContext` 改成组合门面，`generate` 走 harness，结果加 `runId`、`stopReason`，日志里多了 `ctx.run.*`；`compact` 另记 `ctx.compacted`。`thread` → `session`、`ContextStore` → `SessionStore`、`threads()` → `sessions()`，旧名留作弃用别名。
+- **实现**：ctx-sqlite、ctx-mcp、ctx-gateway 只依赖协议包。sqlite 的列改名 `session`，加轮询的 `watch`；mcp 的 hub 本身是一个 `Executor`（名字缺省 `mcp`），`registerInto` 写 `ToolDefinition`；gateway 的 `withContext` 也收 `(builder, session)`。
+- **新增** 协议包的 `describeHarnessContract`、`describeOrchestratorContract`（工厂收一份模型剧本），核心包的 `/testing` 加 `createScriptedModel`。
+- **更新** [架构](architecture.md)：去掉 `thread` 改名的提示，补函数执行环境、harness、编排器三节；根 README 和各包 README 跟上。
+
 - **新增** `packages/protocol`（`@modelctx-ai/ctx-protocol` 0.2.0）：六个协议的接口、JSON 形状、纯函数和 `/testing` 契约测试（`describeSessionStoreContract`、`describeExecutorContract`、`describeToolRegistryContract`）。
 - **更新** [协议层](protocol.md)：签名按代码定稿。和草案相比：`AgentSpec.tools` 改成能序列化的 `ToolSelection`（函数筛选只留在进程内的 `ToolFilter`）；`WindowOptions` 不再带 `estimate`；`StopReason` 去掉 `hook_denied`、加 `max_tokens`，`RunResult` 加 `error`，出错也照常返回；`RunStatus` 的 `idle` 改成 `completed`；`append` 的原子性写清楚了去重时其余照写；`ToolRegistry` 加 `get`；`ToolOutput` 的内容块定成 `text` / `file`，给了和 AI SDK 互转的函数；补契约测试一节。
 - **更新** [概念](concepts.md)：术语表补 `CTX_EVENTS`、`StopReason` 的取值。

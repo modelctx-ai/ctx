@@ -84,10 +84,12 @@ describeSessionStoreContract('pg', ({ now }) => createPgStore({ url: 'postgres:/
 describeToolRegistryContract('mine', () => createMyRegistry(), { describe, test });
 ```
 
-| 契约测试                       | 工厂                                  | 覆盖                                                                                                                                           |
-| ------------------------------ | ------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeSessionStoreContract` | `({ now }) => SessionStore`，每例一个 | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、查询组合、`last`、往返、二进制和 URL、像标记的数据、`clear`/`sessions`、`watch?` |
-| `describeExecutorContract`     | `() => { executor, echo }`            | 有名字、`tools?()` 列出回显工具、`execute` 回显且结果能序列化、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复  |
-| `describeToolRegistryContract` | `() => ToolRegistry`，每例一个空的    | 增查、按加入顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                          |
+| 契约测试                       | 工厂                                             | 覆盖                                                                                                                                                                                     |
+| ------------------------------ | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `describeSessionStoreContract` | `({ now }) => SessionStore`，每例一个            | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、查询组合、`last`、往返、二进制和 URL、像标记的数据、`clear`/`sessions`、`watch?`                                           |
+| `describeExecutorContract`     | `() => { executor, echo }`                       | 有名字、`tools?()` 列出回显工具、`execute` 回显且结果能序列化、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                            |
+| `describeToolRegistryContract` | `() => ToolRegistry`，每例一个空的               | 增查、按加入顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                    |
+| `describeHarnessContract`      | `({ script }) => { harness, store, agent }`      | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错 |
+| `describeOrchestratorContract` | `({ script }) => { orchestrator, store, agent }` | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`、`close` 后不收                                                                                  |
 
-`Harness`、`Orchestrator`、`ContextBuilder` 的契约测试要一个模型和一个存储才能跑，下一阶段和 `@modelctx-ai/ctx` 的参考实现一起补。
+harness 和编排器的契约要一个按剧本回答的模型：工厂收到 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），自己造模型和回显工具。`@modelctx-ai/ctx/testing` 的 `createScriptedModel(script, { tool })` 就是这样一个模型（基于 `ai/test`）。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里，协议方法能比的只剩 `build` 的形状。

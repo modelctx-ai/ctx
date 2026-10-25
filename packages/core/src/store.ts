@@ -1,26 +1,16 @@
-import { compareCursor, type ContextEntry, type Cursor, type EntryType, type NewEntry } from './entry.ts';
+import {
+  compareCursor,
+  filterEntries,
+  type Entry,
+  type SessionStore,
+  type WatchOptions,
+} from '@modelctx-ai/ctx-protocol';
 
-export interface ListOptions {
-  /** 只要这个位置之后（不含）的条目。 */
-  readonly after?: Cursor;
-  /** 只要最后 N 条，仍按从旧到新返回。小数向下取整，不是有限正数时返回空。 */
-  readonly last?: number;
-  /** 只要这些类型。 */
-  readonly types?: readonly EntryType[];
-}
+/** @deprecated 改名为 `SessionStore`，下一个 minor 删掉。 */
+export type ContextStore = SessionStore;
 
-/**
- * 上下文的持久化边界。只追加：写进来的条目不再修改，压缩靠追加摘要条目完成。
- * 返回顺序统一是 `(at, seq)` 从旧到新。
- */
-export interface ContextStore {
-  /** 追加条目，返回真正写入的那些。幂等键或 id 重复的条目静默跳过。 */
-  append(thread: string, entries: readonly NewEntry[]): Promise<ContextEntry[]>;
-  list(thread: string, options?: ListOptions): Promise<ContextEntry[]>;
-  /** 清空一个线程，返回删掉的条数。 */
-  clear(thread: string): Promise<number>;
-  threads(): Promise<string[]>;
-}
+/** @deprecated 改名为 `Entry`，下一个 minor 删掉。 */
+export type ContextEntry = Entry;
 
 export interface MemoryStoreOptions {
   readonly now?: () => number;
@@ -28,7 +18,7 @@ export interface MemoryStoreOptions {
 }
 
 /** 按 `(at, seq)` 有序插入；新条目的 seq 最大，所以只需找到第一个 at 更大的位置。 */
-function insertSorted(list: ContextEntry[], entry: ContextEntry): void {
+function insertSorted(list: Entry[], entry: Entry): void {
   let low = 0;
   let high = list.length;
   while (low < high) {
@@ -39,65 +29,94 @@ function insertSorted(list: ContextEntry[], entry: ContextEntry): void {
   list.splice(low, 0, entry);
 }
 
-export function filterEntries(entries: readonly ContextEntry[], options: ListOptions | undefined): ContextEntry[] {
-  let out = entries.filter((entry) => {
-    if (options?.after && compareCursor(entry, options.after) <= 0) return false;
-    if (options?.types && !options.types.includes(entry.type)) return false;
-    return true;
-  });
-  if (options?.last !== undefined) {
-    const last = Number.isFinite(options.last) ? Math.floor(options.last) : 0;
-    out = last > 0 ? out.slice(-last) : [];
-  }
-  return out;
-}
-
-/** 进程内存储。测试、短会话和不需要落盘的场景用。 */
-export function createMemoryStore(options: MemoryStoreOptions = {}): ContextStore {
+/** 进程内存储。测试、短会话和不需要落盘的场景用。`watch` 靠内存里的订阅，写入后立刻唤醒。 */
+export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStore {
   const now = options.now ?? Date.now;
   const id = options.id ?? (() => crypto.randomUUID());
-  const threads = new Map<string, { entries: ContextEntry[]; keys: Set<string> }>();
+  const sessions = new Map<string, { entries: Entry[]; keys: Set<string> }>();
   const ids = new Set<string>();
+  /** 每个会话上等新条目的 `watch`。 */
+  const waiters = new Map<string, Set<() => void>>();
   let seq = 0;
 
-  function thread(name: string): { entries: ContextEntry[]; keys: Set<string> } {
-    let found = threads.get(name);
+  function session(name: string): { entries: Entry[]; keys: Set<string> } {
+    let found = sessions.get(name);
     if (!found) {
       found = { entries: [], keys: new Set() };
-      threads.set(name, found);
+      sessions.set(name, found);
     }
     return found;
   }
 
+  function wake(name: string): void {
+    const set = waiters.get(name);
+    if (!set) return;
+    waiters.delete(name);
+    for (const resolve of set) resolve();
+  }
+
+  /** 等到这个会话有新写入或 `signal` 中止。 */
+  function waitFor(name: string, signal: AbortSignal | undefined): Promise<void> {
+    return new Promise((resolve) => {
+      let set = waiters.get(name);
+      if (!set) {
+        set = new Set();
+        waiters.set(name, set);
+      }
+      const done = (): void => {
+        waiters.get(name)?.delete(done);
+        signal?.removeEventListener('abort', done);
+        resolve();
+      };
+      set.add(done);
+      signal?.addEventListener('abort', done, { once: true });
+    });
+  }
+
   return {
     async append(name, drafts) {
-      const target = thread(name);
-      const written: ContextEntry[] = [];
+      const target = session(name);
+      const written: Entry[] = [];
       for (const draft of drafts) {
         if (draft.key !== undefined && target.keys.has(draft.key)) continue;
         const entryId = draft.id ?? id();
         if (ids.has(entryId)) continue;
         seq += 1;
-        const entry = { ...draft, id: entryId, thread: name, seq, at: draft.at ?? now() } as ContextEntry;
+        const entry = { ...draft, id: entryId, session: name, seq, at: draft.at ?? now() } as Entry;
         ids.add(entryId);
         if (entry.key !== undefined) target.keys.add(entry.key);
         insertSorted(target.entries, entry);
         written.push(entry);
       }
+      if (written.length > 0) wake(name);
       return written;
     },
     async list(name, listOptions) {
-      return filterEntries(threads.get(name)?.entries ?? [], listOptions);
+      return filterEntries(sessions.get(name)?.entries ?? [], listOptions);
     },
     async clear(name) {
-      const found = threads.get(name);
+      const found = sessions.get(name);
       if (!found) return 0;
       for (const entry of found.entries) ids.delete(entry.id);
-      threads.delete(name);
+      sessions.delete(name);
       return found.entries.length;
     },
-    async threads() {
-      return [...threads.keys()].filter((name) => (threads.get(name)?.entries.length ?? 0) > 0);
+    async sessions() {
+      return [...sessions.keys()].filter((name) => (sessions.get(name)?.entries.length ?? 0) > 0);
+    },
+    async *watch(name: string, watchOptions: WatchOptions = {}) {
+      const { signal } = watchOptions;
+      let after = watchOptions.after;
+      for (;;) {
+        if (signal?.aborted) return;
+        const fresh = filterEntries(sessions.get(name)?.entries ?? [], after ? { after } : undefined);
+        for (const entry of fresh) {
+          if (signal?.aborted) return;
+          yield entry;
+          after = entry;
+        }
+        if (fresh.length === 0) await waitFor(name, signal);
+      }
     },
   };
 }

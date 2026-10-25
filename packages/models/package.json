@@ -1,6 +1,6 @@
 {
   "name": "@modelctx-ai/ctx-models",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "按配置创建 Vercel AI SDK 语言模型：内置 openai-compatible 与 anthropic，可注册更多服务商。",
   "keywords": [
     "ai",

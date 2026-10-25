@@ -1,7 +1,7 @@
 {
   "name": "@modelctx-ai/ctx",
-  "version": "0.1.0",
-  "description": "上下文管理核心：追加式上下文日志、投影成模型消息、上下文来源、工具注册，以及基于 Vercel AI SDK 的模型调用。",
+  "version": "0.2.0",
+  "description": "ctx 的进程内参考实现：内存会话存储、投影和来源组成的上下文、工具注册表、函数执行环境、基于 Vercel AI SDK 的 harness、进程内编排器，以及组合门面 createContext()。",
   "keywords": [
     "ai",
     "llm",
@@ -48,9 +48,11 @@
     "ai": "^7.0.150"
   },
   "peerDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^",
     "zod": "^3.25.76 || ^4.1.8"
   },
   "devDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^",
     "zod": "^4.6.7"
   }
 }

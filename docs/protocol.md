@@ -385,13 +385,15 @@ interface Orchestrator {
 
 `@modelctx-ai/ctx-protocol/testing`，用法见[包说明](../packages/protocol/README.md#实现一个协议)。
 
-| 契约测试                       | 工厂                        | 覆盖                                                                                                                                                                          |
-| ------------------------------ | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeSessionStoreContract` | `({ now }) => SessionStore` | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`types`、往返、二进制和 URL、像标记的数据、`clear`/`sessions`、`watch?` 的读已有、读新写入、中止 |
-| `describeExecutorContract`     | `() => { executor, echo }`  | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                       |
-| `describeToolRegistryContract` | `() => ToolRegistry`        | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                               |
+| 契约测试                       | 工厂                                             | 覆盖                                                                                                                                                                                     |
+| ------------------------------ | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `describeSessionStoreContract` | `({ now }) => SessionStore`                      | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`types`、往返、二进制和 URL、像标记的数据、`clear`/`sessions`、`watch?` 的读已有、读新写入、中止            |
+| `describeExecutorContract`     | `() => { executor, echo }`                       | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                  |
+| `describeToolRegistryContract` | `() => ToolRegistry`                             | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                          |
+| `describeHarnessContract`      | `({ script }) => { harness, store, agent }`      | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错 |
+| `describeOrchestratorContract` | `({ script }) => { orchestrator, store, agent }` | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`、`close` 后不收                                                                                  |
 
-`ContextBuilder`、`Harness`、`Orchestrator` 的契约测试要一个模型和一个存储才写得出来，和参考实现一起补。
+harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里。
 
 ## 托管矩阵
 

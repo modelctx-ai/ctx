@@ -28,10 +28,10 @@
 ## 快速开始
 
 ```sh
-pnpm add @modelctx-ai/ctx @modelctx-ai/ctx-models zod
+pnpm add @modelctx-ai/ctx @modelctx-ai/ctx-protocol @modelctx-ai/ctx-models zod
 ```
 
-`zod` 是 `ai` 的 peer dependency；下面用到的 `@modelctx-ai/ctx-sqlite`、`@modelctx-ai/ctx-gateway` 按需再装。发布之前用[同级目录链接](#现在同级目录链接)代替这一步。
+`@modelctx-ai/ctx-protocol` 是核心包的 peer dependency（类型和纯函数核心包都原样转出，应用只从 `@modelctx-ai/ctx` 导入就行），`zod` 是 `ai` 的；下面用到的 `@modelctx-ai/ctx-sqlite`、`@modelctx-ai/ctx-gateway` 按需再装。发布之前用[同级目录链接](#现在同级目录链接)代替这一步。
 
 ### 对话
 
@@ -41,7 +41,7 @@ import { createModel } from '@modelctx-ai/ctx-models';
 
 const context = createContext({
   store: createMemoryStore(),
-  thread: 'demo',
+  session: 'demo',
   model: createModel({
     provider: 'openai-compatible',
     baseUrl: 'https://api.deepseek.com/v1',
@@ -70,8 +70,9 @@ import { z } from 'zod';
 
 const db = new DatabaseSync('app.db'); // 应用自己的库，ctx 的表加 ctx_ 前缀
 
-const tools = createToolRegistry().add(
-  'weather',
+// zod 工具转成 JSON Schema 定义，执行函数放进注册表自带的进程内执行环境
+const tools = createToolRegistry().addTool(
+  'weather_get',
   tool({
     description: '查城市天气',
     inputSchema: z.object({ city: z.string() }),
@@ -81,7 +82,7 @@ const tools = createToolRegistry().add(
 
 const context = createContext({
   store: createSqliteStore({ database: db, prefix: 'ctx_' }),
-  thread: 'user:42',
+  session: 'user:42',
   model: createModel({
     baseUrl: 'https://api.deepseek.com/v1',
     apiKey: process.env.DEEPSEEK_API_KEY,
@@ -93,7 +94,7 @@ const context = createContext({
   projection: {
     // 事件默认对模型不可见，有规则的才渲染；fold 把连续的同类事件合成一条
     events: {
-      reminder: {
+      'app.reminder': {
         fold: true,
         render: (events) => ({ role: 'user', content: `已提醒：${events.map((event) => event.text).join('、')}` }),
       },
@@ -102,7 +103,7 @@ const context = createContext({
   },
 });
 
-await context.append(eventEntry('reminder', { text: '15:30 喝水' }));
+await context.append(eventEntry('app.reminder', { text: '15:30 喝水' }));
 const { text } = await context.generate({ instructions: '你是生活助手。', input: '台北下午要带伞吗？' });
 console.log(text);
 ```
@@ -117,7 +118,7 @@ import { randomBytes } from 'node:crypto';
 import { createContext, createMemoryStore } from '@modelctx-ai/ctx';
 import { startGateway, withContext } from '@modelctx-ai/ctx-gateway';
 
-const context = createContext({ store: createMemoryStore(), thread: 'pet:main' });
+const context = createContext({ store: createMemoryStore(), session: 'pet:main' });
 const accessToken = randomBytes(24).toString('base64url');
 
 const gateway = await startGateway({
@@ -130,7 +131,50 @@ const gateway = await startGateway({
 console.log(gateway.baseUrl); // http://127.0.0.1:<随机端口>/v1
 ```
 
-上面三段都是进程内的用法：`createContext()` 把会话存储、上下文组装、工具、执行环境和 harness 组合成一个对象。要把其中任何一个换掉或放到别处，按协议给另一份实现，见[协议层](docs/protocol.md)；投影规则、记录和压缩的细节见[架构](docs/architecture.md)。
+### 直接用 harness 和编排器
+
+`createContext()` 是糖。底下的几样都能单独拿来用：`createContextBuilder()` 组装上下文，`createHarness()` 跑一轮（出错不抛，`stopReason` 说明原因，日志里有 `ctx.run.started` / `ctx.run.ended`），`createOrchestrator()` 排队：同一会话串行，不同会话并行。
+
+```ts
+import {
+  createContextBuilder,
+  createFunctionExecutor,
+  createHarness,
+  createMemoryStore,
+  createOrchestrator,
+  createToolRegistry,
+} from '@modelctx-ai/ctx';
+import { createModel } from '@modelctx-ai/ctx-models';
+
+const store = createMemoryStore();
+
+// 进程内函数执行环境：名字 → (input, context) => ToolOutput；出错返回 { type: 'error' }，不抛
+const local = createFunctionExecutor('local').register(
+  { name: 'clock_now', description: '当前时间', inputSchema: { type: 'object', properties: {} } },
+  () => ({ type: 'text', text: new Date().toISOString() }),
+);
+
+const harness = createHarness({
+  store,
+  context: createContextBuilder({ store }),
+  tools: createToolRegistry({ executor: local }).add(local.definition('clock_now')!),
+  // AgentSpec 里的模型只是名字，在这里造出来
+  models: (name) =>
+    createModel({ baseUrl: 'https://api.deepseek.com/v1', apiKey: process.env.DEEPSEEK_API_KEY, model: name }),
+});
+
+const agent = { model: 'deepseek-chat', instructions: '回答控制在一句话。' };
+const result = await harness.run({ session: 'demo', agent, input: '现在几点？' });
+console.log(result.stopReason, result.text); // end_turn …
+
+const orchestrator = createOrchestrator({ harness, store });
+await orchestrator.recover?.(); // 上次崩溃时断掉的运行补一条 ctx.run.ended
+const handle = await orchestrator.submit({ session: 'demo', agent, input: '再说一遍？' });
+console.log((await handle.done).text);
+await orchestrator.close();
+```
+
+上面几段都是进程内的用法：`createContext()` 把会话存储、上下文组装、工具、执行环境和 harness 组合成一个对象。要把其中任何一个换掉或放到别处，按协议给另一份实现，见[协议层](docs/protocol.md)；投影规则、记录和压缩的细节见[架构](docs/architecture.md)。
 
 ## 在其他仓库里使用
 
@@ -142,7 +186,7 @@ console.log(gateway.baseUrl); // http://127.0.0.1:<随机端口>/v1
 └── yoyo/    使用方
 ```
 
-使用方的 `package.json` 照常写版本范围（`"@modelctx-ai/ctx": "^0.1.0"`），在 `pnpm-workspace.yaml` 里用 `overrides` 指到同级目录：
+使用方的 `package.json` 照常写版本范围（`"@modelctx-ai/ctx": "^0.2.0"`），在 `pnpm-workspace.yaml` 里用 `overrides` 指到同级目录：
 
 ```yaml
 overrides:
@@ -160,7 +204,7 @@ overrides:
 
 ### 发布以后
 
-删掉 `overrides`，重新 `pnpm install`，同样的 `^0.1.0` 从 npm 解析。
+删掉 `overrides`，重新 `pnpm install`，同样的 `^0.2.0` 从 npm 解析。
 
 ## 开发
 
@@ -180,10 +224,10 @@ overrides:
 
 ## 要求
 
-| 场景 | 要求                                                                                                                |
-| ---- | ------------------------------------------------------------------------------------------------------------------- |
-| 开发 | Node ≥22.18（直接运行 `.ts`）；pnpm 10，版本由 `packageManager` 固定                                                |
-| 使用 | Node 版本见包表；peer dependency：`zod`（核心包）、`ai@^7`（ctx-models）、`@modelctx-ai/ctx-protocol`（其余实现包） |
+| 场景 | 要求                                                                                                                                             |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 开发 | Node ≥22.18（直接运行 `.ts`）；pnpm 10，版本由 `packageManager` 固定                                                                             |
+| 使用 | Node 版本见包表；peer dependency：`@modelctx-ai/ctx-protocol`、`zod`（核心包）、`ai@^7`（ctx-models）、`@modelctx-ai/ctx-protocol`（其余实现包） |
 
 ## 文档
 

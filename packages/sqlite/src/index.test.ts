@@ -4,19 +4,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { eventEntry, messageEntry, userEntry, type JsonValue, type ModelMessage } from '@modelctx-ai/ctx';
-import { describeStoreContract } from '@modelctx-ai/ctx/testing';
+import { eventEntry, messageEntry, userEntry, type JsonValue, type MessageEntry } from '@modelctx-ai/ctx-protocol';
+import { describeSessionStoreContract } from '@modelctx-ai/ctx-protocol/testing';
 import { describe, test } from 'vite-plus/test';
 
 import { createSqliteStore } from './index.ts';
 
-describeStoreContract('sqlite', ({ now }) => createSqliteStore({ path: ':memory:', now }), { describe, test });
+type ModelMessage = MessageEntry['message'];
+
+describeSessionStoreContract('sqlite', ({ now }) => createSqliteStore({ path: ':memory:', now, pollIntervalMs: 10 }), {
+  describe,
+  test,
+});
 
 describe('sqlite store', () => {
   test('关掉重开，条目和顺序都还在', async () => {
     const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
     const first = createSqliteStore({ path });
-    await first.append('t', [userEntry('一'), eventEntry('whisper', { text: '二' })]);
+    await first.append('t', [userEntry('一'), eventEntry('pet.whisper', { text: '二' })]);
     first.close();
     const second = createSqliteStore({ path });
     const entries = await second.list('t');
@@ -79,7 +84,7 @@ describe('sqlite store', () => {
       { '\u0000ctx': 'url', href: 'not a url' },
       { '\u0000ctx': 'bytes', base64: 42 },
     ];
-    await store.append('t', [eventEntry('tool-log', { data })]);
+    await store.append('t', [eventEntry('tool.log', { data })]);
     const [entry] = await store.list('t');
     assert.deepEqual(entry?.type === 'event' && entry.data, data);
     store.close();
@@ -100,5 +105,22 @@ describe('sqlite store', () => {
 
   test('表名前缀只能是标识符', () => {
     assert.throws(() => createSqliteStore({ path: ':memory:', prefix: 'x; DROP TABLE y' }), /Invalid table prefix/);
+  });
+
+  test('watch 轮询：另一个连接写进同一个库的条目也能读到', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
+    const reader = createSqliteStore({ path, pollIntervalMs: 10 });
+    const writer = createSqliteStore({ path });
+    const controller = new AbortController();
+    const iterator = reader.watch('s', { signal: controller.signal })[Symbol.asyncIterator]();
+    const pending = iterator.next();
+    await writer.append('s', [userEntry('别的进程写的')]);
+    const { value } = await pending;
+    assert.equal(value?.type === 'message' && value.message.content, '别的进程写的');
+    const ending = iterator.next();
+    controller.abort();
+    assert.equal((await ending).done, true);
+    reader.close();
+    writer.close();
   });
 });
