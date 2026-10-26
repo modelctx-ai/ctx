@@ -2,7 +2,7 @@
 
 ## 2026-10-26
 
-- **新增** [ADR 0005](adr/0005-session-position-writes-format.md)（提议，待审，不改代码）：会话位置改用 `seq`（补写旧记录会被摘要盖掉）、写入前提条件 `expectSeq` 和围栏、`recover` 的 `owner`、ctx 自己的带版本 JSON 消息格式（读时升级）、`AgentSpec.context`、会话分页和事件 `kinds` 过滤；列出对内存、sqlite、remote、gateway 和 yoyo 的破坏面。
+- **新增** [ADR 0005](adr/0005-session-position-writes-format.md)（已采纳，不改代码）：会话位置改用 `seq`（补写旧记录会被摘要盖掉）、写入前提条件 `expectSeq` 和围栏、`recover` 的 `owner`、ctx 自己的带版本 JSON 消息格式（读时升级，部件逐项对照 `ai@7.0.150`）、`AgentSpec.context`、会话分页和事件 `kinds` 过滤；`ctx-sqlite` 结构版本 2 → 3；对内存、sqlite、remote、gateway 的破坏面，和对照 yoyo `main` 代码核对出的 yoyo 影响。
 
 ## 2026-10-25
 
