@@ -8,6 +8,7 @@ import type {
   MessageEntry,
   NewEntry,
   SessionStore,
+  SessionsOptions,
   WatchOptions,
 } from '@modelctx-ai/ctx-protocol';
 
@@ -65,7 +66,8 @@ interface Body {
  * 结构版本，存在 `${prefix}meta` 的 `schema` 里。
  * 1：0.1 和 0.2 都写这个值，但 0.1 的列叫 `thread`，0.2 叫 `session`，所以升到 2 时要看实际的列。
  * 2：列叫 `session`。
- * 3：位置只用 `seq`，索引是 `(session, seq)`，不再有 `(session, at, seq)`。
+ * 3：位置只用 `seq`，索引是 `(session, seq)`，不再有 `(session, at, seq)`；生成列 `kind` 和索引 `(session, kind, seq)`。
+ *    同一级的结构分阶段补全，所以版本号等于 3 时也要查实际的列和索引（见 `repairs`）。
  */
 const SCHEMA_VERSION = 3;
 
@@ -163,6 +165,19 @@ function decode(row: Row): Entry {
   };
 }
 
+/**
+ * 以 `prefix` 开头的名字的上界（不含）：最后一个码点加 1。SQLite 按 UTF-8 字节比较，和码点序一致。
+ * 最后一个码点已经是最大值时往前进一位；空串或全是最大码点时没有上界，返回 `undefined`。
+ */
+function prefixEnd(prefix: string): string | undefined {
+  const points = Array.from(prefix);
+  while (points.length > 0) {
+    const last = points.pop()!.codePointAt(0)!;
+    if (last < 0x10ffff) return points.join('') + String.fromCodePoint(last === 0xd7ff ? 0xe000 : last + 1);
+  }
+  return undefined;
+}
+
 function hasTable(database: DatabaseSync, name: string): boolean {
   return database.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) !== undefined;
 }
@@ -212,7 +227,7 @@ function inspect(database: DatabaseSync, table: string): { columns: Set<string>;
  * 所以半截的库、别的版本建出来的同一级库（schema 版本号相同、结构不全）都能补齐，重复执行也没有副作用。
  */
 function repairs(database: DatabaseSync, table: string): string[] {
-  const { indexes } = inspect(database, table);
+  const { columns, indexes } = inspect(database, table);
   const sql: string[] = [];
   // 旧的 `(session, at, seq)` 索引：位置只看 `seq` 以后不再需要。
   if (indexes.has(`${table}_order`)) sql.push(`DROP INDEX ${table}_order`);
@@ -220,6 +235,12 @@ function repairs(database: DatabaseSync, table: string): string[] {
     sql.push(`CREATE UNIQUE INDEX ${table}_key ON ${table} (session, key) WHERE key IS NOT NULL`);
   }
   if (!indexes.has(`${table}_seq`)) sql.push(`CREATE INDEX ${table}_seq ON ${table} (session, seq)`);
+  // 事件的 `kind` 是 body 顶层的字段，用 VIRTUAL 生成列取出来，`list({ kinds })` 靠 (session, kind, seq) 索引。
+  // 不占行空间，不用回填，旧版本写的行也自动有 `kind`；SQLite 只允许 ADD COLUMN 加 VIRTUAL 的生成列。
+  if (!columns.has('kind')) {
+    sql.push(`ALTER TABLE ${table} ADD COLUMN kind TEXT GENERATED ALWAYS AS (json_extract(body, '$.kind')) VIRTUAL`);
+  }
+  if (!indexes.has(`${table}_kind`)) sql.push(`CREATE INDEX ${table}_kind ON ${table} (session, kind, seq)`);
   return sql;
 }
 
@@ -290,7 +311,7 @@ function migrate(database: DatabaseSync, prefix: string): void {
 }
 
 /**
- * 基于 `node:sqlite` 的存储。所有条目在一张表里，按会话和写入序号 `seq` 建索引。
+ * 基于 `node:sqlite` 的存储。所有条目在一张表里，按会话和写入序号 `seq` 建索引，事件另按 `kind` 建索引。
  * 写入用 SAVEPOINT，所以和应用共用一个库、处在应用自己的事务里也能用。
  * 消息里的二进制（Uint8Array、Buffer、ArrayBuffer、其他 TypedArray）读回来都是 Uint8Array，URL 读回来还是 URL。
  */
@@ -322,7 +343,6 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
     `INSERT INTO ${table} (id, session, at, type, key, source, body, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
   );
   const removeSession = database.prepare(`DELETE FROM ${table} WHERE session = ?`);
-  const listSessions = database.prepare(`SELECT DISTINCT session FROM ${table} ORDER BY session`);
   const pollInterval = options.pollIntervalMs ?? 250;
 
   function run<T>(work: () => T): T {
@@ -374,6 +394,12 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
         where.push(`type IN (${listOptions.types.map(() => '?').join(', ')})`);
         params.push(...listOptions.types);
       }
+      if (listOptions.kinds) {
+        if (listOptions.kinds.length === 0) return [];
+        // 只有事件有 kind（生成列取 body 顶层的 `kind`，消息和摘要的 body 里没有）；和 types 取交集靠两个条件同时成立。
+        where.push(`type = 'event' AND kind IN (${listOptions.kinds.map(() => '?').join(', ')})`);
+        params.push(...listOptions.kinds);
+      }
       let sql = `SELECT * FROM ${table} WHERE ${where.join(' AND ')}`;
       if (listOptions.last !== undefined) {
         // 和内存存储一样：小数向下取整，不是有限正数时返回空。
@@ -390,8 +416,35 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
     async clear(session) {
       return Number(removeSession.run(session).changes);
     },
-    async sessions() {
-      return (listSessions.all() as { session: string }[]).map((row) => row.session);
+    async sessions(sessionsOptions: SessionsOptions = {}) {
+      const where: string[] = [];
+      const params: SQLInputValue[] = [];
+      // 前缀用范围查询，不用 LIKE：`%`、`_` 不用转义，也能用上 (session, seq) 索引。
+      if (sessionsOptions.prefix) {
+        where.push('session >= ?');
+        params.push(sessionsOptions.prefix);
+        const end = prefixEnd(sessionsOptions.prefix);
+        if (end !== undefined) {
+          where.push('session < ?');
+          params.push(end);
+        }
+      }
+      if (sessionsOptions.after !== undefined) {
+        where.push('session > ?');
+        params.push(sessionsOptions.after);
+      }
+      let sql = `SELECT DISTINCT session FROM ${table}${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY session`;
+      if (sessionsOptions.limit !== undefined) {
+        // 和 `filterSessions` 一样：小数向下取整，不是正数时返回空。
+        const limit = Number.isNaN(sessionsOptions.limit) ? 0 : Math.floor(sessionsOptions.limit);
+        if (limit <= 0) return [];
+        if (Number.isFinite(limit)) {
+          sql += ' LIMIT ?';
+          params.push(limit);
+        }
+      }
+      const rows = database.prepare(sql).all(...params) as { session: string }[];
+      return rows.map((row) => row.session);
     },
     /** 轮询 `list(after)`：别的进程写进同一个库的条目也能看到。 */
     async *watch(session: string, watchOptions: WatchOptions = {}) {

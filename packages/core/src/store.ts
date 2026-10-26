@@ -1,4 +1,10 @@
-import { filterEntries, type Entry, type SessionStore, type WatchOptions } from '@modelctx-ai/ctx-protocol';
+import {
+  filterEntries,
+  filterSessions,
+  type Entry,
+  type SessionStore,
+  type WatchOptions,
+} from '@modelctx-ai/ctx-protocol';
 
 /** @deprecated 改名为 `SessionStore`，下一个 minor 删掉。 */
 export type ContextStore = SessionStore;
@@ -84,8 +90,11 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
       sessions.delete(name);
       return found.entries.length;
     },
-    async sessions() {
-      return [...sessions.keys()].filter((name) => (sessions.get(name)?.entries.length ?? 0) > 0);
+    async sessions(sessionsOptions) {
+      return filterSessions(
+        [...sessions.keys()].filter((name) => (sessions.get(name)?.entries.length ?? 0) > 0),
+        sessionsOptions,
+      );
     },
     async *watch(name: string, watchOptions: WatchOptions = {}) {
       const { signal } = watchOptions;

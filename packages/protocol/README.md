@@ -14,14 +14,14 @@ Node ≥22。
 
 ## 六个协议
 
-| 协议             | 方法                                                            | 一句话                                                        |
-| ---------------- | --------------------------------------------------------------- | ------------------------------------------------------------- |
-| `SessionStore`   | `append`、`list`、`clear`、`sessions`、`watch?`                 | 只追加的事件日志，按 `seq`（写入顺序）排序                    |
-| `ContextBuilder` | `build`、`view`、`compact?`                                     | 日志 + 事实 + 输入 → 一次调用的指令、消息、工具名单           |
-| `ToolRegistry`   | `add`、`remove`、`removeSource`、`has`、`get`、`list`、`select` | 工具目录：JSON Schema 定义，每个绑一个执行环境的名字          |
-| `Executor`       | `execute`、`tools?`、`provision?`、`dispose?`                   | 工具调用真正发生的地方；出错返回 `{ type: 'error' }` 而不是抛 |
-| `Harness`        | `run`、`stream?`                                                | 一轮：组装 → 调模型 → 分发工具 → 写回，直到停下               |
-| `Orchestrator`   | `submit`、`status`、`cancel`、`close`、`recover?`、`events?`    | 跨轮次、跨会话的调度：同一会话串行，不同会话并行              |
+| 协议             | 方法                                                            | 一句话                                                                                               |
+| ---------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `SessionStore`   | `append`、`list`、`clear`、`sessions`、`watch?`                 | 只追加的事件日志，按 `seq`（写入顺序）排序；`sessions` 名字升序，可分页，`list` 可按事件 `kind` 过滤 |
+| `ContextBuilder` | `build`、`view`、`compact?`                                     | 日志 + 事实 + 输入 → 一次调用的指令、消息、工具名单                                                  |
+| `ToolRegistry`   | `add`、`remove`、`removeSource`、`has`、`get`、`list`、`select` | 工具目录：JSON Schema 定义，每个绑一个执行环境的名字                                                 |
+| `Executor`       | `execute`、`tools?`、`provision?`、`dispose?`                   | 工具调用真正发生的地方；出错返回 `{ type: 'error' }` 而不是抛                                        |
+| `Harness`        | `run`、`stream?`                                                | 一轮：组装 → 调模型 → 分发工具 → 写回，直到停下                                                      |
+| `Orchestrator`   | `submit`、`status`、`cancel`、`close`、`recover?`、`events?`    | 跨轮次、跨会话的调度：同一会话串行，不同会话并行                                                     |
 
 模型用 AI SDK 的 `LanguageModel`，不另定义。随协议走的值：`AgentSpec`（一个 agent 的配置）、`Hooks`（harness 的切入点）、框架事件 `CTX_EVENTS`（`ctx.run.started`、`ctx.run.ended`、`ctx.compacted`、`ctx.error`）。
 
@@ -29,17 +29,17 @@ Node ≥22。
 
 ## 纯函数
 
-| 导出                                                                                     | 说明                                                    |
-| ---------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| `userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry`              | 构造新条目                                              |
-| `runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`isFrameworkKind` | 框架事件                                                |
-| `compareEntries`、`filterEntries`、`textOf`                                              | 投影顺序、`ListOptions` 的语义、消息文字                |
-| `project`、`latestSummary`、`defaultSummaryMessage`                                      | 条目渲染成 `ModelMessage[]`：摘要、事件规则、窗口       |
-| `defineSource`、`collectFacts`、`renderFacts`                                            | 上下文来源和事实（`collectFacts` 并行、单个来源有超时） |
-| `estimateTokens`、`estimateTextTokens`                                                   | 不依赖分词器的 token 估算                               |
-| `isValidToolName`、`matchesTool`、`selectTools`、`errorOutput`                           | 工具名校验、工具筛选、错误结果                          |
-| `toolOutputToAiSdk`、`toolOutputFromAiSdk`                                               | `ToolOutput` 和 AI SDK 工具结果 `output` 互转           |
-| `modelName`、`agentSpecToJson`                                                           | 模型名的字符串写法；`AgentSpec` 的可序列化部分          |
+| 导出                                                                                     | 说明                                                        |
+| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| `userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry`              | 构造新条目                                                  |
+| `runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`isFrameworkKind` | 框架事件                                                    |
+| `compareEntries`、`filterEntries`、`filterSessions`、`textOf`                            | 投影顺序、`ListOptions`、`SessionsOptions` 的语义、消息文字 |
+| `project`、`latestSummary`、`defaultSummaryMessage`                                      | 条目渲染成 `ModelMessage[]`：摘要、事件规则、窗口           |
+| `defineSource`、`collectFacts`、`renderFacts`                                            | 上下文来源和事实（`collectFacts` 并行、单个来源有超时）     |
+| `estimateTokens`、`estimateTextTokens`                                                   | 不依赖分词器的 token 估算                                   |
+| `isValidToolName`、`matchesTool`、`selectTools`、`errorOutput`                           | 工具名校验、工具筛选、错误结果                              |
+| `toolOutputToAiSdk`、`toolOutputFromAiSdk`                                               | `ToolOutput` 和 AI SDK 工具结果 `output` 互转               |
+| `modelName`、`agentSpecToJson`                                                           | 模型名的字符串写法；`AgentSpec` 的可序列化部分              |
 
 ## 实现一个协议
 
@@ -86,7 +86,7 @@ describeToolRegistryContract('mine', () => createMyRegistry(), { describe, test 
 
 | 契约测试                       | 工厂                                             | 覆盖                                                                                                                                                                                     |
 | ------------------------------ | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeSessionStoreContract` | `({ now }) => SessionStore`，每例一个            | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、查询组合、`last`、往返、二进制和 URL、像标记的数据、`clear`/`sessions`、`watch?`                                           |
+| `describeSessionStoreContract` | `({ now }) => SessionStore`，每例一个            | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、查询组合（含 `kinds`）、`last`、往返、二进制和 URL、像标记的数据、`clear`、`sessions` 的升序和翻页、`watch?`               |
 | `describeExecutorContract`     | `() => { executor, echo }`                       | 有名字、`tools?()` 列出回显工具、`execute` 回显且结果能序列化、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                            |
 | `describeToolRegistryContract` | `() => ToolRegistry`，每例一个空的               | 增查、按加入顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                    |
 | `describeHarnessContract`      | `({ script }) => { harness, store, agent }`      | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错 |

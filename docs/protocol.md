@@ -56,6 +56,12 @@ interface ListOptions {
   after?: number; // seq，不含
   last?: number; // seq 最大的 N 条，仍按 seq 升序；向下取整，不是有限正数时返回空
   types?: readonly EntryType[];
+  kinds?: readonly string[]; // 只要事件，且 kind 在其中；与 types 取交集；空列表什么都不匹配
+}
+interface SessionsOptions {
+  prefix?: string; // 字面前缀，不是通配符
+  after?: string; // 上一页最后一个名字，不含
+  limit?: number; // 向下取整，不是正数时返回空；不给就不限
 }
 interface WatchOptions {
   after?: number; // seq，不含
@@ -66,7 +72,7 @@ interface SessionStore {
   append(session: string, entries: readonly NewEntry[]): Promise<Entry[]>;
   list(session: string, options?: ListOptions): Promise<Entry[]>;
   clear(session: string): Promise<number>;
-  sessions(): Promise<string[]>;
+  sessions(options?: SessionsOptions): Promise<string[]>; // 名字升序
   /** 先给出 after 之后已有的条目，再持续给出新写入的；远端流式读用。 */
   watch?(session: string, options?: WatchOptions): AsyncIterable<Entry>;
 }
@@ -74,7 +80,9 @@ interface SessionStore {
 
 - `append` 对一批条目是原子的：不会只写一半，也不会和并发的另一批交错。崩溃后续跑依赖这一点。
 - 去重不算失败：`id` 重复（全局）或 `key` 重复（同一会话，含同一批里的）的那一条静默跳过，同批其余照写；返回值就是真正写入的条目。重试一批时靠它不重复记。
-- `list` 和 `watch` 都按 `seq` 升序返回，也就是写入顺序。带旧 `at` 导入的条目排在写入的位置（所以游标之后一定看得到新写入的），模型看到的逻辑顺序由投影按 `(at, seq)` 重排（`compareEntries`）。`seq` 只要求会话内单调，消费者不能跨会话比较。`sessions()` 只列有内容的会话。
+- `list` 和 `watch` 都按 `seq` 升序返回，也就是写入顺序。带旧 `at` 导入的条目排在写入的位置（所以游标之后一定看得到新写入的），模型看到的逻辑顺序由投影按 `(at, seq)` 重排（`compareEntries`）。`seq` 只要求会话内单调，消费者不能跨会话比较。
+- `sessions` 只列有内容的会话，按名字升序（码点序，也就是 UTF-8 字节序）。翻页：`after` 给上一页最后一个名字，`prefix` 按字面匹配，`limit` 限条数。
+- `kinds` 只返回事件，消息和摘要没有 `kind`；和 `types` 取交集，`types` 里没有 `event` 就什么都不返回；`last` 在过滤之后取，所以 `{ kinds: [a, b], last: 1 }` 是这些事件里最后写的一条。
 - 生效的摘要是 `covers` 最大的那条；`covers` 相同时 `seq` 大的（后写的）生效。
 - 事件 `kind` 用 `{domain}.{action}`。框架保留 `ctx.` 前缀，常量是 `CTX_EVENTS`：
 
@@ -87,7 +95,7 @@ interface SessionStore {
 
 这些事件缺省对模型不可见，和应用事件一样由投影规则决定要不要渲染。
 
-纯函数：`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareEntries`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，存储可以直接用。
+纯函数：`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareEntries`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，`filterSessions(names, options)` 是 `SessionsOptions` 的语义，内存里的存储可以直接用。
 
 ## 上下文 `ContextBuilder`
 
@@ -381,13 +389,13 @@ interface Orchestrator {
 
 `@modelctx-ai/ctx-protocol/testing`，用法见[包说明](../packages/protocol/README.md#实现一个协议)。
 
-| 契约测试                       | 工厂                                             | 覆盖                                                                                                                                                                                     |
-| ------------------------------ | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeSessionStoreContract` | `({ now }) => SessionStore`                      | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`types`、往返、二进制和 URL、像标记的数据、`clear`/`sessions`、`watch?` 的读已有、读新写入、中止            |
-| `describeExecutorContract`     | `() => { executor, echo }`                       | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                  |
-| `describeToolRegistryContract` | `() => ToolRegistry`                             | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                          |
-| `describeHarnessContract`      | `({ script }) => { harness, store, agent }`      | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错 |
-| `describeOrchestratorContract` | `({ script }) => { orchestrator, store, agent }` | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`、`close` 后不收                                                                                  |
+| 契约测试                       | 工厂                                             | 覆盖                                                                                                                                                                                                |
+| ------------------------------ | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `describeSessionStoreContract` | `({ now }) => SessionStore`                      | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`types`/`kinds`、往返、二进制和 URL、像标记的数据、`clear`、`sessions` 的升序和翻页、`watch?` 的读已有、读新写入、中止 |
+| `describeExecutorContract`     | `() => { executor, echo }`                       | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                             |
+| `describeToolRegistryContract` | `() => ToolRegistry`                             | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                     |
+| `describeHarnessContract`      | `({ script }) => { harness, store, agent }`      | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错            |
+| `describeOrchestratorContract` | `({ script }) => { orchestrator, store, agent }` | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页）、`close` 后不收                                                                           |
 
 harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里。
 
@@ -413,24 +421,24 @@ harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptSte
 
 `ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON（每行一个值，出错时最后一行是 `{ error }`）；错误正文是 `{ error: ErrorInfo }`，客户端转成带 `status` 的 `Error`。鉴权用 `Authorization: Bearer <token>`，缺省只听本机，Host 只认监听地址，带 `Origin` 的请求缺省 403。消息里的二进制和 `URL` 编码成带标记的对象（`{"\u0000ctx": "bytes", "base64"}`、`{"\u0000ctx": "url", "href"}`），两头还原。路径按组件分组，可以整体挂在一个前缀下：
 
-| 组件     | 方法              | 路径                                                 | 请求体 → 响应                                                       |
-| -------- | ----------------- | ---------------------------------------------------- | ------------------------------------------------------------------- |
-| 会话     | `append`          | `POST /sessions/:session/entries`                    | `{ entries }` → `{ entries }`                                       |
-|          | `list`            | `GET /sessions/:session/entries?after=&last=&types=` | → `{ entries }`；`types` 逗号分隔                                   |
-|          | `watch`           | `GET /sessions/:session/entries/stream?after=`       | → NDJSON `Entry`；存储没有 `watch` 时服务端轮询 `list`              |
-|          | `clear`           | `DELETE /sessions/:session`                          | → `{ deleted }`                                                     |
-|          | `sessions`        | `GET /sessions`                                      | → `{ sessions }`                                                    |
-| 执行环境 | （列出名字）      | `GET /executors`                                     | → `{ executors }`                                                   |
-|          | `tools`           | `GET /executors/:name/tools`                         | → `{ tools }`                                                       |
-|          | `execute`         | `POST /executors/:name/execute`                      | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止 |
-| Harness  | `run`             | `POST /runs`                                         | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`     |
-|          | `stream`          | `POST /runs?stream=1`                                | 同上 → NDJSON `RunEvent`；断开即中止                                |
-|          | 取消（`signal`）  | `DELETE /runs/:runId`                                | → `{ cancelled }`                                                   |
-| 编排     | `submit`          | `POST /orchestrator/runs`                            | 同 `POST /runs` → `{ runId, session }`                              |
-|          | `status` / `done` | `GET /orchestrator/runs/:runId?wait=<ms>`            | → `{ runId, status, result?, error? }`；`wait` 是长轮询             |
-|          | `cancel`          | `DELETE /orchestrator/runs/:runId`                   | → `{ cancelled }`                                                   |
-|          | `recover`         | `POST /orchestrator/recover`                         | → `{ recovered }`                                                   |
-|          | `events`          | `GET /orchestrator/events`                           | → NDJSON `OrchestratorEvent`                                        |
+| 组件     | 方法              | 路径                                                        | 请求体 → 响应                                                       |
+| -------- | ----------------- | ----------------------------------------------------------- | ------------------------------------------------------------------- |
+| 会话     | `append`          | `POST /sessions/:session/entries`                           | `{ entries }` → `{ entries }`                                       |
+|          | `list`            | `GET /sessions/:session/entries?after=&last=&types=&kinds=` | → `{ entries }`；`types`、`kinds` 逗号分隔（`kind` 里不能有逗号）   |
+|          | `watch`           | `GET /sessions/:session/entries/stream?after=`              | → NDJSON `Entry`；存储没有 `watch` 时服务端轮询 `list`              |
+|          | `clear`           | `DELETE /sessions/:session`                                 | → `{ deleted }`                                                     |
+|          | `sessions`        | `GET /sessions?prefix=&after=&limit=`                       | → `{ sessions }`；名字升序                                          |
+| 执行环境 | （列出名字）      | `GET /executors`                                            | → `{ executors }`                                                   |
+|          | `tools`           | `GET /executors/:name/tools`                                | → `{ tools }`                                                       |
+|          | `execute`         | `POST /executors/:name/execute`                             | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止 |
+| Harness  | `run`             | `POST /runs`                                                | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`     |
+|          | `stream`          | `POST /runs?stream=1`                                       | 同上 → NDJSON `RunEvent`；断开即中止                                |
+|          | 取消（`signal`）  | `DELETE /runs/:runId`                                       | → `{ cancelled }`                                                   |
+| 编排     | `submit`          | `POST /orchestrator/runs`                                   | 同 `POST /runs` → `{ runId, session }`                              |
+|          | `status` / `done` | `GET /orchestrator/runs/:runId?wait=<ms>`                   | → `{ runId, status, result?, error? }`；`wait` 是长轮询             |
+|          | `cancel`          | `DELETE /orchestrator/runs/:runId`                          | → `{ cancelled }`                                                   |
+|          | `recover`         | `POST /orchestrator/recover`                                | → `{ recovered }`                                                   |
+|          | `events`          | `GET /orchestrator/events`                                  | → NDJSON `OrchestratorEvent`                                        |
 
 编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 

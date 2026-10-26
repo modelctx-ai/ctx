@@ -153,13 +153,13 @@ sequenceDiagram
 
 ## 存储
 
-| 方法                                    | 行为                                                                                                                                     |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `append(session, entries)`              | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）                   |
-| `list(session, { after, last, types })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；三者可以组合 |
-| `clear(session)`                        | 删掉整个会话，返回条数                                                                                                                   |
-| `sessions()`                            | 有内容的会话                                                                                                                             |
-| `watch(session, { after, signal })`     | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                    |
+| 方法                                           | 行为                                                                                                                                                                                                                                 |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `append(session, entries)`                     | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）                                                                                                               |
+| `list(session, { after, last, types, kinds })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；`kinds` 只要 `kind` 在其中的事件（消息和摘要不返回），与 `types` 取交集；都可以组合，`last` 在过滤之后取 |
+| `clear(session)`                               | 删掉整个会话，返回条数                                                                                                                                                                                                               |
+| `sessions({ prefix, after, limit })`           | 有内容的会话，按名字升序（码点序）。`prefix` 按字面匹配，`after` 是上一页最后一个名字（不含），`limit` 限条数，小数向下取整，不是正数时返回空；都不给就是全部                                                                        |
+| `watch(session, { after, signal })`            | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                                                                                                                |
 
 实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，缺省每 250ms，别的进程写进同一个库的也能读到）。条目只追加；除了 `clear`，没有删除和修改。
 
@@ -478,7 +478,7 @@ await orchestrator.close(); // 不再收新运行，等运行中的结束
 
 - 状态：`completed` 跑完；`failed` 是 `stopReason: 'error'` 或 harness 抛错（`done` 跟着 reject）；`cancelled` 是被 `cancel` 或请求的 `signal` 取消。
 - `cancel(runId)`：排队中的直接取消，`done` 给出 `stopReason: 'aborted'` 的空结果，不调 harness；运行中的中止传给 harness 的 `signal`。跑完的或不认识的返回 `false`。
-- `recover()`：只在给了 `store` 时有。扫描 `store.sessions()`，找日志里有 `ctx.run.started` 没有配对 `ctx.run.ended` 的运行（这个编排器自己正在跑的除外），补一条 `ctx.run.ended`（`stopReason: 'error'`，`source: 'orchestrator'`），不续跑。
+- `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外），补一条 `ctx.run.ended`（`stopReason: 'error'`，`source: 'orchestrator'`），不续跑。
 
 ## 网关
 
@@ -573,18 +573,18 @@ describeSessionStoreContract('pg', ({ now }) => createPgStore({ url: 'postgres:/
 });
 ```
 
-| 用例            | 要求                                                                                                                                                   |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 位置            | `list` 按 `seq` 升序；补写的旧记录排在写入的位置，`list(after)`、`watch(after)` 仍然给出它；`seq` 会话内递增、从 1 起，`clear` 后不回退                |
-| 同一时刻        | 按写入先后                                                                                                                                             |
-| 去重            | 同会话重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按会话隔离；一批里有重复的，其余照写                                                     |
-| 原子            | 并发追加的两批不交错                                                                                                                                   |
-| 查询            | `after`、`last`、`types` 可以组合；`last` 向下取整，`0`、负数、`NaN`、`Infinity` 返回空                                                                |
-| 往返            | 消息分段（含工具调用的对象入参、图片 `URL`）、事件 `data`、摘要 `covers`、`source`、`meta` 原样读回；`seq` 递增                                        |
-| 二进制和 URL    | `Buffer`、`ArrayBuffer`、带标签的 `{ type: 'data' }` 读回来字节不变（容器可以换成 `Uint8Array`）；`URL`（包括 `{ type: 'url' }` 里的）读回来还是 `URL` |
-| 像标记的数据    | 事件 `data` 里 `{ $url }`、`{ $bytes }` 这类普通对象原样读回                                                                                           |
-| 会话            | `clear` 返回删掉的条数；`sessions()` 只列有内容的会话                                                                                                  |
-| `watch`（有时） | 先给出 `after` 之后已有的，再给出新写入的，只看这个会话；`signal` 中止后迭代正常结束                                                                   |
+| 用例            | 要求                                                                                                                                                         |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 位置            | `list` 按 `seq` 升序；补写的旧记录排在写入的位置，`list(after)`、`watch(after)` 仍然给出它；`seq` 会话内递增、从 1 起，`clear` 后不回退                      |
+| 同一时刻        | 按写入先后                                                                                                                                                   |
+| 去重            | 同会话重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按会话隔离；一批里有重复的，其余照写                                                           |
+| 原子            | 并发追加的两批不交错                                                                                                                                         |
+| 查询            | `after`、`last`、`types`、`kinds` 可以组合；`last` 向下取整，`0`、负数、`NaN`、`Infinity` 返回空；`kinds` 只返回事件，与 `types` 取交集，`last` 在过滤之后取 |
+| 往返            | 消息分段（含工具调用的对象入参、图片 `URL`）、事件 `data`、摘要 `covers`、`source`、`meta` 原样读回；`seq` 递增                                              |
+| 二进制和 URL    | `Buffer`、`ArrayBuffer`、带标签的 `{ type: 'data' }` 读回来字节不变（容器可以换成 `Uint8Array`）；`URL`（包括 `{ type: 'url' }` 里的）读回来还是 `URL`       |
+| 像标记的数据    | 事件 `data` 里 `{ $url }`、`{ $bytes }` 这类普通对象原样读回                                                                                                 |
+| 会话            | `clear` 返回删掉的条数；`sessions()` 只列有内容的会话，名字升序（码点序）；`prefix` 按字面匹配（`%`、`_`、`\` 不特殊），`after`、`limit` 翻页不重不漏        |
+| `watch`（有时） | 先给出 `after` 之后已有的，再给出新写入的，只看这个会话；`signal` 中止后迭代正常结束                                                                         |
 
 ### 模型服务商
 

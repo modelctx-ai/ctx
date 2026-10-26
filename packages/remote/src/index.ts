@@ -19,6 +19,7 @@ import {
   type RunRequest,
   type RunResult,
   type RunStatus,
+  type SessionsOptions,
   type SessionStore,
   type ToolCall,
   type ToolDefinition,
@@ -160,12 +161,15 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
       return body.entries;
     },
     async list(session: string, listOptions: ListOptions = {}): Promise<Entry[]> {
-      const { after, last, types } = listOptions;
+      const { after, last, types, kinds } = listOptions;
+      // kinds 用逗号分隔，带逗号的 kind 过不了线；与其静默拆成两个，不如直接报错。
+      if (kinds?.some((kind) => kind.includes(','))) throw new Error('An entry kind cannot contain a comma.');
       const body = await connection.json<{ entries: Entry[] }>('GET', entriesPath(session), {
         query: {
           after: after !== undefined ? String(after) : undefined,
           last: last !== undefined ? String(last) : undefined,
           types: types ? types.join(',') : undefined,
+          kinds: kinds ? kinds.join(',') : undefined,
         },
       });
       return body.entries;
@@ -173,8 +177,16 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
     async clear(session: string): Promise<number> {
       return (await connection.json<{ deleted: number }>('DELETE', `/sessions/${segment(session)}`)).deleted;
     },
-    async sessions(): Promise<string[]> {
-      return (await connection.json<{ sessions: string[] }>('GET', '/sessions')).sessions;
+    async sessions(sessionsOptions: SessionsOptions = {}): Promise<string[]> {
+      const { prefix, after, limit } = sessionsOptions;
+      const body = await connection.json<{ sessions: string[] }>('GET', '/sessions', {
+        query: {
+          prefix,
+          after,
+          limit: limit !== undefined ? String(limit) : undefined,
+        },
+      });
+      return body.sessions;
     },
     async *watch(session: string, watchOptions: WatchOptions = {}): AsyncGenerator<Entry> {
       const { after, signal } = watchOptions;

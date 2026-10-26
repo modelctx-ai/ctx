@@ -221,6 +221,7 @@ describe('schema 迁移', () => {
     assert.equal(schemaVersion(database), '3');
     const indexes = (database.prepare(`PRAGMA index_list(ctx_entries)`).all() as { name: string }[]).map((i) => i.name);
     assert.ok(indexes.includes('ctx_entries_seq'));
+    assert.ok(indexes.includes('ctx_entries_kind'));
     assert.ok(!indexes.includes('ctx_entries_order'));
     const entries = await store.list('user:1');
     assert.deepEqual(
@@ -247,6 +248,86 @@ describe('schema 迁移', () => {
       (await store.list('user:1')).map((entry) => entry.id),
       ['p1-1', 'p1-2'],
     );
+  });
+
+  test('阶段 1 的 schema 3 库补上生成列 kind 和 (session, kind, seq) 索引，旧行自动有 kind，可以按 kinds 查', async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec(PHASE1_DDL);
+    const columns = (): string[] =>
+      (database.prepare(`PRAGMA table_xinfo(ctx_entries)`).all() as { name: string }[]).map((c) => c.name);
+    assert.ok(!columns().includes('kind'));
+    const store = createSqliteStore({ database });
+    assert.ok(columns().includes('kind'));
+    assert.ok(indexNames(database).includes('ctx_entries_kind'));
+    assert.equal(schemaVersion(database), '3');
+    assert.deepEqual(
+      (
+        database.prepare(`SELECT id, kind FROM ctx_entries ORDER BY seq`).all() as { id: string; kind: string | null }[]
+      ).map((row) => [row.id, row.kind]),
+      [
+        ['p1-1', null],
+        ['p1-2', 'note'],
+      ],
+      '消息的 kind 是 NULL，旧事件的 kind 从 body 里取出来',
+    );
+    assert.deepEqual(
+      (await store.list('user:1', { kinds: ['note'] })).map((entry) => entry.id),
+      ['p1-2'],
+    );
+    await store.append('user:1', [eventEntry('note', { text: '新写的' })]);
+    assert.equal((await store.list('user:1', { kinds: ['note'] })).length, 2);
+    // 再打开一次：结构完整，什么都不改。
+    const before = indexNames(database).toSorted();
+    createSqliteStore({ database });
+    assert.deepEqual(indexNames(database).toSorted(), before);
+    assert.equal(columns().filter((name) => name === 'kind').length, 1);
+  });
+
+  test('只补缺的：kind 列在、索引缺时只补索引；索引在、列缺时先补列', () => {
+    const lacksIndex = new DatabaseSync(':memory:');
+    lacksIndex.exec(PHASE1_DDL);
+    lacksIndex.exec(
+      `ALTER TABLE ctx_entries ADD COLUMN kind TEXT GENERATED ALWAYS AS (json_extract(body, '$.kind')) VIRTUAL`,
+    );
+    createSqliteStore({ database: lacksIndex });
+    assert.ok(indexNames(lacksIndex).includes('ctx_entries_kind'));
+    const partial = new DatabaseSync(':memory:');
+    partial.exec(PHASE1_DDL);
+    partial.exec(`DROP INDEX ctx_entries_key`);
+    createSqliteStore({ database: partial });
+    assert.ok(indexNames(partial).includes('ctx_entries_key'));
+    assert.ok(indexNames(partial).includes('ctx_entries_kind'));
+  });
+
+  test('在应用的事务里补齐 schema 3，回滚后回到阶段 1 的结构', () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec(PHASE1_DDL);
+    database.exec('BEGIN');
+    createSqliteStore({ database });
+    assert.ok(indexNames(database).includes('ctx_entries_kind'));
+    database.exec('ROLLBACK');
+    assert.ok(!indexNames(database).includes('ctx_entries_kind'));
+    assert.ok(
+      !(database.prepare(`PRAGMA table_xinfo(ctx_entries)`).all() as { name: string }[]).some((c) => c.name === 'kind'),
+    );
+  });
+
+  test('kind 条件能用上 (session, kind, seq) 索引；前缀按字面匹配，最大码点做前缀也不出错', async () => {
+    const store = createSqliteStore({ path: ':memory:' });
+    const plan = (sql: string, ...params: (string | number)[]): string =>
+      (store.database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as { detail: string }[])
+        .map((row) => row.detail)
+        .join('\n');
+    // 带 ORDER BY seq 时规划器可能改走 (session, seq) 索引顺着扫；这里只确认 kind 条件能用上新索引。
+    assert.match(
+      plan(`SELECT seq FROM ctx_entries WHERE session = ? AND kind IN (?, ?)`, 's', 'a', 'b'),
+      /USING (COVERING )?INDEX ctx_entries_kind \(session=\? AND kind=\?\)/,
+    );
+    await store.append('a', [userEntry('x')]);
+    await store.append('a%', [userEntry('x')]);
+    assert.deepEqual(await store.sessions({ prefix: 'a%' }), ['a%']);
+    assert.deepEqual(await store.sessions({ prefix: '\u{10ffff}' }), [], '最大码点做前缀：没有上界也不出错');
+    store.close();
   });
 
   test('比自己新的版本拒绝打开，库原样不动；自己开的库也关掉', () => {

@@ -4,7 +4,7 @@
  */
 import { describe, test } from 'vite-plus/test';
 
-import { filterEntries, type Entry, type SessionStore } from './session.ts';
+import { filterEntries, filterSessions, type Entry, type SessionStore } from './session.ts';
 import { describeExecutorContract, describeSessionStoreContract, describeToolRegistryContract } from './testing.ts';
 import {
   errorOutput,
@@ -52,8 +52,8 @@ function fakeStore(now: () => number): SessionStore {
       sessions.delete(session);
       return list.length;
     },
-    async sessions() {
-      return [...sessions.keys()];
+    async sessions(options) {
+      return filterSessions([...sessions.keys()], options);
     },
     async *watch(session, options = {}) {
       let after = options.after;

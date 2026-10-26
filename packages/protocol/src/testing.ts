@@ -203,6 +203,45 @@ export function describeSessionStoreContract(
       }
     });
 
+    test('kinds 只要 kind 在其中的事件，消息和摘要不返回，与 types 取交集', async () => {
+      let clock = 0;
+      const store = await factory({ now: () => (clock += 10) });
+      const [, , , , , , last] = await store.append('s', [
+        userEntry('消息'),
+        eventEntry('pet.whisper', { text: '甲' }),
+        eventEntry('pet.reminder', { text: '乙' }),
+        { type: 'summary', text: '摘要', covers: 1 },
+        eventEntry('pet.whisper', { text: '丙' }),
+        eventEntry('ctx.run.started', { text: '丁', data: { runId: 'r' } }),
+        eventEntry('pet.whisper', { text: '戊' }),
+      ]);
+      const listKinds = async (
+        list: string[],
+        more: { after?: number; last?: number; types?: ('event' | 'message')[] } = {},
+      ) => texts(await store.list('s', { kinds: list, ...more }));
+      assert.deepEqual(await listKinds(['pet.whisper']), ['甲', '丙', '戊']);
+      assert.deepEqual(await listKinds(['pet.whisper', 'ctx.run.started']), ['甲', '丙', '丁', '戊']);
+      assert.deepEqual(await listKinds(['pet.whisper'], { last: 1 }), ['戊'], 'last 是过滤之后的最后几条');
+      assert.deepEqual(await listKinds(['pet.whisper', 'pet.reminder'], { last: 2 }), ['丙', '戊']);
+      assert.deepEqual(await listKinds(['pet.whisper'], { after: last!.seq - 2 }), ['戊']);
+      assert.deepEqual(await listKinds(['pet.whisper'], { types: ['event'] }), ['甲', '丙', '戊']);
+      assert.deepEqual(await listKinds(['pet.whisper'], { types: ['message'] }), [], '与 types 取交集：消息没有 kind');
+      assert.deepEqual(await listKinds([]), [], '空列表什么都不匹配');
+      assert.deepEqual(await listKinds(['nope']), []);
+      assert.equal((await store.list('s', { types: ['event'] })).length, 5, '不给 kinds 时不过滤');
+    });
+
+    test('kinds 只看事件自己的 kind：消息正文和事件数据里的 kind 字样不算', async () => {
+      const store = await factory({ now: Date.now });
+      await store.append('s', [
+        userEntry('kind'),
+        eventEntry('app.note', { text: '数据里有 kind', data: { kind: 'pet.whisper' } }),
+        eventEntry('pet.whisper', { text: '真的' }),
+      ]);
+      assert.deepEqual(texts(await store.list('s', { kinds: ['pet.whisper'] })), ['真的']);
+      assert.deepEqual(texts(await store.list('s', { kinds: ['kind'] })), []);
+    });
+
     test('条目原样读回：消息分段、事件数据、摘要位置、元数据', async () => {
       const store = await factory({ now: () => 42 });
       const call: ModelMessage = {
@@ -275,6 +314,95 @@ export function describeSessionStoreContract(
       await store.append('s', [eventEntry('tool.log', { data })]);
       const [entry] = await store.list('s');
       assert.deepEqual(entry?.type === 'event' && entry.data, data);
+    });
+
+    test('sessions 按名字升序（码点序），prefix 是字面前缀，after 和 limit 翻页', async () => {
+      const store = await factory({ now: Date.now });
+      const names = [
+        'b',
+        'a_b',
+        'user:10',
+        'a%b',
+        'user:2',
+        'ab',
+        'a',
+        'a\\b',
+        'user:1',
+        'user;x',
+        '用户:1',
+        '😀:1',
+        'Ａ:1',
+      ];
+      for (const session of names) await store.append(session, [userEntry(session)]);
+      // 码点序：ASCII 在前，然后是 U+7528、U+FF21、U+1F600（JavaScript 的 `<` 会把补充平面的 😀 排到 Ａ 前面）。
+      const sorted = [
+        'a',
+        'a%b',
+        'a\\b',
+        'a_b',
+        'ab',
+        'b',
+        'user:1',
+        'user:10',
+        'user:2',
+        'user;x',
+        '用户:1',
+        'Ａ:1',
+        '😀:1',
+      ];
+      assert.deepEqual(await store.sessions(), sorted, '不给选项时是全部，名字升序');
+      assert.deepEqual(await store.sessions({}), sorted);
+      assert.deepEqual(await store.sessions({ prefix: '' }), sorted, '空前缀是全部');
+      assert.deepEqual(await store.sessions({ prefix: 'user:' }), ['user:1', 'user:10', 'user:2']);
+      assert.deepEqual(await store.sessions({ prefix: 'a%' }), ['a%b'], '% 不是通配符');
+      assert.deepEqual(await store.sessions({ prefix: 'a_' }), ['a_b'], '_ 不是通配符');
+      assert.deepEqual(await store.sessions({ prefix: 'a\\' }), ['a\\b'], '反斜杠不是转义');
+      assert.deepEqual(await store.sessions({ prefix: 'a' }), ['a', 'a%b', 'a\\b', 'a_b', 'ab']);
+      assert.deepEqual(await store.sessions({ prefix: '😀' }), ['😀:1']);
+      assert.deepEqual(await store.sessions({ prefix: 'nope' }), []);
+      assert.deepEqual(
+        await store.sessions({ after: 'user:10' }),
+        ['user:2', 'user;x', '用户:1', 'Ａ:1', '😀:1'],
+        'after 不含',
+      );
+      assert.deepEqual(await store.sessions({ after: 'user:1', prefix: 'user:' }), ['user:10', 'user:2']);
+      assert.deepEqual(
+        await store.sessions({ after: 'zzz-不存在' }),
+        ['用户:1', 'Ａ:1', '😀:1'],
+        'after 不必是存在的名字',
+      );
+      assert.deepEqual(await store.sessions({ limit: 3 }), sorted.slice(0, 3));
+      assert.deepEqual(await store.sessions({ limit: 2.9 }), sorted.slice(0, 2), '小数向下取整');
+      assert.deepEqual(await store.sessions({ limit: 0 }), []);
+      assert.deepEqual(await store.sessions({ limit: 1000 }), sorted);
+      const pages: string[][] = [];
+      for (let after: string | undefined; ;) {
+        const page = await store.sessions({ limit: 4, ...(after !== undefined ? { after } : {}) });
+        if (page.length === 0) break;
+        pages.push(page);
+        after = page.at(-1)!;
+      }
+      assert.deepEqual(
+        pages.map((page) => page.length),
+        [4, 4, 4, 1],
+      );
+      assert.deepEqual(pages.flat(), sorted, '翻页不重不漏');
+      const user: string[] = [];
+      for (let after: string | undefined; ;) {
+        const page = await store.sessions({ prefix: 'user:', limit: 2, ...(after !== undefined ? { after } : {}) });
+        if (page.length === 0) break;
+        user.push(...page);
+        after = page.at(-1)!;
+      }
+      assert.deepEqual(user, ['user:1', 'user:10', 'user:2']);
+    });
+
+    test('sessions 翻页：清掉的会话不再出现，没有内容的会话不出现', async () => {
+      const store = await factory({ now: Date.now });
+      for (const session of ['a', 'b', 'c']) await store.append(session, [userEntry(session)]);
+      await store.clear('b');
+      assert.deepEqual(await store.sessions({ limit: 2 }), ['a', 'c']);
+      assert.deepEqual(await store.sessions({ after: 'a', limit: 1 }), ['c']);
     });
 
     test('clear 删掉整个会话，sessions 只列有内容的', async () => {
@@ -583,6 +711,11 @@ function kinds(entries: readonly Entry[]): string[] {
   });
 }
 
+/** 一条 `ctx.run.*` 事件，`data` 只带 `runId` 和最小的 `agent`。 */
+function lifecycle(kind: string, runId: string): NewEntry {
+  return eventEntry(kind, { data: { runId, agent: { model: 'm' } } });
+}
+
 function eventData(entries: readonly Entry[], kind: string): Record<string, unknown>[] {
   return entries.flatMap((entry) =>
     entry.type === 'event' && entry.kind === kind ? [(entry.data ?? {}) as Record<string, unknown>] : [],
@@ -880,6 +1013,30 @@ export function describeOrchestratorContract(
           ended.map((data) => [data['runId'], data['stopReason']]),
           [['lost', 'error']],
         );
+        assert.deepEqual(await orchestrator.recover(), []);
+      });
+    });
+
+    test('recover（有时）：会话多于一页时每个断掉的运行都补，只看最后一个生命周期事件', async () => {
+      await withOrchestrator(factory, answers(0), async ({ orchestrator, store }) => {
+        if (!orchestrator.recover) return;
+        const crashed = ['s010', 's101', 's199', 's249'];
+        for (let i = 0; i < 250; i += 1) {
+          const session = `s${String(i).padStart(3, '0')}`;
+          const runId = `run-${i}`;
+          const entries = [userEntry('在吗'), lifecycle(CTX_EVENTS.runStarted, runId)];
+          if (!crashed.includes(session)) entries.push(lifecycle(CTX_EVENTS.runEnded, runId));
+          await store.append(session, entries);
+        }
+        const recovered = await orchestrator.recover();
+        assert.deepEqual(recovered.map((run) => run.session).toSorted(), crashed);
+        for (const session of crashed) {
+          const ended = eventData(await store.list(session), CTX_EVENTS.runEnded);
+          assert.deepEqual(
+            ended.map((data) => data['stopReason']),
+            ['error'],
+          );
+        }
         assert.deepEqual(await orchestrator.recover(), []);
       });
     });

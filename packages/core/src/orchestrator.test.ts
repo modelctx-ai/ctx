@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 
-import type { Harness, RunRequest, RunResult } from '@modelctx-ai/ctx-protocol';
+import {
+  eventEntry,
+  userEntry,
+  type Harness,
+  type ListOptions,
+  type RunRequest,
+  type RunResult,
+  type SessionsOptions,
+} from '@modelctx-ai/ctx-protocol';
 import { describe, test } from 'vite-plus/test';
 
 import { createContextBuilder } from './builder.ts';
@@ -10,6 +18,10 @@ import { createMemoryStore } from './store.ts';
 import { createScriptedModel } from './testing.ts';
 
 const agent = { model: 'fake' };
+
+function lifecycle(kind: string, runId: string) {
+  return eventEntry(kind, { data: { runId, agent: { model: 'fake' } } });
+}
 
 /** 每一轮都卡住，直到测试放行或被取消；记下开始的顺序。 */
 function gatedHarness() {
@@ -152,5 +164,48 @@ describe('orchestrator', () => {
     await handle.done;
     await orchestrator.close();
     assert.ok(!('recover' in createOrchestrator({ harness })));
+  });
+
+  test('recover 翻页读会话名，每个会话只查最后一个生命周期事件，不读消息正文', async () => {
+    const base = createMemoryStore();
+    const pages: SessionsOptions[] = [];
+    const lists: ListOptions[] = [];
+    const store: typeof base = {
+      ...base,
+      sessions: (options) => {
+        pages.push(options ?? {});
+        return base.sessions(options);
+      },
+      list: (session, options) => {
+        lists.push(options ?? {});
+        return base.list(session, options);
+      },
+    };
+    for (let i = 0; i < 230; i += 1) {
+      const session = `s${String(i).padStart(3, '0')}`;
+      const entries = [userEntry('在吗'), lifecycle('ctx.run.started', `r${i}`)];
+      if (i % 100 !== 7) entries.push(lifecycle('ctx.run.ended', `r${i}`));
+      await base.append(session, entries);
+    }
+    const orchestrator = createOrchestrator({ harness: gatedHarness().harness, store });
+    assert.deepEqual(await orchestrator.recover?.(), [
+      { session: 's007', runId: 'r7' },
+      { session: 's107', runId: 'r107' },
+      { session: 's207', runId: 'r207' },
+    ]);
+    assert.deepEqual(
+      pages.map((page) => [page.after, page.limit]),
+      [
+        [undefined, 100],
+        ['s099', 100],
+        ['s199', 100],
+      ],
+      '一页一页读，after 是上一页最后一个名字',
+    );
+    assert.equal(lists.length, 230, '每个会话一次 list');
+    assert.ok(
+      lists.every((options) => options.last === 1 && options.kinds?.join() === 'ctx.run.started,ctx.run.ended'),
+    );
+    await orchestrator.close();
   });
 });

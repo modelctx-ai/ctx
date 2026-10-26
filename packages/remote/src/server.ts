@@ -22,6 +22,7 @@ import {
   type RunRequest,
   type RunResult,
   type RunStatus,
+  type SessionsOptions,
   type SessionStore,
   type ToolCall,
 } from '@modelctx-ai/ctx-protocol';
@@ -254,8 +255,22 @@ function afterParam(query: URLSearchParams): number | undefined {
   return after;
 }
 
+function sessionsOptionsOf(query: URLSearchParams): SessionsOptions {
+  const options: { prefix?: string; after?: string; limit?: number } = {};
+  const prefix = query.get('prefix');
+  if (prefix !== null) options.prefix = prefix;
+  const after = query.get('after');
+  if (after !== null) options.after = after;
+  const limit = query.get('limit');
+  if (limit !== null) {
+    options.limit = Number(limit);
+    if (limit === '' || Number.isNaN(options.limit)) fail(400, 'limit must be a number');
+  }
+  return options;
+}
+
 function listOptionsOf(query: URLSearchParams): ListOptions {
-  const options: { after?: number; last?: number; types?: EntryType[] } = {};
+  const options: { after?: number; last?: number; types?: EntryType[]; kinds?: string[] } = {};
   const after = afterParam(query);
   if (after !== undefined) options.after = after;
   const last = query.get('last');
@@ -267,6 +282,8 @@ function listOptionsOf(query: URLSearchParams): ListOptions {
     if (unknown.length > 0) fail(400, `unknown entry types: ${unknown.join(', ')}; use ${ENTRY_TYPES.join(', ')}`);
     options.types = list as EntryType[];
   }
+  const kinds = query.get('kinds');
+  if (kinds !== null) options.kinds = kinds.split(',').filter(Boolean);
   return options;
 }
 
@@ -317,7 +334,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     const [session, sub, tail, extra] = rest;
     if (session === undefined) {
       if (method !== 'GET') fail(405, 'use GET /sessions');
-      sendJson(res, 200, { sessions: await sessionStore.sessions() });
+      sendJson(res, 200, { sessions: await sessionStore.sessions(sessionsOptionsOf(url.searchParams)) });
       return;
     }
     if (sub === undefined) {

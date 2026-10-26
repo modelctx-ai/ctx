@@ -51,11 +51,12 @@ watcher.close();
 
 ## 表
 
-| 表                | 内容                                                                                                                                                                            |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<prefix>entries` | 每行一个条目：`seq`（自增，就是写入序号）、`id`（唯一）、`session`、`at`、`type`、`key`、`source`、`body`（JSON）、`meta`（JSON）。索引 `(session, seq)`；`(session, key)` 唯一 |
-| `<prefix>meta`    | 结构版本 `schema`                                                                                                                                                               |
+| 表                | 内容                                                                                                                                                                                                                                                                                 |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `<prefix>entries` | 每行一个条目：`seq`（自增，就是写入序号）、`id`（唯一）、`session`、`at`、`type`、`key`、`source`、`body`（JSON）、`meta`（JSON）。索引 `(session, seq)`；`(session, key)` 唯一。生成列 `kind`（`json_extract(body, '$.kind')`，VIRTUAL，只有事件有值）和索引 `(session, kind, seq)` |
+| `<prefix>meta`    | 结构版本 `schema`                                                                                                                                                                                                                                                                    |
 
+- `list({ kinds })` 只返回 `type = 'event'` 且 `kind` 在其中的行，靠 `kind` 列和索引；旧版本写的行不用回填，`kind` 自动有值。`sessions({ prefix, after, limit })` 按名字升序，前缀用范围查询（`session >= ? AND session < ?`），不用 `LIKE`，`%`、`_` 不用转义。
 - 重复的 `id`、同会话重复的 `key` 由 `ON CONFLICT DO NOTHING` 跳过，同一批的其余照写；只跳过唯一约束冲突，NOT NULL 之类的违例照常报错；一批在一个 SAVEPOINT 里，要么全写要么不写。
 - `watch(session, { after, signal })` 轮询 `list(session, { after })`，先给出已有的再给出新写入的；`signal` 中止后迭代结束。
 - 二进制和 URL 在序列化之前换成带标记的对象：`Uint8Array`、`Buffer`、`ArrayBuffer` 和其他 TypedArray 存成 `{"\u0000ctx": "bytes", "base64": "…"}`，`URL` 存成 `{"\u0000ctx": "url", "href": "…"}`。读回来二进制都是 `Uint8Array`，URL 还是 `URL`。

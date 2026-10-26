@@ -8,6 +8,7 @@ import {
   CTX_EVENTS,
   eventEntry,
   filterEntries,
+  filterSessions,
   isFrameworkKind,
   runEndedEntry,
   runStartedEntry,
@@ -78,6 +79,22 @@ describe('entries', () => {
     );
     assert.deepEqual(filterEntries(entries, { last: Number.NaN }), []);
     assert.equal(filterEntries(entries, undefined).length, 3);
+    assert.deepEqual(
+      filterEntries(entries, { kinds: ['pet.whisper'] }).map((entry) => entry.id),
+      ['e1'],
+    );
+    assert.deepEqual(filterEntries(entries, { kinds: [] }), []);
+    assert.deepEqual(filterEntries(entries, { kinds: ['pet.whisper'], types: ['message'] }), []);
+  });
+
+  test('filterSessions：码点升序，字面前缀，after 不含，limit 向下取整', () => {
+    const names = ['b', 'a%b', 'ab', 'a', '😀', 'Ａ', 'a'];
+    assert.deepEqual(filterSessions(names, undefined), ['a', 'a', 'a%b', 'ab', 'b', 'Ａ', '😀']);
+    assert.deepEqual(filterSessions(names, { prefix: 'a%' }), ['a%b']);
+    assert.deepEqual(filterSessions(names, { after: 'ab', limit: 2.5 }), ['b', 'Ａ']);
+    assert.deepEqual(filterSessions(names, { limit: 0 }), []);
+    assert.deepEqual(filterSessions(names, { limit: Number.NaN }), []);
+    assert.equal(filterSessions(names, { limit: Number.POSITIVE_INFINITY }).length, 7);
   });
 });
 

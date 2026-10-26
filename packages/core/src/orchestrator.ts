@@ -38,9 +38,12 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** `recover` 一次向存储要多少个会话名。 */
+const RECOVER_PAGE = 100;
+
 /**
  * 进程内编排器：每个会话一条队列，同一会话的运行串行，不同会话并行；一个 harness。
- * `recover` 给日志里有 `ctx.run.started` 没有 `ctx.run.ended` 的运行补一条 `ctx.run.ended`（`stopReason: error`），不续跑。
+ * `recover` 给日志里最后一个生命周期事件是 `ctx.run.started`（没有配对的 `ctx.run.ended`）的运行补一条 `ctx.run.ended`（`stopReason: error`），不续跑。
  */
 export function createOrchestrator(options: OrchestratorOptions): LocalOrchestrator {
   const { harness, store } = options;
@@ -172,22 +175,27 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
   if (store) {
     orchestrator.recover = async (): Promise<RecoveredRun[]> => {
       const recovered: RecoveredRun[] = [];
-      for (const session of await store.sessions()) {
-        const open = new Set<string>();
-        for (const entry of await store.list(session, { types: ['event'] })) {
-          if (entry.type !== 'event') continue;
-          const runId = (entry.data as { runId?: unknown } | undefined)?.runId;
+      for (let after: string | undefined; ;) {
+        const page = await store.sessions({ limit: RECOVER_PAGE, ...(after !== undefined ? { after } : {}) });
+        for (const session of page) {
+          // 只看最后一个生命周期事件：它是 started 就是断掉的运行。不读消息正文，每个会话一次查询。
+          const [last] = await store.list(session, {
+            kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded],
+            last: 1,
+          });
+          if (last?.type !== 'event' || last.kind !== CTX_EVENTS.runStarted) continue;
+          const runId = (last.data as { runId?: unknown } | undefined)?.runId;
           if (typeof runId !== 'string') continue;
-          if (entry.kind === CTX_EVENTS.runStarted) open.add(runId);
-          else if (entry.kind === CTX_EVENTS.runEnded) open.delete(runId);
-        }
-        for (const runId of open) {
           // 这个编排器自己正在跑的不算断掉。
           const known = runs.get(runId);
           if (known && (known.status === 'queued' || known.status === 'running')) continue;
           await store.append(session, [runEndedEntry({ runId, stopReason: 'error' }, { source: 'orchestrator' })]);
           recovered.push({ session, runId });
         }
+        const next = page.at(-1);
+        // 不满一页就是读完了；存储不认 `after` 时每页都一样，不能原地转圈。
+        if (page.length < RECOVER_PAGE || next === undefined || next === after) break;
+        after = next;
       }
       return recovered;
     };

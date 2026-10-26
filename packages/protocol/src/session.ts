@@ -65,6 +65,21 @@ export interface ListOptions {
   readonly last?: number;
   /** 只要这些类型。 */
   readonly types?: readonly EntryType[];
+  /**
+   * 只要事件，且 `kind` 在其中；消息和摘要不返回。与 `types` 取交集（`types` 里没有 `event` 就什么都不返回），
+   * 空列表什么都不匹配。`last` 在过滤之后取。
+   */
+  readonly kinds?: readonly string[];
+}
+
+/** `sessions` 的分页和前缀。 */
+export interface SessionsOptions {
+  /** 只要以它开头的名字，按字面匹配（`%`、`_`、`\` 都不是通配符或转义）。空串是全部。 */
+  readonly prefix?: string;
+  /** 从名字大于它的会话开始（不含），一般是上一页的最后一个名字。 */
+  readonly after?: string;
+  /** 最多返回多少个。小数向下取整，不是正数时返回空；不给就不限。 */
+  readonly limit?: number;
 }
 
 export interface WatchOptions {
@@ -88,8 +103,8 @@ export interface SessionStore {
   list(session: string, options?: ListOptions): Promise<Entry[]>;
   /** 清空一个会话，返回删掉的条数。 */
   clear(session: string): Promise<number>;
-  /** 有内容的会话。 */
-  sessions(): Promise<string[]>;
+  /** 有内容的会话，按名字升序（码点序，也就是 UTF-8 字节序）。翻页：`after` 给上一页最后一个名字。 */
+  sessions(options?: SessionsOptions): Promise<string[]>;
   /** 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止。远端流式读用。 */
   watch?(session: string, options?: WatchOptions): AsyncIterable<Entry>;
 }
@@ -157,6 +172,7 @@ export function filterEntries(entries: readonly Entry[], options: ListOptions | 
   let out = entries.filter((entry) => {
     if (options?.after !== undefined && entry.seq <= options.after) return false;
     if (options?.types && !options.types.includes(entry.type)) return false;
+    if (options?.kinds && (entry.type !== 'event' || !options.kinds.includes(entry.kind))) return false;
     return true;
   });
   if (options?.last !== undefined) {
@@ -164,6 +180,35 @@ export function filterEntries(entries: readonly Entry[], options: ListOptions | 
     out = last > 0 ? out.slice(-last) : [];
   }
   return out;
+}
+
+/** 按码点比较，和 UTF-8 字节序一致（JavaScript 的 `<` 按 UTF-16 码元比，补充平面的字符会排错）。 */
+function compareNames(a: string, b: string): number {
+  const x = a[Symbol.iterator]();
+  const y = b[Symbol.iterator]();
+  for (;;) {
+    const p = x.next();
+    const q = y.next();
+    if (p.done || q.done) return Number(!p.done) - Number(!q.done);
+    const diff = p.value.codePointAt(0)! - q.value.codePointAt(0)!;
+    if (diff !== 0) return diff;
+  }
+}
+
+/**
+ * `SessionsOptions` 的语义写成纯函数：内存里的存储可以直接用。输入不必排序，也不必去重。
+ */
+export function filterSessions(names: readonly string[], options: SessionsOptions | undefined): string[] {
+  const out = names
+    .filter(
+      (name) =>
+        (options?.prefix === undefined || name.startsWith(options.prefix)) &&
+        (options?.after === undefined || compareNames(name, options.after) > 0),
+    )
+    .toSorted(compareNames);
+  if (options?.limit === undefined) return out;
+  const limit = Number.isNaN(options.limit) ? 0 : Math.floor(options.limit);
+  return limit > 0 ? out.slice(0, limit) : [];
 }
 
 /** 消息里能直接读出来的文字。工具调用、图片等非文字部分不算。 */
