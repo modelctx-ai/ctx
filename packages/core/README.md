@@ -110,7 +110,7 @@ const harness = createHarness({
   store,
   context: createContextBuilder({ store, factsPlacement: 'prompt' }),
   tools, // 上面的注册表；它自带的函数执行环境自动加进 executors
-  executors: [], // 其余执行环境，例如 ctx-mcp 的 hub
+  executors: [], // 其余执行环境，例如 ctx-mcp 的 hub；工具绑定的执行环境不在这里，开跑前 logger.warn 一次，调用时模型收到错误
   models: (name) => createMyModel(name), // AgentSpec.model 是名字时怎么造
   hooks: {
     beforeTool: (call) => (call.name === 'weather_get' ? undefined : { allow: false, reason: '只能查天气' }),

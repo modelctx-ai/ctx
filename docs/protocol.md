@@ -15,7 +15,7 @@
 | 流是事件序列 | 流式结果用 `AsyncIterable<Event>` 表达，跨边界是 NDJSON 或 SSE                                                                     |
 | 可选方法     | 协议里标 `?` 的方法实现可以不提供，调用方要检查                                                                                    |
 | 取消         | 需要取消的方法收 `signal?: AbortSignal`                                                                                            |
-| 错误         | 抛 `Error`；跨边界时是 `{ error: ErrorInfo }`，`ErrorInfo` 是 `{ message, type?, retryable? }`                                     |
+| 错误         | 抛 `Error`；跨边界时是 `{ error: ErrorInfo }`，`ErrorInfo` 是 `{ message, type?, retryable?, statusCode?, responseBody? }`         |
 | 契约测试     | `@modelctx-ai/ctx-protocol/testing` 的 `describeXContract(name, factory, { describe, test })`，实现跑它（见[契约测试](#契约测试)） |
 
 ## 会话 `SessionStore`
@@ -308,7 +308,7 @@ interface RunResult {
   recorded: readonly Entry[];
   stopReason: StopReason;
   usage?: Usage;
-  error?: ErrorInfo; // stopReason 是 error 时
+  error?: ErrorInfo; // stopReason 是 error 时；上游 HTTP 接口出错时带 statusCode 和 responseBody
 }
 type RunEvent =
   | { type: 'run.started'; runId: string; session: string }
@@ -378,7 +378,7 @@ interface Orchestrator {
 
 - `completed` 是跑完了；`failed` 是 `stopReason: error` 或 harness 抛错；`cancelled` 是被 `cancel` 或 `signal` 取消。
 - 参考实现是进程内队列：每个会话一条队列，一个 harness。
-- yoyo 的常驻循环和导演是一个应用级的编排器：定时、让路、收件箱。它应当实现这个协议，而不是另一套。
+- yoyo 的 `createYoyoOrchestrator` 是一个应用级的编排器，实现这个协议：定时、让路、收件箱。碎碎念和回复是同一个 harness 跑的两份 `AgentSpec`，导演只剩舞台动作，常驻循环只管进程。
 - 远端编排器（`ctx-remote`）：路径放在 `/orchestrator` 下，和 harness 的 `/runs` 分开：`POST /orchestrator/runs`、`GET /orchestrator/runs/:id`（`?wait=` 长轮询，结束后带 `result`，客户端的 `done` 靠它）、`DELETE /orchestrator/runs/:id`、`POST /orchestrator/recover`、`GET /orchestrator/events`（NDJSON）。
 
 ## 契约测试

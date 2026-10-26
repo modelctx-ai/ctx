@@ -17,8 +17,13 @@ type ModelMessage = MessageEntry['message'];
 export interface SqliteStoreOptions {
   /** 数据库文件；也可以是 `:memory:`。和 `database` 二选一。 */
   readonly path?: string;
-  /** 复用应用已经打开的库（例如应用自己的 yoyo.db）。这种情况下 `close()` 不关它。 */
+  /** 复用应用已经打开的库（例如应用自己的 yoyo.db）。这种情况下 `close()` 不关它，也不改它的 `journal_mode`。 */
   readonly database?: DatabaseSync;
+  /**
+   * 别的连接占着写锁时，写入最多等多久（毫秒，`PRAGMA busy_timeout`）。自己开库时缺省 5000；
+   * 传 `database` 时缺省不动应用设的值，只有显式传了才设。
+   */
+  readonly busyTimeoutMs?: number;
   /** 表名前缀，缺省 `ctx_`，和应用自己的表分开。 */
   readonly prefix?: string;
   readonly now?: () => number;
@@ -56,7 +61,15 @@ interface Body {
   covers?: Cursor;
 }
 
-const SCHEMA_VERSION = '1';
+/**
+ * 结构版本，存在 `${prefix}meta` 的 `schema` 里。
+ * 1：0.1 和 0.2 都写这个值，但 0.1 的列叫 `thread`，0.2 叫 `session`，所以升到 2 时要看实际的列。
+ * 2：列叫 `session`。
+ */
+const SCHEMA_VERSION = 2;
+
+/** 自己开库时 `busy_timeout` 的缺省值（毫秒）。 */
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 
 /** 编码标记用的键，正常数据里不会出现。 */
 const TAG = '\u0000ctx';
@@ -144,6 +157,99 @@ function decode(row: Row): Entry {
   };
 }
 
+function hasTable(database: DatabaseSync, name: string): boolean {
+  return database.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) !== undefined;
+}
+
+/** 读 `${prefix}meta` 里的结构版本；没有 meta 表或没有这一行时返回 `undefined`。 */
+function readSchemaVersion(database: DatabaseSync, prefix: string): number | undefined {
+  if (!hasTable(database, `${prefix}meta`)) return undefined;
+  const row = database.prepare(`SELECT value FROM ${prefix}meta WHERE key = 'schema'`).get() as
+    | { value: string }
+    | undefined;
+  if (!row) return undefined;
+  const version = Number(row.value);
+  if (!Number.isInteger(version) || version < 1) throw new Error(`Unrecognized ctx schema version "${row.value}".`);
+  return version;
+}
+
+/**
+ * 拿到写锁再做 `work`。库上没有事务时用 `BEGIN IMMEDIATE`：一开始就要写锁，会等 `busy_timeout`，
+ * 不会像先读后升级的延迟事务那样直接 `SQLITE_BUSY`。库上已经有应用的事务时只能用 SAVEPOINT，锁归应用管。
+ */
+function withWriteLock(database: DatabaseSync, prefix: string, work: () => void): void {
+  const savepoint = database.isTransaction;
+  database.exec(savepoint ? `SAVEPOINT ${prefix}migrate` : 'BEGIN IMMEDIATE');
+  try {
+    work();
+  } catch (error) {
+    database.exec(savepoint ? `ROLLBACK TO ${prefix}migrate` : 'ROLLBACK');
+    if (savepoint) database.exec(`RELEASE ${prefix}migrate`);
+    throw error;
+  }
+  database.exec(savepoint ? `RELEASE ${prefix}migrate` : 'COMMIT');
+}
+
+function createSchema(database: DatabaseSync, prefix: string): void {
+  const table = `${prefix}entries`;
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS ${table} (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      id TEXT NOT NULL UNIQUE,
+      session TEXT NOT NULL,
+      at INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      key TEXT,
+      source TEXT,
+      body TEXT NOT NULL,
+      meta TEXT
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS ${table}_key ON ${table} (session, key) WHERE key IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS ${table}_order ON ${table} (session, at, seq);
+  `);
+}
+
+/**
+ * 把库带到 `SCHEMA_VERSION`：没有表就建；旧版本按序升级；比自己新的版本拒绝打开（旧代码不知道新结构，写进去可能写坏）。
+ * 升级在写锁里做，进程同时打开同一个旧库时只有一个真的在迁，别的拿到锁后重读版本发现已经是新的。
+ */
+function migrate(database: DatabaseSync, prefix: string): void {
+  const table = `${prefix}entries`;
+  const check = (version: number | undefined): void => {
+    if (version !== undefined && version > SCHEMA_VERSION) {
+      throw new Error(
+        `The ctx schema in this database is version ${version}, newer than the version ${SCHEMA_VERSION} this ctx-sqlite supports. Upgrade @modelctx-ai/ctx-sqlite.`,
+      );
+    }
+  };
+  const seen = readSchemaVersion(database, prefix);
+  check(seen);
+  if (seen === SCHEMA_VERSION) return;
+
+  withWriteLock(database, prefix, () => {
+    database.exec(`CREATE TABLE IF NOT EXISTS ${prefix}meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    let version = readSchemaVersion(database, prefix);
+    check(version);
+    if (version === SCHEMA_VERSION) return;
+    // 没有版本记录但有数据表：只可能是更早的写法，按 1 处理。
+    version ??= hasTable(database, table) ? 1 : 0;
+    if (version < 2) {
+      // 0.1 的列叫 `thread`；0.2 改成 `session` 时没升版本，所以 1 里两种库都有，要看实际的列。
+      // yoyo 之前自己改过名的库也是 `session`，这里跳过。RENAME COLUMN 会把索引定义一起改掉。
+      const columns = (database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+      if (columns.includes('thread') && !columns.includes('session')) {
+        database.exec(`ALTER TABLE ${table} RENAME COLUMN thread TO session`);
+      }
+    }
+    createSchema(database, prefix);
+    database
+      .prepare(
+        `INSERT INTO ${prefix}meta (key, value) VALUES ('schema', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(String(SCHEMA_VERSION));
+  });
+}
+
 /**
  * 基于 `node:sqlite` 的存储。所有条目在一张表里，按会话、时间、写入序号建索引。
  * 写入用 SAVEPOINT，所以和应用共用一个库、处在应用自己的事务里也能用。
@@ -159,27 +265,22 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
   const id = options.id ?? (() => crypto.randomUUID());
   const table = `${prefix}entries`;
 
-  if (owned) database.exec('PRAGMA journal_mode = WAL');
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS ${table} (
-      seq INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      session TEXT NOT NULL,
-      at INTEGER NOT NULL,
-      type TEXT NOT NULL,
-      key TEXT,
-      source TEXT,
-      body TEXT NOT NULL,
-      meta TEXT
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS ${table}_key ON ${table} (session, key) WHERE key IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS ${table}_order ON ${table} (session, at, seq);
-    CREATE TABLE IF NOT EXISTS ${prefix}meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    INSERT OR IGNORE INTO ${prefix}meta (key, value) VALUES ('schema', '${SCHEMA_VERSION}');
-  `);
+  try {
+    if (options.busyTimeoutMs !== undefined || owned) {
+      const timeout = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
+      if (!Number.isInteger(timeout) || timeout < 0) throw new Error(`Invalid busyTimeoutMs ${timeout}.`);
+      database.exec(`PRAGMA busy_timeout = ${timeout}`);
+    }
+    if (owned) database.exec('PRAGMA journal_mode = WAL');
+    migrate(database, prefix);
+  } catch (error) {
+    if (owned) database.close();
+    throw error;
+  }
 
   const insert = database.prepare(
-    `INSERT OR IGNORE INTO ${table} (id, session, at, type, key, source, body, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    // ON CONFLICT DO NOTHING 只跳过唯一约束冲突；NOT NULL 之类的违例照常报错。INSERT OR IGNORE 会把它们一起吞掉。
+    `INSERT INTO ${table} (id, session, at, type, key, source, body, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
   );
   const removeSession = database.prepare(`DELETE FROM ${table} WHERE session = ?`);
   const listSessions = database.prepare(`SELECT DISTINCT session FROM ${table} ORDER BY session`);

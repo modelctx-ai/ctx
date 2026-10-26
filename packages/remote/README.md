@@ -133,7 +133,7 @@ await orchestrator.close(); // 只关这个客户端
 | `createRemoteHarness(…)`                                                | `Harness`：`run`、`stream`。`agent.model` 不是字符串就抛。`signal` 中止时发 `DELETE /runs/:runId`，`run` 照常返回 `stopReason: aborted`；`stream` 提前不读就断开连接，服务端同样中止并写 `ctx.run.ended`                                     |
 | `createRemoteOrchestrator({ …, waitMs? })`                              | `Orchestrator`：`submit`、`status`、`cancel`、`recover`、`events`、`close`。`done` 用长轮询 `GET /orchestrator/runs/:id?wait=` 实现（每次最多等 `waitMs`，缺省 25 秒）；`close` 只关这个客户端：不再提交、结束它的事件流、等它提交的运行结束 |
 
-服务端返回的 `{ error }` 变成抛出的 `RemoteError`：一个 `Error`，带 `status`（HTTP 状态码）、`type`、`retryable?`；`isRemoteError(error)` 判断。NDJSON 流中途出错时最后一行是 `{ error }`，客户端同样抛出。
+服务端返回的 `{ error }` 变成抛出的 `RemoteError`：一个 `Error`，带 `status`（HTTP 状态码）、`type`、`retryable?`、`statusCode?`、`responseBody?`（后两个是上游接口的状态码和响应正文，服务端有才带；`status` 仍是本次 HTTP 响应的）；`isRemoteError(error)` 判断。NDJSON 流中途出错时最后一行是 `{ error }`，客户端同样抛出。
 
 ## 线上形态
 

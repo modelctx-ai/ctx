@@ -5,6 +5,7 @@
 import {
   errorOutput,
   type Entry,
+  type ErrorInfo,
   type ExecutionContext,
   type Executor,
   type Harness,
@@ -337,7 +338,7 @@ interface RunView {
   readonly status: RunStatus;
   readonly session?: string;
   readonly result?: RunResult;
-  readonly error?: { readonly message: string; readonly type?: string };
+  readonly error?: ErrorInfo;
 }
 
 function runPath(runId: string): string {

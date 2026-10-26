@@ -4,15 +4,15 @@ ctx 是框架，yoyo 是用它做出来的第一个程序：一个常驻的桌�
 
 yoyo 和 ctx 组件的对应：
 
-| ctx 组件 | yoyo 里是什么                                                                           |
-| -------- | --------------------------------------------------------------------------------------- |
-| 会话     | `~/.yoyo/yoyo.db` 里的 `ctx_entries`，每只宠物一个会话 `pet:<id>`                       |
-| 上下文   | `yoyoProjection`：碎碎念事件折叠成一条助手消息；来源是工作状态和粘贴板                  |
-| 工具     | `web_search`、`weather_forecast`、`list_alarms`、`add_alarm`，加 `mcpServers` 的工具    |
-| 执行环境 | 进程内函数；MCP 服务器                                                                  |
-| Harness  | `createContext().generate`（`record: false`，说出口以后才记）                           |
-| 编排     | 常驻循环和导演：每秒一拍、到点说话、让路、收件箱、定时压缩。之后改成实现 `Orchestrator` |
-| 模型     | `ctx-models` 按 `llm` 配置造                                                            |
+| ctx 组件 | yoyo 里是什么                                                                                                                                                       |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 会话     | `~/.yoyo/yoyo.db` 里的 `ctx_entries`，每只宠物一个会话 `pet:<id>`                                                                                                   |
+| 上下文   | `yoyoProjection`：碎碎念事件折叠成一条助手消息；来源是工作状态和粘贴板                                                                                              |
+| 工具     | `web_search`、`weather_forecast`、`list_alarms`、`add_alarm`，加 `mcpServers` 的工具                                                                                |
+| 执行环境 | 进程内函数；MCP 服务器                                                                                                                                              |
+| Harness  | `createHarness`：碎碎念和回复是同一个 harness 跑的两份 `AgentSpec`（`record: false`，说出口以后才记）                                                               |
+| 编排     | `createYoyoOrchestrator` 实现 ctx 的 `Orchestrator`：排队、让路、收件箱、定时压缩；导演只剩舞台动作（让桌宠说话、做动作），常驻循环只管进程（启动、每秒一拍、退出） |
+| 模型     | `ctx-models` 按 `llm` 配置造                                                                                                                                        |
 
 ## 职责
 
@@ -77,7 +77,9 @@ flowchart LR
     chat["右键对话"]
   end
   subgraph yoyo["yoyo 常驻进程"]
-    director["导演"]
+    director["导演<br/>舞台动作"]
+    orch["createYoyoOrchestrator<br/>实现 Orchestrator"]
+    harness["createHarness<br/>碎碎念、回复两份 AgentSpec"]
     context["ctx Context"]
     db[("~/.yoyo/yoyo.db<br/>ctx_entries")]
     registry["ToolRegistry"]
@@ -88,12 +90,14 @@ flowchart LR
   servers["MCP 服务器"]
 
   director <-->|"HTTP /dsh-pet-7340<br/>x-dsh-pet-token"| stage
-  director --> context
+  director --> orch
+  orch --> harness
+  harness --> context
   context --> db
-  context -- "AI SDK" --> llm
+  harness -- "AI SDK" --> llm
   servers --> hub
   hub -- registerInto --> registry
-  registry --> context
+  registry --> harness
   chat -- "OpenAI 协议<br/>本机令牌" --> gw
   gw -- "view()" --> context
   gw -- "真密钥" --> llm
