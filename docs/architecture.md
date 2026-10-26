@@ -29,20 +29,20 @@ flowchart TB
 
 ## 概念
 
-| 概念                    | 说明                                                                                                   |
-| ----------------------- | ------------------------------------------------------------------------------------------------------ |
-| 会话 `session`          | 一个 agent 实例的日志的名字，例如 `pet:main`、`user:42`。条目按会话存放                                |
-| 条目 `Entry`            | 会话里的一条记录，分 `message`、`event`、`summary` 三种，写入后不再修改                                |
-| 位置 `seq`              | 存储按写入顺序分配的序号，会话内严格递增、从 1 起。`at` 是逻辑时间（毫秒），只用于投影排序和展示       |
-| 会话存储 `SessionStore` | 只追加的持久化边界：`append`、`list`、`clear`、`sessions`、`watch`                                     |
-| 投影 `project()`        | 把条目渲染成这一次交给模型的 `ModelMessage[]`，每次调用重新计算，不改日志                              |
-| 来源 `ContextSource`    | 调用那一刻才去取的上下文，取到的文字叫事实 `Fact`，不写日志                                            |
-| 上下文 `ContextBuilder` | `createContextBuilder()`：投影 + 来源 + 压缩，把会话组装成一次调用的指令、消息和工具名单               |
-| 工具目录 `ToolRegistry` | `createToolRegistry()`：工具定义（名字、说明、JSON Schema）放在一处，每个绑一个执行环境                |
-| 执行环境 `Executor`     | 工具调用真正发生的地方。核心包有进程内的 `createFunctionExecutor()`，MCP hub 也是一个                  |
-| Harness                 | `createHarness()`：跑一轮，组装 → 调模型 → 分发工具 → 写回，前后写 `ctx.run.started` / `ctx.run.ended` |
-| 编排器 `Orchestrator`   | `createOrchestrator()`：进程内队列，同一会话串行，不同会话并行，崩溃后补 `ctx.run.ended`               |
-| 门面 `Context`          | `createContext()` 的返回值：在一个会话上把上面几样组合起来，带投影规则、来源、工具和缺省模型           |
+| 概念                    | 说明                                                                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| 会话 `session`          | 一个 agent 实例的日志的名字，例如 `pet:main`、`user:42`。条目按会话存放                                                      |
+| 条目 `Entry`            | 会话里的一条记录，分 `message`、`event`、`summary` 三种，写入后不再修改                                                      |
+| 位置 `seq`              | 存储按写入顺序分配的序号，会话内严格递增、从 1 起。`at` 是逻辑时间（毫秒），只用于投影排序和展示                             |
+| 会话存储 `SessionStore` | 只追加的持久化边界：`append`、`list`、`clear`、`sessions`、`watch`                                                           |
+| 投影 `project()`        | 把条目渲染成这一次交给模型的 `Message[]`（ctx 自己的 JSON 消息，harness 调模型时转成 AI SDK 的），每次调用重新计算，不改日志 |
+| 来源 `ContextSource`    | 调用那一刻才去取的上下文，取到的文字叫事实 `Fact`，不写日志                                                                  |
+| 上下文 `ContextBuilder` | `createContextBuilder()`：投影 + 来源 + 压缩，把会话组装成一次调用的指令、消息和工具名单                                     |
+| 工具目录 `ToolRegistry` | `createToolRegistry()`：工具定义（名字、说明、JSON Schema）放在一处，每个绑一个执行环境                                      |
+| 执行环境 `Executor`     | 工具调用真正发生的地方。核心包有进程内的 `createFunctionExecutor()`，MCP hub 也是一个                                        |
+| Harness                 | `createHarness()`：跑一轮，组装 → 调模型 → 分发工具 → 写回，前后写 `ctx.run.started` / `ctx.run.ended`                       |
+| 编排器 `Orchestrator`   | `createOrchestrator()`：进程内队列，同一会话串行，不同会话并行，崩溃后补 `ctx.run.ended`                                     |
+| 门面 `Context`          | `createContext()` 的返回值：在一个会话上把上面几样组合起来，带投影规则、来源、工具和缺省模型                                 |
 
 ## 组件
 
@@ -132,22 +132,23 @@ sequenceDiagram
 
 ## 条目
 
-| 类型      | 字段                                | 怎么进模型上下文                                                   |
-| --------- | ----------------------------------- | ------------------------------------------------------------------ |
-| `message` | `message: ModelMessage`             | AI SDK 消息原样保存（文字、图片、工具调用和结果），投影时原样带上  |
-| `event`   | `kind`、`text?`、`data?: JsonValue` | 应用自己的事件。缺省不可见，`projection.events[kind]` 有规则才渲染 |
-| `summary` | `text`、`covers: number`            | 压缩点：代替 `seq` ≤ `covers` 的全部条目，固定在第一条             |
+| 类型      | 字段                                | 怎么进模型上下文                                                     |
+| --------- | ----------------------------------- | -------------------------------------------------------------------- |
+| `message` | `message: Message`                  | ctx 的 JSON 消息（文字、文件、推理、工具调用和结果），投影时原样带上 |
+| `event`   | `kind`、`text?`、`data?: JsonValue` | 应用自己的事件。缺省不可见，`projection.events[kind]` 有规则才渲染   |
+| `summary` | `text`、`covers: number`            | 压缩点：代替 `seq` ≤ `covers` 的全部条目，固定在第一条               |
 
 公共字段：
 
-| 字段             | 说明                                                                 |
-| ---------------- | -------------------------------------------------------------------- |
-| `id`             | 全局唯一；不给就由存储生成                                           |
-| `session`、`seq` | 由存储填                                                             |
-| `at`             | 逻辑时间，缺省是写入时刻。导入的旧记录写原来的时间，会排回原来的位置 |
-| `key`            | 幂等键：同一会话里键相同的第二条被跳过                               |
-| `source`         | 谁写的，例如 `user`、`model`、`harness`、`dsh-pet`                   |
-| `meta`           | 任意 JSON 对象                                                       |
+| 字段             | 说明                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------- |
+| `id`             | 全局唯一；不给就由存储生成                                                         |
+| `session`、`seq` | 由存储填                                                                           |
+| `v`              | 写入这一行时的格式版本，由存储填；读出来的形状永远是当前版本，旧行读时升级、不回写 |
+| `at`             | 逻辑时间，缺省是写入时刻。导入的旧记录写原来的时间，会排回原来的位置               |
+| `key`            | 幂等键：同一会话里键相同的第二条被跳过                                             |
+| `source`         | 谁写的，例如 `user`、`model`、`harness`、`dsh-pet`                                 |
+| `meta`           | 任意 JSON 对象                                                                     |
 
 用 `userEntry(content)`、`assistantEntry(text)`、`messageEntry(message)`、`eventEntry(kind, { text, data })` 构造条目，都接受 `{ id, at, key, source, meta }`。摘要条目一般由 `compact()` 写。事件 `kind` 用 `{domain}.{action}`，`ctx.` 前缀留给框架：harness 写 `ctx.run.started`、`ctx.run.ended`、`ctx.error`，压缩写 `ctx.compacted`，缺省都对模型不可见。
 

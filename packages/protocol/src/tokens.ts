@@ -1,4 +1,5 @@
-import type { ModelMessage, ToolResultPart } from 'ai';
+import type { Message } from './message.ts';
+import type { ToolOutput } from './tools.ts';
 
 /** 每条消息的格式开销，按常见聊天模板粗估。 */
 const MESSAGE_OVERHEAD = 4;
@@ -43,17 +44,24 @@ function estimateValue(value: unknown): number {
 }
 
 /** 工具结果里的图片、文件按附件定额算，不去数 base64。 */
-function estimateOutput(output: ToolResultPart['output']): number {
-  if (output.type !== 'content' || !Array.isArray(output.value)) return estimateValue(output);
-  let total = 0;
-  for (const part of output.value) {
-    if (part.type === 'text') total += estimateTextTokens(part.text);
-    else if (part.type !== 'custom') total += ATTACHMENT_TOKENS;
+function estimateOutput(output: ToolOutput): number {
+  switch (output.type) {
+    case 'text':
+      return estimateTextTokens(output.text);
+    case 'json':
+      return estimateValue(output.value);
+    case 'error':
+      return estimateTextTokens(output.message) + estimateValue(output.data);
+    default: {
+      let total = 0;
+      for (const part of output.parts)
+        total += part.type === 'text' ? estimateTextTokens(part.text) : ATTACHMENT_TOKENS;
+      return total;
+    }
   }
-  return total;
 }
 
-export function estimateTokens(message: ModelMessage): number {
+export function estimateTokens(message: Message): number {
   const { content } = message;
   if (typeof content === 'string') return MESSAGE_OVERHEAD + estimateTextTokens(content);
   let total = MESSAGE_OVERHEAD;
@@ -64,10 +72,10 @@ export function estimateTokens(message: ModelMessage): number {
         total += estimateTextTokens(part.text);
         break;
       case 'tool-call':
-        total += estimateTextTokens(part.toolName) + estimateValue(part.input);
+        total += estimateTextTokens(part.name) + estimateValue(part.input);
         break;
       case 'tool-result':
-        total += estimateTextTokens(part.toolName) + estimateOutput(part.output);
+        total += estimateTextTokens(part.name) + estimateOutput(part.output);
         break;
       default:
         total += ATTACHMENT_TOKENS;

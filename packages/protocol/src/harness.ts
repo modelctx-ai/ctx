@@ -1,5 +1,6 @@
-import type { LanguageModel, ModelMessage, UserContent } from 'ai';
+import type { LanguageModel } from 'ai';
 
+import type { Message, MessageContent } from './message.ts';
 import type { PreparedCall, WindowOptions } from './context.ts';
 import type { Entry } from './session.ts';
 import type { ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
@@ -67,11 +68,11 @@ export interface RunRequest {
   readonly session: string;
   readonly agent: AgentSpec;
   /** 这一轮用户新说的话。记录时在调用模型前写进日志。 */
-  readonly input?: UserContent;
+  readonly input?: MessageContent;
   /** 输入的幂等键：失败后用同一个键重试，不会再记一遍。 */
   readonly inputKey?: string;
   /** 放在最后的临时用户消息，不写日志。 */
-  readonly prompt?: UserContent;
+  readonly prompt?: MessageContent;
   /** 把输入、产出和 `ctx.run.*` 写进日志，缺省写。 */
   readonly record?: boolean;
   /** 不给就由 harness 生成。 */
@@ -96,7 +97,7 @@ export interface RunResult {
   /** 最后一步的文字。 */
   readonly text: string;
   /** 这一轮模型产出的消息（含工具调用和结果）。 */
-  readonly messages: ModelMessage[];
+  readonly messages: Message[];
   /** 实际写进日志的条目。 */
   readonly recorded: readonly Entry[];
   readonly stopReason: StopReason;

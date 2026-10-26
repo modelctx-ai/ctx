@@ -1,4 +1,5 @@
 import {
+  ENTRY_VERSION,
   filterEntries,
   filterSessions,
   type Entry,
@@ -71,7 +72,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
         const entryId = draft.id ?? id();
         if (ids.has(entryId)) continue;
         seq += 1;
-        const entry = { ...draft, id: entryId, session: name, seq, at: draft.at ?? now() } as Entry;
+        const entry = { ...draft, id: entryId, session: name, seq, at: draft.at ?? now(), v: ENTRY_VERSION } as Entry;
         ids.add(entryId);
         if (entry.key !== undefined) target.keys.add(entry.key);
         target.entries.push(entry);

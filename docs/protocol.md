@@ -1,22 +1,22 @@
 # 协议层
 
-`@modelctx-ai/ctx-protocol` 定义六个协议、随它们走的 JSON 形状、只依赖这些形状的纯函数，以及每个协议的契约测试。它不含实现。模型用 AI SDK 的 `LanguageModel`，不另定义。
+`@modelctx-ai/ctx-protocol` 定义六个协议、随它们走的 JSON 形状、只依赖这些形状的纯函数，以及每个协议的契约测试。它不含实现。模型用 AI SDK 的 `LanguageModel`，不另定义；消息是 ctx 自己的 JSON 格式（见[消息格式和版本](#消息格式和版本)），协议包不依赖 AI SDK 的消息类型。
 
 本文是协议的说明；类型以包里的 `.d.ts` 为准，下面的签名省略了 `readonly` 和注释。包的用法和契约测试一览见 [`packages/protocol`](../packages/protocol/README.md)。
 
 ## 总则
 
-| 规则         | 说明                                                                                                                               |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| 接口加工厂   | 协议是 `interface`，实现是 `createX(options): X`。不用类继承                                                                       |
-| 只收发 JSON  | 方法参数和返回值都能 `JSON.stringify`。例外：`AbortSignal`、进程内的 `LanguageModel`。跨边界时模型用名字字符串                     |
-| 消息         | `ModelMessage` 原样用 AI SDK 的；其中的二进制和 `URL` 由跨边界的一方编码（如 `ctx-sqlite` 的 `$bytes`、`$url`）                    |
-| 字符串身份   | `session`、工具名、执行环境名、`runId` 都是字符串                                                                                  |
-| 流是事件序列 | 流式结果用 `AsyncIterable<Event>` 表达，跨边界是 NDJSON 或 SSE                                                                     |
-| 可选方法     | 协议里标 `?` 的方法实现可以不提供，调用方要检查                                                                                    |
-| 取消         | 需要取消的方法收 `signal?: AbortSignal`                                                                                            |
-| 错误         | 抛 `Error`；跨边界时是 `{ error: ErrorInfo }`，`ErrorInfo` 是 `{ message, type?, retryable?, statusCode?, responseBody? }`         |
-| 契约测试     | `@modelctx-ai/ctx-protocol/testing` 的 `describeXContract(name, factory, { describe, test })`，实现跑它（见[契约测试](#契约测试)） |
+| 规则         | 说明                                                                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| 接口加工厂   | 协议是 `interface`，实现是 `createX(options): X`。不用类继承                                                                         |
+| 只收发 JSON  | 方法参数和返回值都能 `JSON.stringify`。例外：`AbortSignal`、进程内的 `LanguageModel`。跨边界时模型用名字字符串                       |
+| 消息         | ctx 自己的 `Message`，全是 JSON（二进制是 base64 字符串，URL 是字符串），存储和线上都不需要编码；和 AI SDK 互转在 `@modelctx-ai/ctx` |
+| 字符串身份   | `session`、工具名、执行环境名、`runId` 都是字符串                                                                                    |
+| 流是事件序列 | 流式结果用 `AsyncIterable<Event>` 表达，跨边界是 NDJSON 或 SSE                                                                       |
+| 可选方法     | 协议里标 `?` 的方法实现可以不提供，调用方要检查                                                                                      |
+| 取消         | 需要取消的方法收 `signal?: AbortSignal`                                                                                              |
+| 错误         | 抛 `Error`；跨边界时是 `{ error: ErrorInfo }`，`ErrorInfo` 是 `{ message, type?, retryable?, statusCode?, responseBody? }`           |
+| 契约测试     | `@modelctx-ai/ctx-protocol/testing` 的 `describeXContract(name, factory, { describe, test })`，实现跑它（见[契约测试](#契约测试)）   |
 
 ## 会话 `SessionStore`
 
@@ -26,6 +26,7 @@
 interface EntryBase {
   id: string; // 全局唯一；不给就由存储生成
   session: string; // 由存储填
+  v: number; // 写入这一行时的格式版本，读出来的形状永远是当前版本；新条目是 `ENTRY_VERSION`（1），由存储填
   seq: number; // 会话内位置，由存储按写入顺序填：会话内严格递增、从 1 起，`clear` 后不回退；0 是会话开头
   at: number; // 逻辑时间（毫秒），缺省写入时刻；只用于投影排序和展示，可以早于已有的条目
   key?: string; // 幂等键：同一会话里键相同的第二条跳过
@@ -34,7 +35,7 @@ interface EntryBase {
 }
 interface MessageEntry extends EntryBase {
   type: 'message';
-  message: ModelMessage;
+  message: Message;
 }
 interface EventEntry extends EntryBase {
   type: 'event';
@@ -95,7 +96,27 @@ interface SessionStore {
 
 这些事件缺省对模型不可见，和应用事件一样由投影规则决定要不要渲染。
 
-纯函数：`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareEntries`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，`filterSessions(names, options)` 是 `SessionsOptions` 的语义，内存里的存储可以直接用。
+纯函数：`upgradeEntry`（见下）；`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareEntries`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，`filterSessions(names, options)` 是 `SessionsOptions` 的语义，内存里的存储可以直接用。
+
+### 消息格式和版本
+
+协议包定义 ctx 自己的 `Message`（`system`、`user`、`assistant`、`tool` 四种角色），是 AI SDK `ModelMessage` 的子集，但全是 JSON：
+
+| 部件                                 | 形状                                                                                                                                                |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `text`、`reasoning`                  | `{ type, text, providerOptions? }`；推理签名放在 `providerOptions`，原样保存，回传时要用                                                            |
+| `file`                               | `{ type, mediaType, data: ToolFileData, filename?, providerOptions? }`；`mediaType` 可以只写 `image`；AI SDK 已弃用的 `image` 并入 `file`           |
+| `reasoning-file`                     | 同 `file`，但 `data` 只有字节（`data`）和地址（`url`）两种，和 AI SDK 一致                                                                          |
+| `custom`                             | `{ type, kind, providerOptions? }`，服务商自定义内容                                                                                                |
+| `tool-call`                          | `{ type, id, name, input, providerExecuted?, providerOptions? }`，字段名同 `ToolCall`                                                               |
+| `tool-result`                        | `{ type, id, name, output: ToolOutput, providerOptions? }`                                                                                          |
+| `tool-approval-request`、`-response` | `approvalId`、`callId`、`reason?`、`approved`……；请求另带 `isAutomatic?`、`signature?`、`inputSchemaInput?`（签名把批准绑定到调用上，丢了就验不过） |
+
+`ToolFileData` 是 `{ type: 'data', data: base64 } | { type: 'url', url } | { type: 'reference', reference } | { type: 'text', text }`。`tool-result.output` 里的 `providerOptions` 和 `custom` 内容分段没有可序列化的内容，转换时丢掉。
+
+- 和 AI SDK 互转在 `@modelctx-ai/ctx`：`toModelMessages`、`fromModelMessages`（`createContext()` 仍收 AI SDK 的 `UserContent`，在边界上转）。遇到子集之外的部件（AI SDK 以后新加的）抛 `unsupported_part`，不静默丢；harness 把这一轮以 `error` 结束，写 `ctx.error`，不写半截的产出。核心包里有编译期的穷尽检查（`AI_SDK_PART_TYPES`）：AI SDK 在 `UserContent`、`AssistantContent`、`ToolContent` 里加了部件，核心包编译不过。
+- `ENTRY_VERSION = 1`，每个条目带 `v`。存储写新行时写 `v: 1`，读时对每一行调 `upgradeEntry(raw)` 升到当前形状，**不回写**旧行。没有 `v` 读作 0（0.2 及以前的写法：AI SDK 消息原样，二进制和 URL 用 `\u0000ctx` 标记，摘要的 `covers` 是 `{ at, seq }`）；0 → 1 把消息转成 `Message`，`covers` 取 `covers.seq`。读出来的 `Entry.v` 是这一行写入时的版本（旧行是 0），形状已是当前的；比自己认识的更高的 `v` 抛 `unsupported_version`，升级 ctx 再读。
+- 0 版的摘要按 `at` 盖住旧条目，1 版按 `seq`，所以补写的旧记录可能被旧摘要盖住。`@modelctx-ai/ctx` 的 `findLossySummaries(store, { session? })` 只读，列出 `v` 为 0 且有条目被盖住的摘要 `{ session, summaryId, covers, hidden: seq[] }`；`recompactLossy(builder, finding, options)` 追加一条 `covers` 相同的新摘要（输入是旧摘要的文字加上被盖住的条目），靠「`covers` 相同时后写的生效」取代旧摘要。新摘要是 `v: 1`，所以 `findLossySummaries` 跑第二次找不到东西，可以放在启动阶段反复跑。
 
 ## 上下文 `ContextBuilder`
 
@@ -108,9 +129,9 @@ interface WindowOptions {
 }
 interface BuildRequest {
   session: string;
-  input?: UserContent; // 这一轮的输入；已经写进日志时不传
+  input?: MessageContent; // 这一轮的输入；已经写进日志时不传
   instructions?: string; // AgentSpec 的指令
-  prompt?: UserContent; // 最后一条临时用户消息，不写日志
+  prompt?: MessageContent; // 最后一条临时用户消息，不写日志
   tools?: readonly ToolDefinition[]; // 候选工具，builder 可以再筛
   window?: WindowOptions;
   facts?: boolean; // 是否收集来源，缺省收集
@@ -118,7 +139,7 @@ interface BuildRequest {
 }
 interface PreparedCall {
   instructions?: string; // 指令 + 事实 + 投影里的 system 文字
-  messages: ModelMessage[]; // 不再含 system 消息
+  messages: Message[]; // 不再含 system 消息
   tools: readonly string[]; // 这次给模型的工具名
   facts: readonly Fact[];
   projection: Projection;
@@ -152,16 +173,16 @@ interface Fact {
 // 投影：纯函数 project(entries, options) 的输入输出
 interface ProjectionOptions {
   events?: Record<string, EventRule>; // 没有规则的事件不进上下文
-  summary?: (entry: SummaryEntry) => ModelMessage;
-  message?: (entry: MessageEntry) => ModelMessage | null | undefined;
-  window?: WindowOptions & { estimate?: (message: ModelMessage) => number }; // ProjectionWindow
+  summary?: (entry: SummaryEntry) => Message;
+  message?: (entry: MessageEntry) => Message | null | undefined;
+  window?: WindowOptions & { estimate?: (message: Message) => number }; // ProjectionWindow
 }
 interface EventRule {
   fold?: boolean;
-  render(events: readonly EventEntry[]): ModelMessage | readonly ModelMessage[] | null | undefined;
+  render(events: readonly EventEntry[]): Message | readonly Message[] | null | undefined;
 }
 interface Projection {
-  messages: ModelMessage[];
+  messages: Message[];
   items: readonly ProjectedMessage[]; // 每条带 upTo、pinned、tokens
   tokens: number;
   dropped: number;
@@ -292,9 +313,9 @@ interface AgentSpec {
 interface RunRequest {
   session: string;
   agent: AgentSpec;
-  input?: UserContent;
+  input?: MessageContent;
   inputKey?: string; // 输入的幂等键，重试不重复记
-  prompt?: UserContent; // 临时的最后一条，不写日志
+  prompt?: MessageContent; // 临时的最后一条，不写日志
   record?: boolean; // 缺省写日志
   runId?: string; // 不给就生成
   signal?: AbortSignal;
@@ -308,7 +329,7 @@ interface Usage {
 interface RunResult {
   runId: string;
   text: string;
-  messages: ModelMessage[]; // 这一轮模型产出的消息
+  messages: Message[]; // 这一轮模型产出的消息
   recorded: readonly Entry[];
   stopReason: StopReason;
   usage?: Usage;
@@ -419,7 +440,7 @@ harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptSte
 
 ## 线上形态
 
-`ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON（每行一个值，出错时最后一行是 `{ error }`）；错误正文是 `{ error: ErrorInfo }`，客户端转成带 `status` 的 `Error`。鉴权用 `Authorization: Bearer <token>`，缺省只听本机，Host 只认监听地址，带 `Origin` 的请求缺省 403。消息里的二进制和 `URL` 编码成带标记的对象（`{"\u0000ctx": "bytes", "base64"}`、`{"\u0000ctx": "url", "href"}`），两头还原。路径按组件分组，可以整体挂在一个前缀下：
+`ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON（每行一个值，出错时最后一行是 `{ error }`）；错误正文是 `{ error: ErrorInfo }`，客户端转成带 `status` 的 `Error`。鉴权用 `Authorization: Bearer <token>`，缺省只听本机，Host 只认监听地址，带 `Origin` 的请求缺省 403。消息本身就是 JSON，线上不做编码（0.3 起；0.2 的客户端和服务端不能混用）。路径按组件分组，可以整体挂在一个前缀下：
 
 | 组件     | 方法              | 路径                                                        | 请求体 → 响应                                                       |
 | -------- | ----------------- | ----------------------------------------------------------- | ------------------------------------------------------------------- |

@@ -10,7 +10,7 @@ import {
   createMemoryStore,
   eventEntry,
   userEntry,
-  type ModelMessage,
+  type Message,
 } from '@modelctx-ai/ctx';
 import { afterAll, beforeAll, describe, test } from 'vite-plus/test';
 
@@ -88,7 +88,7 @@ describe('gateway', () => {
   });
 
   let gateway: Gateway;
-  const history: ModelMessage[] = [
+  const history: Message[] = [
     { role: 'assistant', content: '碎碎念：\n先把这一小步做完' },
     { role: 'user', content: '昨天说过要带伞' },
     { role: 'assistant', content: '带了' },
@@ -355,7 +355,10 @@ describe('rewrite', () => {
 
   test('只有内容完全相同才去重：图片不一样的用户话不丢', async () => {
     const rewrite = replaceHistory(() => [
-      { role: 'user', content: [{ type: 'image', image: new URL('https://example.com/a.png') }] },
+      {
+        role: 'user',
+        content: [{ type: 'file', mediaType: 'image', data: { type: 'url', url: 'https://example.com/a.png' } }],
+      },
     ]);
     const other = await rewrite({ messages: [picture('https://example.com/b.png')] });
     assert.deepEqual(other.messages, [picture('https://example.com/a.png'), picture('https://example.com/b.png')]);
@@ -407,20 +410,20 @@ describe('rewrite', () => {
         role: 'user',
         content: [
           { type: 'text', text: '看图' },
-          { type: 'image', image: 'aGVsbG8=', mediaType: 'image/png' },
+          { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'aGVsbG8=' } },
         ],
       },
       {
         role: 'assistant',
-        content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'weather', input: { city: '台北' } }],
+        content: [{ type: 'tool-call', id: 'c1', name: 'weather', input: { city: '台北' } }],
       },
       {
         role: 'tool',
         content: [
           {
             type: 'tool-result',
-            toolCallId: 'c1',
-            toolName: 'weather',
+            id: 'c1',
+            name: 'weather',
             output: { type: 'json', value: { sky: '晴' } },
           },
         ],
@@ -451,20 +454,19 @@ describe('rewrite', () => {
     ]);
   });
 
-  test('AI SDK v7 的文件写法：mediaType 只写 image、带标签的 data 和 url 都认，服务商的文件引用跳过', () => {
+  test('文件的几种数据：mediaType 只写 image 也认，base64 变 data URL，地址原样，服务商的文件引用和内联文字跳过', () => {
     const converted = toChatMessages([
       {
         role: 'user',
         content: [
           { type: 'text', text: '看' },
           { type: 'file', mediaType: 'image', data: { type: 'data', data: 'aGVsbG8=' } },
-          { type: 'file', mediaType: 'image/jpeg', data: { type: 'data', data: new Uint8Array([104, 105]) } },
-          { type: 'file', mediaType: 'image/png', data: { type: 'url', url: new URL('https://example.com/a.png') } },
-          { type: 'file', mediaType: 'image', data: new URL('https://example.com/b.png') },
-          { type: 'file', mediaType: 'image/*', data: Buffer.from('hi') },
+          { type: 'file', mediaType: 'image/jpeg', data: { type: 'data', data: 'aGk=' } },
+          { type: 'file', mediaType: 'image/png', data: { type: 'url', url: 'https://example.com/a.png' } },
+          { type: 'file', mediaType: 'image/*', data: { type: 'data', data: 'aGk=' } },
           { type: 'file', mediaType: 'image', data: { type: 'reference', reference: { openai: 'file-1' } } },
-          { type: 'image', image: { openai: 'file-2' } },
-          { type: 'file', mediaType: 'application/pdf', data: 'JVBERi0=' },
+          { type: 'file', mediaType: 'image', data: { type: 'text', text: '文字' } },
+          { type: 'file', mediaType: 'application/pdf', data: { type: 'data', data: 'JVBERi0=' } },
         ],
       },
     ]);
@@ -476,7 +478,6 @@ describe('rewrite', () => {
           { type: 'image_url', image_url: { url: 'data:image/png;base64,aGVsbG8=' } },
           { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,aGk=' } },
           { type: 'image_url', image_url: { url: 'https://example.com/a.png' } },
-          { type: 'image_url', image_url: { url: 'https://example.com/b.png' } },
           { type: 'image_url', image_url: { url: 'data:image/png;base64,aGk=' } },
         ],
       },

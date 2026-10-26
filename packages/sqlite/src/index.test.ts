@@ -7,13 +7,11 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 
-import { eventEntry, messageEntry, userEntry, type JsonValue, type MessageEntry } from '@modelctx-ai/ctx-protocol';
+import { eventEntry, messageEntry, userEntry, type Message } from '@modelctx-ai/ctx-protocol';
 import { describeSessionStoreContract } from '@modelctx-ai/ctx-protocol/testing';
 import { describe, test } from 'vite-plus/test';
 
 import { createSqliteStore } from './index.ts';
-
-type ModelMessage = MessageEntry['message'];
 
 describeSessionStoreContract('sqlite', ({ now }) => createSqliteStore({ path: ':memory:', now, pollIntervalMs: 10 }), {
   describe,
@@ -50,58 +48,15 @@ describe('sqlite store', () => {
     assert.equal(database.prepare('SELECT count(*) AS n FROM app').get()?.['n'], 0, 'close 不关别人的库');
   });
 
-  test('别的 TypedArray 和切片按字节存，Buffer 读回来是普通的 Uint8Array', async () => {
-    const store = createSqliteStore({ path: ':memory:' });
-    const bytes = new Uint8Array([9, 1, 2, 3, 9]);
-    const message: ModelMessage = {
-      role: 'user',
-      content: [
-        { type: 'image', image: Buffer.from('hi') },
-        { type: 'image', image: bytes.subarray(1, 4) },
-        { type: 'image', image: new Uint16Array([1, 2]) as unknown as Uint8Array },
-        { type: 'image', image: new DataView(bytes.buffer, 3, 2) as unknown as Uint8Array },
-      ],
-    };
-    await store.append('t', [messageEntry(message)]);
-    const [entry] = await store.list('t');
-    const images = (entry?.type === 'message' && Array.isArray(entry.message.content) ? entry.message.content : []).map(
-      (part) => (part.type === 'image' ? part.image : undefined),
-    );
-    for (const image of images) assert.equal(Object.getPrototypeOf(image), Uint8Array.prototype);
-    assert.deepEqual(
-      images.map((image) => [...(image as Uint8Array)]),
-      [
-        [104, 105],
-        [1, 2, 3],
-        [1, 0, 2, 0],
-        [3, 9],
-      ],
-    );
-    store.close();
-  });
-
-  test('只有恰好是编码结果的对象才还原，多一个键或地址不合法都原样读回', async () => {
-    const store = createSqliteStore({ path: ':memory:' });
-    const data: JsonValue = [
-      { '\u0000ctx': 'url', href: 'https://example.com/', note: 'extra' },
-      { '\u0000ctx': 'url', href: 'not a url' },
-      { '\u0000ctx': 'bytes', base64: 42 },
-    ];
-    await store.append('t', [eventEntry('tool.log', { data })]);
-    const [entry] = await store.list('t');
-    assert.deepEqual(entry?.type === 'event' && entry.data, data);
-    store.close();
-  });
-
   test('循环结构写不进去，整批回滚', async () => {
     const store = createSqliteStore({ path: ':memory:' });
     const loop: Record<string, unknown> = {};
     loop['self'] = loop;
-    const call: ModelMessage = {
+    const call = {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'x', input: loop }],
-    };
-    await assert.rejects(store.append('t', [userEntry('先写的'), messageEntry(call)]), /circular/);
+      content: [{ type: 'tool-call', id: 'c1', name: 'x', input: loop }],
+    } as unknown as Message;
+    await assert.rejects(store.append('t', [userEntry('先写的'), messageEntry(call)]), /circular/i);
     assert.deepEqual(await store.list('t'), []);
     store.close();
   });
@@ -283,6 +238,92 @@ describe('schema 迁移', () => {
     assert.equal(columns().filter((name) => name === 'kind').length, 1);
   });
 
+  test('阶段 1 的库补上 v 列（缺省 0），旧行读出来 v 是 0 且消息已是当前格式，新写的是 v 1，旧行的 body 不被改写', async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec(PHASE1_DDL);
+    const body = JSON.stringify({
+      message: {
+        role: 'user',
+        content: [
+          { type: 'text', text: '看图' },
+          { type: 'image', image: { '\u0000ctx': 'bytes', base64: 'AQID' }, mediaType: 'image/png' },
+          { type: 'image', image: { '\u0000ctx': 'url', href: 'https://example.com/a.png' } },
+        ],
+      },
+    });
+    database
+      .prepare(`INSERT INTO ctx_entries (id, session, at, type, body) VALUES ('p1-img', 'user:1', 3, 'message', ?)`)
+      .run(body);
+    database.exec(`INSERT INTO ctx_entries (id, session, at, type, body)
+      VALUES ('p1-sum', 'user:1', 4, 'summary', '{"text":"摘要","covers":{"at":2,"seq":2}}')`);
+    const columns = (): { name: string; dflt_value: unknown; notnull: number }[] =>
+      database.prepare(`PRAGMA table_xinfo(ctx_entries)`).all() as never;
+    assert.ok(!columns().some((column) => column.name === 'v'));
+
+    const store = createSqliteStore({ database });
+    const v = columns().find((column) => column.name === 'v');
+    assert.equal(v?.notnull, 1);
+    assert.equal(String(v?.dflt_value), '0');
+
+    const entries = await store.list('user:1');
+    assert.deepEqual(
+      entries.map((entry) => [entry.id, entry.v]),
+      [
+        ['p1-1', 0],
+        ['p1-2', 0],
+        ['p1-img', 0],
+        ['p1-sum', 0],
+      ],
+    );
+    const image = entries.find((entry) => entry.id === 'p1-img');
+    assert.deepEqual(image?.type === 'message' && image.message.content, [
+      { type: 'text', text: '看图' },
+      { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'AQID' } },
+      { type: 'file', mediaType: 'image', data: { type: 'url', url: 'https://example.com/a.png' } },
+    ]);
+    const summary = entries.find((entry) => entry.id === 'p1-sum');
+    assert.equal(summary?.type === 'summary' && summary.covers, 2);
+
+    const [written] = await store.append('user:1', [userEntry('新写的')]);
+    assert.equal(written?.v, 1);
+    assert.equal((await store.list('user:1', { last: 1 }))[0]?.v, 1);
+    const stored = database
+      .prepare(`SELECT id, v, body FROM ctx_entries WHERE id IN ('p1-img', ?) ORDER BY seq`)
+      .all(written.id) as { id: string; v: number; body: string }[];
+    assert.deepEqual(
+      stored.map((row) => row.v),
+      [0, 1],
+    );
+    assert.equal(stored[0]?.body, body, '旧行不被改写');
+
+    // 再打开一次：v 列不重复加。
+    createSqliteStore({ database });
+    assert.equal(columns().filter((column) => column.name === 'v').length, 1);
+  });
+
+  test('补 v 列也是只补缺的：已有 v 列的库不报错，在应用的事务里补齐后回滚回到原结构', () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec(PHASE1_DDL);
+    database.exec(`ALTER TABLE ctx_entries ADD COLUMN v INTEGER NOT NULL DEFAULT 0`);
+    createSqliteStore({ database });
+    const rolledBack = new DatabaseSync(':memory:');
+    rolledBack.exec(PHASE1_DDL);
+    rolledBack.exec('BEGIN');
+    createSqliteStore({ database: rolledBack });
+    rolledBack.exec('ROLLBACK');
+    assert.ok(
+      !(rolledBack.prepare(`PRAGMA table_xinfo(ctx_entries)`).all() as { name: string }[]).some((c) => c.name === 'v'),
+    );
+  });
+
+  test('比自己新的行格式读不了：unsupported_version，不猜', async () => {
+    const database = new DatabaseSync(':memory:');
+    const store = createSqliteStore({ database });
+    await store.append('t', [userEntry('好')]);
+    database.exec(`UPDATE ctx_entries SET v = 2`);
+    await assert.rejects(store.list('t'), (error: Error) => error.name === 'unsupported_version');
+  });
+
   test('只补缺的：kind 列在、索引缺时只补索引；索引在、列缺时先补列', () => {
     const lacksIndex = new DatabaseSync(':memory:');
     lacksIndex.exec(PHASE1_DDL);
@@ -420,7 +461,9 @@ describe('多进程', () => {
   const writer = fileURLToPath(new URL('./fixtures/writer.ts', import.meta.url));
   const exec = promisify(execFile);
   const spawnWriter = (path: string, session: string, count: number) =>
-    exec(process.execPath, [writer, path, session, String(count)], { timeout: 60_000 });
+    exec(process.execPath, ['--conditions=@modelctx-ai/source', writer, path, session, String(count)], {
+      timeout: 60_000,
+    });
 
   test('几个进程同时往同一个库写：不报 SQLITE_BUSY，一条不丢，seq 不重复', async () => {
     const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');

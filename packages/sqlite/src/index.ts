@@ -1,18 +1,18 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 
-import type {
-  Entry,
-  JsonObject,
-  JsonValue,
-  ListOptions,
-  MessageEntry,
-  NewEntry,
-  SessionStore,
-  SessionsOptions,
-  WatchOptions,
+import {
+  ENTRY_VERSION,
+  upgradeEntry,
+  type Entry,
+  type JsonObject,
+  type JsonValue,
+  type ListOptions,
+  type Message,
+  type NewEntry,
+  type SessionStore,
+  type SessionsOptions,
+  type WatchOptions,
 } from '@modelctx-ai/ctx-protocol';
-
-type ModelMessage = MessageEntry['message'];
 
 export interface SqliteStoreOptions {
   /** 数据库文件；也可以是 `:memory:`。和 `database` 二选一。 */
@@ -51,15 +51,16 @@ interface Row {
   source: string | null;
   body: string;
   meta: string | null;
+  /** 这一行写入时的格式版本；0.2 及以前的行没有，列的缺省值是 0。 */
+  v: number | bigint;
 }
 
 interface Body {
-  message?: ModelMessage;
+  message?: Message;
   kind?: string;
   text?: string;
   data?: JsonValue;
-  /** 0.2 及以前写的是 `{ at, seq }`，读的时候取 `seq`。 */
-  covers?: number | { seq: number };
+  covers?: number;
 }
 
 /**
@@ -67,57 +68,13 @@ interface Body {
  * 1：0.1 和 0.2 都写这个值，但 0.1 的列叫 `thread`，0.2 叫 `session`，所以升到 2 时要看实际的列。
  * 2：列叫 `session`。
  * 3：位置只用 `seq`，索引是 `(session, seq)`，不再有 `(session, at, seq)`；生成列 `kind` 和索引 `(session, kind, seq)`。
+ *    加列 `v`（条目格式版本，见 `ENTRY_VERSION`）。
  *    同一级的结构分阶段补全，所以版本号等于 3 时也要查实际的列和索引（见 `repairs`）。
  */
 const SCHEMA_VERSION = 3;
 
 /** 自己开库时 `busy_timeout` 的缺省值（毫秒）。 */
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
-
-/** 编码标记用的键，正常数据里不会出现。 */
-const TAG = '\u0000ctx';
-
-function base64(view: ArrayBufferView | ArrayBuffer): string {
-  const bytes = view instanceof ArrayBuffer ? new Uint8Array(view) : view;
-  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
-}
-
-/**
- * JSON 存不了二进制和 URL，先把它们换成带 `TAG` 的对象再序列化。必须在 `JSON.stringify` 之前做：
- * 它会先调 `toJSON`，Buffer 和 URL 到了 replacer 里已经变了样。
- */
-function encode(value: unknown, parents: Set<object> = new Set()): unknown {
-  if (value instanceof URL) return { [TAG]: 'url', href: value.href };
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return { [TAG]: 'bytes', base64: base64(value) };
-  if (value === null || typeof value !== 'object' || typeof (value as { toJSON?: unknown }).toJSON === 'function') {
-    return value;
-  }
-  if (parents.has(value)) throw new TypeError('Cannot store a circular structure.');
-  parents.add(value);
-  try {
-    if (Array.isArray(value)) return value.map((item) => encode(item, parents));
-    const out: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(value)) out[key] = encode(item, parents);
-    return out;
-  } finally {
-    parents.delete(value);
-  }
-}
-
-/** 只认恰好是编码结果的对象；别的对象（包括 `{ $url }`、`{ $bytes }` 这种）原样返回。 */
-function reviver(_key: string, value: unknown): unknown {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
-  const tagged = value as Record<string, unknown>;
-  const keys = Object.keys(tagged);
-  if (keys.length !== 2 || !keys.includes(TAG)) return value;
-  if (tagged[TAG] === 'bytes' && typeof tagged['base64'] === 'string') {
-    return new Uint8Array(Buffer.from(tagged['base64'], 'base64'));
-  }
-  if (tagged[TAG] === 'url' && typeof tagged['href'] === 'string' && URL.canParse(tagged['href'])) {
-    return new URL(tagged['href']);
-  }
-  return value;
-}
 
 /** 等一会儿；`signal` 中止时提前醒。 */
 function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
@@ -138,31 +95,24 @@ function bodyOf(entry: NewEntry): Body {
   return { text: entry.text, covers: entry.covers };
 }
 
-/** 旧行的 `covers` 是 `{ at, seq }`，位置现在只看 `seq`。 */
-function coversOf(covers: number | { seq: number }): number {
-  return typeof covers === 'number' ? covers : covers.seq;
-}
-
+/**
+ * 一行转成条目：行里的字段和 `body` 平铺成一个对象交给 `upgradeEntry`，它按 `v` 升到当前格式
+ * （0 版的消息是 AI SDK 的 `ModelMessage`，二进制和 URL 带 `\u0000ctx` 标记，摘要的 `covers` 是 `{ at, seq }`）。
+ * 存量行不改写，每次读都现升。
+ */
 function decode(row: Row): Entry {
-  const base = {
+  return upgradeEntry({
     id: row.id,
     session: row.session,
     seq: Number(row.seq),
     at: Number(row.at),
+    v: Number(row.v),
     ...(row.key !== null ? { key: row.key } : {}),
     ...(row.source !== null ? { source: row.source } : {}),
     ...(row.meta !== null ? { meta: JSON.parse(row.meta) as JsonObject } : {}),
-  };
-  const body = JSON.parse(row.body, reviver) as Body;
-  if (row.type === 'message') return { ...base, type: 'message', message: body.message! };
-  if (row.type === 'summary') return { ...base, type: 'summary', text: body.text!, covers: coversOf(body.covers!) };
-  return {
-    ...base,
-    type: 'event',
-    kind: body.kind!,
-    ...(body.text !== undefined ? { text: body.text } : {}),
-    ...(body.data !== undefined ? { data: body.data } : {}),
-  };
+    type: row.type,
+    ...(JSON.parse(row.body) as Body),
+  });
 }
 
 /**
@@ -235,6 +185,8 @@ function repairs(database: DatabaseSync, table: string): string[] {
     sql.push(`CREATE UNIQUE INDEX ${table}_key ON ${table} (session, key) WHERE key IS NOT NULL`);
   }
   if (!indexes.has(`${table}_seq`)) sql.push(`CREATE INDEX ${table}_seq ON ${table} (session, seq)`);
+  // 格式版本：0.2 及以前的行没有这一列，缺省 0；新写的行带 `ENTRY_VERSION`。读时按它升级，存量行不改写。
+  if (!columns.has('v')) sql.push(`ALTER TABLE ${table} ADD COLUMN v INTEGER NOT NULL DEFAULT 0`);
   // 事件的 `kind` 是 body 顶层的字段，用 VIRTUAL 生成列取出来，`list({ kinds })` 靠 (session, kind, seq) 索引。
   // 不占行空间，不用回填，旧版本写的行也自动有 `kind`；SQLite 只允许 ADD COLUMN 加 VIRTUAL 的生成列。
   if (!columns.has('kind')) {
@@ -313,7 +265,6 @@ function migrate(database: DatabaseSync, prefix: string): void {
 /**
  * 基于 `node:sqlite` 的存储。所有条目在一张表里，按会话和写入序号 `seq` 建索引，事件另按 `kind` 建索引。
  * 写入用 SAVEPOINT，所以和应用共用一个库、处在应用自己的事务里也能用。
- * 消息里的二进制（Uint8Array、Buffer、ArrayBuffer、其他 TypedArray）读回来都是 Uint8Array，URL 读回来还是 URL。
  */
 export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionStore {
   const prefix = options.prefix ?? 'ctx_';
@@ -340,7 +291,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
 
   const insert = database.prepare(
     // ON CONFLICT DO NOTHING 只跳过唯一约束冲突；NOT NULL 之类的违例照常报错。INSERT OR IGNORE 会把它们一起吞掉。
-    `INSERT INTO ${table} (id, session, at, type, key, source, body, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
+    `INSERT INTO ${table} (id, session, at, type, key, source, body, meta, v) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
   );
   const removeSession = database.prepare(`DELETE FROM ${table} WHERE session = ?`);
   const pollInterval = options.pollIntervalMs ?? 250;
@@ -373,11 +324,19 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
             draft.type,
             draft.key ?? null,
             draft.source ?? null,
-            JSON.stringify(encode(bodyOf(draft))),
+            JSON.stringify(bodyOf(draft)),
             draft.meta !== undefined ? JSON.stringify(draft.meta) : null,
+            ENTRY_VERSION,
           );
           if (result.changes === 0) continue;
-          written.push({ ...draft, id: entryId, session, at, seq: Number(result.lastInsertRowid) });
+          written.push({
+            ...draft,
+            id: entryId,
+            session,
+            at,
+            seq: Number(result.lastInsertRowid),
+            v: ENTRY_VERSION,
+          });
         }
         return written;
       });

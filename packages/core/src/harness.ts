@@ -14,6 +14,7 @@ import {
   type Harness,
   type Hooks,
   type Logger,
+  type Message,
   type ModelHookContext,
   type NewEntry,
   type PreparedCall,
@@ -42,6 +43,7 @@ import {
 } from 'ai';
 
 import { isEmptyContent, resolveModel } from './builder.ts';
+import { fromModelMessages, toModelMessages } from './messages.ts';
 import { dispatchTo, executorMap, toToolSet, type Executors, type ToolDispatch } from './tools.ts';
 
 export type GenerateTextResult = Awaited<ReturnType<typeof generateText>>;
@@ -114,7 +116,7 @@ interface Setup {
 
 interface Produced {
   readonly text: string;
-  readonly messages: readonly ModelMessage[];
+  readonly messages: readonly Message[];
   readonly finishReason: FinishReason;
   readonly steps: number;
   readonly usage: LanguageModelUsage | undefined;
@@ -284,7 +286,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     return {
       model: ready.model,
       ...(prepared.instructions ? { instructions: prepared.instructions } : {}),
-      messages: prepared.messages,
+      messages: toModelMessages(prepared.messages),
       ...(ready.toolCount > 0 ? { tools: ready.tools } : {}),
       stopWhen: stepCountIs(ready.maxSteps),
       ...(settings.temperature !== undefined ? { temperature: settings.temperature } : {}),
@@ -307,7 +309,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         ? {
             prepareStep: async ({ stepNumber, messages }: { stepNumber: number; messages: ModelMessage[] }) => {
               if (stepNumber === 0) return undefined;
-              const call: PreparedCall = { ...prepared, messages };
+              const call: PreparedCall = { ...prepared, messages: fromModelMessages(messages) };
               const changed = await beforeModel(call, {
                 runId: state.runId,
                 session: state.request.session,
@@ -316,7 +318,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
               });
               if (!changed || changed === call) return undefined;
               return {
-                messages: changed.messages,
+                messages: toModelMessages(changed.messages),
                 ...(changed.instructions !== undefined ? { instructions: changed.instructions } : {}),
               };
             },
@@ -378,7 +380,8 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       const raw = await generateText(callOptions(state, ready, controller.signal));
       const result = await finish(state, ready, {
         text: raw.text,
-        messages: raw.responseMessages,
+        // 子集之外的部件在这里抛 `unsupported_part`，下面的 catch 把这一轮以 `error` 结束。
+        messages: fromModelMessages(raw.responseMessages),
         finishReason: raw.finishReason,
         steps: raw.steps.length,
         usage: raw.usage,
@@ -430,10 +433,18 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         report(error);
       },
       onEnd: (event) => {
+        let messages: Message[];
+        try {
+          messages = fromModelMessages(event.responseMessages);
+        } catch (error) {
+          // 子集之外的部件：这一轮以 `error` 结束，不写半截的产出。
+          settle(() => fail(state, error, controller.signal), error);
+          return;
+        }
         settle(() =>
           finish(state, ready, {
             text: event.text,
-            messages: event.responseMessages,
+            messages,
             finishReason: event.finishReason,
             steps: event.steps.length,
             usage: event.totalUsage,

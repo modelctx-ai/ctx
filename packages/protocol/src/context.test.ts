@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 
-import type { ModelMessage } from 'ai';
 import { describe, test } from 'vite-plus/test';
 
+import type { Message } from './message.ts';
 import { collectFacts, defineSource, latestSummary, project, renderFacts, type EventRule } from './context.ts';
 import {
   assistantEntry,
@@ -14,6 +14,7 @@ import {
   type NewEntry,
   type SummaryEntry,
 } from './session.ts';
+import { ENTRY_VERSION } from './version.ts';
 
 const whisper: EventRule = {
   fold: true,
@@ -31,6 +32,7 @@ async function seed(...drafts: NewEntry[]): Promise<Entry[]> {
     session: 's',
     seq: i + 1,
     at: draft.at ?? i + 1,
+    v: ENTRY_VERSION,
   }));
 }
 
@@ -43,6 +45,7 @@ function summaryOf(id: string, covers: Entry, seq: number): SummaryEntry {
     session: 's',
     seq,
     at: 100 + seq,
+    v: ENTRY_VERSION,
   };
 }
 
@@ -84,6 +87,7 @@ describe('project', () => {
       session: 's',
       seq: 99,
       at: 99,
+      v: ENTRY_VERSION,
     };
     const result = project([...entries, summary]);
     assert.equal(result.summary?.id, 's');
@@ -160,13 +164,13 @@ describe('project', () => {
   });
 
   test('工具调用和结果成组进出，开头不留孤立的工具结果', async () => {
-    const call: ModelMessage = {
+    const call: Message = {
       role: 'assistant',
-      content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'weather', input: { city: '台北' } }],
+      content: [{ type: 'tool-call', id: 'c1', name: 'weather', input: { city: '台北' } }],
     };
-    const result: ModelMessage = {
+    const result: Message = {
       role: 'tool',
-      content: [{ type: 'tool-result', toolCallId: 'c1', toolName: 'weather', output: { type: 'text', value: '晴' } }],
+      content: [{ type: 'tool-result', id: 'c1', name: 'weather', output: { type: 'text', text: '晴' } }],
     };
     const entries = await seed(userEntry('天气？'), messageEntry(call), messageEntry(result), assistantEntry('晴天。'));
     const kept = project(entries, { window: { maxMessages: 3 } });

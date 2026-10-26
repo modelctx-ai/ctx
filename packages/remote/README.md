@@ -158,7 +158,7 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 |          | `recover`        | `POST /orchestrator/recover`                                      | —                                                  | `{ recovered: RecoveredRun[] }`                              |
 |          | `events`         | `GET /orchestrator/events`                                        | —                                                  | NDJSON，每行一个 `OrchestratorEvent`                         |
 
-- 消息里的二进制和 `URL` 不是 JSON：序列化前换成带标记的对象，`Uint8Array`、`Buffer`、`ArrayBuffer` 等是 `{"\u0000ctx": "bytes", "base64": "…"}`，`URL` 是 `{"\u0000ctx": "url", "href": "…"}`，读回来是 `Uint8Array` 和 `URL`（和 `ctx-sqlite` 存盘的写法一样）。只有恰好是这个形状的对象才会还原，`{ $url }` 这类普通对象原样往返。
+- 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），线上不做编码，`JSON.stringify`、`JSON.parse` 直接用。0.2 的编码（带 `\u0000ctx` 标记的对象）删掉了，所以客户端和服务端要一起升到 0.3。条目带 `v`，客户端读到比自己认识的更高的版本时抛 `unsupported_version`。
 - harness 的取消：客户端断开（`stream` 不读了、进程崩了）时服务端中止这一轮；`signal` 中止时客户端发 `DELETE /runs/:runId`，同一个 `POST /runs` 照常回 `RunResult`（`stopReason: aborted`）。`DELETE` 比 `POST` 先到时服务端记一分钟，那一轮到了就以已中止开始。`signal` 在发出前已经中止时请求体带 `aborted: true`，服务端照样写 `ctx.run.started` / `ctx.run.ended`。
 - `GET /orchestrator/runs/:runId?wait=<ms>` 是长轮询：这一轮没结束时最多等 `wait` 毫秒（上限 30 秒）再回；结束了就带上 `result`（或 harness 抛错时的 `error`）。
 - `GET /orchestrator/events` 先订阅再回响应头：客户端拿到响应头以后提交的运行，事件一定在这条流里。客户端在提交前会等自己正在建立的事件流连上。

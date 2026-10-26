@@ -13,13 +13,14 @@ import {
   runEndedEntry,
   runStartedEntry,
   summaryEntry,
-  textOf,
   userEntry,
   type Entry,
 } from './session.ts';
+import { textOf } from './message.ts';
+import { ENTRY_VERSION } from './version.ts';
 
 function entryAt(seq: number, at: number): Entry {
-  return { ...userEntry('x'), id: `e${seq}`, session: 's', seq, at };
+  return { ...userEntry('x'), id: `e${seq}`, session: 's', seq, at, v: ENTRY_VERSION };
 }
 
 describe('compareEntries', () => {
@@ -54,7 +55,7 @@ describe('entries', () => {
         role: 'assistant',
         content: [
           { type: 'text', text: '查' },
-          { type: 'tool-call', toolCallId: 'c', toolName: 't', input: {} },
+          { type: 'tool-call', id: 'c', name: 't', input: {} },
           { type: 'text', text: '一下' },
         ],
       }),
@@ -69,6 +70,7 @@ describe('entries', () => {
       session: 's',
       seq: i + 1,
       at: 10,
+      v: ENTRY_VERSION,
     }));
     assert.equal(filterEntries(entries, { after: 1 }).length, 2);
     assert.equal(filterEntries(entries, { after: 0 }).length, 3);

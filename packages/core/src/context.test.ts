@@ -474,23 +474,23 @@ describe('createContext', () => {
         role: 'user',
         content: [
           { type: 'text', text: '看图' },
-          { type: 'image', image: data, mediaType: 'image/png' },
+          { type: 'file', mediaType: 'image/png', data: { type: 'data', data } },
         ],
       }),
       messageEntry({
         role: 'assistant',
-        content: [{ type: 'tool-call', toolCallId: 'c1', toolName: 'screenshot', input: {} }],
+        content: [{ type: 'tool-call', id: 'c1', name: 'screenshot', input: {} }],
       }),
       messageEntry({
         role: 'tool',
         content: [
           {
             type: 'tool-result',
-            toolCallId: 'c1',
-            toolName: 'screenshot',
+            id: 'c1',
+            name: 'screenshot',
             output: {
               type: 'content',
-              value: [
+              parts: [
                 { type: 'text', text: '截好了' },
                 { type: 'file', mediaType: 'image/png', data: { type: 'data', data } },
               ],
@@ -504,7 +504,7 @@ describe('createContext', () => {
     assert.ok(await context.compact({ keep: 2, minimum: 1 }));
     const sent = JSON.stringify(summarizer.doGenerateCalls[0]!.prompt);
     assert.match(sent, /user: 看图 \[image image\/png\]/);
-    assert.match(sent, /screenshot returned 截好了 \[file image\/png\]/);
+    assert.match(sent, /screenshot returned 截好了 \[image image\/png\]/);
     assert.ok(!sent.includes(data.slice(0, 64)), '不带 base64');
   });
 

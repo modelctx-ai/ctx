@@ -1,5 +1,4 @@
-import type { ModelMessage, UserContent } from 'ai';
-
+import type { Message, MessageContent } from './message.ts';
 import type { StopReason, Usage } from './harness.ts';
 import type { JsonObject, JsonValue } from './types.ts';
 
@@ -15,6 +14,11 @@ interface EntryBase {
   readonly seq: number;
   /** 逻辑时间（毫秒），只用于投影排序和展示。缺省是写入时刻；导入的旧记录保留原来的时间，所以可以早于已有的条目。 */
   readonly at: number;
+  /**
+   * 这一行写入时的格式版本（`ENTRY_VERSION`，当前是 1）。存储写入时填；读到的条目形状总是当前版本，`v` 是 0 的是
+   * 旧版本写的行，读时已经升级过（见 `upgradeEntry`）。
+   */
+  readonly v: number;
   /** 幂等键。同一会话里键相同的第二条会被跳过。 */
   readonly key?: string;
   /** 谁写的，例如 `user`、`model`、`harness`、应用名。 */
@@ -25,7 +29,7 @@ interface EntryBase {
 /** 一条模型消息，原样保存，投影时直接带上。 */
 export interface MessageEntry extends EntryBase {
   readonly type: 'message';
-  readonly message: ModelMessage;
+  readonly message: Message;
 }
 
 /** 应用或框架的事件。缺省不进模型上下文，要在投影规则里声明怎么渲染。 */
@@ -47,7 +51,7 @@ export interface SummaryEntry extends EntryBase {
 export type Entry = MessageEntry | EventEntry | SummaryEntry;
 export type EntryType = Entry['type'];
 
-type Draft<T extends Entry> = Omit<T, 'id' | 'session' | 'seq' | 'at'> & {
+type Draft<T extends Entry> = Omit<T, 'id' | 'session' | 'seq' | 'at' | 'v'> & {
   readonly id?: string;
   readonly at?: number;
 };
@@ -55,7 +59,7 @@ type Draft<T extends Entry> = Omit<T, 'id' | 'session' | 'seq' | 'at'> & {
 export type NewMessageEntry = Draft<MessageEntry>;
 export type NewEventEntry = Draft<EventEntry>;
 export type NewSummaryEntry = Draft<SummaryEntry>;
-/** 追加时传入的条目：`id`、`at` 可选，`session`、`seq` 由存储填。 */
+/** 追加时传入的条目：`id`、`at` 可选，`session`、`seq`、`v` 由存储填。 */
 export type NewEntry = NewMessageEntry | NewEventEntry | NewSummaryEntry;
 
 export interface ListOptions {
@@ -129,11 +133,11 @@ function common(options: EntryOptions | undefined): EntryOptions {
   return out;
 }
 
-export function messageEntry(message: ModelMessage, options?: EntryOptions): NewMessageEntry {
+export function messageEntry(message: Message, options?: EntryOptions): NewMessageEntry {
   return { type: 'message', message, ...common(options) };
 }
 
-export function userEntry(content: UserContent, options?: EntryOptions): NewMessageEntry {
+export function userEntry(content: MessageContent, options?: EntryOptions): NewMessageEntry {
   return messageEntry({ role: 'user', content }, options);
 }
 
@@ -209,17 +213,6 @@ export function filterSessions(names: readonly string[], options: SessionsOption
   if (options?.limit === undefined) return out;
   const limit = Number.isNaN(options.limit) ? 0 : Math.floor(options.limit);
   return limit > 0 ? out.slice(0, limit) : [];
-}
-
-/** 消息里能直接读出来的文字。工具调用、图片等非文字部分不算。 */
-export function textOf(message: ModelMessage): string {
-  const { content } = message;
-  if (typeof content === 'string') return content;
-  let text = '';
-  for (const part of content) {
-    if (part.type === 'text') text += part.text;
-  }
-  return text;
 }
 
 // ---- 框架事件 ----

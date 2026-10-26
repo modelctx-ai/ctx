@@ -10,9 +10,8 @@
  */
 import assert from 'node:assert/strict';
 
-import type { ModelMessage } from 'ai';
-
 import type { AgentSpec, Harness, RunEvent, RunRequest } from './harness.ts';
+import type { Message } from './message.ts';
 import type { Orchestrator, OrchestratorEvent } from './orchestrator.ts';
 import {
   CTX_EVENTS,
@@ -24,6 +23,7 @@ import {
   type NewEntry,
   type SessionStore,
 } from './session.ts';
+import { ENTRY_VERSION } from './version.ts';
 import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type ToolRegistry } from './tools.ts';
 import type { JsonObject } from './types.ts';
 
@@ -46,24 +46,6 @@ function texts(entries: readonly Entry[]): string[] {
     if (entry.type === 'message') return typeof entry.message.content === 'string' ? entry.message.content : '[parts]';
     return entry.text ?? '';
   });
-}
-
-/** 二进制读回来可以换容器（Buffer 变 Uint8Array 之类），只比字节。 */
-function bytesOf(value: unknown): number[] | undefined {
-  if (value instanceof ArrayBuffer) return [...new Uint8Array(value)];
-  if (ArrayBuffer.isView(value)) return [...new Uint8Array(value.buffer, value.byteOffset, value.byteLength)];
-  return undefined;
-}
-
-function hrefOf(value: unknown): string | undefined {
-  return value instanceof URL ? value.href : undefined;
-}
-
-type Loose = Record<string, unknown> | undefined;
-
-function partsOf(entry: Entry | undefined): Loose[] {
-  if (entry?.type !== 'message' || typeof entry.message.content === 'string') return [];
-  return entry.message.content as unknown as Loose[];
 }
 
 function batch(tag: string): NewEntry[] {
@@ -242,18 +224,18 @@ export function describeSessionStoreContract(
       assert.deepEqual(texts(await store.list('s', { kinds: ['kind'] })), []);
     });
 
-    test('条目原样读回：消息分段、事件数据、摘要位置、元数据', async () => {
+    test('条目原样读回：消息分段、事件数据、摘要位置、元数据、格式版本', async () => {
       const store = await factory({ now: () => 42 });
-      const call: ModelMessage = {
+      const call: Message = {
         role: 'assistant',
         content: [
           { type: 'text', text: '查一下' },
-          { type: 'tool-call', toolCallId: 'c1', toolName: 'weather', input: { city: '台北', days: [1, 2] } },
+          { type: 'tool-call', id: 'c1', name: 'weather', input: { city: '台北', days: [1, 2] } },
         ],
       };
-      const image: ModelMessage = {
+      const image: Message = {
         role: 'user',
-        content: [{ type: 'image', image: new URL('https://example.com/a.png'), mediaType: 'image/png' }],
+        content: [{ type: 'file', mediaType: 'image/png', data: { type: 'url', url: 'https://example.com/a.png' } }],
       };
       const [written] = await store.append('s', [messageEntry(call, { source: 'model', meta: { step: 1 } })]);
       await store.append('s', [
@@ -268,8 +250,7 @@ export function describeSessionStoreContract(
       assert.equal(first?.source, 'model');
       assert.deepEqual(first?.meta, { step: 1 });
       assert.deepEqual(first?.type === 'message' && first.message, call);
-      const part = second?.type === 'message' && Array.isArray(second.message.content) && second.message.content[0];
-      assert.equal(part && part.type === 'image' && hrefOf(part.image), 'https://example.com/a.png');
+      assert.deepEqual(second?.type === 'message' && second.message, image);
       assert.deepEqual(third?.type === 'event' && [third.kind, third.text, third.data], [
         'pet.reminder',
         '喝水',
@@ -277,35 +258,89 @@ export function describeSessionStoreContract(
       ]);
       assert.deepEqual(fourth?.type === 'summary' && [fourth.text, fourth.covers], ['摘要', 2]);
       assert.ok((second?.seq ?? 0) > (first?.seq ?? 0));
+      assert.equal(written?.v, ENTRY_VERSION, 'append 返回的条目带格式版本');
+      assert.ok(
+        [first, second, third, fourth].every((entry) => entry?.v === ENTRY_VERSION),
+        'list 读到的也是',
+      );
     });
 
-    test('二进制和 URL 读回来字节、地址不变：Buffer、ArrayBuffer、带标签的数据', async () => {
+    test('消息全是 JSON：每种部件、每种文件数据都原样读回，不经任何编码', async () => {
       const store = await factory({ now: () => 42 });
-      const message: ModelMessage = {
-        role: 'user',
-        content: [
-          { type: 'image', image: Buffer.from('hello'), mediaType: 'image/png' },
-          { type: 'image', image: new Uint8Array([1, 2, 3]).buffer, mediaType: 'image/png' },
-          { type: 'file', mediaType: 'image', data: { type: 'data', data: Buffer.from('hi') } },
-          { type: 'image', image: new URL('https://example.com/a.png') },
-          { type: 'file', mediaType: 'image', data: { type: 'url', url: new URL('https://example.com/b.png') } },
-        ],
-      };
-      await store.append('s', [messageEntry(message)]);
-      const [image, buffer, tagged, url, taggedUrl] = partsOf((await store.list('s'))[0]);
-      assert.deepEqual(bytesOf(image?.['image']), [...Buffer.from('hello')], 'Buffer');
-      assert.deepEqual(bytesOf(buffer?.['image']), [1, 2, 3], 'ArrayBuffer');
+      const options = { anthropic: { signature: 'sig==' } };
+      const messages: Message[] = [
+        { role: 'system', content: '系统', providerOptions: { openai: { cache: true } } },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '看图', providerOptions: options },
+            { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'aGVsbG8=' }, filename: 'a.png' },
+            { type: 'file', mediaType: 'image', data: { type: 'url', url: 'https://example.com/a.png' } },
+            {
+              type: 'file',
+              mediaType: 'application/pdf',
+              data: { type: 'reference', reference: { openai: 'file-1' } },
+            },
+            { type: 'file', mediaType: 'text/plain', data: { type: 'text', text: '内联文字' } },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: '想一想', providerOptions: options },
+            { type: 'reasoning-file', mediaType: 'image/png', data: { type: 'data', data: 'AQID' } },
+            { type: 'custom', kind: 'openai.compaction', providerOptions: options },
+            { type: 'tool-call', id: 'c1', name: 'lookup', input: { q: ['台北'] }, providerExecuted: true },
+            { type: 'tool-result', id: 'c1', name: 'lookup', output: { type: 'json', value: { n: 1 } } },
+            { type: 'tool-approval-request', approvalId: 'a1', callId: 'c2', reason: '要联网', signature: 's' },
+          ],
+        },
+        {
+          role: 'tool',
+          content: [
+            {
+              type: 'tool-result',
+              id: 'c2',
+              name: 'shot',
+              output: {
+                type: 'content',
+                parts: [
+                  { type: 'text', text: '截图' },
+                  { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'AQID' } },
+                ],
+              },
+            },
+            { type: 'tool-approval-response', approvalId: 'a1', approved: false, reason: '不行' },
+          ],
+        },
+      ];
+      await store.append(
+        's',
+        messages.map((message) => messageEntry(message)),
+      );
+      const listed = await store.list('s');
       assert.deepEqual(
-        bytesOf((tagged?.['data'] as Loose)?.['data']),
-        [...Buffer.from('hi')],
-        '{ type: data } 里的 Buffer',
+        listed.map((entry) => entry.type === 'message' && entry.message),
+        messages,
       );
-      assert.equal(hrefOf(url?.['image']), 'https://example.com/a.png', 'URL');
-      assert.equal(
-        hrefOf((taggedUrl?.['data'] as Loose)?.['url']),
-        'https://example.com/b.png',
-        '{ type: url } 里的 URL',
-      );
+      assert.deepEqual(JSON.parse(JSON.stringify(messages)), messages, '消息本身就是 JSON');
+    });
+
+    test('像旧编码标记的普通对象原样读回：新写的行不再解码 \\u0000ctx', async () => {
+      const store = await factory({ now: () => 42 });
+      const tagged = { '\u0000ctx': 'bytes', base64: 'aGk=' };
+      const link = { '\u0000ctx': 'url', href: 'https://example.com/' };
+      await store.append('s', [
+        messageEntry({
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'x', input: { tagged, link } }],
+        }),
+        eventEntry('tool.log', { data: { tagged, link } }),
+      ]);
+      const [message, event] = await store.list('s');
+      const part = message?.type === 'message' && Array.isArray(message.message.content) && message.message.content[0];
+      assert.deepEqual(part && part.type === 'tool-call' && part.input, { tagged, link });
+      assert.deepEqual(event?.type === 'event' && event.data, { tagged, link });
     });
 
     test('事件数据里长得像编码标记的普通对象原样读回', async () => {

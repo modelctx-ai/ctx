@@ -2,7 +2,7 @@
 
 ctx 的协议层：六个协议的接口、随接口走的 JSON 形状、只依赖这些形状的纯函数，以及契约测试。**不含实现**——内存存储、harness 这些在 `@modelctx-ai/ctx` 和各 `ctx-*` 包里。实现别的存储、执行环境或 harness 时只装它。
 
-运行时没有依赖；`ai` 只用类型（`ModelMessage`、`UserContent`、`LanguageModel`、工具结果），是 peer dependency。
+运行时没有依赖；`ai` 只用类型 `LanguageModel`（`ModelRef` 里的进程内模型），是 peer dependency。消息是协议包自己定义的 JSON 格式 `Message`，和 AI SDK 互转在 `@modelctx-ai/ctx`。
 
 ## 安装
 
@@ -29,17 +29,18 @@ Node ≥22。
 
 ## 纯函数
 
-| 导出                                                                                     | 说明                                                        |
-| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry`              | 构造新条目                                                  |
-| `runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`isFrameworkKind` | 框架事件                                                    |
-| `compareEntries`、`filterEntries`、`filterSessions`、`textOf`                            | 投影顺序、`ListOptions`、`SessionsOptions` 的语义、消息文字 |
-| `project`、`latestSummary`、`defaultSummaryMessage`                                      | 条目渲染成 `ModelMessage[]`：摘要、事件规则、窗口           |
-| `defineSource`、`collectFacts`、`renderFacts`                                            | 上下文来源和事实（`collectFacts` 并行、单个来源有超时）     |
-| `estimateTokens`、`estimateTextTokens`                                                   | 不依赖分词器的 token 估算                                   |
-| `isValidToolName`、`matchesTool`、`selectTools`、`errorOutput`                           | 工具名校验、工具筛选、错误结果                              |
-| `toolOutputToAiSdk`、`toolOutputFromAiSdk`                                               | `ToolOutput` 和 AI SDK 工具结果 `output` 互转               |
-| `modelName`、`agentSpecToJson`                                                           | 模型名的字符串写法；`AgentSpec` 的可序列化部分              |
+| 导出                                                                                     | 说明                                                                                                     |
+| ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry`              | 构造新条目                                                                                               |
+| `runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`isFrameworkKind` | 框架事件                                                                                                 |
+| `compareEntries`、`filterEntries`、`filterSessions`、`textOf`                            | 投影顺序、`ListOptions`、`SessionsOptions` 的语义、消息文字                                              |
+| `ENTRY_VERSION`、`upgradeEntry`                                                          | 条目格式版本；存储读每一行时调 `upgradeEntry(raw)`，旧版本升到当前形状，更高版本抛 `unsupported_version` |
+| `project`、`latestSummary`、`defaultSummaryMessage`                                      | 条目渲染成 `Message[]`：摘要、事件规则、窗口                                                             |
+| `defineSource`、`collectFacts`、`renderFacts`                                            | 上下文来源和事实（`collectFacts` 并行、单个来源有超时）                                                  |
+| `estimateTokens`、`estimateTextTokens`                                                   | 不依赖分词器的 token 估算                                                                                |
+| `isValidToolName`、`matchesTool`、`selectTools`、`errorOutput`                           | 工具名校验、工具筛选、错误结果                                                                           |
+| `toolOutputToAiSdk`、`toolOutputFromAiSdk`                                               | `ToolOutput` 和 AI SDK 工具结果 `output` 互转                                                            |
+| `modelName`、`agentSpecToJson`                                                           | 模型名的字符串写法；`AgentSpec` 的可序列化部分                                                           |
 
 ## 实现一个协议
 

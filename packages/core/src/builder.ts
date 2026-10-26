@@ -1,6 +1,7 @@
 import {
   collectFacts,
   compactedEntry,
+  defaultSummaryMessage,
   latestSummary,
   project,
   renderFacts,
@@ -13,17 +14,21 @@ import {
   type Entry,
   type Fact,
   type Logger,
+  type Message,
+  type MessageContent,
   type ModelRef,
   type PreparedCall,
   type Projection,
   type ProjectionOptions,
+  type ToolOutput,
   type SessionStore,
   type SummaryEntry,
   type ToolDefinition,
   type ViewOptions,
   silentLogger,
 } from '@modelctx-ai/ctx-protocol';
-import { generateText, type LanguageModel, type ModelMessage, type ToolResultPart, type UserContent } from 'ai';
+import { generateText, type LanguageModel } from 'ai';
+import type { LossySummary } from './migrate.ts';
 
 /**
  * 事实放在哪：`instructions` 接在指令后面（缺省）；`prompt` 放进最后一条临时用户消息，
@@ -47,8 +52,11 @@ export interface ContextBuilderOptions {
 
 /** 参考实现另外给出事实收集，`createContext` 的 `facts()` 用它。 */
 export interface LocalContextBuilder extends ContextBuilder {
+  readonly store: SessionStore;
   facts(session: string, signal?: AbortSignal): Promise<Fact[]>;
   compact(session: string, options?: CompactOptions): Promise<SummaryEntry | null>;
+  /** 对一条 `findLossySummaries` 的结果追加一条取代它的摘要，见 `recompactLossy`。 */
+  recompact(finding: LossySummary, options?: CompactOptions): Promise<SummaryEntry | null>;
 }
 
 const DEFAULT_SUMMARY_INSTRUCTIONS =
@@ -58,32 +66,37 @@ const DEFAULT_SUMMARY_INSTRUCTIONS =
 
 /** 图片、文件只写一个占位，例如 `[file image/png]`，数据不进摘要的输入。 */
 function placeholder(part: { readonly type: string; readonly mediaType?: unknown }): string {
-  const kind = part.type.startsWith('image') ? 'image' : 'file';
-  return typeof part.mediaType === 'string' && part.mediaType ? `[${kind} ${part.mediaType}]` : `[${kind}]`;
+  const mediaType = typeof part.mediaType === 'string' ? part.mediaType : '';
+  const kind = part.type.startsWith('image') || /^image(\/|$)/i.test(mediaType) ? 'image' : 'file';
+  return mediaType ? `[${kind} ${mediaType}]` : `[${kind}]`;
 }
 
-function outputText(output: ToolResultPart['output']): string {
-  if (output.type !== 'content' || !Array.isArray(output.value)) return JSON.stringify(output);
-  return output.value
-    .map((part) => (part.type === 'text' ? part.text : part.type === 'custom' ? '' : placeholder(part)))
-    .filter(Boolean)
-    .join(' ');
+function outputText(output: ToolOutput): string {
+  switch (output.type) {
+    case 'text':
+      return output.text;
+    case 'json':
+      return JSON.stringify(output.value);
+    case 'error':
+      return output.message;
+    default:
+      return output.parts.map((part) => (part.type === 'text' ? part.text : placeholder(part))).join(' ');
+  }
 }
 
-function transcript(messages: readonly ModelMessage[]): string {
+function transcript(messages: readonly Message[]): string {
   const lines: string[] = [];
   for (const message of messages) {
     if (typeof message.content === 'string') {
       lines.push(`${message.role}: ${message.content}`);
       continue;
     }
-    const attachments = message.content.filter((part) => part.type === 'image' || part.type === 'file');
+    const attachments = message.content.filter((part) => part.type === 'file');
     const text = [textOf(message), ...attachments.map(placeholder)].filter(Boolean).join(' ');
     if (text) lines.push(`${message.role}: ${text}`);
     for (const part of message.content) {
-      if (part.type === 'tool-call')
-        lines.push(`${message.role} called ${part.toolName}(${JSON.stringify(part.input)})`);
-      if (part.type === 'tool-result') lines.push(`${part.toolName} returned ${outputText(part.output)}`);
+      if (part.type === 'tool-call') lines.push(`${message.role} called ${part.name}(${JSON.stringify(part.input)})`);
+      if (part.type === 'tool-result') lines.push(`${part.name} returned ${outputText(part.output)}`);
     }
   }
   return lines.join('\n');
@@ -93,7 +106,7 @@ function messageOf(error: unknown): unknown {
   return error instanceof Error ? error.message : error;
 }
 
-export function isEmptyContent(content: UserContent | undefined): boolean {
+export function isEmptyContent(content: MessageContent | undefined): boolean {
   if (content === undefined) return true;
   return typeof content === 'string' ? content.trim() === '' : content.length === 0;
 }
@@ -104,7 +117,7 @@ function joined(parts: readonly (string | undefined)[]): string | undefined {
 }
 
 /** 事实放进临时用户消息：在原来的提示前面加一段文字。 */
-function withFacts(prompt: UserContent | undefined, facts: string): UserContent {
+function withFacts(prompt: MessageContent | undefined, facts: string): MessageContent {
   if (prompt === undefined || isEmptyContent(prompt)) return facts;
   if (typeof prompt === 'string') return `${facts}\n\n${prompt}`;
   return [{ type: 'text', text: facts }, ...prompt];
@@ -117,8 +130,8 @@ export interface AssembleInput {
   readonly placeFacts: boolean;
   readonly placement: FactsPlacement;
   readonly instructions?: string | undefined;
-  readonly input?: UserContent | undefined;
-  readonly prompt?: UserContent | undefined;
+  readonly input?: MessageContent | undefined;
+  readonly prompt?: MessageContent | undefined;
   readonly tools?: readonly ToolDefinition[] | undefined;
 }
 
@@ -129,7 +142,7 @@ export interface AssembleInput {
 export function assemble(input: AssembleInput): PreparedCall {
   const factText = input.placeFacts && input.facts.length > 0 ? renderFacts(input.facts) : undefined;
   const system: string[] = [];
-  const messages: ModelMessage[] = [];
+  const messages: Message[] = [];
   for (const message of input.projection.messages) {
     if (message.role === 'system') system.push(textOf(message));
     else messages.push(message);
@@ -213,7 +226,6 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     if (ref === undefined) {
       throw new Error('No language model: pass `model` to the context builder or to compact().');
     }
-    const model = resolveModel(ref, options.models);
     const full = await view(session, { window: {} });
     const pinned = full.items.filter((item) => item.pinned);
     const rest = full.items.filter((item) => !item.pinned);
@@ -241,11 +253,28 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     }
     const older = rest.slice(0, cut).filter((item) => item.upTo <= covers);
     if (older.length === 0) return null;
+    return write(
+      session,
+      covers,
+      [...pinned, ...older].map((item) => item.message),
+      ref,
+      compactOptions,
+    );
+  }
+
+  /** 让模型把一段记录压成摘要，追加一条 `summary` 和一条 `ctx.compacted`；被截断或没有内容时返回 null，不写。 */
+  async function write(
+    session: string,
+    covers: number,
+    messages: readonly Message[],
+    ref: ModelRef,
+    compactOptions: CompactOptions,
+  ): Promise<SummaryEntry | null> {
     const maxOutputTokens = compactOptions.maxOutputTokens ?? 1024;
     const { text, finishReason } = await generateText({
-      model,
+      model: resolveModel(ref, options.models),
       instructions: compactOptions.instructions ?? DEFAULT_SUMMARY_INSTRUCTIONS,
-      prompt: transcript([...pinned, ...older].map((item) => item.message)),
+      prompt: transcript(messages),
       temperature: 0,
       maxOutputTokens,
       ...(compactOptions.timeoutMs !== undefined ? { timeout: compactOptions.timeoutMs } : {}),
@@ -266,5 +295,23 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     return entry?.type === 'summary' ? entry : null;
   }
 
-  return { build, view, facts, compact };
+  async function recompact(finding: LossySummary, compactOptions: CompactOptions = {}): Promise<SummaryEntry | null> {
+    const ref = compactOptions.model ?? options.model;
+    if (ref === undefined) {
+      throw new Error('No language model: pass `model` to the context builder or to recompactLossy().');
+    }
+    const { session } = finding;
+    const old = (await store.list(session, { types: ['summary'] })).find((entry) => entry.id === finding.summaryId);
+    if (old?.type !== 'summary' || finding.hidden.length === 0) return null;
+    const hidden = new Set(finding.hidden);
+    const entries = (await store.list(session, { after: Math.min(...finding.hidden) - 1 })).filter((entry) =>
+      hidden.has(entry.seq),
+    );
+    // 输入是旧摘要的文字，加上被误盖住的条目（按投影规则渲染）。`covers` 不变，靠“相同时后写的生效”取代旧摘要。
+    const rendered = project(entries, { ...projection, window: {} });
+    const summary = (projection.summary ?? defaultSummaryMessage)(old);
+    return write(session, old.covers, [summary, ...rendered.messages], ref, compactOptions);
+  }
+
+  return { store, build, view, facts, compact, recompact };
 }

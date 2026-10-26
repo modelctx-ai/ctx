@@ -1,5 +1,3 @@
-import type { ToolResultPart } from 'ai';
-
 import type { JsonObject, JsonValue } from './types.ts';
 
 // ---- 工具目录 ----
@@ -151,9 +149,38 @@ export interface Executor {
 
 // ---- 和 AI SDK 互转 ----
 
-export type AiSdkToolOutput = ToolResultPart['output'];
-type AiSdkContentPart = Extract<AiSdkToolOutput, { type: 'content' }>['value'][number];
-type AiSdkFileData = Extract<AiSdkContentPart, { type: 'file' }>['data'];
+/**
+ * AI SDK 工具结果 `output` 的形状（`@ai-sdk/provider-utils` 的 `ToolResultOutput`）。协议包不依赖 `ai` 的消息类型，
+ * 这里照它的结构写了一份，AI SDK 的值可以直接传进来。
+ */
+export type AiSdkFileData =
+  | { type: 'data'; data: string | Uint8Array | ArrayBuffer }
+  | { type: 'url'; url: URL; originalUrl?: string }
+  | { type: 'reference'; reference: Record<string, string> }
+  | { type: 'text'; text: string };
+
+type AiSdkContentPart =
+  | { type: 'text'; text: string; providerOptions?: unknown }
+  | { type: 'file'; data: AiSdkFileData; mediaType: string; filename?: string; providerOptions?: unknown }
+  // 下面是 AI SDK 已弃用的写法。
+  | { type: 'file-data'; data: string; mediaType: string; filename?: string; providerOptions?: unknown }
+  | { type: 'file-url'; url: string; mediaType?: string; providerOptions?: unknown }
+  | { type: 'file-id'; fileId: string | Record<string, string>; providerOptions?: unknown }
+  | { type: 'file-reference'; providerReference: Record<string, string>; providerOptions?: unknown }
+  | { type: 'image-data'; data: string; mediaType: string; providerOptions?: unknown }
+  | { type: 'image-url'; url: string; providerOptions?: unknown }
+  | { type: 'image-file-id'; fileId: string | Record<string, string>; providerOptions?: unknown }
+  | { type: 'image-file-reference'; providerReference: Record<string, string>; providerOptions?: unknown }
+  // 服务商自定义分段，没有可序列化的内容。
+  | { type: 'custom'; providerOptions?: unknown };
+
+export type AiSdkToolOutput =
+  | { type: 'text'; value: string; providerOptions?: unknown }
+  | { type: 'json'; value: unknown; providerOptions?: unknown }
+  | { type: 'execution-denied'; reason?: string; providerOptions?: unknown }
+  | { type: 'error-text'; value: string; providerOptions?: unknown }
+  | { type: 'error-json'; value: unknown; providerOptions?: unknown }
+  | { type: 'content'; value: AiSdkContentPart[]; providerOptions?: unknown };
 
 /** 错误带 `retryable` 或 `data` 时放进 `error-json`，只有文字时用 `error-text`。 */
 interface ErrorJson {
@@ -162,7 +189,8 @@ interface ErrorJson {
   data?: JsonValue;
 }
 
-function fileDataToAiSdk(data: ToolFileData): AiSdkFileData {
+/** 协议的文件数据转成 AI SDK 带标签的 `FileData`。 */
+export function fileDataToAiSdk(data: ToolFileData): AiSdkFileData {
   switch (data.type) {
     case 'data':
       return { type: 'data', data: data.data };
@@ -209,7 +237,8 @@ export function toolOutputToAiSdk(output: ToolOutput): AiSdkToolOutput {
   }
 }
 
-function base64(bytes: Uint8Array): string {
+/** 字节转 base64，大数组分块，免得展开参数时溢出栈。 */
+export function encodeBase64(bytes: Uint8Array): string {
   let binary = '';
   const chunk = 0x8000;
   for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
@@ -218,10 +247,11 @@ function base64(bytes: Uint8Array): string {
 
 function bytesToBase64(data: string | Uint8Array | ArrayBuffer): string {
   if (typeof data === 'string') return data;
-  return base64(data instanceof Uint8Array ? data : new Uint8Array(data));
+  return encodeBase64(data instanceof Uint8Array ? data : new Uint8Array(data));
 }
 
-function fileDataFromAiSdk(data: AiSdkFileData): ToolFileData {
+/** AI SDK 带标签的 `FileData` 转成协议的文件数据：字节变 base64，`URL` 变字符串（保留 `originalUrl`）。 */
+export function fileDataFromAiSdk(data: AiSdkFileData): ToolFileData {
   switch (data.type) {
     case 'data':
       return { type: 'data', data: bytesToBase64(data.data) };

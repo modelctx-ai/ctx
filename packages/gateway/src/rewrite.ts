@@ -1,8 +1,6 @@
-import type { Awaitable, ContextBuilder, MessageEntry } from '@modelctx-ai/ctx-protocol';
+import type { Awaitable, ContextBuilder, Message } from '@modelctx-ai/ctx-protocol';
 
 import { toChatMessages, type ChatCompletionRequest, type ChatMessage } from './messages.ts';
-
-type ModelMessage = MessageEntry['message'];
 
 /** 在请求转发到上游之前改写它。 */
 export type Rewrite = (request: ChatCompletionRequest) => Awaitable<ChatCompletionRequest>;
@@ -22,7 +20,7 @@ function isSystem(message: ChatMessage): boolean {
  * 全文最后一条已经是这句用户话（内容逐字相同，图片也算）时，这句不重复带。
  */
 export function replaceHistory(
-  history: () => Awaitable<readonly ModelMessage[]>,
+  history: () => Awaitable<readonly Message[]>,
   options: ReplaceHistoryOptions = {},
 ): Rewrite {
   return async (request) => {
@@ -42,7 +40,7 @@ export function replaceHistory(
 
 /** 绑定了会话、能直接给出当前视图的东西，例如 `@modelctx-ai/ctx` 的 `createContext()`。 */
 export interface SessionView {
-  view(): Promise<{ readonly messages: readonly ModelMessage[] }>;
+  view(): Promise<{ readonly messages: readonly Message[] }>;
 }
 
 /** 按会话名给出视图的东西：协议的 `ContextBuilder` 就是。 */
