@@ -5,15 +5,18 @@
 
 ## 拆分
 
-按依赖和运行环境拆，不按概念拆。所有应用都要的、和运行环境无关的放进核心包；带额外依赖或只能在 Node 上跑的各成一个适配包，用不到就不装。
+先按层拆：协议一个包，实现若干包（[ADR 0004](0004-protocol-and-implementation.md)）。实现包再按依赖和运行环境拆，不按概念拆：所有应用都要的、和运行环境无关的放进核心包；带额外依赖或只能在 Node 上跑的各成一个适配包，用不到就不装。
 
-| 包                         | 内容                                                                            | 单独成包的原因                                                                                          |
-| -------------------------- | ------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `@modelctx-ai/ctx`         | 条目和存储接口、内存存储、投影、来源、工具注册表、`createContext()`、`/testing` | 每个应用都要；只依赖 `ai`                                                                               |
-| `@modelctx-ai/ctx-sqlite`  | `node:sqlite` 存储                                                              | 只能在 Node ≥22.13 上跑；自带存储的应用用不到                                                           |
-| `@modelctx-ai/ctx-models`  | 按配置建模型                                                                    | 带进服务商 SDK（`@ai-sdk/openai-compatible`、`@ai-sdk/anthropic`）；自己传 `LanguageModel` 的应用用不到 |
-| `@modelctx-ai/ctx-mcp`     | MCP 接入                                                                        | 带进 `@ai-sdk/mcp`，要起子进程                                                                          |
-| `@modelctx-ai/ctx-gateway` | OpenAI 兼容网关                                                                 | 本机 HTTP 服务；只有要接 OpenAI 协议客户端的应用才用                                                    |
+| 包                          | 内容                                                                                            | 单独成包的原因                                                                                          |
+| --------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `@modelctx-ai/ctx-protocol` | 六个协议的接口、JSON 形状、纯函数、`/testing` 契约测试                                          | 实现别的存储、执行环境或 harness 时只装它，不带进任何实现和 `ai` 的运行时                               |
+| `@modelctx-ai/ctx`          | 内存存储、投影和来源、工具注册表、函数执行环境、AI SDK harness、进程内编排器、`createContext()` | 进程内的参考实现，每个应用都要；只依赖协议包和 `ai`                                                     |
+| `@modelctx-ai/ctx-sqlite`   | `node:sqlite` 存储                                                                              | 只能在 Node ≥22.13 上跑；自带存储的应用用不到                                                           |
+| `@modelctx-ai/ctx-models`   | 按配置建模型                                                                                    | 带进服务商 SDK（`@ai-sdk/openai-compatible`、`@ai-sdk/anthropic`）；自己传 `LanguageModel` 的应用用不到 |
+| `@modelctx-ai/ctx-mcp`      | MCP 服务器作为执行环境                                                                          | 带进 `@ai-sdk/mcp`，要起子进程                                                                          |
+| `@modelctx-ai/ctx-exec`     | 本机子进程执行环境                                                                              | 要 `node:child_process`；不跑命令的应用用不到                                                           |
+| `@modelctx-ai/ctx-remote`   | 会话存储、执行环境、harness、编排器的 HTTP 服务端和客户端                                       | 服务端要 `node:http`；进程内用法用不到                                                                  |
+| `@modelctx-ai/ctx-gateway`  | OpenAI 兼容网关                                                                                 | 本机 HTTP 服务；只有要接 OpenAI 协议客户端的应用才用                                                    |
 
 没选一个包加子路径（`@modelctx-ai/ctx/sqlite`）：适配器的依赖要么所有人都装上，要么变成可选的 peer 让使用方自己补；各部分对 Node 版本的要求也不一样。
 
@@ -26,15 +29,18 @@
 
 ## 依赖关系
 
-| 包                         | `dependencies`                                   | `peerDependencies` |
-| -------------------------- | ------------------------------------------------ | ------------------ |
-| `@modelctx-ai/ctx`         | `ai`                                             | `zod`（`ai` 要的） |
-| `@modelctx-ai/ctx-sqlite`  | —                                                | `@modelctx-ai/ctx` |
-| `@modelctx-ai/ctx-models`  | `@ai-sdk/openai-compatible`、`@ai-sdk/anthropic` | `ai`               |
-| `@modelctx-ai/ctx-mcp`     | `@ai-sdk/mcp`                                    | `@modelctx-ai/ctx` |
-| `@modelctx-ai/ctx-gateway` | —                                                | `@modelctx-ai/ctx` |
+| 包                          | `dependencies`                                   | `peerDependencies`    |
+| --------------------------- | ------------------------------------------------ | --------------------- |
+| `@modelctx-ai/ctx-protocol` | —                                                | `ai`（只用类型）      |
+| `@modelctx-ai/ctx`          | `ai`                                             | `ctx-protocol`、`zod` |
+| `@modelctx-ai/ctx-sqlite`   | —                                                | `ctx-protocol`        |
+| `@modelctx-ai/ctx-models`   | `@ai-sdk/openai-compatible`、`@ai-sdk/anthropic` | `ai`                  |
+| `@modelctx-ai/ctx-mcp`      | `@ai-sdk/mcp`                                    | `ctx-protocol`        |
+| `@modelctx-ai/ctx-exec`     | —                                                | `ctx-protocol`        |
+| `@modelctx-ai/ctx-remote`   | —                                                | `ctx-protocol`        |
+| `@modelctx-ai/ctx-gateway`  | —                                                | `ctx-protocol`        |
 
-适配包把核心包当 peer：应用里只有一份核心包，`ContextStore`、`ToolRegistry`、`Context` 这些类型和运行时对象都来自同一份。ctx-models 不需要核心包，只把 `ai` 当 peer，返回的 `LanguageModel` 和应用用的是同一份 AI SDK。仓库里对核心包的 peer 写成 `workspace:^`，同时列进 `devDependencies` 供测试和构建使用。
+依赖只朝一个方向：协议 ← 实现 ← 实践。实现包把协议包当 peer：应用里只有一份协议包，`SessionStore`、`Executor`、`Harness` 这些类型来自同一份。实现包之间不互相依赖；测试里需要一个会话存储时把 `@modelctx-ai/ctx` 列进 `devDependencies`。ctx-models 不需要协议包，只把 `ai` 当 peer，返回的 `LanguageModel` 和应用用的是同一份 AI SDK。仓库里对协议包的 peer 写成 `workspace:^`，同时列进 `devDependencies` 供测试和构建使用。
 
 ## 源码条件
 

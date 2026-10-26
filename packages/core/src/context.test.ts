@@ -6,18 +6,20 @@ import { convertArrayToReadableStream, MockLanguageModelV4 } from 'ai/test';
 import { z } from 'zod';
 import { describe, test } from 'vite-plus/test';
 
-import { createContext } from './context.ts';
 import {
   assistantEntry,
+  defineSource,
   eventEntry,
   messageEntry,
   textOf,
   userEntry,
-  type ContextEntry,
+  type Entry,
   type NewEntry,
-} from './entry.ts';
-import { defineSource } from './sources.ts';
-import { createMemoryStore, type ContextStore } from './store.ts';
+  type SessionStore,
+} from '@modelctx-ai/ctx-protocol';
+
+import { createContext } from './context.ts';
+import { createMemoryStore } from './store.ts';
 import { createToolRegistry } from './tools.ts';
 
 type GenerateResult = Awaited<ReturnType<MockLanguageModelV4['doGenerate']>>;
@@ -50,23 +52,30 @@ function textStream(text: string): StreamResult {
 }
 
 /** 包一层存储：每次追加先等一会儿，或者按需失败。 */
-function wrapStore(base: ContextStore, before: (entries: readonly NewEntry[]) => Promise<void>): ContextStore {
+function wrapStore(base: SessionStore, before: (entries: readonly NewEntry[]) => Promise<void>): SessionStore {
   return {
     ...base,
-    append: async (thread, entries) => {
+    append: async (session, entries) => {
       await before(entries);
-      return base.append(thread, entries);
+      return base.append(session, entries);
     },
   };
 }
 
-function shapeOf(entries: readonly ContextEntry[]): string[] {
+/** 消息写成 `role:内容`，框架事件写成 kind，其余写类型。 */
+function shapeOf(entries: readonly Entry[]): string[] {
   return entries.map((entry) => {
+    if (entry.type === 'event') return entry.kind;
     if (entry.type !== 'message') return entry.type;
     const { content } = entry.message;
     if (typeof content === 'string') return `${entry.message.role}:${content}`;
     return `${entry.message.role}:${content.map((part) => part.type).join('+')}`;
   });
+}
+
+/** 只看消息。 */
+function messagesOf(entries: readonly Entry[]): string[] {
+  return shapeOf(entries.filter((entry) => entry.type === 'message'));
 }
 
 /** 每次一个新模型：流一开始就报 401。 */
@@ -83,7 +92,7 @@ describe('createContext', () => {
     const model = new MockLanguageModelV4({ doGenerate: textResult('在的') });
     const context = createContext({
       store: createMemoryStore(),
-      thread: 'pet:main',
+      session: 'pet:main',
       model,
       sources: [defineSource('task', () => '当前任务：修天气地点')],
     });
@@ -92,8 +101,15 @@ describe('createContext', () => {
     const prompt = model.doGenerateCalls[0]!.prompt;
     assert.deepEqual(prompt[0], { role: 'system', content: '你是桌宠\n\n当前任务：修天气地点' });
     assert.equal(prompt[1]?.role, 'user');
-    assert.deepEqual(shapeOf(await context.entries()), ['user:在吗', 'assistant:text']);
-    assert.equal(result.recorded.length, 2);
+    assert.deepEqual(shapeOf(await context.entries()), [
+      'ctx.run.started',
+      'user:在吗',
+      'assistant:text',
+      'ctx.run.ended',
+    ]);
+    assert.equal(result.recorded.length, 4);
+    assert.equal(result.stopReason, 'end_turn');
+    assert.equal(typeof result.runId, 'string');
   });
 
   test('record:false 不写日志；prompt 函数拿到事实，放在最后', async () => {
@@ -101,7 +117,7 @@ describe('createContext', () => {
     const store = createMemoryStore();
     const context = createContext({
       store,
-      thread: 't',
+      session: 't',
       model,
       sources: [defineSource('task', () => '当前任务：写周报')],
       projection: {
@@ -148,10 +164,10 @@ describe('createContext', () => {
         execute: async ({ city }) => `${city}晴`,
       }),
     );
-    const context = createContext({ store: createMemoryStore(), thread: 't', model, tools });
+    const context = createContext({ store: createMemoryStore(), session: 't', model, tools });
     const result = await context.generate({ input: '天气？' });
     assert.equal(result.text, '台北晴。');
-    assert.deepEqual(shapeOf(await context.entries()), [
+    assert.deepEqual(messagesOf(await context.entries()), [
       'user:天气？',
       'assistant:tool-call',
       'tool:tool-result',
@@ -168,21 +184,21 @@ describe('createContext', () => {
     const base = createMemoryStore();
     const context = createContext({
       store: wrapStore(base, () => delay(20)),
-      thread: 't',
+      session: 't',
       model: new MockLanguageModelV4({ doStream: [textStream('你好'), textStream('嗯')] }),
     });
     const { result, recorded } = await context.stream({ input: '嗨' });
     assert.equal(await result.text, '你好');
-    assert.deepEqual(shapeOf(await recorded), ['user:嗨', 'assistant:text']);
-    assert.deepEqual(shapeOf(await base.list('t')), ['user:嗨', 'assistant:text']);
+    assert.deepEqual(shapeOf(await recorded), ['ctx.run.started', 'user:嗨', 'assistant:text', 'ctx.run.ended']);
+    assert.deepEqual(messagesOf(await base.list('t')), ['user:嗨', 'assistant:text']);
 
     const quiet = await context.stream({ input: '不记', record: false });
     await quiet.result.consumeStream();
     assert.deepEqual(await quiet.recorded, []);
-    assert.equal((await base.list('t')).length, 2);
+    assert.equal((await base.list('t')).length, 4);
   });
 
-  test('stream 出错时 recorded 只有用户这句；onError 只在给了回调或 logger 时接管', async () => {
+  test('stream 出错时 recorded 只有用户这句和 ctx.run.*；onError 只在给了回调或 logger 时接管', async () => {
     const printed: unknown[] = [];
     const original = console.error;
     console.error = (...args: unknown[]) => {
@@ -192,15 +208,15 @@ describe('createContext', () => {
       const warned: string[] = [];
       const logged = createContext({
         store: createMemoryStore(),
-        thread: 't',
+        session: 't',
         model: failingModel(),
         logger: { warn: (message) => warned.push(message) },
       });
       const first = await logged.stream({ input: '在吗', maxRetries: 0 });
-      assert.deepEqual(shapeOf(await first.recorded), ['user:在吗']);
+      assert.deepEqual(shapeOf(await first.recorded), ['ctx.run.started', 'user:在吗', 'ctx.error', 'ctx.run.ended']);
       assert.deepEqual(warned, ['stream failed']);
 
-      const plain = createContext({ store: createMemoryStore(), thread: 't', model: failingModel() });
+      const plain = createContext({ store: createMemoryStore(), session: 't', model: failingModel() });
       const seen: unknown[] = [];
       const second = await plain.stream({ input: '在吗', maxRetries: 0, onError: (error) => seen.push(error) });
       await second.recorded;
@@ -208,7 +224,7 @@ describe('createContext', () => {
       assert.equal(printed.length, 0);
 
       const third = await plain.stream({ input: '还在吗', maxRetries: 0 });
-      assert.deepEqual(shapeOf(await third.recorded), ['user:还在吗']);
+      assert.deepEqual(messagesOf(await third.recorded), ['user:还在吗']);
       assert.equal((printed[0] as Error | undefined)?.message, '401 Unauthorized', '缺省交给 AI SDK 的 console.error');
     } finally {
       console.error = original;
@@ -219,17 +235,18 @@ describe('createContext', () => {
     let writes = 0;
     const warned: string[] = [];
     const context = createContext({
+      // 前两次是 ctx.run.started 和用户这句，第三次写回复时失败。
       store: wrapStore(createMemoryStore(), async () => {
         writes += 1;
-        if (writes > 1) throw new Error('disk full');
+        if (writes > 2) throw new Error('disk full');
       }),
-      thread: 't',
+      session: 't',
       model: new MockLanguageModelV4({ doStream: textStream('你好') }),
       logger: { warn: (message) => warned.push(message) },
     });
     const { recorded } = await context.stream({ input: '嗨' });
     await assert.rejects(recorded, /disk full/);
-    assert.deepEqual(warned, ['failed to record streamed response']);
+    assert.deepEqual(warned, ['failed to record run']);
   });
 
   test('投影出的 system 消息不进 messages，文字按顺序接到这次的指令后面', async () => {
@@ -237,7 +254,7 @@ describe('createContext', () => {
     const model = new MockLanguageModelV4({ doGenerate: textResult('好') });
     const context = createContext({
       store: createMemoryStore({ now: () => (clock += 1) }),
-      thread: 't',
+      session: 't',
       model,
       sources: [defineSource('task', () => '当前任务：写周报')],
       projection: {
@@ -273,7 +290,7 @@ describe('createContext', () => {
   });
 
   test('没有模型时什么都不写；inputKey 让失败后的重试不再记一遍用户这句', async () => {
-    const bare = createContext({ store: createMemoryStore(), thread: 't' });
+    const bare = createContext({ store: createMemoryStore(), session: 't' });
     await assert.rejects(bare.generate({ input: '在吗' }), /No language model/);
     await assert.rejects(bare.stream({ input: '在吗' }), /No language model/);
     assert.deepEqual(await bare.entries(), []);
@@ -285,13 +302,13 @@ describe('createContext', () => {
         return textResult('三点了');
       },
     });
-    const context = createContext({ store: createMemoryStore(), thread: 't', model });
+    const context = createContext({ store: createMemoryStore(), session: 't', model });
     await assert.rejects(context.generate({ input: '几点了？', inputKey: 'turn-1', maxRetries: 0 }), /network down/);
-    assert.deepEqual(shapeOf(await context.entries()), ['user:几点了？'], '先记下的用户这句留在日志里');
+    assert.deepEqual(messagesOf(await context.entries()), ['user:几点了？'], '先记下的用户这句留在日志里');
     fail = false;
     const retry = await context.generate({ input: '几点了？', inputKey: 'turn-1', maxRetries: 0 });
-    assert.deepEqual(shapeOf(retry.recorded), ['assistant:text']);
-    assert.deepEqual(shapeOf(await context.entries()), ['user:几点了？', 'assistant:text']);
+    assert.deepEqual(messagesOf(retry.recorded), ['assistant:text']);
+    assert.deepEqual(messagesOf(await context.entries()), ['user:几点了？', 'assistant:text']);
     assert.deepEqual(
       model.doGenerateCalls.at(-1)!.prompt.map((message) => message.role),
       ['user'],
@@ -303,7 +320,7 @@ describe('createContext', () => {
     let clock = 0;
     const context = createContext({
       store: createMemoryStore({ now: () => (clock += 1) }),
-      thread: 't',
+      session: 't',
       model: summarizer,
     });
     for (let i = 0; i < 10; i += 1) {
@@ -320,13 +337,19 @@ describe('createContext', () => {
     assert.match(JSON.stringify(view.messages[0]?.content), /主人每天下午喝水/);
     assert.equal(view.messages[1]?.content, '问题8');
 
+    const [compacted] = await context.entries({ types: ['event'] });
+    assert.deepEqual(compacted?.type === 'event' && [compacted.kind, compacted.data], [
+      'ctx.compacted',
+      { covers: summary?.covers, summaryId: summary?.id },
+    ]);
+
     await context.append(userEntry('新的一句'));
     assert.equal(await context.compact({ keep: 4, minimum: 4 }), null, '摘要之后的历史不够长');
   });
 
   test('compact：没有可压的就不调模型；摘要被截断时不写', async () => {
     const unused = new MockLanguageModelV4({ doGenerate: textResult('不该用到') });
-    const short = createContext({ store: createMemoryStore(), thread: 't', model: unused });
+    const short = createContext({ store: createMemoryStore(), session: 't', model: unused });
     for (let i = 0; i < 6; i += 1) await short.append(userEntry(`问题${i}`), assistantEntry(`回答${i}`));
     assert.equal(await short.compact({ minimum: 0 }), null);
     assert.equal(unused.doGenerateCalls.length, 0);
@@ -337,7 +360,7 @@ describe('createContext', () => {
     });
     const context = createContext({
       store: createMemoryStore(),
-      thread: 't',
+      session: 't',
       model: truncated,
       logger: { warn: (message) => warned.push(message) },
     });
@@ -353,7 +376,7 @@ describe('createContext', () => {
     let clock = 0;
     const context = createContext({
       store: createMemoryStore({ now: () => (clock += 1) }),
-      thread: 't',
+      session: 't',
       model: summarizer,
     });
     const data = Buffer.alloc(3000, 7).toString('base64');
@@ -397,7 +420,50 @@ describe('createContext', () => {
   });
 
   test('没有模型时报清楚的错', async () => {
-    const context = createContext({ store: createMemoryStore(), thread: 't' });
+    const context = createContext({ store: createMemoryStore(), session: 't' });
     await assert.rejects(context.generate({ prompt: 'hi' }), /No language model/);
+  });
+
+  test('factsPlacement: prompt 把事实放进最后一条临时用户消息，system 前缀不变', async () => {
+    const model = new MockLanguageModelV4({ doGenerate: [textResult('好'), textResult('好')] });
+    let task = '写周报';
+    const context = createContext({
+      store: createMemoryStore(),
+      session: 't',
+      model,
+      factsPlacement: 'prompt',
+      sources: [defineSource('task', () => `当前任务：${task}`)],
+    });
+    await context.generate({ instructions: '你是桌宠', input: '在吗', prompt: '说一句' });
+    task = '修 bug';
+    await context.generate({ instructions: '你是桌宠', input: '还在吗' });
+    const [first, second] = model.doGenerateCalls.map((call) => call.prompt);
+    assert.deepEqual(first?.[0], { role: 'system', content: '你是桌宠' });
+    assert.deepEqual(second?.[0], first?.[0], 'system 前缀一样');
+    assert.deepEqual(first?.at(-1)?.content, [{ type: 'text', text: '当前任务：写周报\n\n说一句' }]);
+    assert.deepEqual(second?.at(-1)?.content, [{ type: 'text', text: '当前任务：修 bug' }]);
+    assert.ok(!JSON.stringify(await context.entries()).includes('当前任务'), '事实不写日志');
+  });
+
+  test('thread 是 session 的弃用别名；门面暴露 builder、executor、harness', async () => {
+    const model = new MockLanguageModelV4({ doGenerate: textResult('在的') });
+    const tools = createToolRegistry();
+    const context = createContext({ store: createMemoryStore(), thread: 'old', model, tools });
+    assert.equal(context.session, 'old');
+    assert.equal(context.thread, 'old');
+    assert.equal(context.executor, tools.executor);
+    const result = await context.harness.run({ session: 'old', agent: { model }, input: '在吗' });
+    assert.equal(result.text, '在的');
+    assert.equal((await context.builder.view('old')).messages.length, 2);
+    assert.throws(() => createContext({ store: createMemoryStore() } as never), /Pass `session`/);
+  });
+
+  test('generate 被取消时抛出；harness.run 同样的情况返回 aborted', async () => {
+    const model = new MockLanguageModelV4({ doGenerate: textResult('不该说') });
+    const context = createContext({ store: createMemoryStore(), session: 't', model });
+    await assert.rejects(context.generate({ input: '在吗', signal: AbortSignal.abort() }));
+    const result = await context.harness.run({ session: 't', agent: { model }, signal: AbortSignal.abort() });
+    assert.equal(result.stopReason, 'aborted');
+    assert.equal(model.doGenerateCalls.length, 0);
   });
 });

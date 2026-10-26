@@ -33,15 +33,27 @@ importers:
         specifier: ^7.0.150
         version: 7.0.150(zod@4.6.7)
     devDependencies:
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
       zod:
         specifier: ^4.6.7
         version: 4.6.7
+
+  packages/exec:
+    devDependencies:
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
 
   packages/gateway:
     devDependencies:
       '@modelctx-ai/ctx':
         specifier: workspace:^
         version: link:../core
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
       ai:
         specifier: ^7.0.150
         version: 7.0.150(zod@4.6.7)
@@ -58,6 +70,9 @@ importers:
       '@modelctx-ai/ctx':
         specifier: workspace:^
         version: link:../core
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
       ai:
         specifier: ^7.0.150
         version: 7.0.150(zod@4.6.7)
@@ -81,11 +96,35 @@ importers:
         specifier: ^4.6.7
         version: 4.6.7
 
-  packages/sqlite:
+  packages/protocol:
+    devDependencies:
+      ai:
+        specifier: ^7.0.150
+        version: 7.0.150(zod@4.6.7)
+
+  packages/remote:
     devDependencies:
       '@modelctx-ai/ctx':
         specifier: workspace:^
         version: link:../core
+      '@modelctx-ai/ctx-exec':
+        specifier: workspace:^
+        version: link:../exec
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
+      ai:
+        specifier: ^7.0.150
+        version: 7.0.150(zod@4.6.7)
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+
+  packages/sqlite:
+    devDependencies:
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
 
 packages:
 

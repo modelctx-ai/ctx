@@ -1,6 +1,8 @@
-import type { Awaitable, Context, ModelMessage } from '@modelctx-ai/ctx';
+import type { Awaitable, ContextBuilder, MessageEntry } from '@modelctx-ai/ctx-protocol';
 
 import { toChatMessages, type ChatCompletionRequest, type ChatMessage } from './messages.ts';
+
+type ModelMessage = MessageEntry['message'];
 
 /** 在请求转发到上游之前改写它。 */
 export type Rewrite = (request: ChatCompletionRequest) => Awaitable<ChatCompletionRequest>;
@@ -28,17 +30,39 @@ export function replaceHistory(
     const system = options.keepSystem === false ? [] : incoming.filter(isSystem);
     const start = incoming.findLastIndex((message) => message.role === 'user');
     const tail = start < 0 ? [] : incoming.slice(start).filter((message) => !isSystem(message));
-    const thread = toChatMessages(await history()).filter((message) => message.role !== 'system');
-    const last = thread.at(-1);
+    const session = toChatMessages(await history()).filter((message) => message.role !== 'system');
+    const last = session.at(-1);
     const repeated =
       last?.role === 'user' &&
       tail[0] !== undefined &&
       JSON.stringify(last.content) === JSON.stringify(tail[0].content);
-    return { ...request, messages: [...system, ...thread, ...(repeated ? tail.slice(1) : tail)] };
+    return { ...request, messages: [...system, ...session, ...(repeated ? tail.slice(1) : tail)] };
   };
 }
 
-/** 用一个 ctx 上下文的当前视图作为历史。 */
-export function withContext(context: Context, options?: ReplaceHistoryOptions): Rewrite {
-  return replaceHistory(async () => (await context.view()).messages, options);
+/** 绑定了会话、能直接给出当前视图的东西，例如 `@modelctx-ai/ctx` 的 `createContext()`。 */
+export interface SessionView {
+  view(): Promise<{ readonly messages: readonly ModelMessage[] }>;
+}
+
+/** 按会话名给出视图的东西：协议的 `ContextBuilder` 就是。 */
+export type ViewSource = Pick<ContextBuilder, 'view'>;
+
+/**
+ * 用一个会话的当前视图作为历史：`withContext(context)` 给绑定了会话的上下文，
+ * `withContext(builder, session)` 给一个 `ContextBuilder` 和会话名。
+ */
+export function withContext(context: SessionView, options?: ReplaceHistoryOptions): Rewrite;
+export function withContext(builder: ViewSource, session: string, options?: ReplaceHistoryOptions): Rewrite;
+export function withContext(
+  source: SessionView | ViewSource,
+  second?: string | ReplaceHistoryOptions,
+  third?: ReplaceHistoryOptions,
+): Rewrite {
+  if (typeof second === 'string') {
+    const builder = source as ViewSource;
+    return replaceHistory(async () => (await builder.view(second)).messages, third);
+  }
+  const context = source as SessionView;
+  return replaceHistory(async () => (await context.view()).messages, second);
 }

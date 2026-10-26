@@ -1,0 +1,57 @@
+{
+  "name": "@modelctx-ai/ctx-remote",
+  "version": "0.2.0",
+  "description": "把 ctx 的协议搬到 HTTP 上：会话存储、执行环境、harness、编排器的服务端（node:http）和客户端（只用 fetch）。",
+  "keywords": [
+    "ai",
+    "agent",
+    "context",
+    "http",
+    "ndjson",
+    "remote"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/remote"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server": {
+      "@modelctx-ai/source": "./src/server.ts",
+      "types": "./dist/server.d.ts",
+      "default": "./dist/server.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "vp pack"
+  },
+  "peerDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^"
+  },
+  "devDependencies": {
+    "@modelctx-ai/ctx": "workspace:^",
+    "@modelctx-ai/ctx-exec": "workspace:^",
+    "@modelctx-ai/ctx-protocol": "workspace:^",
+    "ai": "^7.0.150",
+    "zod": "^4.6.7"
+  }
+}

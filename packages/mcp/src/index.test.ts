@@ -5,13 +5,42 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
-import { createToolRegistry, tool, type ToolRegistry, type ToolSet } from '@modelctx-ai/ctx';
-import { z } from 'zod';
+import {
+  createContextBuilder,
+  createHarness,
+  createMemoryStore,
+  createToolRegistry,
+  jsonSchema,
+  tool,
+  type ToolRegistry,
+} from '@modelctx-ai/ctx';
+import { createScriptedModel, describeExecutorContract } from '@modelctx-ai/ctx/testing';
 import { describe, test } from 'vite-plus/test';
 
-import { createMcpHub, namespaced, type McpConnector } from './index.ts';
+import { createMcpHub, namespaced, toolOutputFromMcp, type McpConnector, type McpToolSet } from './index.ts';
 
-const fake = (text: string) => tool({ description: text, inputSchema: z.object({}), execute: async () => text });
+/** 和 `@ai-sdk/mcp` 给出的工具一样：输入结构是 `jsonSchema(...)`。 */
+const fake = (text: string) =>
+  tool({ description: text, inputSchema: jsonSchema({ type: 'object', properties: {} }), execute: async () => text });
+
+/** 回显工具：像 MCP 服务器那样回 `{ content: [{ type: 'text' }] }`。 */
+const echoTool = tool({
+  description: '原样返回',
+  inputSchema: jsonSchema<{ text: string }>({ type: 'object', properties: { text: { type: 'string' } } }),
+  execute: async (input) => ({ content: [{ type: 'text', text: JSON.stringify(input) }], isError: false }),
+});
+
+describeExecutorContract(
+  'mcp hub',
+  () => ({
+    executor: createMcpHub(
+      { local: { command: 'x' } },
+      { connector: async () => ({ tools: async () => ({ echo: echoTool }), close: async () => {} }) },
+    ),
+    echo: 'local__echo',
+  }),
+  { describe, test },
+);
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
 
@@ -33,10 +62,7 @@ function alive(pid: number): boolean {
 }
 
 function describedTools(registry: ToolRegistry): string[] {
-  return registry.list().map((info) => {
-    const found = registry.select([info.name])[info.name] as { description?: string } | undefined;
-    return `${info.name}@${info.source}:${found?.description}`;
-  });
+  return registry.list().map((info) => `${info.name}@${info.source}:${info.description}`);
 }
 
 describe('mcp hub', () => {
@@ -70,7 +96,11 @@ describe('mcp hub', () => {
       },
     );
     assert.equal(statuses.find((status) => status.name === 'off')?.state, 'disabled');
-    assert.deepEqual(Object.keys(hub.tools()).toSorted(), ['local__read_file', 'web__search']);
+    assert.deepEqual(Object.keys(hub.toolSet()).toSorted(), ['local__read_file', 'web__search']);
+    assert.deepEqual(
+      (await hub.tools()).map((definition) => `${definition.name}@${definition.source}→${definition.executor}`),
+      ['web__search@mcp:web→mcp', 'local__read_file@mcp:local→mcp'],
+    );
 
     const registry = createToolRegistry().add('local_only', fake('x'));
     assert.equal(hub.registerInto(registry), 2);
@@ -82,7 +112,8 @@ describe('mcp hub', () => {
 
     await hub.close();
     assert.deepEqual(closed.toSorted(), ['local', 'web']);
-    assert.deepEqual(hub.tools(), {});
+    assert.deepEqual(hub.toolSet(), {});
+    assert.deepEqual(await hub.tools(), []);
   });
 
   test('前缀后的名字合法且不超过 64', () => {
@@ -156,13 +187,13 @@ describe('mcp hub', () => {
     assert.equal(signals.get('hangs')?.aborted, true, '超时会中止连接用的 signal');
     assert.deepEqual(closed, ['slow']);
     await waitFor(() => closed.includes('late'));
-    assert.deepEqual(Object.keys(hub.tools()), ['good__ok'], '超时以后才连上的也关掉，不收它的工具');
+    assert.deepEqual(Object.keys(hub.toolSet()), ['good__ok'], '超时以后才连上的也关掉，不收它的工具');
     await hub.close();
   });
 
   test('改名后重名的工具留第一个，其余记进 skipped；registerInto 不替换别的来源的同名工具', async () => {
     const connector: McpConnector = async (name) => ({
-      tools: async (): Promise<ToolSet> =>
+      tools: async (): Promise<McpToolSet> =>
         name === 'my.srv'
           ? { 'read file': fake('A1'), read_file: fake('A2') }
           : { read_file: fake('B1'), search: fake('B2') },
@@ -177,7 +208,7 @@ describe('mcp hub', () => {
       { name: 'my.srv', state: 'connected', tools: ['my_srv__read_file'], skipped: ['read_file'] },
       { name: 'my_srv', state: 'connected', tools: ['my_srv__search'], skipped: ['read_file'] },
     ]);
-    assert.equal((hub.tools()['my_srv__read_file'] as { description?: string }).description, 'A1');
+    assert.equal(hub.toolSet()['my_srv__read_file']?.description, 'A1');
 
     const registry = createToolRegistry().add('my_srv__search', fake('local'));
     assert.equal(hub.registerInto(registry), 1);
@@ -199,7 +230,7 @@ describe('mcp hub', () => {
     assert.equal(hub.registerInto(two), 1);
     await hub.close();
     assert.deepEqual(hub.status(), []);
-    assert.deepEqual(hub.tools(), {});
+    assert.deepEqual(hub.toolSet(), {});
     assert.deepEqual(describedTools(one), ['local@local:l']);
     assert.equal(two.size, 0);
 
@@ -265,13 +296,89 @@ describe('mcp hub', () => {
     try {
       const [status] = await hub.connect();
       assert.deepEqual(status, { name: 'echo', state: 'connected', tools: ['echo__echo', 'echo__shout'] });
-      const execute = hub.tools()['echo__echo']?.execute as
-        | ((input: unknown, options: { toolCallId: string; messages: [] }) => Promise<unknown>)
-        | undefined;
-      const output = await execute?.({ text: '在吗' }, { toolCallId: 'c1', messages: [] });
-      assert.deepEqual(output, { content: [{ type: 'text', text: '回声：在吗' }], isError: false });
+      const [definition] = await hub.tools();
+      assert.deepEqual(definition, {
+        name: 'echo__echo',
+        description: '原样返回',
+        inputSchema: {
+          type: 'object',
+          properties: { text: { type: 'string' } },
+          required: ['text'],
+          additionalProperties: false,
+        },
+        executor: 'mcp',
+        source: 'mcp:echo',
+      });
+      const output = await hub.execute({ id: 'c1', name: 'echo__echo', input: { text: '在吗' } }, { session: 's' });
+      assert.deepEqual(output, { type: 'text', text: '回声：在吗' });
     } finally {
       await hub.close();
     }
+  });
+
+  test('hub 作为执行环境接进 harness：模型调用 MCP 工具，结果回到模型', async () => {
+    const hub = createMcpHub(
+      { web: { url: 'https://mcp.example/api' } },
+      { connector: async () => ({ tools: async () => ({ echo: echoTool }), close: async () => {} }) },
+    );
+    await hub.connect();
+    const registry = createToolRegistry();
+    hub.registerInto(registry);
+    const store = createMemoryStore();
+    const harness = createHarness({
+      store,
+      context: createContextBuilder({ store }),
+      tools: registry,
+      executors: [hub],
+    });
+    const model = createScriptedModel(
+      [
+        { type: 'tool-call', id: 'c1', input: { text: '在吗' } },
+        { type: 'text', text: '好' },
+      ],
+      { tool: 'web__echo' },
+    );
+    const result = await harness.run({ session: 's', agent: { model }, input: '回显' });
+    assert.equal(result.stopReason, 'end_turn');
+    assert.match(JSON.stringify(model.doGenerateCalls[1]!.prompt.at(-1)), /在吗/);
+    await hub.close();
+  });
+
+  test('MCP 结果转成协议的结果：文字合成一段，图片是文件，isError 是错误', () => {
+    assert.deepEqual(
+      toolOutputFromMcp({
+        content: [
+          { type: 'text', text: 'a' },
+          { type: 'text', text: 'b' },
+        ],
+      }),
+      {
+        type: 'text',
+        text: 'a\nb',
+      },
+    );
+    assert.deepEqual(
+      toolOutputFromMcp({
+        content: [
+          { type: 'text', text: '截图' },
+          { type: 'image', data: 'aGk=', mimeType: 'image/png' },
+        ],
+      }),
+      {
+        type: 'content',
+        parts: [
+          { type: 'text', text: '截图' },
+          { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'aGk=' } },
+        ],
+      },
+    );
+    assert.deepEqual(toolOutputFromMcp({ content: [{ type: 'text', text: '文件不存在' }], isError: true }), {
+      type: 'error',
+      message: '文件不存在',
+    });
+    assert.deepEqual(toolOutputFromMcp({ toolResult: { ok: true } }), {
+      type: 'json',
+      value: { toolResult: { ok: true } },
+    });
   });
 });

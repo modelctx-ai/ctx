@@ -1,6 +1,6 @@
 {
   "name": "@modelctx-ai/ctx-sqlite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "ctx 的 SQLite 存储，基于 Node 自带的 node:sqlite，不需要原生依赖。",
   "keywords": [
     "ai",
@@ -37,9 +37,9 @@
     "build": "vp pack"
   },
   "peerDependencies": {
-    "@modelctx-ai/ctx": "workspace:^"
+    "@modelctx-ai/ctx-protocol": "workspace:^"
   },
   "devDependencies": {
-    "@modelctx-ai/ctx": "workspace:^"
+    "@modelctx-ai/ctx-protocol": "workspace:^"
   }
 }

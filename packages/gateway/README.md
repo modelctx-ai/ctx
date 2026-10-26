@@ -5,10 +5,10 @@
 ## 安装
 
 ```sh
-pnpm add @modelctx-ai/ctx-gateway @modelctx-ai/ctx zod
+pnpm add @modelctx-ai/ctx-gateway @modelctx-ai/ctx-protocol
 ```
 
-Node ≥22。
+Node ≥22。只依赖 `@modelctx-ai/ctx-protocol`；下面的例子另外用到核心包 `@modelctx-ai/ctx`（`pnpm add @modelctx-ai/ctx zod`）。
 
 ## 用法
 
@@ -18,7 +18,7 @@ import { randomBytes } from 'node:crypto';
 import { createContext, createMemoryStore } from '@modelctx-ai/ctx';
 import { startGateway, withContext } from '@modelctx-ai/ctx-gateway';
 
-const context = createContext({ store: createMemoryStore(), thread: 'pet:main' });
+const context = createContext({ store: createMemoryStore(), session: 'pet:main' });
 const accessToken = randomBytes(24).toString('base64url');
 
 // 缺省只听 127.0.0.1、随机端口；只认本机的 Host，带 Origin 的浏览器请求一律 403
@@ -40,8 +40,9 @@ import { createServer } from 'node:http';
 import { createContext, createMemoryStore } from '@modelctx-ai/ctx';
 import { createGatewayHandler, withContext, type Rewrite } from '@modelctx-ai/ctx-gateway';
 
-const context = createContext({ store: createMemoryStore(), thread: 'pet:main' });
+const context = createContext({ store: createMemoryStore(), session: 'pet:main' });
 const history = withContext(context, { keepSystem: false });
+// 不经门面也行：任何 ContextBuilder 加会话名，例如 withContext(createContextBuilder({ store }), 'pet:main')
 const rewrite: Rewrite = async (request) => ({ ...(await history(request)), model: 'deepseek-chat' });
 
 const handle = createGatewayHandler({
@@ -78,15 +79,15 @@ createServer((req, res) => void handle(req, res)).listen(8080, '127.0.0.1');
 
 ## 导出
 
-| 导出                                                                                                                                                          | 说明                                                        |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| `startGateway(options)`                                                                                                                                       | 起一个网关，返回 `{ origin, baseUrl, close() }`             |
-| `createGatewayHandler(options)`                                                                                                                               | 返回 `(req, res) => Promise<void>`，挂到已有的 HTTP 服务上  |
-| `replaceHistory(history, options?)`                                                                                                                           | 生成改写函数，历史换成 `history()` 给的全文                 |
-| `withContext(context, options?)`                                                                                                                              | 用 ctx 上下文的 `view()` 作为历史                           |
-| `toChatMessages(messages)`                                                                                                                                    | AI SDK 消息转成 Chat Completions 消息：工具调用和结果、图片 |
-| `chatText(content)`                                                                                                                                           | Chat Completions 消息里的纯文字                             |
-| `GatewayOptions`、`UpstreamOptions`、`Gateway`、`Rewrite`、`ReplaceHistoryOptions`、`ChatCompletionRequest`、`ChatMessage`、`ChatContentPart`、`ChatToolCall` | 类型                                                        |
+| 导出                                                                                                                                                          | 说明                                                                                                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `startGateway(options)`                                                                                                                                       | 起一个网关，返回 `{ origin, baseUrl, close() }`                                                     |
+| `createGatewayHandler(options)`                                                                                                                               | 返回 `(req, res) => Promise<void>`，挂到已有的 HTTP 服务上                                          |
+| `replaceHistory(history, options?)`                                                                                                                           | 生成改写函数，历史换成 `history()` 给的全文                                                         |
+| `withContext(context, options?)`、`withContext(builder, session, options?)`                                                                                   | 用会话的当前视图作为历史：`createContext()` 的 `view()`，或任何 `ContextBuilder` 的 `view(session)` |
+| `toChatMessages(messages)`                                                                                                                                    | AI SDK 消息转成 Chat Completions 消息：工具调用和结果、图片                                         |
+| `chatText(content)`                                                                                                                                           | Chat Completions 消息里的纯文字                                                                     |
+| `GatewayOptions`、`UpstreamOptions`、`Gateway`、`Rewrite`、`ReplaceHistoryOptions`、`ChatCompletionRequest`、`ChatMessage`、`ChatContentPart`、`ChatToolCall` | 类型                                                                                                |
 
 `GatewayOptions`：
 

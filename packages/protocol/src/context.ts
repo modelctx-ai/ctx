@@ -1,15 +1,87 @@
-import type { ModelMessage } from 'ai';
+import type { ModelMessage, UserContent } from 'ai';
 
 import {
   compareCursor,
   cursorOf,
-  type ContextEntry,
   type Cursor,
+  type Entry,
   type EventEntry,
   type MessageEntry,
   type SummaryEntry,
-} from './entry.ts';
+} from './session.ts';
+import type { ModelRef } from './harness.ts';
 import { estimateTokens } from './tokens.ts';
+import type { ToolDefinition } from './tools.ts';
+import type { Awaitable } from './types.ts';
+
+// ---- 来源和事实 ----
+
+export interface SourceContext {
+  readonly session: string;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * 生成那一刻才去取的上下文，例如当前任务、粘贴板、天气。
+ * 返回的文字只在这一次调用里出现，不写进日志。
+ */
+export interface ContextSource {
+  readonly name: string;
+  collect(context: SourceContext): Awaitable<string | null | undefined>;
+}
+
+export interface Fact {
+  readonly source: string;
+  readonly text: string;
+}
+
+export function defineSource(name: string, collect: ContextSource['collect']): ContextSource {
+  return { name, collect };
+}
+
+export interface CollectOptions extends SourceContext {
+  /** 单个来源最多等多久，超时就当它这次没有内容。 */
+  readonly timeoutMs?: number;
+  readonly onError?: (source: string, error: unknown) => void;
+}
+
+const DEFAULT_TIMEOUT_MS = 2_000;
+
+function withTimeout<T>(work: Promise<T>, ms: number, name: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`context source "${name}" timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** 并行收集。某个来源出错或超时只影响它自己，顺序按来源列表。 */
+export async function collectFacts(sources: readonly ContextSource[], options: CollectOptions): Promise<Fact[]> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const context: SourceContext = options.signal
+    ? { session: options.session, signal: options.signal }
+    : { session: options.session };
+  const results = await Promise.all(
+    sources.map(async (source): Promise<Fact | null> => {
+      try {
+        const text = await withTimeout(Promise.resolve(source.collect(context)), timeoutMs, source.name);
+        const trimmed = typeof text === 'string' ? text.trim() : '';
+        return trimmed ? { source: source.name, text: trimmed } : null;
+      } catch (error) {
+        options.onError?.(source.name, error);
+        return null;
+      }
+    }),
+  );
+  return results.filter((fact): fact is Fact => fact !== null);
+}
+
+export function renderFacts(facts: readonly Fact[], heading?: string): string {
+  const lines = facts.map((fact) => fact.text);
+  return (heading ? [heading, ...lines] : lines).join('\n');
+}
+
+// ---- 投影 ----
 
 /** 一种事件怎么进入模型上下文。没有规则的事件不进上下文。 */
 export interface EventRule {
@@ -19,11 +91,16 @@ export interface EventRule {
   render(events: readonly EventEntry[]): ModelMessage | readonly ModelMessage[] | null | undefined;
 }
 
+/** 窗口：这一次投影最多带多少。能序列化，`AgentSpec`、`BuildRequest` 直接带它。 */
 export interface WindowOptions {
   /** 最多保留多少条消息（摘要不算）。 */
   readonly maxMessages?: number;
   /** 估算 token 的预算（摘要计入）。 */
   readonly maxTokens?: number;
+}
+
+/** 进程内投影另可换掉 token 估算。 */
+export interface ProjectionWindow extends WindowOptions {
   readonly estimate?: (message: ModelMessage) => number;
 }
 
@@ -34,7 +111,7 @@ export interface ProjectionOptions {
   /** 改写或过滤消息条目，返回空就丢掉。 */
   readonly message?: (entry: MessageEntry) => ModelMessage | null | undefined;
   /** 不给就不裁剪：整段历史都带上。 */
-  readonly window?: WindowOptions;
+  readonly window?: ProjectionWindow;
 }
 
 export interface ProjectedMessage {
@@ -60,7 +137,7 @@ export function defaultSummaryMessage(entry: SummaryEntry): ModelMessage {
 }
 
 /** 生效的摘要是覆盖范围最大的那一条。 */
-export function latestSummary(entries: readonly ContextEntry[]): SummaryEntry | undefined {
+export function latestSummary(entries: readonly Entry[]): SummaryEntry | undefined {
   let found: SummaryEntry | undefined;
   for (const entry of entries) {
     if (entry.type !== 'summary') continue;
@@ -119,7 +196,7 @@ function windowed(
  * 2. 消息条目原样带上；事件按规则渲染，`fold` 的同类事件连在一起时合成一组；
  * 3. 有窗口时从最旧的消息开始裁，工具调用和结果成组进出。
  */
-export function project(entries: readonly ContextEntry[], options: ProjectionOptions = {}): Projection {
+export function project(entries: readonly Entry[], options: ProjectionOptions = {}): Projection {
   const estimate = options.window?.estimate ?? estimateTokens;
   const sorted = entries.toSorted(compareCursor);
   const summary = latestSummary(sorted);
@@ -171,4 +248,63 @@ export function project(entries: readonly ContextEntry[], options: ProjectionOpt
     ...(summary ? { summary } : {}),
   };
   return result;
+}
+
+// ---- 组装 ----
+
+export interface BuildRequest {
+  readonly session: string;
+  /** 这一轮的输入，接在历史后面。已经写进日志时不传。 */
+  readonly input?: UserContent;
+  /** `AgentSpec` 的指令。事实、投影里的 system 文字接在它后面。 */
+  readonly instructions?: string;
+  /** 最后一条临时用户消息，不写日志。 */
+  readonly prompt?: UserContent;
+  /** 候选工具，builder 可以再筛。 */
+  readonly tools?: readonly ToolDefinition[];
+  /** 覆盖 builder 自己的窗口设置。 */
+  readonly window?: WindowOptions;
+  /** 是否收集来源，缺省收集。 */
+  readonly facts?: boolean;
+  readonly signal?: AbortSignal;
+}
+
+/** 一次模型调用的输入。能序列化：harness 可以把它交给别处的模型调用方。 */
+export interface PreparedCall {
+  /** 指令 + 事实 + 投影里的 system 文字；`messages` 里不再有 system 消息。 */
+  readonly instructions?: string;
+  readonly messages: ModelMessage[];
+  /** 这次交给模型的工具名，是 `BuildRequest.tools` 的子集。 */
+  readonly tools: readonly string[];
+  readonly facts: readonly Fact[];
+  readonly projection: Projection;
+}
+
+export interface ViewOptions {
+  readonly window?: WindowOptions;
+}
+
+export interface CompactOptions {
+  /** 写摘要用的模型。跨边界时只能是名字。 */
+  readonly model?: ModelRef;
+  /** 最近多少条消息原样保留。 */
+  readonly keep?: number;
+  /** 更早的消息少于这么多条就不压缩。 */
+  readonly minimum?: number;
+  readonly instructions?: string;
+  readonly maxOutputTokens?: number;
+  readonly timeoutMs?: number;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * 上下文：把会话日志、来源取到的事实、这一轮的输入组装成一次调用。它持有一个 `SessionStore`，
+ * 调用方只给会话名。每次重算，不改日志（压缩除外，它追加摘要）。
+ */
+export interface ContextBuilder {
+  build(request: BuildRequest): Promise<PreparedCall>;
+  /** 当前视图：摘要 + 之后的条目，按规则渲染。 */
+  view(session: string, options?: ViewOptions): Promise<Projection>;
+  /** 把较早的历史压成一条摘要并追加，同时记一条 `ctx.compacted`。历史不够长时返回 null。 */
+  compact?(session: string, options?: CompactOptions): Promise<SummaryEntry | null>;
 }

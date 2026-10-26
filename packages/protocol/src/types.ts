@@ -11,3 +11,13 @@ export interface Logger {
 }
 
 export const silentLogger: Logger = { warn() {} };
+
+/**
+ * 跨进程边界时错误的形状：`{ error: ErrorInfo }`。进程内照常抛 `Error`。
+ * `type` 是机器可读的类别（例如 `not_found`、`timeout`），`message` 写给人看。
+ */
+export interface ErrorInfo {
+  readonly message: string;
+  readonly type?: string;
+  readonly retryable?: boolean;
+}

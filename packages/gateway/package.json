@@ -1,6 +1,6 @@
 {
   "name": "@modelctx-ai/ctx-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenAI 兼容的本机网关：转发聊天请求，把调用方带来的历史换成 ctx 管理的上下文。",
   "keywords": [
     "ai",
@@ -38,10 +38,11 @@
     "build": "vp pack"
   },
   "peerDependencies": {
-    "@modelctx-ai/ctx": "workspace:^"
+    "@modelctx-ai/ctx-protocol": "workspace:^"
   },
   "devDependencies": {
     "@modelctx-ai/ctx": "workspace:^",
+    "@modelctx-ai/ctx-protocol": "workspace:^",
     "ai": "^7.0.150",
     "zod": "^4.6.7"
   }

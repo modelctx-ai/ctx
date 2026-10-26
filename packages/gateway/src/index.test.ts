@@ -6,6 +6,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   assistantEntry,
   createContext,
+  createContextBuilder,
   createMemoryStore,
   eventEntry,
   userEntry,
@@ -364,20 +365,21 @@ describe('rewrite', () => {
     assert.deepEqual(same.messages, [picture('https://example.com/a.png'), { role: 'assistant', content: '预填' }]);
   });
 
-  test('withContext 用上下文的视图作为历史', async () => {
+  test('withContext 用上下文的视图作为历史；也可以给 builder 和会话名', async () => {
+    const store = createMemoryStore();
     const context = createContext({
-      store: createMemoryStore(),
-      thread: 't',
+      store,
+      session: 't',
       projection: {
         events: {
-          whisper: {
+          'pet.whisper': {
             fold: true,
             render: (events) => ({ role: 'assistant', content: events.map((e) => e.text).join('\n') }),
           },
         },
       },
     });
-    await context.append(eventEntry('whisper', { text: '在呢' }), userEntry('看一下测试'), assistantEntry('好'));
+    await context.append(eventEntry('pet.whisper', { text: '在呢' }), userEntry('看一下测试'), assistantEntry('好'));
     const out = await withContext(context, { keepSystem: false })({
       messages: [
         { role: 'system', content: '丢掉' },
@@ -387,6 +389,15 @@ describe('rewrite', () => {
     assert.deepEqual(
       out.messages.map((message) => `${message.role}:${contentText(message)}`),
       ['assistant:在呢', 'user:看一下测试', 'assistant:好', 'user:继续'],
+    );
+    const viaBuilder = await withContext(
+      createContextBuilder({ store }),
+      't',
+    )({ messages: [{ role: 'user', content: '继续' }] });
+    assert.deepEqual(
+      viaBuilder.messages.map((message) => `${message.role}:${contentText(message)}`),
+      ['user:看一下测试', 'assistant:好', 'user:继续'],
+      '这个 builder 没有事件规则，碎碎念不进视图',
     );
   });
 
