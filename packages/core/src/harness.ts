@@ -1,6 +1,10 @@
 import {
   agentSpecToJson,
+  CTX_EVENTS,
+  CtxError,
   ctxErrorEntry,
+  headSeq,
+  isConflict,
   errorOutput,
   messageEntry,
   runEndedEntry,
@@ -14,6 +18,7 @@ import {
   type Harness,
   type Hooks,
   type Logger,
+  type Message,
   type ModelHookContext,
   type NewEntry,
   type PreparedCall,
@@ -42,6 +47,7 @@ import {
 } from 'ai';
 
 import { isEmptyContent, resolveModel } from './builder.ts';
+import { fromModelMessages, toModelMessages } from './messages.ts';
 import { dispatchTo, executorMap, toToolSet, type Executors, type ToolDispatch } from './tools.ts';
 
 export type GenerateTextResult = Awaited<ReturnType<typeof generateText>>;
@@ -100,6 +106,8 @@ interface RunState {
   readonly request: RunRequest;
   readonly record: boolean;
   readonly recorded: Entry[];
+  /** 本轮最后一次写入之后会话的末尾 `seq`，下一次写入拿它当 `expectSeq`；还没写过时是 `undefined`。 */
+  head: number | undefined;
   /** 写日志失败过：这时 run 要 reject，不能当成模型出错。 */
   logFailed: boolean;
 }
@@ -114,7 +122,7 @@ interface Setup {
 
 interface Produced {
   readonly text: string;
-  readonly messages: readonly ModelMessage[];
+  readonly messages: readonly Message[];
   readonly finishReason: FinishReason;
   readonly steps: number;
   readonly usage: LanguageModelUsage | undefined;
@@ -149,7 +157,12 @@ export function errorInfo(error: unknown): ErrorInfo {
     };
   }
   if (root instanceof Error) {
-    return root.name && root.name !== 'Error' ? { message: root.message, type: root.name } : { message: root.message };
+    const retryable = (root as { retryable?: unknown }).retryable;
+    return {
+      message: root.message,
+      ...(root.name && root.name !== 'Error' ? { type: root.name } : {}),
+      ...(typeof retryable === 'boolean' ? { retryable } : {}),
+    };
   }
   return { message: String(root) };
 }
@@ -177,8 +190,35 @@ function begin(request: RunRequest): RunState {
     request,
     record: request.record !== false,
     recorded: [],
+    head: undefined,
     logFailed: false,
   };
+}
+
+/** 前提冲突时别人已经给这一轮写了 `ctx.run.ended`（被 `recover` 当作断掉的运行收走了）：这一轮停下，不再写。 */
+class Fenced extends Error {
+  constructor() {
+    super('This run was ended by another process (fenced).');
+    this.name = 'Fenced';
+  }
+}
+
+/** 写入冲突后最多重试几次；超过就当写日志失败。冲突只来自应用事件，几次之内必然追上。 */
+const MAX_CONFLICTS = 20;
+
+/** 会话里已有未结束的运行：什么都没写，这一轮以 `error` 结束，稍后重试。 */
+function busy(state: RunState): RunResult {
+  const info = errorInfo(
+    new CtxError('session_busy', `Session "${state.request.session}" already has a run in progress.`, {
+      retryable: true,
+    }),
+  );
+  return { runId: state.runId, text: '', messages: [], recorded: [], stopReason: 'error', error: info };
+}
+
+/** 被围栏：别人已经结束了这一轮，不再写 ended。 */
+function fenced(state: RunState): RunResult {
+  return { runId: state.runId, text: '', messages: [], recorded: state.recorded, stopReason: 'aborted' };
 }
 
 export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
@@ -223,19 +263,81 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     return (await hooks.afterTool?.(actual, output, execution)) ?? output;
   };
 
+  /** 追加并记下新的末尾。 */
+  async function append(state: RunState, entries: readonly NewEntry[], expectSeq: number | undefined) {
+    const written = await store.append(
+      state.request.session,
+      entries,
+      expectSeq === undefined ? undefined : { expectSeq },
+    );
+    state.recorded.push(...written);
+    state.head = written.at(-1)?.seq ?? state.head;
+  }
+
+  /**
+   * 本轮的写入：带 `expectSeq`（上一次写入返回的末尾）。冲突时先看有没有人给自己的 `runId` 写了 `ended`：
+   * 有就是被围栏了，抛 `Fenced`；没有只是别人写了应用事件，用新的末尾重试。
+   */
   async function write(state: RunState, entries: readonly NewEntry[]): Promise<void> {
     if (!state.record || entries.length === 0) return;
     try {
-      state.recorded.push(...(await store.append(state.request.session, entries)));
+      for (let conflicts = 0; ; conflicts += 1) {
+        try {
+          return await append(state, entries, state.head);
+        } catch (error) {
+          if (!isConflict(error) || state.head === undefined || conflicts >= MAX_CONFLICTS) throw error;
+          // 先读末尾再读 ended：中间若又有人写，下一次写入会再冲突，再查一遍。
+          const head = await headSeq(store, state.request.session);
+          const ended = await store.list(state.request.session, { after: state.head, kinds: [CTX_EVENTS.runEnded] });
+          if (
+            ended.some(
+              (entry) =>
+                (entry.type === 'event' ? (entry.data as { runId?: unknown } | undefined)?.runId : undefined) ===
+                state.runId,
+            )
+          ) {
+            throw new Fenced();
+          }
+          state.head = head;
+        }
+      }
     } catch (error) {
-      state.logFailed = true;
+      if (!(error instanceof Fenced)) state.logFailed = true;
       throw error;
     }
   }
 
-  async function writeStarted(state: RunState): Promise<void> {
-    const { agent } = state.request;
-    await write(state, [runStartedEntry({ runId: state.runId, agent: agentSpecToJson(agent) }, { source: 'harness' })]);
+  /**
+   * 开始一轮：会话里最后一个生命周期事件是 `started` 就说明有未结束的运行，返回 false，什么都不写；
+   * 否则带着刚读到的末尾追加 `ctx.run.started`，冲突就重读重判。`record: false` 不碰日志，总是 true。
+   */
+  async function writeStarted(state: RunState): Promise<boolean> {
+    if (!state.record) return true;
+    const { agent, session } = state.request;
+    const started = runStartedEntry(
+      {
+        runId: state.runId,
+        agent: agentSpecToJson(agent),
+        ...(state.request.owner !== undefined ? { owner: state.request.owner } : {}),
+      },
+      { source: 'harness' },
+    );
+    try {
+      for (let conflicts = 0; ; conflicts += 1) {
+        const head = await headSeq(store, session);
+        const [last] = await store.list(session, { kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded], last: 1 });
+        if (last?.type === 'event' && last.kind === CTX_EVENTS.runStarted) return false;
+        try {
+          await append(state, [started], head);
+          return true;
+        } catch (error) {
+          if (!isConflict(error) || conflicts >= MAX_CONFLICTS) throw error;
+        }
+      }
+    } catch (error) {
+      state.logFailed = true;
+      throw error;
+    }
   }
 
   async function setup(state: RunState, extras: RunExtras, signal: AbortSignal): Promise<Setup> {
@@ -255,7 +357,15 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       ...(request.prompt !== undefined ? { prompt: request.prompt } : {}),
       tools: candidates,
       ...(agent.window ? { window: agent.window } : {}),
-      ...(extras.facts !== undefined ? { facts: extras.facts } : {}),
+      // `createContext` 自己收了事实时给 `false`，以它为准；否则按 `agent.context` 选事实和投影。
+      ...(extras.facts === false
+        ? { facts: false }
+        : agent.context?.facts !== undefined
+          ? { facts: agent.context.facts }
+          : extras.facts !== undefined
+            ? { facts: extras.facts }
+            : {}),
+      ...(agent.context?.projection !== undefined ? { projection: agent.context.projection } : {}),
       signal,
     });
     const hookContext: ModelHookContext = { runId: state.runId, session, step: 0, signal };
@@ -284,7 +394,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     return {
       model: ready.model,
       ...(prepared.instructions ? { instructions: prepared.instructions } : {}),
-      messages: prepared.messages,
+      messages: toModelMessages(prepared.messages),
       ...(ready.toolCount > 0 ? { tools: ready.tools } : {}),
       stopWhen: stepCountIs(ready.maxSteps),
       ...(settings.temperature !== undefined ? { temperature: settings.temperature } : {}),
@@ -307,7 +417,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         ? {
             prepareStep: async ({ stepNumber, messages }: { stepNumber: number; messages: ModelMessage[] }) => {
               if (stepNumber === 0) return undefined;
-              const call: PreparedCall = { ...prepared, messages };
+              const call: PreparedCall = { ...prepared, messages: fromModelMessages(messages) };
               const changed = await beforeModel(call, {
                 runId: state.runId,
                 session: state.request.session,
@@ -316,7 +426,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
               });
               if (!changed || changed === call) return undefined;
               return {
-                messages: changed.messages,
+                messages: toModelMessages(changed.messages),
                 ...(changed.instructions !== undefined ? { instructions: changed.instructions } : {}),
               };
             },
@@ -345,20 +455,26 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
 
   /** 出错或取消：照样写 `ctx.run.ended`，返回结果而不是抛。 */
   async function fail(state: RunState, error: unknown, signal: AbortSignal): Promise<RunResult> {
+    if (error instanceof Fenced) return fenced(state);
     const stopReason: StopReason = signal.aborted ? 'aborted' : 'error';
     const info = errorInfo(error);
     if (stopReason === 'error') logger.debug?.('run failed', { runId: state.runId, error: info.message });
-    await write(state, [
-      ...(stopReason === 'error'
-        ? [
-            ctxErrorEntry(
-              { runId: state.runId, message: info.message, ...(info.type ? { type: info.type } : {}) },
-              { source: 'harness' },
-            ),
-          ]
-        : []),
-      runEndedEntry({ runId: state.runId, stopReason }, { source: 'harness' }),
-    ]);
+    try {
+      await write(state, [
+        ...(stopReason === 'error'
+          ? [
+              ctxErrorEntry(
+                { runId: state.runId, message: info.message, ...(info.type ? { type: info.type } : {}) },
+                { source: 'harness' },
+              ),
+            ]
+          : []),
+        runEndedEntry({ runId: state.runId, stopReason }, { source: 'harness' }),
+      ]);
+    } catch (writeError) {
+      if (writeError instanceof Fenced) return fenced(state);
+      throw writeError;
+    }
     return {
       runId: state.runId,
       text: '',
@@ -369,16 +485,78 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     };
   }
 
+  /** 进程内每会话一条队列，队尾是前一个记录型运行结束的时刻。队列里的 promise 永远 resolve，不会 reject。 */
+  const tails = new Map<string, Promise<void>>();
+
+  /**
+   * 排进这个会话的队：同一个 harness 里记录型运行（`record` 不为 `false`）一个接一个，第二个等前一个结束再开始，
+   * 所以 `session_busy` 只会出现在跨进程（或别的 harness 实例）的时候。`record: false` 不排。
+   * 前面有人在跑、自己在排队时 `signal` 中止，就退出队列，返回 `undefined`，调用方以 `aborted` 结束，什么都没写。
+   * 返回的 `release` 在运行结束时调；可以重复调。
+   */
+  async function enter(state: RunState): Promise<(() => void) | undefined> {
+    if (!state.record) return () => {};
+    const { session } = state.request;
+    const { signal } = state.request;
+    const queued = tails.has(session);
+    const previous = tails.get(session) ?? Promise.resolve();
+    const turn = Promise.withResolvers<void>();
+    const tail = previous.then(() => turn.promise);
+    tails.set(session, tail);
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      turn.resolve();
+      void tail.finally(() => {
+        if (tails.get(session) === tail) tails.delete(session);
+      });
+    };
+    // 没人排在前面就直接开始：`signal` 已经中止的运行照常写 started 和 ended（见契约）。
+    if (!queued) return release;
+    if (signal) {
+      // 等完就摘掉监听：调用方长期复用同一个 signal 时不会越积越多。
+      let onAbort: (() => void) | undefined;
+      const aborted = new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        onAbort = resolve;
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      let waited = false;
+      await Promise.race([previous.then(() => (waited = true)), aborted]);
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      if (signal.aborted || !waited) {
+        release();
+        return undefined;
+      }
+    } else {
+      await previous;
+    }
+    return release;
+  }
+
   async function run(request: RunRequest, extras: RunExtras = {}): Promise<RunOutcome> {
     const state = begin(request);
+    const release = await enter(state);
+    if (!release) return { result: fenced(state) };
+    try {
+      return await runLocked(state, extras);
+    } finally {
+      release();
+    }
+  }
+
+  async function runLocked(state: RunState, extras: RunExtras): Promise<RunOutcome> {
+    const { request } = state;
     const controller = linked(request.signal);
-    await writeStarted(state);
+    if (!(await writeStarted(state))) return { result: busy(state) };
     try {
       const ready = await setup(state, extras, controller.signal);
       const raw = await generateText(callOptions(state, ready, controller.signal));
       const result = await finish(state, ready, {
         text: raw.text,
-        messages: raw.responseMessages,
+        // 子集之外的部件在这里抛 `unsupported_part`，下面的 catch 把这一轮以 `error` 结束。
+        messages: fromModelMessages(raw.responseMessages),
         finishReason: raw.finishReason,
         steps: raw.steps.length,
         usage: raw.usage,
@@ -392,8 +570,28 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
 
   async function startStream(request: RunRequest, extras: RunExtras = {}): Promise<StartedStream> {
     const state = begin(request);
+    const release = await enter(state);
+    if (!release) {
+      const outcome = Promise.resolve<RunOutcome>({ result: fenced(state) });
+      return { runId: state.runId, done: () => outcome };
+    }
+    try {
+      return await startStreamLocked(state, extras, release);
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
+  /** 流式的一轮；队列的位置在这一轮真正结束（结果落定）时才交出去，由 `release` 负责。 */
+  async function startStreamLocked(state: RunState, extras: RunExtras, release: () => void): Promise<StartedStream> {
+    const { request } = state;
     const controller = linked(request.signal);
-    await writeStarted(state);
+    if (!(await writeStarted(state))) {
+      release();
+      const outcome = Promise.resolve<RunOutcome>({ result: busy(state) });
+      return { runId: state.runId, done: () => outcome };
+    }
     let ready: Setup;
     try {
       ready = await setup(state, extras, controller.signal);
@@ -401,24 +599,32 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       if (state.logFailed) throw error;
       const outcome = fail(state, error, controller.signal).then((result) => ({ result, cause: error }));
       outcome.catch(() => {});
+      void outcome.then(release, release);
       return { runId: state.runId, done: () => outcome };
     }
 
     const finished = Promise.withResolvers<RunOutcome>();
     // 没人等结果时，写日志失败也不能变成未处理的 rejection。
     finished.promise.catch(() => {});
+    void finished.promise.then(release, release);
     let settled = false;
     let failure: unknown;
     const settle = (work: () => Promise<RunResult>, cause?: unknown): void => {
       if (settled) return;
       settled = true;
-      work().then(
-        (result) => finished.resolve(cause === undefined ? { result } : { result, cause }),
-        (error: unknown) => {
-          logger.warn('failed to record run', { runId: state.runId, error: errorInfo(error).message });
-          finished.reject(error);
-        },
-      );
+      work()
+        .catch((error: unknown) => {
+          // 被围栏：别人已经结束了这一轮，不算写日志失败。
+          if (error instanceof Fenced) return fenced(state);
+          throw error;
+        })
+        .then(
+          (result) => finished.resolve(cause === undefined ? { result } : { result, cause }),
+          (error: unknown) => {
+            logger.warn('failed to record run', { runId: state.runId, error: errorInfo(error).message });
+            finished.reject(error);
+          },
+        );
     };
     const report =
       extras.onError ?? ((error: unknown) => logger.warn('stream failed', { error: errorInfo(error).message }));
@@ -430,10 +636,18 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         report(error);
       },
       onEnd: (event) => {
+        let messages: Message[];
+        try {
+          messages = fromModelMessages(event.responseMessages);
+        } catch (error) {
+          // 子集之外的部件：这一轮以 `error` 结束，不写半截的产出。
+          settle(() => fail(state, error, controller.signal), error);
+          return;
+        }
         settle(() =>
           finish(state, ready, {
             text: event.text,
-            messages: event.responseMessages,
+            messages,
             finishReason: event.finishReason,
             steps: event.steps.length,
             usage: event.totalUsage,

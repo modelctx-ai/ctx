@@ -134,12 +134,31 @@ for await (const event of harness.stream({
 
 流程：`ctx.run.started` → 记输入（`inputKey` 幂等）→ `build` → `beforeModel` → 调模型（每个工具调用经 `beforeTool` → 执行环境 → `afterTool`）→ 记产出 → `ctx.run.ended`。`record: false` 一条都不写。
 
+`AgentSpec.context` 按一轮选事实和投影（只按名字选，所以能序列化）：builder 里注册，agent 里引用。
+
+```ts
+const builder = createContextBuilder({
+  store,
+  sources: [clock, weather], // ContextSource，按 name 选
+  projection: {}, // default
+  projections: { brief: { window: { maxMessages: 6 } } },
+});
+// 只用 weather 的事实，放进最后一条临时用户消息；用 brief 投影
+const agent = {
+  model: 'deepseek-chat',
+  context: { facts: { sources: ['weather'], placement: 'prompt' }, projection: 'brief' },
+};
+```
+
+`facts: false` 不收事实；不认识的投影名这一轮以 `not_found` 结束，不回退到缺省。
+
 ### 编排器
 
 ```ts
 import { createOrchestrator } from '@modelctx-ai/ctx';
 
-const orchestrator = createOrchestrator({ harness, store });
+const orchestrator = createOrchestrator({ harness, store, owner: 'pet' });
+// 用缺省 record（写日志）的应用：启动时先 recover 再 submit，否则崩溃留下的运行会让该会话一直 session_busy
 await orchestrator.recover?.(); // 给崩溃时断掉的运行补 ctx.run.ended（error）
 const handle = await orchestrator.submit({ session: 'user:42', agent: { model: 'deepseek-chat' }, input: '在吗' });
 await orchestrator.status(handle.runId); // queued / running / completed / failed / cancelled
@@ -151,21 +170,23 @@ await orchestrator.close();
 
 ## 导出
 
-| 导出                                                                                                                           | 说明                                                                                                                                                                                           |
-| ------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 协议包的全部导出                                                                                                               | `SessionStore`、`ContextBuilder`、`ToolRegistry`、`Executor`、`Harness`、`Orchestrator` 等类型，条目构造、`project`、`collectFacts`、`selectTools`、`toolOutputToAiSdk` 等纯函数，`CTX_EVENTS` |
-| `createMemoryStore({ now?, id? })`                                                                                             | 内存 `SessionStore`，带 `watch`                                                                                                                                                                |
-| `createFunctionExecutor(name = 'local')`                                                                                       | 进程内函数执行环境：`register(definition, fn, { replace? })`、`unregister`、`has`、`definition`、`tools`、`execute`                                                                            |
-| `createToolRegistry({ executor? })`                                                                                            | `ToolRegistry` 加 `addTool(name, tool, meta?)`、`addAll`、`toolSet(filter?, { executors? })`、`executor`；`add(name, tool, meta)` 是弃用的写法                                                 |
-| `toToolSet(definitions, executors, { session?, runId?, dispatch? })`、`dispatchTo(executors)`                                  | 定义包成 AI SDK `ToolSet`，`execute` 转给绑定的执行环境                                                                                                                                        |
-| `createContextBuilder({ store, projection?, sources?, sourceTimeoutMs?, logger?, factsPlacement?, model?, models? })`          | `ContextBuilder`：`build`、`view`、`compact`，另加 `facts(session, signal?)`                                                                                                                   |
-| `createHarness({ store, context, tools?, executors?, models?, hooks?, logger?, source? })`                                     | `Harness`：`run`、`stream`                                                                                                                                                                     |
-| `createOrchestrator({ harness, store?, logger? })`                                                                             | `Orchestrator`：`submit`、`status`、`cancel`、`events`、`close`；给了 `store` 才有 `recover`                                                                                                   |
-| `createContext(options)`                                                                                                       | 门面：`append`、`entries`、`view`、`facts`、`prepare`、`generate`、`stream`、`compact`，以及 `builder`、`executor`、`harness`                                                                  |
-| `describeError`、`redact`、`errorInfo`                                                                                         | 给日志和界面用的错误摘要；去密钥；`RunResult.error` 的形状                                                                                                                                     |
-| `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`asSchema`、`stepCountIs`，`ModelMessage`、`LanguageModel`、`ToolSet` 等类型 | 从 `ai` 转出，应用不用单独依赖 `ai`                                                                                                                                                            |
-| `@modelctx-ai/ctx/testing`                                                                                                     | 原样转出协议包的契约测试（`describeSessionStoreContract` 等），加 `createScriptedModel(script, { tool? })`：按剧本回答的假模型                                                                 |
-| 弃用：`ContextStore`、`ContextEntry`、`createContext({ thread })`、`context.thread`、`describeStoreContract`                   | 0.1 的名字，下一个 minor 删掉                                                                                                                                                                  |
+| 导出                                                                                                                                | 说明                                                                                                                                                                                                   |
+| ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 协议包的全部导出                                                                                                                    | `SessionStore`、`ContextBuilder`、`ToolRegistry`、`Executor`、`Harness`、`Orchestrator` 等类型，条目构造、`project`、`collectFacts`、`selectTools`、`toolOutputToAiSdk` 等纯函数，`CTX_EVENTS`         |
+| `createMemoryStore({ now?, id? })`                                                                                                  | 内存 `SessionStore`，带 `watch`                                                                                                                                                                        |
+| `createFunctionExecutor(name = 'local')`                                                                                            | 进程内函数执行环境：`register(definition, fn, { replace? })`、`unregister`、`has`、`definition`、`tools`、`execute`                                                                                    |
+| `createToolRegistry({ executor? })`                                                                                                 | `ToolRegistry` 加 `addTool(name, tool, meta?)`、`addAll`、`toolSet(filter?, { executors? })`、`executor`；`add(name, tool, meta)` 是弃用的写法                                                         |
+| `toToolSet(definitions, executors, { session?, runId?, dispatch? })`、`dispatchTo(executors)`                                       | 定义包成 AI SDK `ToolSet`，`execute` 转给绑定的执行环境                                                                                                                                                |
+| `createContextBuilder({ store, projection?, projections?, sources?, sourceTimeoutMs?, logger?, factsPlacement?, model?, models? })` | `ContextBuilder`：`build`、`view`、`compact`，另加 `facts(session, signal?, { sources? })`、`recompact`                                                                                                |
+| `createHarness({ store, context, tools?, executors?, models?, hooks?, logger?, source? })`                                          | `Harness`：`run`、`stream`                                                                                                                                                                             |
+| `createOrchestrator({ harness, store?, owner?, logger? })`                                                                          | `Orchestrator`：`submit`、`status`、`cancel`、`events`、`close`；给了 `store` 才有 `recover`                                                                                                           |
+| `createContext(options)`                                                                                                            | 门面：`append`、`entries`、`view`、`facts`、`prepare`、`generate`、`stream`、`compact`，以及 `builder`、`executor`、`harness`                                                                          |
+| `describeError`、`redact`、`errorInfo`                                                                                              | 给日志和界面用的错误摘要；去密钥；`RunResult.error` 的形状                                                                                                                                             |
+| `toModelMessages`、`fromModelMessages`（单条是 `toModelMessage`、`fromModelMessage`）、`toUserContent`、`fromUserContent`           | ctx 的 `Message` 和 AI SDK 的 `ModelMessage`、`UserContent` 互转；遇到子集之外的部件抛 `unsupported_part`，harness 把这一轮以 `error` 结束。`createContext()` 仍收 AI SDK 的 `UserContent`，在边界上转 |
+| `findLossySummaries(store, { session? })`、`recompactLossy(builder, finding, options)`                                              | 升级后修复：列出 0.2 写的、有条目被新规则盖住的摘要，再用模型重新压缩一次（见[协议层](https://github.com/modelctx-ai/ctx/blob/main/docs/protocol.md#消息格式和版本)）                                  |
+| `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`asSchema`、`stepCountIs`，`ModelMessage`、`LanguageModel`、`ToolSet` 等类型      | 从 `ai` 转出，应用不用单独依赖 `ai`                                                                                                                                                                    |
+| `@modelctx-ai/ctx/testing`                                                                                                          | 原样转出协议包的契约测试（`describeSessionStoreContract` 等），加 `createScriptedModel(script, { tool? })`：按剧本回答的假模型                                                                         |
+| 弃用：`ContextStore`、`ContextEntry`、`createContext({ thread })`、`context.thread`、`describeStoreContract`                        | 0.1 的名字，下一个 minor 删掉                                                                                                                                                                          |
 
 `createContext` 的选项：`store`、`session`、`projection`、`sources`、`sourceTimeoutMs`、`factsPlacement`、`tools`、`executors`、`hooks`、`model`、`source`、`logger`。
 

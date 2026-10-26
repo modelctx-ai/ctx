@@ -17,7 +17,7 @@ describe('tokens', () => {
       role: 'user',
       content: [
         { type: 'text', text: '看图' },
-        { type: 'image', image: new URL('https://example.com/a.png') },
+        { type: 'file', mediaType: 'image', data: { type: 'url', url: 'https://example.com/a.png' } },
       ],
     });
     assert.equal(withImage, 4 + 2 + 256);
@@ -30,14 +30,14 @@ describe('tokens', () => {
       content: [
         {
           type: 'tool-result',
-          toolCallId: 'c1',
-          toolName: 'screenshot',
+          id: 'c1',
+          name: 'screenshot',
           output: {
             type: 'content',
-            value: [
+            parts: [
               { type: 'text', text: '截好了' },
               { type: 'file', mediaType: 'image/png', data: { type: 'data', data } },
-              { type: 'image-data', data, mediaType: 'image/png' },
+              { type: 'file', mediaType: 'image/png', data: { type: 'data', data } },
             ],
           },
         },

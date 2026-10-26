@@ -1,5 +1,8 @@
 export * from './types.ts';
+export * from './message.ts';
 export * from './session.ts';
+export * from './version.ts';
+export { contentFromLoose, messageFromModelMessage } from './ai-sdk.ts';
 export * from './tokens.ts';
 export * from './context.ts';
 export * from './tools.ts';

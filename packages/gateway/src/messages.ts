@@ -1,6 +1,4 @@
-import type { MessageEntry } from '@modelctx-ai/ctx-protocol';
-
-type ModelMessage = MessageEntry['message'];
+import type { Message, ToolFileData, ToolOutput } from '@modelctx-ai/ctx-protocol';
 
 /** OpenAI Chat Completions 消息里网关会碰到的部分，其余字段原样透传。 */
 export type ChatContentPart =
@@ -37,33 +35,6 @@ export function chatText(content: ChatMessage['content']): string {
   return content.map((part) => (part.type === 'text' && typeof part.text === 'string' ? part.text : '')).join('');
 }
 
-function base64(data: Uint8Array | ArrayBuffer): string {
-  return Buffer.from(data instanceof ArrayBuffer ? new Uint8Array(data) : data).toString('base64');
-}
-
-type InlineData = string | Uint8Array | ArrayBuffer | URL;
-
-/**
- * 取出能内联的数据：裸数据、URL，或者 AI SDK v7 带标签的 `{ type: 'data' }`、`{ type: 'url' }`。
- * 服务商侧的文件引用（上传后的 id）对方不认，返回 undefined。
- */
-function inlineOf(data: unknown): InlineData | undefined {
-  if (typeof data === 'string' || data instanceof Uint8Array || data instanceof ArrayBuffer || data instanceof URL) {
-    return data;
-  }
-  if (!data || typeof data !== 'object') return undefined;
-  const tagged = data as { type?: unknown; data?: unknown; url?: unknown };
-  if (tagged.type === 'data') {
-    const inner = tagged.data;
-    return typeof inner === 'string' || inner instanceof Uint8Array || inner instanceof ArrayBuffer ? inner : undefined;
-  }
-  if (tagged.type === 'url') {
-    if (tagged.url instanceof URL) return tagged.url;
-    if (typeof tagged.url === 'string' && URL.canParse(tagged.url)) return new URL(tagged.url);
-  }
-  return undefined;
-}
-
 function isImage(mediaType: string | undefined): boolean {
   const type = mediaType?.toLowerCase();
   return type === 'image' || type?.startsWith('image/') === true;
@@ -74,55 +45,36 @@ function imageType(mediaType: string | undefined): string {
   return mediaType && /^image\/[^*\s]+$/i.test(mediaType) ? mediaType : 'image/png';
 }
 
-/** AI SDK 的图片/文件数据转成 OpenAI 能收的地址：URL 原样，二进制和 base64 变成 data URL。 */
-function urlOf(data: InlineData, mediaType: string | undefined): string {
-  if (data instanceof URL) return data.href;
-  if (typeof data === 'string') {
-    if (/^(https?:|data:)/i.test(data)) return data;
-    return `data:${imageType(mediaType)};base64,${data}`;
-  }
-  return `data:${imageType(mediaType)};base64,${base64(data)}`;
+/**
+ * 文件数据转成 OpenAI 能收的地址：地址原样（`data:` 和 `http(s):` 之外的当相对地址，也原样），
+ * base64 变成 data URL。服务商侧的文件引用和内联文字对方不认，返回 undefined。
+ */
+function urlOf(data: ToolFileData, mediaType: string | undefined): string | undefined {
+  if (data.type === 'url') return data.url;
+  if (data.type === 'data') return `data:${imageType(mediaType)};base64,${data.data}`;
+  return undefined;
 }
 
-function imagePart(data: unknown, mediaType: string | undefined): ChatContentPart | undefined {
-  const inline = inlineOf(data);
-  return inline === undefined ? undefined : { type: 'image_url', image_url: { url: urlOf(inline, mediaType) } };
+function imagePart(data: ToolFileData, mediaType: string | undefined): ChatContentPart | undefined {
+  const url = urlOf(data, mediaType);
+  return url === undefined ? undefined : { type: 'image_url', image_url: { url } };
 }
 
-/** 标量转成文字；null、undefined 和函数之类转不出有意义文字的给空串，对象交给调用方。 */
-function scalarText(value: unknown): string {
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
-  return '';
-}
-
-function outputText(output: unknown): string {
-  if (!output || typeof output !== 'object') return scalarText(output);
-  const typed = output as { type?: string; value?: unknown; reason?: string };
-  switch (typed.type) {
+function outputText(output: ToolOutput): string {
+  switch (output.type) {
     case 'text':
-    case 'error-text':
-      return typeof typed.value === 'object' && typed.value !== null
-        ? JSON.stringify(typed.value)
-        : scalarText(typed.value);
+      return output.text;
     case 'json':
-    case 'error-json':
-      return JSON.stringify(typed.value);
-    case 'content':
-      return Array.isArray(typed.value)
-        ? typed.value
-            .map((part: { type?: string; text?: string }) => (part.type === 'text' ? (part.text ?? '') : ''))
-            .join('')
-        : '';
-    case 'execution-denied':
-      return typed.reason ? `Tool execution denied: ${typed.reason}` : 'Tool execution denied.';
+      return JSON.stringify(output.value);
+    case 'error':
+      return output.message;
     default:
-      return JSON.stringify(output);
+      return output.parts.map((part) => (part.type === 'text' ? part.text : '')).join('');
   }
 }
 
-/** AI SDK 的消息转成 OpenAI Chat Completions 的消息。推理过程、审批等对方不认的部分丢掉。 */
-export function toChatMessages(messages: readonly ModelMessage[]): ChatMessage[] {
+/** ctx 的消息转成 OpenAI Chat Completions 的消息。推理过程、审批等对方不认的部分丢掉。 */
+export function toChatMessages(messages: readonly Message[]): ChatMessage[] {
   const out: ChatMessage[] = [];
   for (const message of messages) {
     switch (message.role) {
@@ -140,12 +92,7 @@ export function toChatMessages(messages: readonly ModelMessage[]): ChatMessage[]
             parts.push({ type: 'text', text: part.text });
             continue;
           }
-          const image =
-            part.type === 'image'
-              ? imagePart(part.image, part.mediaType)
-              : part.type === 'file' && isImage(part.mediaType)
-                ? imagePart(part.data, part.mediaType)
-                : undefined;
+          const image = isImage(part.mediaType) ? imagePart(part.data, part.mediaType) : undefined;
           if (image) parts.push(image);
         }
         if (parts.length > 0) out.push({ role: 'user', content: parts });
@@ -162,9 +109,9 @@ export function toChatMessages(messages: readonly ModelMessage[]): ChatMessage[]
           if (part.type === 'text') text += part.text;
           else if (part.type === 'tool-call' && !part.providerExecuted) {
             calls.push({
-              id: part.toolCallId,
+              id: part.id,
               type: 'function',
-              function: { name: part.toolName, arguments: JSON.stringify(part.input ?? {}) },
+              function: { name: part.name, arguments: JSON.stringify(part.input ?? {}) },
             });
           }
         }
@@ -175,7 +122,7 @@ export function toChatMessages(messages: readonly ModelMessage[]): ChatMessage[]
       case 'tool':
         for (const part of message.content) {
           if (part.type !== 'tool-result') continue;
-          out.push({ role: 'tool', tool_call_id: part.toolCallId, content: outputText(part.output) });
+          out.push({ role: 'tool', tool_call_id: part.id, content: outputText(part.output) });
         }
         break;
     }

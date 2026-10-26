@@ -14,7 +14,7 @@ import {
 } from '@modelctx-ai/ctx';
 import { createScriptedModel } from '@modelctx-ai/ctx/testing';
 import { createProcessExecutor } from '@modelctx-ai/ctx-exec';
-import { CTX_EVENTS, type Entry, type SessionStore } from '@modelctx-ai/ctx-protocol';
+import { CTX_EVENTS, eventEntry, userEntry, type Entry, type SessionStore } from '@modelctx-ai/ctx-protocol';
 import {
   type ModelScriptStep,
   describeExecutorContract,
@@ -117,10 +117,10 @@ describeSessionStoreContract(
     const memory = createMemoryStore({ now });
     // 去掉 watch：服务端退回轮询 list(after)。
     const store: SessionStore = {
-      append: (session, entries) => memory.append(session, entries),
+      append: (session, entries, options) => memory.append(session, entries, options),
       list: (session, options) => memory.list(session, options),
       clear: (session) => memory.clear(session),
-      sessions: () => memory.sessions(),
+      sessions: (options) => memory.sessions(options),
     };
     return createRemoteSessionStore(client(await serve({ store, pollIntervalMs: 20 })));
   },
@@ -353,6 +353,27 @@ describe('鉴权和安全缺省', () => {
       'this server does not serve a harness',
     ]);
     expect((await fetch(`${baseUrl}/nope`, { headers: { authorization: `Bearer ${accessToken}` } })).status).toBe(404);
+  });
+
+  test('分页和 kinds 走查询参数；limit 不是数字是 400；kind 里带逗号客户端直接报错', async () => {
+    const remote = await serve({ store: createMemoryStore() });
+    const store = createRemoteSessionStore(client(remote));
+    for (const name of ['b', 'a%', 'a', 'ab']) await store.append(name, [userEntry('x')]);
+    await store.append('a', [eventEntry('pet.whisper', { text: 'w' }), eventEntry('pet.reminder', { text: 'r' })]);
+    const get = (path: string) =>
+      fetch(`${remote.baseUrl}${path}`, { headers: { authorization: `Bearer ${accessToken}` } });
+    expect(await (await get('/sessions?prefix=a&after=a&limit=1')).json()).toEqual({ sessions: ['a%'] });
+    expect(await store.sessions({ prefix: 'a', limit: 2 })).toEqual(['a', 'a%']);
+    expect(await store.sessions({ after: 'a%' })).toEqual(['ab', 'b']);
+    expect((await get('/sessions?limit=abc')).status).toBe(400);
+    expect(
+      ((await (await get('/sessions/a/entries?kinds=pet.whisper,nope')).json()) as { entries: unknown[] }).entries,
+    ).toHaveLength(1);
+    expect(((await (await get('/sessions/a/entries?kinds=')).json()) as { entries: unknown[] }).entries).toHaveLength(
+      0,
+    );
+    expect((await store.list('a', { kinds: ['pet.reminder', 'pet.whisper'] })).length).toBe(2);
+    await expect(store.list('a', { kinds: ['a,b'] })).rejects.toThrow(/comma/);
   });
 
   test('basePath：只认前缀下的路径', async () => {

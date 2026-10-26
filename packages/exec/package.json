@@ -1,6 +1,6 @@
 {
   "name": "@modelctx-ai/ctx-exec",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "ctx 的本机子进程执行环境：跑命令行、读写工作目录里的文件；工作目录、环境变量白名单、超时、输出截断。",
   "keywords": [
     "ai",

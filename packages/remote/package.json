@@ -1,6 +1,6 @@
 {
   "name": "@modelctx-ai/ctx-remote",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "把 ctx 的协议搬到 HTTP 上：会话存储、执行环境、harness、编排器的服务端（node:http）和客户端（只用 fetch）。",
   "keywords": [
     "ai",

@@ -29,20 +29,20 @@ flowchart TB
 
 ## 概念
 
-| 概念                    | 说明                                                                                                   |
-| ----------------------- | ------------------------------------------------------------------------------------------------------ |
-| 会话 `session`          | 一个 agent 实例的日志的名字，例如 `pet:main`、`user:42`。条目按会话存放                                |
-| 条目 `Entry`            | 会话里的一条记录，分 `message`、`event`、`summary` 三种，写入后不再修改                                |
-| 游标 `Cursor`           | `{ at, seq }`。`at` 是逻辑时间（毫秒），`seq` 是存储分配的写入序号，同一时刻靠它排先后                 |
-| 会话存储 `SessionStore` | 只追加的持久化边界：`append`、`list`、`clear`、`sessions`、`watch`                                     |
-| 投影 `project()`        | 把条目渲染成这一次交给模型的 `ModelMessage[]`，每次调用重新计算，不改日志                              |
-| 来源 `ContextSource`    | 调用那一刻才去取的上下文，取到的文字叫事实 `Fact`，不写日志                                            |
-| 上下文 `ContextBuilder` | `createContextBuilder()`：投影 + 来源 + 压缩，把会话组装成一次调用的指令、消息和工具名单               |
-| 工具目录 `ToolRegistry` | `createToolRegistry()`：工具定义（名字、说明、JSON Schema）放在一处，每个绑一个执行环境                |
-| 执行环境 `Executor`     | 工具调用真正发生的地方。核心包有进程内的 `createFunctionExecutor()`，MCP hub 也是一个                  |
-| Harness                 | `createHarness()`：跑一轮，组装 → 调模型 → 分发工具 → 写回，前后写 `ctx.run.started` / `ctx.run.ended` |
-| 编排器 `Orchestrator`   | `createOrchestrator()`：进程内队列，同一会话串行，不同会话并行，崩溃后补 `ctx.run.ended`               |
-| 门面 `Context`          | `createContext()` 的返回值：在一个会话上把上面几样组合起来，带投影规则、来源、工具和缺省模型           |
+| 概念                    | 说明                                                                                                                         |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| 会话 `session`          | 一个 agent 实例的日志的名字，例如 `pet:main`、`user:42`。条目按会话存放                                                      |
+| 条目 `Entry`            | 会话里的一条记录，分 `message`、`event`、`summary` 三种，写入后不再修改                                                      |
+| 位置 `seq`              | 存储按写入顺序分配的序号，会话内严格递增、从 1 起。`at` 是逻辑时间（毫秒），只用于投影排序和展示                             |
+| 会话存储 `SessionStore` | 只追加的持久化边界：`append`、`list`、`clear`、`sessions`、`watch`                                                           |
+| 投影 `project()`        | 把条目渲染成这一次交给模型的 `Message[]`（ctx 自己的 JSON 消息，harness 调模型时转成 AI SDK 的），每次调用重新计算，不改日志 |
+| 来源 `ContextSource`    | 调用那一刻才去取的上下文，取到的文字叫事实 `Fact`，不写日志                                                                  |
+| 上下文 `ContextBuilder` | `createContextBuilder()`：投影 + 来源 + 压缩，把会话组装成一次调用的指令、消息和工具名单                                     |
+| 工具目录 `ToolRegistry` | `createToolRegistry()`：工具定义（名字、说明、JSON Schema）放在一处，每个绑一个执行环境                                      |
+| 执行环境 `Executor`     | 工具调用真正发生的地方。核心包有进程内的 `createFunctionExecutor()`，MCP hub 也是一个                                        |
+| Harness                 | `createHarness()`：跑一轮，组装 → 调模型 → 分发工具 → 写回，前后写 `ctx.run.started` / `ctx.run.ended`                       |
+| 编排器 `Orchestrator`   | `createOrchestrator()`：进程内队列，同一会话串行，不同会话并行，崩溃后补 `ctx.run.ended`                                     |
+| 门面 `Context`          | `createContext()` 的返回值：在一个会话上把上面几样组合起来，带投影规则、来源、工具和缺省模型                                 |
 
 ## 组件
 
@@ -100,7 +100,8 @@ sequenceDiagram
   App->>Ctx: generate(instructions, input, inputKey)
   Note over Ctx: 没有模型就报错，什么都不写
   Ctx->>H: run(RunRequest)
-  H->>Store: append ctx.run.started
+  H->>Store: 读最后一个生命周期事件（是 started 就 session_busy）
+  H->>Store: append ctx.run.started（expectSeq）
   H->>Store: append 用户这句（inputKey 作幂等键）
   H->>B: build（会话名、指令、候选工具）
   Note over B: 收集事实（并行，单个超时 2 秒）<br/>从最近一条摘要读起再投影<br/>事实、投影出的 system 消息接到指令后面
@@ -132,34 +133,35 @@ sequenceDiagram
 
 ## 条目
 
-| 类型      | 字段                                | 怎么进模型上下文                                                   |
-| --------- | ----------------------------------- | ------------------------------------------------------------------ |
-| `message` | `message: ModelMessage`             | AI SDK 消息原样保存（文字、图片、工具调用和结果），投影时原样带上  |
-| `event`   | `kind`、`text?`、`data?: JsonValue` | 应用自己的事件。缺省不可见，`projection.events[kind]` 有规则才渲染 |
-| `summary` | `text`、`covers: Cursor`            | 压缩点：代替 `covers` 及之前的全部条目，固定在第一条               |
+| 类型      | 字段                                | 怎么进模型上下文                                                     |
+| --------- | ----------------------------------- | -------------------------------------------------------------------- |
+| `message` | `message: Message`                  | ctx 的 JSON 消息（文字、文件、推理、工具调用和结果），投影时原样带上 |
+| `event`   | `kind`、`text?`、`data?: JsonValue` | 应用自己的事件。缺省不可见，`projection.events[kind]` 有规则才渲染   |
+| `summary` | `text`、`covers: number`            | 压缩点：代替 `seq` ≤ `covers` 的全部条目，固定在第一条               |
 
 公共字段：
 
-| 字段             | 说明                                                                 |
-| ---------------- | -------------------------------------------------------------------- |
-| `id`             | 全局唯一；不给就由存储生成                                           |
-| `session`、`seq` | 由存储填                                                             |
-| `at`             | 逻辑时间，缺省是写入时刻。导入的旧记录写原来的时间，会排回原来的位置 |
-| `key`            | 幂等键：同一会话里键相同的第二条被跳过                               |
-| `source`         | 谁写的，例如 `user`、`model`、`harness`、`dsh-pet`                   |
-| `meta`           | 任意 JSON 对象                                                       |
+| 字段             | 说明                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------- |
+| `id`             | 全局唯一；不给就由存储生成                                                         |
+| `session`、`seq` | 由存储填                                                                           |
+| `v`              | 写入这一行时的格式版本，由存储填；读出来的形状永远是当前版本，旧行读时升级、不回写 |
+| `at`             | 逻辑时间，缺省是写入时刻。导入的旧记录写原来的时间，会排回原来的位置               |
+| `key`            | 幂等键：同一会话里键相同的第二条被跳过                                             |
+| `source`         | 谁写的，例如 `user`、`model`、`harness`、`dsh-pet`                                 |
+| `meta`           | 任意 JSON 对象                                                                     |
 
 用 `userEntry(content)`、`assistantEntry(text)`、`messageEntry(message)`、`eventEntry(kind, { text, data })` 构造条目，都接受 `{ id, at, key, source, meta }`。摘要条目一般由 `compact()` 写。事件 `kind` 用 `{domain}.{action}`，`ctx.` 前缀留给框架：harness 写 `ctx.run.started`、`ctx.run.ended`、`ctx.error`，压缩写 `ctx.compacted`，缺省都对模型不可见。
 
 ## 存储
 
-| 方法                                    | 行为                                                                                                                          |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `append(session, entries)`              | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）        |
-| `list(session, { after, last, types })` | 按 `(at, seq)` 从旧到新。`after` 不含该位置；`last` 取最后 N 条，仍从旧到新，小数向下取整，不是有限正数时返回空；三者可以组合 |
-| `clear(session)`                        | 删掉整个会话，返回条数                                                                                                        |
-| `sessions()`                            | 有内容的会话                                                                                                                  |
-| `watch(session, { after, signal })`     | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                         |
+| 方法                                           | 行为                                                                                                                                                                                                                                   |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `append(session, entries, { expectSeq? })`     | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）。给了 `expectSeq` 而会话末尾 `seq` 不等于它（空会话是 0）时整批不写，抛 `conflict`（`retryable`），检查先于去重 |
+| `list(session, { after, last, types, kinds })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；`kinds` 只要 `kind` 在其中的事件（消息和摘要不返回），与 `types` 取交集；都可以组合，`last` 在过滤之后取   |
+| `clear(session)`                               | 删掉整个会话，返回条数                                                                                                                                                                                                                 |
+| `sessions({ prefix, after, limit })`           | 有内容的会话，按名字升序（码点序）。`prefix` 按字面匹配，`after` 是上一页最后一个名字（不含），`limit` 限条数，小数向下取整，不是正数时返回空；都不给就是全部                                                                          |
+| `watch(session, { after, signal })`            | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                                                                                                                  |
 
 实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，缺省每 250ms，别的进程写进同一个库的也能读到）。条目只追加；除了 `clear`，没有删除和修改。
 
@@ -167,15 +169,15 @@ sequenceDiagram
 
 `project(entries, options)` 按顺序做五步：
 
-1. 按 `(at, seq)` 排序。
-2. 选摘要：`covers` 最大的那条生效。`covers` 及之前的条目不再出现；摘要用 `options.summary` 渲染（缺省是一条用户消息 `Summary of the earlier conversation:\n…`），固定在第一条，不参与裁剪。
+1. 按 `(at, seq)` 排序（`compareEntries`）：补写的旧记录排回逻辑上的位置。
+2. 选摘要：`covers` 最大的那条生效，相同时后写（`seq` 大）的生效。`seq` ≤ `covers` 的条目不再出现，摘要之后补写的旧记录（`seq` > `covers`）仍然可见；摘要用 `options.summary` 渲染（缺省是一条用户消息 `Summary of the earlier conversation:\n…`），固定在第一条，不参与裁剪。
 3. 消息条目原样带上。`options.message(entry)` 可以改写，返回空就丢掉。
 4. 事件条目：没有规则的 `kind` 跳过，也不打断前后同类事件的合并。`fold: true` 的规则把连续的同类事件合成一组交给 `render(events)`；`render` 返回一条消息、多条消息，或者空（丢掉）。
 5. 窗口：开头孤立的工具结果（它的调用已经被摘要盖住或被裁掉）总是丢掉。设了 `maxMessages` 或 `maxTokens` 时，从最旧的消息开始整组丢弃直到不超；带工具调用的助手消息和紧跟的工具结果是一组。至少留下最后一组，宁可超预算也不交出空上下文。
 
 例子：`whisper` 有 `fold` 规则，`clipboard` 没有规则。
 
-| 日志（按 `at, seq`）           | 投影                                                        |
+| 日志（按 `seq`）               | 投影                                                        |
 | ------------------------------ | ----------------------------------------------------------- |
 | `user` 早先的问题              | 被摘要代替                                                  |
 | `assistant` 早先的回答         | 被摘要代替                                                  |
@@ -198,15 +200,15 @@ sequenceDiagram
 
 投影照常输出 `system` 消息（例如摘要渲染成 `system`）；组装调用时 builder 把它们从消息里拿出来，接到指令后面（见[调用](#调用)）。
 
-结果 `Projection`：`messages`；`items`，每条带 `upTo`（覆盖到的最后一个条目的游标）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`summary` 生效的摘要条目。
+结果 `Projection`：`messages`；`items`，每条带 `from`、`upTo`（它来自的条目里最小和最大的 `seq`）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`summary` 生效的摘要条目。
 
 缺省的 token 估算不依赖分词器：中日韩文字一个字约 1 token，其他字符约 4 个 1 token，每条消息另加 4，图片、文件每个按 256（工具结果里的也一样，不去数 base64）。只用于预算和裁剪，不用于计费。
 
 ## 调用
 
-`createContextBuilder({ store, projection, sources, sourceTimeoutMs, logger, factsPlacement, model })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
+`createContextBuilder({ store, projection, projections, sources, sourceTimeoutMs, logger, factsPlacement, model })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
 
-1. 收集事实（`facts: false` 跳过）。
+1. 收集事实（`facts: false` 跳过；`FactsSpec.sources` 只用指定的来源）。投影名先认：不认识就以 `not_found` 失败，不回退，也不先去收事实。
 2. 读视图：只读最近一条摘要和它之后的条目，再投影。`window` 可以覆盖投影里的窗口设置。
 3. 指令：`instructions` 是字符串时，事实追加在后面，用空行隔开；（`createContext` 里）是函数时把事实传进去，由函数决定怎么写。
 4. 投影里的 `system` 消息（摘要、事件规则或 `message` 钩子渲染成的，以及存成消息条目的）不放进 `messages`，文字按顺序接在指令最后，同样用空行隔开。
@@ -214,6 +216,8 @@ sequenceDiagram
 6. 工具：`build` 收候选的 `ToolDefinition[]`，给出工具名单；`context.prepare` 的 `tools` 缺省是注册表里全部，`false` 不给，名字列表、`{ names, tags, sources }` 或 `(definition) => boolean` 筛选。
 
 `instructions` 和 `prompt` 只要有一个是函数，事实就不再自动放进去；投影出的 `system` 消息照样接上。
+
+`BuildRequest.facts` 可以是 `FactsSpec`（`sources`、`placement`、`heading`），`BuildRequest.projection` 选 `projections` 里的哪一套（缺省 `default`，取 `projections.default`，没有就取 `projection` 选项；每套是完整的，不合并）；harness 把 `AgentSpec.context` 放进去，所以同一个 builder 上不同的 agent 可以收不同的事实、放不同的位置、用不同的投影。`factsPlacement` 是缺省值，`FactsSpec.placement` 按一轮覆盖。
 
 `factsPlacement: 'prompt'` 把事实放进最后一条临时用户消息（接在 `prompt` 前面，没有 `prompt` 时单独一条），指令里不再有事实：system 前缀每次都一样，服务商的提示缓存能命中。缺省 `'instructions'`。
 
@@ -297,7 +301,7 @@ await context.append(eventEntry('whisper', { text }));
 2. 最近 `keep`（缺省 12）条原样保留。切点往前挪，保留的部分不以工具结果开头。
 3. 切点之前没有消息，或者不到 `minimum`（缺省 8）条，就不压缩、不调模型，返回 `null`。
 4. 把旧摘要和切点之前的消息转成纯文本记录（图片、文件只写占位，例如 `[image image/png]`，不带数据），用 `instructions`（缺省是内置的压缩指令）、`temperature: 0`、`maxOutputTokens`（缺省 1024）调一次模型。`model` 缺省用上下文的模型。
-5. 摘要被 `maxOutputTokens` 截断（`finishReason` 是 `length`）时不写，告警并返回 `null`；否则在同一批里追加一条 `summary`（`covers` 是最后一条被压缩消息的 `upTo`）和一条 `ctx.compacted`（`covers`、`summaryId`）。
+5. 摘要被 `maxOutputTokens` 截断（`finishReason` 是 `length`）时不写，告警并返回 `null`；否则在同一批里追加一条 `summary`（`covers` 是被保留的消息里最小的 `from` 减 1，即日志顺序上的切点；输入是投影里 `upTo` ≤ `covers` 的消息，补写的旧记录 `seq` 在切点之后，不进这次摘要，压缩后仍然可见。`fold` 合并的事件组里混进补写的旧记录时，组的 `from` ≤ `covers` < `upTo`，整组进摘要会重复，所以 `covers` 退到这一组的 `from` 减 1，整组留在视图里；退到不再有横跨的组为止，退到 0 就返回 `null`）和一条 `ctx.compacted`（`covers`、`summaryId`）。
 
 新摘要已经包含旧摘要，所以只有最新的一条生效；之后 `view()` 从它读起。什么时候压缩由应用决定（例如定时、超过阈值），ctx 不自动压缩。
 
@@ -460,8 +464,8 @@ for await (const event of harness.stream({
 import { createOrchestrator } from '@modelctx-ai/ctx';
 
 // harness、store 接上一段
-const orchestrator = createOrchestrator({ harness, store });
-await orchestrator.recover?.(); // 启动时：给上次崩溃时断掉的运行补 ctx.run.ended（error）
+const orchestrator = createOrchestrator({ harness, store, owner: 'pet' }); // owner：这个实例的稳定名字
+await orchestrator.recover?.(); // 启动时：先给上次崩溃时断掉的运行补 ctx.run.ended（error），再接新的 submit
 
 // 状态变化：run.queued → run.running → run.completed
 void (async () => {
@@ -478,7 +482,9 @@ await orchestrator.close(); // 不再收新运行，等运行中的结束
 
 - 状态：`completed` 跑完；`failed` 是 `stopReason: 'error'` 或 harness 抛错（`done` 跟着 reject）；`cancelled` 是被 `cancel` 或请求的 `signal` 取消。
 - `cancel(runId)`：排队中的直接取消，`done` 给出 `stopReason: 'aborted'` 的空结果，不调 harness；运行中的中止传给 harness 的 `signal`。跑完的或不认识的返回 `false`。
-- `recover()`：只在给了 `store` 时有。扫描 `store.sessions()`，找日志里有 `ctx.run.started` 没有配对 `ctx.run.ended` 的运行（这个编排器自己正在跑的除外），补一条 `ctx.run.ended`（`stopReason: 'error'`，`source: 'orchestrator'`），不续跑。
+- `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外），补一条 `ctx.run.ended`（`stopReason: 'error'`，`source: 'orchestrator'`），不续跑。
+- `owner`：写进每个运行的 `ctx.run.started`；`recover()` 只收 `owner` 相同的断点（都没配置也算相同），两个进程共用一个库时各配一个名字。写 `ctx.run.ended` 时带 `expectSeq`，读和写之间会话有新条目就跳过那个运行。
+- 用缺省 `record`（写日志）的应用，进程崩溃留下的未结束运行会让该会话一直 `session_busy`，所以启动时要先 `recover()` 再 `submit`；`record: false` 的运行不留生命周期事件，没有这个要求。harness 里同一会话最多一个未结束的运行（跨进程也成立；同一个 harness 实例内部先按会话排队，一个接一个，`session_busy` 只出现在跨进程或别的 harness 实例上，`record: false` 不排），每次写入带 `expectSeq`，被 `recover` 结束的运行在下一次写入时发现自己被围栏，以 `aborted` 停下、不再写 `ctx.run.ended`。
 
 ## 网关
 
@@ -573,18 +579,18 @@ describeSessionStoreContract('pg', ({ now }) => createPgStore({ url: 'postgres:/
 });
 ```
 
-| 用例            | 要求                                                                                                                                                   |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 排序            | 按 `(at, seq)`；带旧 `at` 导入的条目排回原来的位置                                                                                                     |
-| 同一时刻        | 按写入先后                                                                                                                                             |
-| 去重            | 同会话重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按会话隔离；一批里有重复的，其余照写                                                     |
-| 原子            | 并发追加的两批不交错                                                                                                                                   |
-| 查询            | `after`、`last`、`types` 可以组合；`last` 向下取整，`0`、负数、`NaN`、`Infinity` 返回空                                                                |
-| 往返            | 消息分段（含工具调用的对象入参、图片 `URL`）、事件 `data`、摘要 `covers`、`source`、`meta` 原样读回；`seq` 递增                                        |
-| 二进制和 URL    | `Buffer`、`ArrayBuffer`、带标签的 `{ type: 'data' }` 读回来字节不变（容器可以换成 `Uint8Array`）；`URL`（包括 `{ type: 'url' }` 里的）读回来还是 `URL` |
-| 像标记的数据    | 事件 `data` 里 `{ $url }`、`{ $bytes }` 这类普通对象原样读回                                                                                           |
-| 会话            | `clear` 返回删掉的条数；`sessions()` 只列有内容的会话                                                                                                  |
-| `watch`（有时） | 先给出 `after` 之后已有的，再给出新写入的，只看这个会话；`signal` 中止后迭代正常结束                                                                   |
+| 用例            | 要求                                                                                                                                                         |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 位置            | `list` 按 `seq` 升序；补写的旧记录排在写入的位置，`list(after)`、`watch(after)` 仍然给出它；`seq` 会话内递增、从 1 起，`clear` 后不回退                      |
+| 同一时刻        | 按写入先后                                                                                                                                                   |
+| 去重            | 同会话重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按会话隔离；一批里有重复的，其余照写                                                           |
+| 原子            | 并发追加的两批不交错                                                                                                                                         |
+| 查询            | `after`、`last`、`types`、`kinds` 可以组合；`last` 向下取整，`0`、负数、`NaN`、`Infinity` 返回空；`kinds` 只返回事件，与 `types` 取交集，`last` 在过滤之后取 |
+| 往返            | 消息分段（含工具调用的对象入参、图片 `URL`）、事件 `data`、摘要 `covers`、`source`、`meta` 原样读回；`seq` 递增                                              |
+| 二进制和 URL    | `Buffer`、`ArrayBuffer`、带标签的 `{ type: 'data' }` 读回来字节不变（容器可以换成 `Uint8Array`）；`URL`（包括 `{ type: 'url' }` 里的）读回来还是 `URL`       |
+| 像标记的数据    | 事件 `data` 里 `{ $url }`、`{ $bytes }` 这类普通对象原样读回                                                                                                 |
+| 会话            | `clear` 返回删掉的条数；`sessions()` 只列有内容的会话，名字升序（码点序）；`prefix` 按字面匹配（`%`、`_`、`\` 不特殊），`after`、`limit` 翻页不重不漏        |
+| `watch`（有时） | 先给出 `after` 之后已有的，再给出新写入的，只看这个会话；`signal` 中止后迭代正常结束                                                                         |
 
 ### 模型服务商
 

@@ -15,7 +15,7 @@ import {
   type ToolOutput,
   type ToolRegistry,
 } from '@modelctx-ai/ctx-protocol';
-import { asSchema, dynamicTool, jsonSchema, type Tool, type ToolSet } from 'ai';
+import { asSchema, dynamicTool, jsonSchema, type Tool, type ToolResultPart, type ToolSet } from 'ai';
 
 import { createFunctionExecutor, type FunctionExecutor, type ToolFunction } from './executor.ts';
 
@@ -90,7 +90,7 @@ export function toToolSet(
         };
         return dispatch(call, definition, context);
       },
-      toModelOutput: ({ output }) => toolOutputToAiSdk(output as ToolOutput),
+      toModelOutput: ({ output }) => toolOutputToAiSdk(output as ToolOutput) as ToolResultPart['output'],
     });
   }
   return out;

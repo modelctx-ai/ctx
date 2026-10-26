@@ -10,21 +10,22 @@
  */
 import assert from 'node:assert/strict';
 
-import type { ModelMessage } from 'ai';
-
 import type { AgentSpec, Harness, RunEvent, RunRequest } from './harness.ts';
+import type { Message } from './message.ts';
 import type { Orchestrator, OrchestratorEvent } from './orchestrator.ts';
 import {
   CTX_EVENTS,
   assistantEntry,
-  cursorOf,
   eventEntry,
+  headSeq,
+  isConflict,
   messageEntry,
   userEntry,
   type Entry,
   type NewEntry,
   type SessionStore,
 } from './session.ts';
+import { ENTRY_VERSION } from './version.ts';
 import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type ToolRegistry } from './tools.ts';
 import type { JsonObject } from './types.ts';
 
@@ -47,24 +48,6 @@ function texts(entries: readonly Entry[]): string[] {
     if (entry.type === 'message') return typeof entry.message.content === 'string' ? entry.message.content : '[parts]';
     return entry.text ?? '';
   });
-}
-
-/** 二进制读回来可以换容器（Buffer 变 Uint8Array 之类），只比字节。 */
-function bytesOf(value: unknown): number[] | undefined {
-  if (value instanceof ArrayBuffer) return [...new Uint8Array(value)];
-  if (ArrayBuffer.isView(value)) return [...new Uint8Array(value.buffer, value.byteOffset, value.byteLength)];
-  return undefined;
-}
-
-function hrefOf(value: unknown): string | undefined {
-  return value instanceof URL ? value.href : undefined;
-}
-
-type Loose = Record<string, unknown> | undefined;
-
-function partsOf(entry: Entry | undefined): Loose[] {
-  if (entry?.type !== 'message' || typeof entry.message.content === 'string') return [];
-  return entry.message.content as unknown as Loose[];
 }
 
 function batch(tag: string): NewEntry[] {
@@ -92,12 +75,31 @@ export function describeSessionStoreContract(
   { describe, test }: ContractTestApi,
 ): void {
   describe(`SessionStore contract: ${name}`, () => {
-    test('按 (at, seq) 排序，导入的旧记录插回原来的位置', async () => {
+    test('list 按 seq 返回：补写的旧记录排在写入的位置，不按 at 插回去', async () => {
       let clock = 1_000;
       const store = await factory({ now: () => clock++ });
       await store.append('s', [userEntry('二'), userEntry('三')]);
       await store.append('s', [userEntry('一', { at: 10 })]);
-      assert.deepEqual(texts(await store.list('s')), ['一', '二', '三']);
+      await store.append('s', [userEntry('四')]);
+      const listed = await store.list('s');
+      assert.deepEqual(texts(listed), ['二', '三', '一', '四']);
+      assert.ok(
+        listed.every((entry, i) => i === 0 || entry.seq > listed[i - 1]!.seq),
+        'seq 在会话内严格递增，按写入顺序分配',
+      );
+      assert.ok(listed[0]!.seq >= 1, 'seq 从 1 起；0 表示会话开头');
+      assert.deepEqual(texts(await store.list('s', { last: 2 })), ['一', '四'], 'last 是 seq 最大的 N 条');
+    });
+
+    test('补写旧记录之后 list(after) 仍然给出它：位置是 seq，不是 at', async () => {
+      let clock = 1_000;
+      const store = await factory({ now: () => clock++ });
+      const [a, b] = await store.append('s', [userEntry('a'), userEntry('b')]);
+      await store.append('s', [{ type: 'summary', text: '摘要', covers: b!.seq }]);
+      await store.append('s', [userEntry('late', { at: a!.at - 1 })]);
+      await store.append('s', [userEntry('c')]);
+      assert.deepEqual(texts(await store.list('s', { after: b!.seq })), ['摘要', 'late', 'c']);
+      assert.deepEqual(texts(await store.list('s', { after: 0 })), ['a', 'b', '摘要', 'late', 'c']);
     });
 
     test('同一时刻按写入先后排', async () => {
@@ -105,6 +107,14 @@ export function describeSessionStoreContract(
       await store.append('s', [eventEntry('pet.whisper', { text: 'a' }), eventEntry('pet.whisper', { text: 'b' })]);
       await store.append('s', [eventEntry('pet.whisper', { text: 'c' })]);
       assert.deepEqual(texts(await store.list('s')), ['a', 'b', 'c']);
+    });
+
+    test('clear 之后 seq 不回退、不复用', async () => {
+      const store = await factory({ now: Date.now });
+      const before = await store.append('s', [userEntry('1'), userEntry('2')]);
+      await store.clear('s');
+      const [after] = await store.append('s', [userEntry('3')]);
+      assert.ok(after!.seq > before[1]!.seq, `${after!.seq} 应大于 ${before[1]!.seq}`);
     });
 
     test('幂等键和 id 重复时跳过，只返回真正写入的', async () => {
@@ -160,7 +170,7 @@ export function describeSessionStoreContract(
         userEntry('3'),
         userEntry('4'),
       ]);
-      assert.deepEqual(texts(await store.list('s', { after: written[1]! })), ['3', '4']);
+      assert.deepEqual(texts(await store.list('s', { after: written[1]!.seq })), ['3', '4']);
       assert.deepEqual(texts(await store.list('s', { types: ['message'], last: 2 })), ['3', '4']);
       assert.deepEqual(texts(await store.list('s', { types: ['event'] })), ['2']);
       assert.deepEqual(await store.list('s', { last: 0 }), []);
@@ -177,24 +187,63 @@ export function describeSessionStoreContract(
       }
     });
 
-    test('条目原样读回：消息分段、事件数据、摘要位置、元数据', async () => {
+    test('kinds 只要 kind 在其中的事件，消息和摘要不返回，与 types 取交集', async () => {
+      let clock = 0;
+      const store = await factory({ now: () => (clock += 10) });
+      const [, , , , , , last] = await store.append('s', [
+        userEntry('消息'),
+        eventEntry('pet.whisper', { text: '甲' }),
+        eventEntry('pet.reminder', { text: '乙' }),
+        { type: 'summary', text: '摘要', covers: 1 },
+        eventEntry('pet.whisper', { text: '丙' }),
+        eventEntry('ctx.run.started', { text: '丁', data: { runId: 'r' } }),
+        eventEntry('pet.whisper', { text: '戊' }),
+      ]);
+      const listKinds = async (
+        list: string[],
+        more: { after?: number; last?: number; types?: ('event' | 'message')[] } = {},
+      ) => texts(await store.list('s', { kinds: list, ...more }));
+      assert.deepEqual(await listKinds(['pet.whisper']), ['甲', '丙', '戊']);
+      assert.deepEqual(await listKinds(['pet.whisper', 'ctx.run.started']), ['甲', '丙', '丁', '戊']);
+      assert.deepEqual(await listKinds(['pet.whisper'], { last: 1 }), ['戊'], 'last 是过滤之后的最后几条');
+      assert.deepEqual(await listKinds(['pet.whisper', 'pet.reminder'], { last: 2 }), ['丙', '戊']);
+      assert.deepEqual(await listKinds(['pet.whisper'], { after: last!.seq - 2 }), ['戊']);
+      assert.deepEqual(await listKinds(['pet.whisper'], { types: ['event'] }), ['甲', '丙', '戊']);
+      assert.deepEqual(await listKinds(['pet.whisper'], { types: ['message'] }), [], '与 types 取交集：消息没有 kind');
+      assert.deepEqual(await listKinds([]), [], '空列表什么都不匹配');
+      assert.deepEqual(await listKinds(['nope']), []);
+      assert.equal((await store.list('s', { types: ['event'] })).length, 5, '不给 kinds 时不过滤');
+    });
+
+    test('kinds 只看事件自己的 kind：消息正文和事件数据里的 kind 字样不算', async () => {
+      const store = await factory({ now: Date.now });
+      await store.append('s', [
+        userEntry('kind'),
+        eventEntry('app.note', { text: '数据里有 kind', data: { kind: 'pet.whisper' } }),
+        eventEntry('pet.whisper', { text: '真的' }),
+      ]);
+      assert.deepEqual(texts(await store.list('s', { kinds: ['pet.whisper'] })), ['真的']);
+      assert.deepEqual(texts(await store.list('s', { kinds: ['kind'] })), []);
+    });
+
+    test('条目原样读回：消息分段、事件数据、摘要位置、元数据、格式版本', async () => {
       const store = await factory({ now: () => 42 });
-      const call: ModelMessage = {
+      const call: Message = {
         role: 'assistant',
         content: [
           { type: 'text', text: '查一下' },
-          { type: 'tool-call', toolCallId: 'c1', toolName: 'weather', input: { city: '台北', days: [1, 2] } },
+          { type: 'tool-call', id: 'c1', name: 'weather', input: { city: '台北', days: [1, 2] } },
         ],
       };
-      const image: ModelMessage = {
+      const image: Message = {
         role: 'user',
-        content: [{ type: 'image', image: new URL('https://example.com/a.png'), mediaType: 'image/png' }],
+        content: [{ type: 'file', mediaType: 'image/png', data: { type: 'url', url: 'https://example.com/a.png' } }],
       };
       const [written] = await store.append('s', [messageEntry(call, { source: 'model', meta: { step: 1 } })]);
       await store.append('s', [
         messageEntry(image),
         eventEntry('pet.reminder', { text: '喝水', data: { id: 's_1', repeat: null } }),
-        { type: 'summary', text: '摘要', covers: { at: 1, seq: 2 } },
+        { type: 'summary', text: '摘要', covers: 2 },
       ]);
       const [first, second, third, fourth] = await store.list('s');
       assert.equal(first?.id, written?.id);
@@ -203,44 +252,97 @@ export function describeSessionStoreContract(
       assert.equal(first?.source, 'model');
       assert.deepEqual(first?.meta, { step: 1 });
       assert.deepEqual(first?.type === 'message' && first.message, call);
-      const part = second?.type === 'message' && Array.isArray(second.message.content) && second.message.content[0];
-      assert.equal(part && part.type === 'image' && hrefOf(part.image), 'https://example.com/a.png');
+      assert.deepEqual(second?.type === 'message' && second.message, image);
       assert.deepEqual(third?.type === 'event' && [third.kind, third.text, third.data], [
         'pet.reminder',
         '喝水',
         { id: 's_1', repeat: null },
       ]);
-      assert.deepEqual(fourth?.type === 'summary' && [fourth.text, fourth.covers], ['摘要', { at: 1, seq: 2 }]);
+      assert.deepEqual(fourth?.type === 'summary' && [fourth.text, fourth.covers], ['摘要', 2]);
       assert.ok((second?.seq ?? 0) > (first?.seq ?? 0));
+      assert.equal(written?.v, ENTRY_VERSION, 'append 返回的条目带格式版本');
+      assert.ok(
+        [first, second, third, fourth].every((entry) => entry?.v === ENTRY_VERSION),
+        'list 读到的也是',
+      );
     });
 
-    test('二进制和 URL 读回来字节、地址不变：Buffer、ArrayBuffer、带标签的数据', async () => {
+    test('消息全是 JSON：每种部件、每种文件数据都原样读回，不经任何编码', async () => {
       const store = await factory({ now: () => 42 });
-      const message: ModelMessage = {
-        role: 'user',
-        content: [
-          { type: 'image', image: Buffer.from('hello'), mediaType: 'image/png' },
-          { type: 'image', image: new Uint8Array([1, 2, 3]).buffer, mediaType: 'image/png' },
-          { type: 'file', mediaType: 'image', data: { type: 'data', data: Buffer.from('hi') } },
-          { type: 'image', image: new URL('https://example.com/a.png') },
-          { type: 'file', mediaType: 'image', data: { type: 'url', url: new URL('https://example.com/b.png') } },
-        ],
-      };
-      await store.append('s', [messageEntry(message)]);
-      const [image, buffer, tagged, url, taggedUrl] = partsOf((await store.list('s'))[0]);
-      assert.deepEqual(bytesOf(image?.['image']), [...Buffer.from('hello')], 'Buffer');
-      assert.deepEqual(bytesOf(buffer?.['image']), [1, 2, 3], 'ArrayBuffer');
+      const options = { anthropic: { signature: 'sig==' } };
+      const messages: Message[] = [
+        { role: 'system', content: '系统', providerOptions: { openai: { cache: true } } },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '看图', providerOptions: options },
+            { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'aGVsbG8=' }, filename: 'a.png' },
+            { type: 'file', mediaType: 'image', data: { type: 'url', url: 'https://example.com/a.png' } },
+            {
+              type: 'file',
+              mediaType: 'application/pdf',
+              data: { type: 'reference', reference: { openai: 'file-1' } },
+            },
+            { type: 'file', mediaType: 'text/plain', data: { type: 'text', text: '内联文字' } },
+          ],
+        },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'reasoning', text: '想一想', providerOptions: options },
+            { type: 'reasoning-file', mediaType: 'image/png', data: { type: 'data', data: 'AQID' } },
+            { type: 'custom', kind: 'openai.compaction', providerOptions: options },
+            { type: 'tool-call', id: 'c1', name: 'lookup', input: { q: ['台北'] }, providerExecuted: true },
+            { type: 'tool-result', id: 'c1', name: 'lookup', output: { type: 'json', value: { n: 1 } } },
+            { type: 'tool-approval-request', approvalId: 'a1', callId: 'c2', reason: '要联网', signature: 's' },
+          ],
+        },
+        {
+          role: 'tool',
+          content: [
+            {
+              type: 'tool-result',
+              id: 'c2',
+              name: 'shot',
+              output: {
+                type: 'content',
+                parts: [
+                  { type: 'text', text: '截图' },
+                  { type: 'file', mediaType: 'image/png', data: { type: 'data', data: 'AQID' } },
+                ],
+              },
+            },
+            { type: 'tool-approval-response', approvalId: 'a1', approved: false, reason: '不行' },
+          ],
+        },
+      ];
+      await store.append(
+        's',
+        messages.map((message) => messageEntry(message)),
+      );
+      const listed = await store.list('s');
       assert.deepEqual(
-        bytesOf((tagged?.['data'] as Loose)?.['data']),
-        [...Buffer.from('hi')],
-        '{ type: data } 里的 Buffer',
+        listed.map((entry) => entry.type === 'message' && entry.message),
+        messages,
       );
-      assert.equal(hrefOf(url?.['image']), 'https://example.com/a.png', 'URL');
-      assert.equal(
-        hrefOf((taggedUrl?.['data'] as Loose)?.['url']),
-        'https://example.com/b.png',
-        '{ type: url } 里的 URL',
-      );
+      assert.deepEqual(JSON.parse(JSON.stringify(messages)), messages, '消息本身就是 JSON');
+    });
+
+    test('像旧编码标记的普通对象原样读回：新写的行不再解码 \\u0000ctx', async () => {
+      const store = await factory({ now: () => 42 });
+      const tagged = { '\u0000ctx': 'bytes', base64: 'aGk=' };
+      const link = { '\u0000ctx': 'url', href: 'https://example.com/' };
+      await store.append('s', [
+        messageEntry({
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'c1', name: 'x', input: { tagged, link } }],
+        }),
+        eventEntry('tool.log', { data: { tagged, link } }),
+      ]);
+      const [message, event] = await store.list('s');
+      const part = message?.type === 'message' && Array.isArray(message.message.content) && message.message.content[0];
+      assert.deepEqual(part && part.type === 'tool-call' && part.input, { tagged, link });
+      assert.deepEqual(event?.type === 'event' && event.data, { tagged, link });
     });
 
     test('事件数据里长得像编码标记的普通对象原样读回', async () => {
@@ -249,6 +351,152 @@ export function describeSessionStoreContract(
       await store.append('s', [eventEntry('tool.log', { data })]);
       const [entry] = await store.list('s');
       assert.deepEqual(entry?.type === 'event' && entry.data, data);
+    });
+
+    test('sessions 按名字升序（码点序），prefix 是字面前缀，after 和 limit 翻页', async () => {
+      const store = await factory({ now: Date.now });
+      const names = [
+        'b',
+        'a_b',
+        'user:10',
+        'a%b',
+        'user:2',
+        'ab',
+        'a',
+        'a\\b',
+        'user:1',
+        'user;x',
+        '用户:1',
+        '😀:1',
+        'Ａ:1',
+      ];
+      for (const session of names) await store.append(session, [userEntry(session)]);
+      // 码点序：ASCII 在前，然后是 U+7528、U+FF21、U+1F600（JavaScript 的 `<` 会把补充平面的 😀 排到 Ａ 前面）。
+      const sorted = [
+        'a',
+        'a%b',
+        'a\\b',
+        'a_b',
+        'ab',
+        'b',
+        'user:1',
+        'user:10',
+        'user:2',
+        'user;x',
+        '用户:1',
+        'Ａ:1',
+        '😀:1',
+      ];
+      assert.deepEqual(await store.sessions(), sorted, '不给选项时是全部，名字升序');
+      assert.deepEqual(await store.sessions({}), sorted);
+      assert.deepEqual(await store.sessions({ prefix: '' }), sorted, '空前缀是全部');
+      assert.deepEqual(await store.sessions({ prefix: 'user:' }), ['user:1', 'user:10', 'user:2']);
+      assert.deepEqual(await store.sessions({ prefix: 'a%' }), ['a%b'], '% 不是通配符');
+      assert.deepEqual(await store.sessions({ prefix: 'a_' }), ['a_b'], '_ 不是通配符');
+      assert.deepEqual(await store.sessions({ prefix: 'a\\' }), ['a\\b'], '反斜杠不是转义');
+      assert.deepEqual(await store.sessions({ prefix: 'a' }), ['a', 'a%b', 'a\\b', 'a_b', 'ab']);
+      assert.deepEqual(await store.sessions({ prefix: '😀' }), ['😀:1']);
+      assert.deepEqual(await store.sessions({ prefix: 'nope' }), []);
+      assert.deepEqual(
+        await store.sessions({ after: 'user:10' }),
+        ['user:2', 'user;x', '用户:1', 'Ａ:1', '😀:1'],
+        'after 不含',
+      );
+      assert.deepEqual(await store.sessions({ after: 'user:1', prefix: 'user:' }), ['user:10', 'user:2']);
+      assert.deepEqual(
+        await store.sessions({ after: 'zzz-不存在' }),
+        ['用户:1', 'Ａ:1', '😀:1'],
+        'after 不必是存在的名字',
+      );
+      assert.deepEqual(await store.sessions({ limit: 3 }), sorted.slice(0, 3));
+      assert.deepEqual(await store.sessions({ limit: 2.9 }), sorted.slice(0, 2), '小数向下取整');
+      assert.deepEqual(await store.sessions({ limit: 0 }), []);
+      assert.deepEqual(await store.sessions({ limit: 1000 }), sorted);
+      const pages: string[][] = [];
+      for (let after: string | undefined; ;) {
+        const page = await store.sessions({ limit: 4, ...(after !== undefined ? { after } : {}) });
+        if (page.length === 0) break;
+        pages.push(page);
+        after = page.at(-1)!;
+      }
+      assert.deepEqual(
+        pages.map((page) => page.length),
+        [4, 4, 4, 1],
+      );
+      assert.deepEqual(pages.flat(), sorted, '翻页不重不漏');
+      const user: string[] = [];
+      for (let after: string | undefined; ;) {
+        const page = await store.sessions({ prefix: 'user:', limit: 2, ...(after !== undefined ? { after } : {}) });
+        if (page.length === 0) break;
+        user.push(...page);
+        after = page.at(-1)!;
+      }
+      assert.deepEqual(user, ['user:1', 'user:10', 'user:2']);
+    });
+
+    test('sessions 翻页：清掉的会话不再出现，没有内容的会话不出现', async () => {
+      const store = await factory({ now: Date.now });
+      for (const session of ['a', 'b', 'c']) await store.append(session, [userEntry(session)]);
+      await store.clear('b');
+      assert.deepEqual(await store.sessions({ limit: 2 }), ['a', 'c']);
+      assert.deepEqual(await store.sessions({ after: 'a', limit: 1 }), ['c']);
+    });
+
+    test('expectSeq：末尾对得上才写，空会话是 0，对不上整批不写并抛 conflict（retryable）', async () => {
+      const store = await factory({ now: Date.now });
+      assert.equal(await headSeq(store, 's'), 0);
+      const [first] = await store.append('s', [userEntry('一')], { expectSeq: 0 });
+      assert.equal(await headSeq(store, 's'), first!.seq);
+      const failure = await store.append('s', batch('二'), { expectSeq: 0 }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      assert.ok(isConflict(failure), '前提不满足抛 conflict');
+      assert.equal((failure as { retryable?: unknown }).retryable, true);
+      assert.deepEqual(texts(await store.list('s')), ['一'], '整批不写');
+      const [second] = await store.append('s', [userEntry('二')], { expectSeq: first!.seq });
+      assert.deepEqual(texts(await store.list('s')), ['一', '二']);
+      assert.equal(await headSeq(store, 's'), second!.seq);
+    });
+
+    test('expectSeq：只看这个会话的末尾；不给就不检查；clear 之后又是 0', async () => {
+      const store = await factory({ now: Date.now });
+      const [a] = await store.append('a', [userEntry('a1')]);
+      await store.append('b', [userEntry('b1')]);
+      await store.append('a', [userEntry('a2')], { expectSeq: await headSeq(store, 'a') });
+      await assert.rejects(store.append('a', [userEntry('a3')], { expectSeq: a!.seq }), isConflict);
+      await store.append('a', [userEntry('a3')]);
+      assert.equal((await store.list('a')).length, 3);
+      await store.clear('a');
+      assert.equal(await headSeq(store, 'a'), 0);
+      await store.append('a', [userEntry('again')], { expectSeq: 0 });
+      assert.deepEqual(texts(await store.list('a')), ['again']);
+    });
+
+    test('expectSeq：前提的检查先于去重，重复的批在前提对得上时是空操作', async () => {
+      const store = await factory({ now: Date.now });
+      const [first] = await store.append('s', [userEntry('一', { key: 'k1' })], { expectSeq: 0 });
+      await store.append('s', [userEntry('二')]);
+      // 重试一批已经成功的写入，其间别人又写了：仍然是 conflict，不是静默的空操作。
+      await assert.rejects(store.append('s', [userEntry('一', { key: 'k1' })], { expectSeq: 0 }), isConflict);
+      const head = await headSeq(store, 's');
+      assert.notEqual(head, first!.seq);
+      // 前提对得上、整批都是重复的：照旧静默跳过。
+      assert.deepEqual(await store.append('s', [userEntry('一', { key: 'k1' })], { expectSeq: head }), []);
+      assert.deepEqual(texts(await store.list('s')), ['一', '二']);
+    });
+
+    test('expectSeq：同一个前提并发写，恰好一个成功', async () => {
+      const store = await factory({ now: Date.now });
+      const [first] = await store.append('s', [userEntry('起点')]);
+      const results = await Promise.allSettled(
+        ['甲', '乙', '丙'].map((tag) => store.append('s', [userEntry(tag)], { expectSeq: first!.seq })),
+      );
+      assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+      for (const result of results) {
+        if (result.status === 'rejected') assert.ok(isConflict(result.reason));
+      }
+      assert.equal((await store.list('s')).length, 2);
     });
 
     test('clear 删掉整个会话，sessions 只列有内容的', async () => {
@@ -268,7 +516,7 @@ export function describeSessionStoreContract(
       const [first] = await store.append('s', [userEntry('旧')]);
       await store.append('s', [userEntry('已有')]);
       const controller = new AbortController();
-      const iterator = store.watch('s', { after: cursorOf(first!), signal: controller.signal })[Symbol.asyncIterator]();
+      const iterator = store.watch('s', { after: first!.seq, signal: controller.signal })[Symbol.asyncIterator]();
       try {
         const existing = await nextWithin(iterator, '已有的条目');
         assert.deepEqual(texts(existing.done ? [] : [existing.value]), ['已有']);
@@ -278,6 +526,28 @@ export function describeSessionStoreContract(
         const fresh = await pending;
         assert.deepEqual(texts(fresh.done ? [] : [fresh.value]), ['新']);
         assert.equal(!fresh.done && fresh.value.session, 's');
+      } finally {
+        controller.abort();
+        await iterator.return?.();
+      }
+    });
+
+    test('watch（有时）：已经看过 b 的 watch 也收到之后补写的旧记录', async () => {
+      let clock = 1_000;
+      const store = await factory({ now: () => clock++ });
+      if (!store.watch) return;
+      const [, b] = await store.append('s', [userEntry('a'), userEntry('b')]);
+      const controller = new AbortController();
+      const iterator = store.watch('s', { after: b!.seq, signal: controller.signal })[Symbol.asyncIterator]();
+      try {
+        const pending = nextWithin(iterator, '补写的旧记录');
+        await store.append('s', [userEntry('late', { at: 1 })]);
+        const late = await pending;
+        assert.deepEqual(texts(late.done ? [] : [late.value]), ['late']);
+        const next = nextWithin(iterator, '之后的条目');
+        await store.append('s', [userEntry('c')]);
+        const fresh = await next;
+        assert.deepEqual(texts(fresh.done ? [] : [fresh.value]), ['c']);
       } finally {
         controller.abort();
         await iterator.return?.();
@@ -535,6 +805,11 @@ function kinds(entries: readonly Entry[]): string[] {
   });
 }
 
+/** 一条 `ctx.run.*` 事件，`data` 只带 `runId` 和最小的 `agent`。 */
+function lifecycle(kind: string, runId: string): NewEntry {
+  return eventEntry(kind, { data: { runId, agent: { model: 'm' } } });
+}
+
 function eventData(entries: readonly Entry[], kind: string): Record<string, unknown>[] {
   return entries.flatMap((entry) =>
     entry.type === 'event' && entry.kind === kind ? [(entry.data ?? {}) as Record<string, unknown>] : [],
@@ -653,6 +928,96 @@ export function describeHarnessContract(
       assert.equal(result.text, '好');
       assert.deepEqual(result.recorded, []);
       assert.deepEqual(await store.list('s'), []);
+    });
+
+    test('会话里有未结束的运行（最后一个生命周期事件是 started）：run 以 session_busy 结束，什么都不写', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
+      const before = await store.list('s');
+      const result = await harness.run({ session: 's', agent, input: '在吗' });
+      assert.equal(result.stopReason, 'error');
+      assert.equal(result.error?.type, 'session_busy');
+      assert.equal(result.error?.retryable, true);
+      assert.deepEqual(result.recorded, []);
+      assert.deepEqual(await store.list('s'), before, '一条都没写');
+      // 别的会话不受影响；那个运行结束以后就能接着跑。
+      assert.equal((await harness.run({ session: 't', agent, input: '在吗' })).stopReason, 'end_turn');
+    });
+
+    test('上一轮已经 ended：可以接着跑；record: false 的运行不受未结束的运行影响，也不留生命周期事件', async () => {
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'text', text: '一' },
+          { type: 'text', text: '二' },
+        ],
+      });
+      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'old'), lifecycle(CTX_EVENTS.runEnded, 'old')]);
+      assert.equal((await harness.run({ session: 's', agent, input: '1' })).stopReason, 'end_turn');
+      await store.append('t', [lifecycle(CTX_EVENTS.runStarted, 'stuck')]);
+      const quiet = await harness.run({ session: 't', agent, input: '2', record: false });
+      assert.equal(quiet.stopReason, 'end_turn');
+      assert.equal(quiet.text, '二');
+      assert.deepEqual(kinds(await store.list('t')), [CTX_EVENTS.runStarted], '只有原来那一条');
+    });
+
+    test('stream（有时）：会话忙时 run.ended 带 session_busy，不写日志', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      if (!harness.stream) return;
+      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
+      const events: RunEvent[] = [];
+      for await (const event of harness.stream({ session: 's', agent, input: '在吗' })) events.push(event);
+      const ended = events.at(-1);
+      assert.equal(ended?.type === 'run.ended' && ended.result.error?.type, 'session_busy');
+      assert.equal((await store.list('s')).length, 1);
+    });
+
+    test('owner 写进 ctx.run.started；不给就没有这个字段', async () => {
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'text', text: '一' },
+          { type: 'text', text: '二' },
+        ],
+      });
+      await harness.run({ session: 's', agent, input: '1', owner: 'yoyo' });
+      await harness.run({ session: 's', agent, input: '2' });
+      const started = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+      assert.deepEqual(
+        started.map((data) => data['owner']),
+        ['yoyo', undefined],
+      );
+      assert.ok(!('owner' in started[1]!));
+    });
+
+    test('agent.context 交给 ContextBuilder：不认识的投影名以 not_found 结束，不调模型；facts: false 照常跑', async () => {
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'text', text: '好' },
+          { type: 'text', text: '多余' },
+        ],
+      });
+      // 忽略 `context` 的 builder 会静默回到缺省，在这里被暴露。
+      const unknown = await harness.run({
+        session: 's',
+        agent: { ...agent, context: { projection: 'no-such-projection' } },
+        input: '在吗',
+      });
+      assert.equal(unknown.stopReason, 'error');
+      assert.equal(unknown.error?.type, 'not_found');
+      assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
+      const quiet = await harness.run({ session: 't', agent: { ...agent, context: { facts: false } }, input: '在吗' });
+      assert.equal(quiet.stopReason, 'end_turn');
+      assert.equal(quiet.text, '好');
+    });
+
+    test('agent.context 记进 ctx.run.started 的 agent，能 JSON 往返', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      const context = {
+        facts: { sources: ['clock'], placement: 'prompt', heading: '环境' },
+        projection: 'default',
+      } as const;
+      await harness.run({ session: 's', agent: { ...agent, context }, input: '在吗' });
+      const [started] = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+      assert.deepEqual((started?.['agent'] as Record<string, unknown> | undefined)?.['context'], context);
     });
 
     test('signal 已中止：返回 stopReason aborted，写 ctx.run.ended', async () => {
@@ -832,6 +1197,46 @@ export function describeOrchestratorContract(
           ended.map((data) => [data['runId'], data['stopReason']]),
           [['lost', 'error']],
         );
+        assert.deepEqual(await orchestrator.recover(), []);
+      });
+    });
+
+    test('recover（有时）：只收 owner 相同的运行，别的实例的断点不动', async () => {
+      await withOrchestrator(factory, answers(0), async ({ orchestrator, store }) => {
+        if (!orchestrator.recover) return;
+        // 夹具里的编排器没配 owner：没有 owner 的算自己的，写了别的 owner 的不是。
+        await store.append('mine', [lifecycle(CTX_EVENTS.runStarted, 'mine-1')]);
+        await store.append('theirs', [
+          eventEntry(CTX_EVENTS.runStarted, {
+            data: { runId: 'theirs-1', agent: { model: 'm' }, owner: 'someone-else' },
+          }),
+        ]);
+        assert.deepEqual(await orchestrator.recover(), [{ session: 'mine', runId: 'mine-1' }]);
+        assert.deepEqual(eventData(await store.list('theirs'), CTX_EVENTS.runEnded), [], '别人的运行没被动');
+        assert.deepEqual(await orchestrator.recover(), []);
+      });
+    });
+
+    test('recover（有时）：会话多于一页时每个断掉的运行都补，只看最后一个生命周期事件', async () => {
+      await withOrchestrator(factory, answers(0), async ({ orchestrator, store }) => {
+        if (!orchestrator.recover) return;
+        const crashed = ['s010', 's101', 's199', 's249'];
+        for (let i = 0; i < 250; i += 1) {
+          const session = `s${String(i).padStart(3, '0')}`;
+          const runId = `run-${i}`;
+          const entries = [userEntry('在吗'), lifecycle(CTX_EVENTS.runStarted, runId)];
+          if (!crashed.includes(session)) entries.push(lifecycle(CTX_EVENTS.runEnded, runId));
+          await store.append(session, entries);
+        }
+        const recovered = await orchestrator.recover();
+        assert.deepEqual(recovered.map((run) => run.session).toSorted(), crashed);
+        for (const session of crashed) {
+          const ended = eventData(await store.list(session), CTX_EVENTS.runEnded);
+          assert.deepEqual(
+            ended.map((data) => data['stopReason']),
+            ['error'],
+          );
+        }
         assert.deepEqual(await orchestrator.recover(), []);
       });
     });

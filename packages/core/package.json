@@ -1,6 +1,6 @@
 {
   "name": "@modelctx-ai/ctx",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "ctx 的进程内参考实现：内存会话存储、投影和来源组成的上下文、工具注册表、函数执行环境、基于 Vercel AI SDK 的 harness、进程内编排器，以及组合门面 createContext()。",
   "keywords": [
     "ai",

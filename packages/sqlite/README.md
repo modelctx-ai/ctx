@@ -24,7 +24,7 @@ const context = createContext({ store, session: 'user:42' });
 await context.append(userEntry('你好'));
 store.close();
 
-// 和应用共用一个库：表名带前缀；写入用 SAVEPOINT，可以放进应用自己的事务
+// 和应用共用一个库：表名带前缀；库上已有应用的事务时写入用 SAVEPOINT，可以放进应用自己的事务
 const db = new DatabaseSync('app.db');
 const shared = createSqliteStore({ database: db, prefix: 'ctx_' });
 db.exec('BEGIN');
@@ -51,24 +51,27 @@ watcher.close();
 
 ## 表
 
-| 表                | 内容                                                                                                                                                                                |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `<prefix>entries` | 每行一个条目：`seq`（自增，就是写入序号）、`id`（唯一）、`session`、`at`、`type`、`key`、`source`、`body`（JSON）、`meta`（JSON）。索引 `(session, at, seq)`；`(session, key)` 唯一 |
-| `<prefix>meta`    | 结构版本 `schema`                                                                                                                                                                   |
+| 表                | 内容                                                                                                                                                                                                                                                                                                  |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<prefix>entries` | 每行一个条目：`seq`（自增，就是写入序号）、`id`（唯一）、`session`、`at`、`type`、`key`、`source`、`v`（格式版本）、`body`（JSON）、`meta`（JSON）。索引 `(session, seq)`；`(session, key)` 唯一。生成列 `kind`（`json_extract(body, '$.kind')`，VIRTUAL，只有事件有值）和索引 `(session, kind, seq)` |
+| `<prefix>meta`    | 结构版本 `schema`                                                                                                                                                                                                                                                                                     |
 
+- `list({ kinds })` 只返回 `type = 'event'` 且 `kind` 在其中的行，靠 `kind` 列和索引；旧版本写的行不用回填，`kind` 自动有值。`sessions({ prefix, after, limit })` 按名字升序，前缀用范围查询（`session >= ? AND session < ?`），不用 `LIKE`，`%`、`_` 不用转义。
+- 每次 `append` 在 `BEGIN IMMEDIATE` 里做：先拿写锁（等 `busy_timeout`），再检查 `expectSeq`，再写。两个进程用同一个 `expectSeq` 并发写，恰好一个成功，另一个得到 `conflict`，不会是 `SQLITE_BUSY`。库上已有应用的事务时改用 SAVEPOINT，锁归应用管。
 - 重复的 `id`、同会话重复的 `key` 由 `ON CONFLICT DO NOTHING` 跳过，同一批的其余照写；只跳过唯一约束冲突，NOT NULL 之类的违例照常报错；一批在一个 SAVEPOINT 里，要么全写要么不写。
 - `watch(session, { after, signal })` 轮询 `list(session, { after })`，先给出已有的再给出新写入的；`signal` 中止后迭代结束。
-- 二进制和 URL 在序列化之前换成带标记的对象：`Uint8Array`、`Buffer`、`ArrayBuffer` 和其他 TypedArray 存成 `{"\u0000ctx": "bytes", "base64": "…"}`，`URL` 存成 `{"\u0000ctx": "url", "href": "…"}`。读回来二进制都是 `Uint8Array`，URL 还是 `URL`。
-- 只有恰好是这个形状的对象才会还原；`{ $url }`、`{ $bytes }` 这类普通对象原样读回。有循环引用的条目写入时报错。
+- 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），`body` 就是 `JSON.stringify` 的结果，不做编码。有循环引用的条目写入时报错。
+- `v` 列记写入这一行时的格式版本（新行是 `1`，列加上之前的行是 `0`）。读每一行经协议包的 `upgradeEntry` 升到当前形状：0.2 及以前存的 AI SDK 消息（二进制和 URL 带 `\u0000ctx` 标记）转成 `Message`，旧摘要的 `covers: { at, seq }` 读成 `seq`；旧行不会被改写。比自己认识的更高的 `v` 读时抛 `unsupported_version`。
 - 通过协议包的契约测试 `describeSessionStoreContract`（含 `watch`）。
 
 ## 结构版本和迁移
 
-`<prefix>meta` 的 `schema` 记结构版本，当前是 `2`。打开时：
+`<prefix>meta` 的 `schema` 记结构版本，当前是 `3`。打开时：
 
 - 没有表：直接建当前结构。
-- 版本比 2 低：在写锁里按序升级，同时打开同一个旧库的几个进程只有一个真的迁，其余拿到锁后重读版本。0.1 的库（列叫 `thread`，`schema` 是 `1`）会被改成 `session`，索引随列一起改，数据不动；0.2 的库（列已经是 `session`，`schema` 也是 `1`）和应用自己改过列名的库只升版本号。
-- 版本比 2 高：抛错，不打开。旧代码不认识新结构，写进去可能写坏；升级本包即可。
+- 版本比 3 低：在写锁里按序升级，同时打开同一个旧库的几个进程只有一个真的迁，其余拿到锁后重读版本。0.1 的库（列叫 `thread`，`schema` 是 `1`）会被改成 `session`，索引随列一起改，数据不动；0.2 的库（列已经是 `session`，`schema` 也是 `1`）和应用自己改过列名的库只升版本号；3 把索引 `(session, at, seq)` 换成 `(session, seq)`，旧摘要的 `covers: { at, seq }` 读成 `seq`。
+- 版本等于 3：不信版本号，查实际的列和索引（`PRAGMA table_xinfo`、`sqlite_master`），缺什么在写锁里补什么，结构完整时什么都不写。所以先前的提交建出来的 schema 3 库，在之后的版本上打开也会补齐；每一步都能重复执行。`v` 列（`INTEGER NOT NULL DEFAULT 0`）也在这一级补：缺就加，已有的行是 0。
+- 版本比 3 高：抛错，不打开。旧代码不认识新结构，写进去可能写坏；升级本包即可。
 
 应用传进来的 `database` 上已经有事务时，迁移用 SAVEPOINT，随应用的事务一起提交或回滚。
 

@@ -7,8 +7,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net';
 
 import {
+  isConflict,
   silentLogger,
-  type Cursor,
   type Entry,
   type EntryType,
   type ErrorInfo,
@@ -23,6 +23,7 @@ import {
   type RunRequest,
   type RunResult,
   type RunStatus,
+  type SessionsOptions,
   type SessionStore,
   type ToolCall,
 } from '@modelctx-ai/ctx-protocol';
@@ -87,6 +88,12 @@ interface HttpFailure {
 function fail(status: number, message: string, type?: string): never {
   const failure: HttpFailure = { status, info: { message, type: type ?? typeOf(status) } };
   throw Object.assign(new Error(message), { failure });
+}
+
+/** 写入前提不满足：409，`type: conflict`，带 `retryable`，客户端据此转回协议的 `conflict`。 */
+function conflictFailure(message: string): Error {
+  const failure: HttpFailure = { status: 409, info: { message, type: 'conflict', retryable: true } };
+  return Object.assign(new Error(message), { failure });
 }
 
 function failureOf(error: unknown): HttpFailure | undefined {
@@ -247,19 +254,32 @@ function runRequestOf(body: unknown): WireRunRequest {
 
 const ENTRY_TYPES: readonly EntryType[] = ['message', 'event', 'summary'];
 
-function cursorParam(query: URLSearchParams): Cursor | undefined {
-  const at = query.get('after.at');
-  const seq = query.get('after.seq');
-  if (at === null && seq === null) return undefined;
-  const cursor = { at: Number(at), seq: Number(seq ?? 0) };
-  if (!Number.isFinite(cursor.at) || !Number.isFinite(cursor.seq)) fail(400, 'after.at and after.seq must be numbers');
-  return cursor;
+function afterParam(query: URLSearchParams): number | undefined {
+  const raw = query.get('after');
+  if (raw === null) return undefined;
+  const after = Number(raw);
+  if (raw === '' || !Number.isFinite(after)) fail(400, 'after must be a number (a seq)');
+  return after;
+}
+
+function sessionsOptionsOf(query: URLSearchParams): SessionsOptions {
+  const options: { prefix?: string; after?: string; limit?: number } = {};
+  const prefix = query.get('prefix');
+  if (prefix !== null) options.prefix = prefix;
+  const after = query.get('after');
+  if (after !== null) options.after = after;
+  const limit = query.get('limit');
+  if (limit !== null) {
+    options.limit = Number(limit);
+    if (limit === '' || Number.isNaN(options.limit)) fail(400, 'limit must be a number');
+  }
+  return options;
 }
 
 function listOptionsOf(query: URLSearchParams): ListOptions {
-  const options: { after?: Cursor; last?: number; types?: EntryType[] } = {};
-  const after = cursorParam(query);
-  if (after) options.after = after;
+  const options: { after?: number; last?: number; types?: EntryType[]; kinds?: string[] } = {};
+  const after = afterParam(query);
+  if (after !== undefined) options.after = after;
   const last = query.get('last');
   if (last !== null) options.last = Number(last);
   const types = query.get('types');
@@ -269,6 +289,8 @@ function listOptionsOf(query: URLSearchParams): ListOptions {
     if (unknown.length > 0) fail(400, `unknown entry types: ${unknown.join(', ')}; use ${ENTRY_TYPES.join(', ')}`);
     options.types = list as EntryType[];
   }
+  const kinds = query.get('kinds');
+  if (kinds !== null) options.kinds = kinds.split(',').filter(Boolean);
   return options;
 }
 
@@ -319,7 +341,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     const [session, sub, tail, extra] = rest;
     if (session === undefined) {
       if (method !== 'GET') fail(405, 'use GET /sessions');
-      sendJson(res, 200, { sessions: await sessionStore.sessions() });
+      sendJson(res, 200, { sessions: await sessionStore.sessions(sessionsOptionsOf(url.searchParams)) });
       return;
     }
     if (sub === undefined) {
@@ -330,7 +352,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     if (sub !== 'entries' || extra !== undefined) fail(404, `not found: ${url.pathname}`);
     if (tail === 'stream') {
       if (method !== 'GET') fail(405, 'use GET /sessions/:session/entries/stream');
-      await watchEntries(sessionStore, session, cursorParam(url.searchParams), res);
+      await watchEntries(sessionStore, session, afterParam(url.searchParams), res);
       return;
     }
     if (tail !== undefined) fail(404, `not found: ${url.pathname}`);
@@ -342,13 +364,28 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     const body = await readBody(req, limit);
     const entries = isObject(body) ? body['entries'] : undefined;
     if (!Array.isArray(entries)) fail(400, 'request body must be { "entries": NewEntry[] }');
-    sendJson(res, 200, { entries: await sessionStore.append(session, entries as NewEntry[]) });
+    const expectSeq = isObject(body) ? body['expectSeq'] : undefined;
+    if (expectSeq !== undefined && (typeof expectSeq !== 'number' || !Number.isInteger(expectSeq) || expectSeq < 0)) {
+      fail(400, '`expectSeq` must be a non-negative integer');
+    }
+    try {
+      sendJson(res, 200, {
+        entries: await sessionStore.append(
+          session,
+          entries as NewEntry[],
+          expectSeq === undefined ? undefined : { expectSeq },
+        ),
+      });
+    } catch (error) {
+      if (isConflict(error)) throw conflictFailure(messageOf(error));
+      throw error;
+    }
   }
 
   async function watchEntries(
     sessionStore: SessionStore,
     session: string,
-    after: Cursor | undefined,
+    after: number | undefined,
     res: ServerResponse,
   ): Promise<void> {
     const controller = new AbortController();
@@ -357,16 +394,16 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     const write = startStream(res);
     try {
       if (sessionStore.watch) {
-        for await (const entry of sessionStore.watch(session, { ...(after ? { after } : {}), signal })) {
+        for await (const entry of sessionStore.watch(session, { ...(after !== undefined ? { after } : {}), signal })) {
           await write(entry);
         }
       } else {
-        let cursor = after;
+        let position = after;
         while (!signal.aborted) {
-          const entries: Entry[] = await sessionStore.list(session, cursor ? { after: cursor } : {});
+          const entries: Entry[] = await sessionStore.list(session, position !== undefined ? { after: position } : {});
           for (const entry of entries) await write(entry);
           const last = entries.at(-1);
-          if (last) cursor = { at: last.at, seq: last.seq };
+          if (last) position = last.seq;
           await sleep(pollIntervalMs, signal);
         }
       }

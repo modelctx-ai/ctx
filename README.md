@@ -186,7 +186,7 @@ await orchestrator.close();
 └── yoyo/    使用方
 ```
 
-使用方的 `package.json` 照常写版本范围（`"@modelctx-ai/ctx": "^0.2.0"`），在 `pnpm-workspace.yaml` 里用 `overrides` 指到同级目录：
+使用方的 `package.json` 照常写版本范围（`"@modelctx-ai/ctx": "^0.3.0"`），在 `pnpm-workspace.yaml` 里用 `overrides` 指到同级目录：
 
 ```yaml
 overrides:
@@ -204,7 +204,7 @@ overrides:
 
 ### 发布以后
 
-删掉 `overrides`，重新 `pnpm install`，同样的 `^0.2.0` 从 npm 解析。
+删掉 `overrides`，重新 `pnpm install`，同样的 `^0.3.0` 从 npm 解析。
 
 ## 开发
 

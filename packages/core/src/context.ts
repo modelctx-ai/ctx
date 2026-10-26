@@ -10,6 +10,7 @@ import type {
   Hooks,
   ListOptions,
   Logger,
+  MessageContent,
   NewEntry,
   PreparedCall,
   Projection,
@@ -28,6 +29,7 @@ import type { generateText, LanguageModel, ModelMessage, ToolSet, UserContent } 
 import { assemble, createContextBuilder, type FactsPlacement, type LocalContextBuilder } from './builder.ts';
 import { createFunctionExecutor, type FunctionExecutor } from './executor.ts';
 import { createHarnessRuntime, type GenerateTextResult, type StreamTextResult } from './harness.ts';
+import { fromUserContent, toModelMessages } from './messages.ts';
 import { executorMap, toToolSet, type LocalToolRegistry } from './tools.ts';
 
 export type { GenerateTextResult, StreamTextResult } from './harness.ts';
@@ -83,8 +85,9 @@ export interface PrepareOptions {
   readonly signal?: AbortSignal;
 }
 
-/** `prepare()` 的结果：协议的 `PreparedCall`，工具另外包成了 AI SDK 的 `ToolSet`。 */
-export interface PreparedContext extends Omit<PreparedCall, 'tools'> {
+/** `prepare()` 的结果：协议的 `PreparedCall`，消息转成了 AI SDK 的 `ModelMessage`，工具另外包成了 `ToolSet`，可以直接交给 `generateText`。 */
+export interface PreparedContext extends Omit<PreparedCall, 'tools' | 'messages'> {
+  readonly messages: ModelMessage[];
   readonly tools?: ToolSet;
   /** 交给模型的工具名。 */
   readonly toolNames: readonly string[];
@@ -238,21 +241,21 @@ export function createContext(options: ContextOptions): Context {
   /** 指令和提示是函数时先收集事实交给它们，事实就不再自动放进去。 */
   async function resolve(call: PrepareOptions): Promise<{
     instructions: string | undefined;
-    prompt: UserContent | undefined;
+    prompt: MessageContent | undefined;
     collected: readonly Fact[] | undefined;
   }> {
     const consumed = typeof call.instructions === 'function' || typeof call.prompt === 'function';
     if (!consumed) {
       return {
         instructions: call.instructions,
-        prompt: call.prompt as UserContent,
+        prompt: call.prompt === undefined ? undefined : fromUserContent(call.prompt),
         collected: undefined,
       };
     }
     const collected = call.facts === false ? [] : await facts(call.signal);
     const instructions = typeof call.instructions === 'function' ? call.instructions(collected) : call.instructions;
     const prompt = typeof call.prompt === 'function' ? call.prompt(collected) : call.prompt;
-    return { instructions, prompt, collected };
+    return { instructions, prompt: prompt === undefined ? undefined : fromUserContent(prompt), collected };
   }
 
   async function prepare(call: PrepareOptions = {}): Promise<PreparedContext> {
@@ -266,13 +269,18 @@ export function createContext(options: ContextOptions): Context {
       placeFacts: resolved.collected === undefined,
       placement: options.factsPlacement ?? 'instructions',
       instructions: resolved.instructions,
-      input: call.input,
+      input: call.input === undefined ? undefined : fromUserContent(call.input),
       prompt: resolved.prompt,
       tools: selected,
     });
-    const { tools: names, ...rest } = prepared;
+    const { tools: names, messages, ...rest } = prepared;
     const set = toToolSet(selected, [...executorMap(executors).values()], { session: session });
-    return { ...rest, toolNames: names, ...(selected.length > 0 ? { tools: set } : {}) };
+    return {
+      ...rest,
+      messages: toModelMessages(messages),
+      toolNames: names,
+      ...(selected.length > 0 ? { tools: set } : {}),
+    };
   }
 
   function modelFor(call: GenerateSettings): LanguageModel {
@@ -296,7 +304,7 @@ export function createContext(options: ContextOptions): Context {
     const run: RunRequest = {
       session: session,
       agent,
-      ...(call.input !== undefined ? { input: call.input } : {}),
+      ...(call.input !== undefined ? { input: fromUserContent(call.input) } : {}),
       ...(call.inputKey !== undefined ? { inputKey: call.inputKey } : {}),
       ...(resolved.prompt !== undefined ? { prompt: resolved.prompt } : {}),
       ...(call.record === false ? { record: false } : {}),
@@ -316,7 +324,7 @@ export function createContext(options: ContextOptions): Context {
       runId: result.runId,
       stopReason: result.stopReason,
       text: result.text,
-      messages: result.messages,
+      messages: outcome.raw.responseMessages,
       recorded: result.recorded,
       raw: outcome.raw,
     };

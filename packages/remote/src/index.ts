@@ -3,7 +3,9 @@
  * 只用 `fetch`、`TextDecoder`、`AbortController`，不用 `node:` 模块，任何运行时都能跑。服务端在 `./server`。
  */
 import {
+  CtxError,
   errorOutput,
+  type AppendOptions,
   type Entry,
   type ErrorInfo,
   type ExecutionContext,
@@ -19,6 +21,7 @@ import {
   type RunRequest,
   type RunResult,
   type RunStatus,
+  type SessionsOptions,
   type SessionStore,
   type ToolCall,
   type ToolDefinition,
@@ -155,18 +158,30 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
 } {
   const connection = connect(options);
   return {
-    async append(session: string, entries: readonly NewEntry[]): Promise<Entry[]> {
-      const body = await connection.json<{ entries: Entry[] }>('POST', entriesPath(session), { body: { entries } });
-      return body.entries;
+    async append(session: string, entries: readonly NewEntry[], appendOptions?: AppendOptions): Promise<Entry[]> {
+      try {
+        const body = await connection.json<{ entries: Entry[] }>('POST', entriesPath(session), {
+          body: { entries, ...(appendOptions?.expectSeq !== undefined ? { expectSeq: appendOptions.expectSeq } : {}) },
+        });
+        return body.entries;
+      } catch (error) {
+        // 409 + conflict：前提不满足，转成协议的 `conflict`，调用方不必认识 HTTP。
+        if (isRemoteError(error) && error.status === 409 && error.type === 'conflict') {
+          throw new CtxError('conflict', error.message, { retryable: true });
+        }
+        throw error;
+      }
     },
     async list(session: string, listOptions: ListOptions = {}): Promise<Entry[]> {
-      const { after, last, types } = listOptions;
+      const { after, last, types, kinds } = listOptions;
+      // kinds 用逗号分隔，带逗号的 kind 过不了线；与其静默拆成两个，不如直接报错。
+      if (kinds?.some((kind) => kind.includes(','))) throw new Error('An entry kind cannot contain a comma.');
       const body = await connection.json<{ entries: Entry[] }>('GET', entriesPath(session), {
         query: {
-          'after.at': after ? String(after.at) : undefined,
-          'after.seq': after ? String(after.seq) : undefined,
+          after: after !== undefined ? String(after) : undefined,
           last: last !== undefined ? String(last) : undefined,
           types: types ? types.join(',') : undefined,
+          kinds: kinds ? kinds.join(',') : undefined,
         },
       });
       return body.entries;
@@ -174,8 +189,16 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
     async clear(session: string): Promise<number> {
       return (await connection.json<{ deleted: number }>('DELETE', `/sessions/${segment(session)}`)).deleted;
     },
-    async sessions(): Promise<string[]> {
-      return (await connection.json<{ sessions: string[] }>('GET', '/sessions')).sessions;
+    async sessions(sessionsOptions: SessionsOptions = {}): Promise<string[]> {
+      const { prefix, after, limit } = sessionsOptions;
+      const body = await connection.json<{ sessions: string[] }>('GET', '/sessions', {
+        query: {
+          prefix,
+          after,
+          limit: limit !== undefined ? String(limit) : undefined,
+        },
+      });
+      return body.sessions;
     },
     async *watch(session: string, watchOptions: WatchOptions = {}): AsyncGenerator<Entry> {
       const { after, signal } = watchOptions;
@@ -183,8 +206,7 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
       try {
         const response = await connection.request('GET', `${entriesPath(session)}/stream`, {
           query: {
-            'after.at': after ? String(after.at) : undefined,
-            'after.seq': after ? String(after.seq) : undefined,
+            after: after !== undefined ? String(after) : undefined,
           },
           ...(signal ? { signal } : {}),
         });

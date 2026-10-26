@@ -1,6 +1,7 @@
-import type { LanguageModel, ModelMessage, UserContent } from 'ai';
+import type { LanguageModel } from 'ai';
 
-import type { PreparedCall, WindowOptions } from './context.ts';
+import type { Message, MessageContent } from './message.ts';
+import type { ContextSpec, PreparedCall, WindowOptions } from './context.ts';
 import type { Entry } from './session.ts';
 import type { ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
 import type { Awaitable, ErrorInfo, JsonObject, JsonValue } from './types.ts';
@@ -42,6 +43,8 @@ export interface AgentSpec {
   /** 工具调用最多走几步。缺省：有工具 5 步，没有工具 1 步。 */
   readonly maxSteps?: number;
   readonly window?: WindowOptions;
+  /** 这个 agent 的上下文怎么组装：事实用哪些来源、放哪，用哪套投影。见 `ContextSpec`。 */
+  readonly context?: ContextSpec;
   readonly settings?: CallSettings;
 }
 
@@ -59,6 +62,7 @@ export function agentSpecToJson(spec: AgentSpec): JsonObject {
   if (spec.tools !== undefined) out['tools'] = spec.tools;
   if (spec.maxSteps !== undefined) out['maxSteps'] = spec.maxSteps;
   if (spec.window !== undefined) out['window'] = spec.window;
+  if (spec.context !== undefined) out['context'] = spec.context;
   if (spec.settings !== undefined) out['settings'] = spec.settings;
   return out as JsonObject;
 }
@@ -67,15 +71,17 @@ export interface RunRequest {
   readonly session: string;
   readonly agent: AgentSpec;
   /** 这一轮用户新说的话。记录时在调用模型前写进日志。 */
-  readonly input?: UserContent;
+  readonly input?: MessageContent;
   /** 输入的幂等键：失败后用同一个键重试，不会再记一遍。 */
   readonly inputKey?: string;
   /** 放在最后的临时用户消息，不写日志。 */
-  readonly prompt?: UserContent;
+  readonly prompt?: MessageContent;
   /** 把输入、产出和 `ctx.run.*` 写进日志，缺省写。 */
   readonly record?: boolean;
   /** 不给就由 harness 生成。 */
   readonly runId?: string;
+  /** 写进 `ctx.run.started` 的 `owner`：这一轮属于哪个编排器实例，`recover` 据此只收自己的运行。编排器按自己的 `owner` 填。 */
+  readonly owner?: string;
   readonly signal?: AbortSignal;
 }
 
@@ -96,7 +102,7 @@ export interface RunResult {
   /** 最后一步的文字。 */
   readonly text: string;
   /** 这一轮模型产出的消息（含工具调用和结果）。 */
-  readonly messages: ModelMessage[];
+  readonly messages: Message[];
   /** 实际写进日志的条目。 */
   readonly recorded: readonly Entry[];
   readonly stopReason: StopReason;

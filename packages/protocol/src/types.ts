@@ -24,3 +24,20 @@ export interface ErrorInfo {
   readonly statusCode?: number;
   readonly responseBody?: string;
 }
+
+/**
+ * 协议层认得的错误：`type` 是机器可读的类别，和 `ErrorInfo.type` 同一套（例如 `unsupported_version`、
+ * `unsupported_part`）。`name` 也设成它，harness 把错误写进 `ctx.error` 和 `RunResult.error` 时沿用。
+ */
+export class CtxError extends Error {
+  readonly type: string;
+  /** 重试可能成功（例如 `conflict`、`session_busy`）；harness 写进 `ErrorInfo.retryable`。 */
+  readonly retryable?: boolean;
+
+  constructor(type: string, message: string, options: { readonly retryable?: boolean } = {}) {
+    super(message);
+    this.name = type;
+    this.type = type;
+    if (options.retryable !== undefined) this.retryable = options.retryable;
+  }
+}

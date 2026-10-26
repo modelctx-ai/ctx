@@ -4,7 +4,8 @@
  */
 import { describe, test } from 'vite-plus/test';
 
-import { compareCursor, filterEntries, type Entry, type SessionStore } from './session.ts';
+import { checkExpectSeq, filterEntries, filterSessions, type Entry, type SessionStore } from './session.ts';
+import { ENTRY_VERSION } from './version.ts';
 import { describeExecutorContract, describeSessionStoreContract, describeToolRegistryContract } from './testing.ts';
 import {
   errorOutput,
@@ -23,8 +24,9 @@ function fakeStore(now: () => number): SessionStore {
   let nextId = 0;
 
   const store: SessionStore = {
-    async append(session, drafts) {
+    async append(session, drafts, options) {
       const list = sessions.get(session) ?? [];
+      checkExpectSeq(list.at(-1)?.seq ?? 0, options);
       const keys = new Set(list.flatMap((entry) => (entry.key === undefined ? [] : [entry.key])));
       const written: Entry[] = [];
       for (const draft of drafts) {
@@ -32,13 +34,13 @@ function fakeStore(now: () => number): SessionStore {
         const id = draft.id ?? `e${(nextId += 1)}`;
         if (ids.has(id)) continue;
         seq += 1;
-        const entry = { ...draft, id, session, seq, at: draft.at ?? now() } as Entry;
+        const entry = { ...draft, id, session, seq, at: draft.at ?? now(), v: ENTRY_VERSION } as Entry;
         ids.add(id);
         if (entry.key !== undefined) keys.add(entry.key);
         written.push(entry);
       }
       if (written.length > 0) {
-        sessions.set(session, [...list, ...written].toSorted(compareCursor));
+        sessions.set(session, [...list, ...written]);
         for (const wake of waiters) wake();
       }
       return written;
@@ -52,8 +54,8 @@ function fakeStore(now: () => number): SessionStore {
       sessions.delete(session);
       return list.length;
     },
-    async sessions() {
-      return [...sessions.keys()];
+    async sessions(options) {
+      return filterSessions([...sessions.keys()], options);
     },
     async *watch(session, options = {}) {
       let after = options.after;
@@ -63,7 +65,7 @@ function fakeStore(now: () => number): SessionStore {
         const fresh = filterEntries(sessions.get(session) ?? [], after ? { after } : {});
         for (const entry of fresh) {
           yield entry;
-          after = entry;
+          after = entry.seq;
         }
         if (fresh.length > 0) continue;
         await new Promise<void>((resolve) => {

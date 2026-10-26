@@ -1,6 +1,8 @@
 import {
-  compareCursor,
+  checkExpectSeq,
+  ENTRY_VERSION,
   filterEntries,
+  filterSessions,
   type Entry,
   type SessionStore,
   type WatchOptions,
@@ -17,18 +19,6 @@ export interface MemoryStoreOptions {
   readonly id?: () => string;
 }
 
-/** 按 `(at, seq)` 有序插入；新条目的 seq 最大，所以只需找到第一个 at 更大的位置。 */
-function insertSorted(list: Entry[], entry: Entry): void {
-  let low = 0;
-  let high = list.length;
-  while (low < high) {
-    const mid = (low + high) >>> 1;
-    if (compareCursor(list[mid]!, entry) <= 0) low = mid + 1;
-    else high = mid;
-  }
-  list.splice(low, 0, entry);
-}
-
 /** 进程内存储。测试、短会话和不需要落盘的场景用。`watch` 靠内存里的订阅，写入后立刻唤醒。 */
 export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStore {
   const now = options.now ?? Date.now;
@@ -37,6 +27,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
   const ids = new Set<string>();
   /** 每个会话上等新条目的 `watch`。 */
   const waiters = new Map<string, Set<() => void>>();
+  /** 全局递增，满足协议要求的会话内递增；`clear` 不重置，所以不会复用。 */
   let seq = 0;
 
   function session(name: string): { entries: Entry[]; keys: Set<string> } {
@@ -74,18 +65,20 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
   }
 
   return {
-    async append(name, drafts) {
+    async append(name, drafts, appendOptions) {
       const target = session(name);
+      // 前提先于去重；和下面的写入在同一个同步段里，中间不会插进别的写入。
+      checkExpectSeq(target.entries.at(-1)?.seq ?? 0, appendOptions);
       const written: Entry[] = [];
       for (const draft of drafts) {
         if (draft.key !== undefined && target.keys.has(draft.key)) continue;
         const entryId = draft.id ?? id();
         if (ids.has(entryId)) continue;
         seq += 1;
-        const entry = { ...draft, id: entryId, session: name, seq, at: draft.at ?? now() } as Entry;
+        const entry = { ...draft, id: entryId, session: name, seq, at: draft.at ?? now(), v: ENTRY_VERSION } as Entry;
         ids.add(entryId);
         if (entry.key !== undefined) target.keys.add(entry.key);
-        insertSorted(target.entries, entry);
+        target.entries.push(entry);
         written.push(entry);
       }
       if (written.length > 0) wake(name);
@@ -101,8 +94,11 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
       sessions.delete(name);
       return found.entries.length;
     },
-    async sessions() {
-      return [...sessions.keys()].filter((name) => (sessions.get(name)?.entries.length ?? 0) > 0);
+    async sessions(sessionsOptions) {
+      return filterSessions(
+        [...sessions.keys()].filter((name) => (sessions.get(name)?.entries.length ?? 0) > 0),
+        sessionsOptions,
+      );
     },
     async *watch(name: string, watchOptions: WatchOptions = {}) {
       const { signal } = watchOptions;
@@ -113,7 +109,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
         for (const entry of fresh) {
           if (signal?.aborted) return;
           yield entry;
-          after = entry;
+          after = entry.seq;
         }
         if (fresh.length === 0) await waitFor(name, signal);
       }
