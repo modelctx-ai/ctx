@@ -515,12 +515,16 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     // 没人排在前面就直接开始：`signal` 已经中止的运行照常写 started 和 ended（见契约）。
     if (!queued) return release;
     if (signal) {
+      // 等完就摘掉监听：调用方长期复用同一个 signal 时不会越积越多。
+      let onAbort: (() => void) | undefined;
       const aborted = new Promise<void>((resolve) => {
-        if (signal.aborted) resolve();
-        else signal.addEventListener('abort', () => resolve(), { once: true });
+        if (signal.aborted) return resolve();
+        onAbort = resolve;
+        signal.addEventListener('abort', onAbort, { once: true });
       });
       let waited = false;
       await Promise.race([previous.then(() => (waited = true)), aborted]);
+      if (onAbort) signal.removeEventListener('abort', onAbort);
       if (signal.aborted || !waited) {
         release();
         return undefined;

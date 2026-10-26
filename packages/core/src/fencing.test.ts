@@ -348,6 +348,36 @@ describe('同一进程内每会话串行', () => {
     );
   });
 
+  test('排队等过的运行：等完就摘掉 signal 上的 abort 监听', async () => {
+    const { harness } = setup();
+    const { model, entered, release } = gatedModel();
+    const running = harness.run({ session: 's', agent: { model }, input: '一', runId: 'r1' });
+    await entered;
+    const { signal } = new AbortController();
+    let queueListeners = 0;
+    const add = signal.addEventListener.bind(signal);
+    const remove = signal.removeEventListener.bind(signal);
+    // 只数排队时挂的那一个：它在 run 开始之前挂上，模型调用还没开始。
+    let counting = true;
+    signal.addEventListener = (type, listener, options) => {
+      if (type === 'abort' && counting) queueListeners += 1;
+      add(type, listener, options);
+    };
+    signal.removeEventListener = (type, listener, options) => {
+      if (type === 'abort' && counting) queueListeners -= 1;
+      remove(type, listener, options);
+    };
+    const queued = harness.run({ session: 's', agent: { model: answerModel() }, input: '二', runId: 'r2', signal });
+    await Promise.resolve();
+    assert.equal(queueListeners, 1, '排队时挂了一个');
+    release();
+    await running;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    counting = false;
+    assert.equal(queueListeners, 0, '轮到它时已经摘掉');
+    assert.equal((await queued).stopReason, 'end_turn');
+  });
+
   test('排队时 signal 已经中止（stream）：直接 aborted，不写', async () => {
     const { store, harness } = setup();
     const { model, entered, release } = gatedModel();
