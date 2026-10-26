@@ -4,6 +4,10 @@
 
 - **实现** `ctx-sqlite`：结构版本升到 2，`<prefix>meta.schema` 真正被检查。0.1 的库（`thread` 列）和 0.2 的库（`session` 列，版本同为 1）打开时在写锁里迁移，不用应用自己 `RENAME COLUMN`；比自己新的版本拒绝打开。自己开库时设 `busy_timeout`（`busyTimeoutMs`，缺省 5000），传进来的 `database` 缺省不改。写入从 `INSERT OR IGNORE` 改成 `ON CONFLICT DO NOTHING`，NOT NULL 违例不再被静默吞掉。
 
+- **更新** [协议层](protocol.md)：`ErrorInfo` 加 `statusCode`、`responseBody`（上游 HTTP 接口出错时的状态码和响应正文，纯 JSON，随 `RunResult.error` 过线）。
+- **更新** [协议层](protocol.md)、[实践：yoyo](repos.md)：yoyo 的描述跟上 yoyo#9：`createYoyoOrchestrator` 实现 `Orchestrator`，碎碎念和回复是同一个 `createHarness` 跑的两份 `AgentSpec`，导演只剩舞台动作，常驻循环只管进程。
+- **实现**：harness 在一轮开始前对「工具绑定的执行环境没交给 harness」告警一次，调用时错误信息列出可用的执行环境；`createOrchestrator` 的 `submit` 在每轮结束后摘掉 `request.signal` 上的 abort 监听。
+
 ## 2026-10-25
 
 - **新增** `packages/exec`（`@modelctx-ai/ctx-exec` 0.2.0）：本机子进程 `Executor`。`run_command` 在工作目录里用 shell 跑命令，`read_file`、`write_file`、`list_dir` 只碰工作目录里面（拒绝 `..` 和指出去的符号链接）；环境变量白名单、超时和取消时杀整个进程组、输出截断并注明截掉多少、`allow` 审批；`commands` 把固定命令包成专门的工具。结果是带 `<exit_code>`、`<stdout>`、`<stderr>` 的文字，非零退出码不算错误。

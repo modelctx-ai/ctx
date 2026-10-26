@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 
 import { CTX_EVENTS, type Entry, type RunEvent, type SessionStore } from '@modelctx-ai/ctx-protocol';
-import { tool } from 'ai';
+import { APICallError, RetryError, tool } from 'ai';
 import { z } from 'zod';
 import { describe, test } from 'vite-plus/test';
 
 import { createContextBuilder } from './builder.ts';
 import { createFunctionExecutor } from './executor.ts';
-import { createHarness, type HarnessOptions } from './harness.ts';
+import { createHarness, errorInfo, type HarnessOptions } from './harness.ts';
 import { createMemoryStore } from './store.ts';
 import { createScriptedModel } from './testing.ts';
 import { createToolRegistry } from './tools.ts';
@@ -135,6 +135,66 @@ describe('harness', () => {
       JSON.stringify(model.doGenerateCalls[1]!.prompt.at(-1)),
       /executor \\"nowhere\\", which is not available/,
     );
+  });
+
+  test('工具绑定的执行环境没交给 harness：告警一次，调用时模型仍看到错误', async () => {
+    const store = createMemoryStore();
+    const warnings: { message: string; data?: Record<string, unknown> }[] = [];
+    const logger = { warn: (message: string, data?: Record<string, unknown>) => void warnings.push({ message, data }) };
+    const registry = createToolRegistry().add({ name: 'remote', inputSchema: { type: 'object' }, executor: 'nowhere' });
+    const harness = createHarness({ store, context: createContextBuilder({ store }), tools: registry, logger });
+    for (const session of ['a', 'b']) {
+      const model = createScriptedModel(
+        [
+          { type: 'tool-call', id: 'c1', input: {} },
+          { type: 'text', text: '好' },
+        ],
+        { tool: 'remote' },
+      );
+      await harness.run({ session, agent: { model }, input: 'x' });
+    }
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!.message, /executor "nowhere".*createHarness/);
+    assert.deepEqual(warnings[0]!.data, { executor: 'nowhere', tools: ['remote'], available: ['local'] });
+
+    // 执行环境交给了 harness，或没有工具绑定到缺失的执行环境：不告警。
+    const quiet: string[] = [];
+    const { harness: complete } = setup({ logger: { warn: (message: string) => void quiet.push(message) } });
+    await complete.run({
+      session: 's',
+      agent: { model: createScriptedModel([{ type: 'text', text: '好' }]) },
+      input: 'x',
+    });
+    assert.deepEqual(quiet, []);
+  });
+
+  test('errorInfo 带上接口错误的状态码和响应正文，重试错误取最后一次', () => {
+    const apiError = new APICallError({
+      message: 'Unauthorized',
+      url: 'https://example.test/v1/chat/completions',
+      requestBodyValues: {},
+      statusCode: 401,
+      responseBody: '{"error":{"message":"bad key"}}',
+    });
+    const expected = {
+      message: 'Unauthorized',
+      type: 'api_call',
+      retryable: false,
+      statusCode: 401,
+      responseBody: '{"error":{"message":"bad key"}}',
+    };
+    assert.deepEqual(errorInfo(apiError), expected);
+    const retry = new RetryError({
+      message: 'failed after 3 attempts',
+      reason: 'maxRetriesExceeded',
+      errors: [apiError],
+    });
+    assert.deepEqual(errorInfo(retry), expected);
+    const bare = new APICallError({ message: 'network down', url: 'https://example.test', requestBodyValues: {} });
+    assert.equal('statusCode' in errorInfo(bare), false);
+    assert.equal('responseBody' in errorInfo(bare), false);
+    // 线上形态：纯 JSON，往返不丢字段。
+    assert.deepEqual(JSON.parse(JSON.stringify(errorInfo(apiError))), expected);
   });
 
   test('模型名经 models 解析；没给 models 时以 error 结束', async () => {
