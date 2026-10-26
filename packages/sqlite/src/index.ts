@@ -178,14 +178,8 @@ function readSchemaVersion(database: DatabaseSync, prefix: string): number | und
  * 不会像先读后升级的延迟事务那样直接 `SQLITE_BUSY`。库上已经有应用的事务时只能用 SAVEPOINT，锁归应用管。
  */
 function withWriteLock(database: DatabaseSync, prefix: string, work: () => void): void {
-  let savepoint = false;
-  try {
-    database.exec('BEGIN IMMEDIATE');
-  } catch (error) {
-    if (!/within a transaction/.test((error as Error).message)) throw error;
-    savepoint = true;
-    database.exec(`SAVEPOINT ${prefix}migrate`);
-  }
+  const savepoint = database.isTransaction;
+  database.exec(savepoint ? `SAVEPOINT ${prefix}migrate` : 'BEGIN IMMEDIATE');
   try {
     work();
   } catch (error) {
