@@ -92,7 +92,15 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
       };
       // 没人等 done 时，harness 抛错也不能变成未处理的 rejection。
       run.done.promise.catch(() => {});
-      request.signal?.addEventListener('abort', () => void orchestrator.cancel(runId), { once: true });
+      // 这一轮结束（跑完、取消、出错）就摘掉监听：调用方长期复用同一个 signal 时不会越积越多。
+      if (request.signal) {
+        const onAbort = (): void => void orchestrator.cancel(runId);
+        request.signal.addEventListener('abort', onAbort, { once: true });
+        void run.done.promise.then(
+          () => request.signal?.removeEventListener('abort', onAbort),
+          () => request.signal?.removeEventListener('abort', onAbort),
+        );
+      }
       runs.set(runId, run);
       emit(run, 'queued');
       const previous = tails.get(run.session) ?? Promise.resolve();

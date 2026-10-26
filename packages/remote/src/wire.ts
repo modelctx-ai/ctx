@@ -88,14 +88,24 @@ export interface RemoteError extends Error {
   readonly status: number;
   readonly type?: string;
   readonly retryable?: boolean;
+  readonly statusCode?: number;
+  readonly responseBody?: string;
 }
 
 export function remoteError(status: number, info: ErrorInfo): RemoteError {
-  const error = new Error(info.message) as Error & { status: number; type?: string; retryable?: boolean };
+  const error = new Error(info.message) as Error & {
+    status: number;
+    type?: string;
+    retryable?: boolean;
+    statusCode?: number;
+    responseBody?: string;
+  };
   error.name = 'RemoteError';
   error.status = status;
   if (info.type !== undefined) error.type = info.type;
   if (info.retryable !== undefined) error.retryable = info.retryable;
+  if (info.statusCode !== undefined) error.statusCode = info.statusCode;
+  if (info.responseBody !== undefined) error.responseBody = info.responseBody;
   return error;
 }
 

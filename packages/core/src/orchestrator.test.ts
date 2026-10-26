@@ -71,6 +71,45 @@ describe('orchestrator', () => {
     await orchestrator.close();
   });
 
+  test('长期复用同一个 signal：每轮结束后不在上面留 abort 监听', async () => {
+    const { harness, release } = gatedHarness();
+    const orchestrator = createOrchestrator({ harness });
+    const controller = new AbortController();
+    const { signal } = controller;
+    let active = 0;
+    const add = signal.addEventListener.bind(signal);
+    const remove = signal.removeEventListener.bind(signal);
+    signal.addEventListener = (type, listener, options) => {
+      if (type === 'abort') active += 1;
+      add(type, listener, options);
+    };
+    signal.removeEventListener = (type, listener, options) => {
+      if (type === 'abort') active -= 1;
+      remove(type, listener, options);
+    };
+
+    for (const input of ['1', '2', '3']) {
+      const handle = await orchestrator.submit({ session: 's', agent, input, signal });
+      await tick();
+      release(input);
+      await handle.done;
+      await tick();
+    }
+    assert.equal(active, 0);
+
+    // 排队中被取消的一轮同样摘掉。
+    const running = await orchestrator.submit({ session: 's', agent, input: 'r', signal });
+    const queued = await orchestrator.submit({ session: 's', agent, input: 'q', signal });
+    await tick();
+    await orchestrator.cancel(queued.runId);
+    await queued.done;
+    release('r');
+    await running.done;
+    await tick();
+    assert.equal(active, 0);
+    await orchestrator.close();
+  });
+
   test('harness 抛错时状态是 failed，done reject', async () => {
     const harness: Harness = {
       run: async () => {

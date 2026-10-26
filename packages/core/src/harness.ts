@@ -23,6 +23,7 @@ import {
   type SessionStore,
   type StopReason,
   type ToolCall,
+  type ToolDefinition,
   type ToolOutput,
   type ToolRegistry,
   type Usage,
@@ -139,7 +140,13 @@ function stopReasonOf(finishReason: FinishReason, steps: number, maxSteps: numbe
 export function errorInfo(error: unknown): ErrorInfo {
   const root = RetryError.isInstance(error) ? error.lastError : error;
   if (APICallError.isInstance(root)) {
-    return { message: root.message, type: 'api_call', retryable: root.isRetryable };
+    return {
+      message: root.message,
+      type: 'api_call',
+      retryable: root.isRetryable,
+      ...(root.statusCode !== undefined ? { statusCode: root.statusCode } : {}),
+      ...(root.responseBody !== undefined ? { responseBody: root.responseBody } : {}),
+    };
   }
   if (root instanceof Error) {
     return root.name && root.name !== 'Error' ? { message: root.message, type: root.name } : { message: root.message };
@@ -180,6 +187,28 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   const executors = executorMap(options.executors);
   if (hasExecutor(tools) && !executors.has(tools.executor.name)) executors.set(tools.executor.name, tools.executor);
   const base = dispatchTo([...executors.values()]);
+  /** 已经告警过的执行环境名：同一个缺口每个 harness 只说一次。 */
+  const warned = new Set<string>();
+
+  /**
+   * 工具绑定的执行环境没交给 harness：调用时模型会收到错误，这里在这一轮开始前提醒开发者。
+   * 不在构造时抛错：注册表可以在 harness 建好之后才加工具，执行环境也可能晚到。
+   */
+  function warnMissingExecutors(definitions: readonly ToolDefinition[]): void {
+    const missing = new Map<string, string[]>();
+    for (const definition of definitions) {
+      if (executors.has(definition.executor) || warned.has(definition.executor)) continue;
+      missing.set(definition.executor, [...(missing.get(definition.executor) ?? []), definition.name]);
+    }
+    for (const [name, toolNames] of missing) {
+      warned.add(name);
+      logger.warn(
+        `Tools are bound to executor "${name}", which was not passed to createHarness; calls will return an error. ` +
+          `Add it to \`executors\`.`,
+        { executor: name, tools: toolNames, available: [...executors.keys()] },
+      );
+    }
+  }
 
   const dispatch: ToolDispatch = async (call, definition, execution) => {
     let actual: ToolCall = call;
@@ -237,6 +266,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       const found = candidates.find((tool) => tool.name === name) ?? tools?.get(name);
       return found ? [found] : [];
     });
+    warnMissingExecutors(definitions);
     return {
       model,
       prepared,
