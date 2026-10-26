@@ -1,5 +1,9 @@
 # 文档更新记录
 
+## 2026-10-26
+
+- **新增** [ADR 0005](adr/0005-session-position-writes-format.md)（提议，待审，不改代码）：会话位置改用 `seq`（补写旧记录会被摘要盖掉）、写入前提条件 `expectSeq` 和围栏、`recover` 的 `owner`、ctx 自己的带版本 JSON 消息格式（读时升级）、`AgentSpec.context`、会话分页和事件 `kinds` 过滤；列出对内存、sqlite、remote、gateway 和 yoyo 的破坏面。
+
 ## 2026-10-25
 
 - **新增** `packages/exec`（`@modelctx-ai/ctx-exec` 0.2.0）：本机子进程 `Executor`。`run_command` 在工作目录里用 shell 跑命令，`read_file`、`write_file`、`list_dir` 只碰工作目录里面（拒绝 `..` 和指出去的符号链接）；环境变量白名单、超时和取消时杀整个进程组、输出截断并注明截掉多少、`allow` 审批；`commands` 把固定命令包成专门的工具。结果是带 `<exit_code>`、`<stdout>`、`<stderr>` 的文字，非零退出码不算错误。
