@@ -1,6 +1,6 @@
 import type { Message, MessageContent } from './message.ts';
 import type { StopReason, Usage } from './harness.ts';
-import type { JsonObject, JsonValue } from './types.ts';
+import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 
 interface EntryBase {
   /** 全局唯一。没给就由存储生成。 */
@@ -76,6 +76,16 @@ export interface ListOptions {
   readonly kinds?: readonly string[];
 }
 
+/** `append` 的写入前提。 */
+export interface AppendOptions {
+  /**
+   * 仅当会话当前最后一条的 `seq` 等于它才写（空会话是 0），否则整批不写，抛 `conflict`
+   * （`CtxError`，`retryable: true`；HTTP 是 409）。前提的检查先于去重：重试一批已经成功的写入，
+   * 如果其间别人又写了，仍然得到 `conflict`，调用方重读就能看到自己的条目已在。不给就不检查。
+   */
+  readonly expectSeq?: number;
+}
+
 /** `sessions` 的分页和前缀。 */
 export interface SessionsOptions {
   /** 只要以它开头的名字，按字面匹配（`%`、`_`、`\` 都不是通配符或转义）。空串是全部。 */
@@ -101,9 +111,9 @@ export interface SessionStore {
   /**
    * 追加一批条目，返回真正写入的那些（带 `id`、`session`、`seq`、`at`）。
    * 一批是原子的：不会只写一半，也不会和并发的另一批交错。`id` 重复（全局）或 `key` 重复（同一会话，
-   * 含同一批里的）不算失败，那一条静默跳过，其余照写。
+   * 含同一批里的）不算失败，那一条静默跳过，其余照写。给了 `options.expectSeq` 时前提不满足整批不写，抛 `conflict`。
    */
-  append(session: string, entries: readonly NewEntry[]): Promise<Entry[]>;
+  append(session: string, entries: readonly NewEntry[], options?: AppendOptions): Promise<Entry[]>;
   list(session: string, options?: ListOptions): Promise<Entry[]>;
   /** 清空一个会话，返回删掉的条数。 */
   clear(session: string): Promise<number>;
@@ -215,6 +225,30 @@ export function filterSessions(names: readonly string[], options: SessionsOption
   return limit > 0 ? out.slice(0, limit) : [];
 }
 
+// ---- 写入前提 ----
+
+/** 会话当前最后一条的 `seq`，空会话是 0。用 `list({ last: 1 })`，存储不必为它加方法。 */
+export async function headSeq(store: Pick<SessionStore, 'list'>, session: string): Promise<number> {
+  const [last] = await store.list(session, { last: 1 });
+  return last?.seq ?? 0;
+}
+
+/** `append` 的前提不满足时抛的错：`type` 是 `conflict`，`retryable: true`。存储实现和远端客户端共用。 */
+export function conflictError(expected: number, actual?: number): CtxError {
+  const found = actual === undefined ? '' : `, but it ends at ${actual}`;
+  return new CtxError('conflict', `Expected the session to end at seq ${expected}${found}.`, { retryable: true });
+}
+
+/** 是不是 `conflict`：本地的 `CtxError` 和远端客户端转出来的错误都认（只看 `type`）。 */
+export function isConflict(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { type?: unknown }).type === 'conflict';
+}
+
+/** 存储在写入之前调：`options.expectSeq` 不等于当前最后一条的 `seq`（`head`）就抛 `conflict`。 */
+export function checkExpectSeq(head: number, options?: AppendOptions): void {
+  if (options?.expectSeq !== undefined && options.expectSeq !== head) throw conflictError(options.expectSeq, head);
+}
+
 // ---- 框架事件 ----
 
 /** 框架写进会话的事件 `kind`。`ctx.` 前缀保留给框架，应用自定其余的 `{domain}.{action}`。 */
@@ -231,6 +265,8 @@ export type CtxEventKind = (typeof CTX_EVENTS)[keyof typeof CTX_EVENTS];
 export interface RunStartedData {
   readonly runId: string;
   readonly agent: JsonObject;
+  /** 这一轮属于哪个编排器实例（`createOrchestrator({ owner })`）；`recover` 只收同一个 `owner` 的运行。 */
+  readonly owner?: string;
 }
 
 /** `ctx.run.ended` 的 `data`。崩溃恢复靠「有 started 没有 ended」找出断掉的运行。 */

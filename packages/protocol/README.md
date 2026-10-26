@@ -14,14 +14,14 @@ Node ≥22。
 
 ## 六个协议
 
-| 协议             | 方法                                                            | 一句话                                                                                               |
-| ---------------- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `SessionStore`   | `append`、`list`、`clear`、`sessions`、`watch?`                 | 只追加的事件日志，按 `seq`（写入顺序）排序；`sessions` 名字升序，可分页，`list` 可按事件 `kind` 过滤 |
-| `ContextBuilder` | `build`、`view`、`compact?`                                     | 日志 + 事实 + 输入 → 一次调用的指令、消息、工具名单                                                  |
-| `ToolRegistry`   | `add`、`remove`、`removeSource`、`has`、`get`、`list`、`select` | 工具目录：JSON Schema 定义，每个绑一个执行环境的名字                                                 |
-| `Executor`       | `execute`、`tools?`、`provision?`、`dispose?`                   | 工具调用真正发生的地方；出错返回 `{ type: 'error' }` 而不是抛                                        |
-| `Harness`        | `run`、`stream?`                                                | 一轮：组装 → 调模型 → 分发工具 → 写回，直到停下                                                      |
-| `Orchestrator`   | `submit`、`status`、`cancel`、`close`、`recover?`、`events?`    | 跨轮次、跨会话的调度：同一会话串行，不同会话并行                                                     |
+| 协议             | 方法                                                            | 一句话                                                                                                                                                    |
+| ---------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SessionStore`   | `append`、`list`、`clear`、`sessions`、`watch?`                 | 只追加的事件日志，按 `seq`（写入顺序）排序；`append` 可带 `expectSeq` 前提，不满足抛 `conflict`；`sessions` 名字升序，可分页，`list` 可按事件 `kind` 过滤 |
+| `ContextBuilder` | `build`、`view`、`compact?`                                     | 日志 + 事实 + 输入 → 一次调用的指令、消息、工具名单                                                                                                       |
+| `ToolRegistry`   | `add`、`remove`、`removeSource`、`has`、`get`、`list`、`select` | 工具目录：JSON Schema 定义，每个绑一个执行环境的名字                                                                                                      |
+| `Executor`       | `execute`、`tools?`、`provision?`、`dispose?`                   | 工具调用真正发生的地方；出错返回 `{ type: 'error' }` 而不是抛                                                                                             |
+| `Harness`        | `run`、`stream?`                                                | 一轮：组装 → 调模型 → 分发工具 → 写回，直到停下                                                                                                           |
+| `Orchestrator`   | `submit`、`status`、`cancel`、`close`、`recover?`、`events?`    | 跨轮次、跨会话的调度：同一会话串行，不同会话并行                                                                                                          |
 
 模型用 AI SDK 的 `LanguageModel`，不另定义。随协议走的值：`AgentSpec`（一个 agent 的配置）、`Hooks`（harness 的切入点）、框架事件 `CTX_EVENTS`（`ctx.run.started`、`ctx.run.ended`、`ctx.compacted`、`ctx.error`）。
 
@@ -34,6 +34,7 @@ Node ≥22。
 | `userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry`              | 构造新条目                                                                                               |
 | `runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`isFrameworkKind` | 框架事件                                                                                                 |
 | `compareEntries`、`filterEntries`、`filterSessions`、`textOf`                            | 投影顺序、`ListOptions`、`SessionsOptions` 的语义、消息文字                                              |
+| `headSeq`、`isConflict`、`checkExpectSeq`、`conflictError`                               | `expectSeq` 前提：读末尾、认 `conflict`、存储实现里检查并抛错                                            |
 | `ENTRY_VERSION`、`upgradeEntry`                                                          | 条目格式版本；存储读每一行时调 `upgradeEntry(raw)`，旧版本升到当前形状，更高版本抛 `unsupported_version` |
 | `project`、`latestSummary`、`defaultSummaryMessage`                                      | 条目渲染成 `Message[]`：摘要、事件规则、窗口                                                             |
 | `defineSource`、`collectFacts`、`renderFacts`                                            | 上下文来源和事实（`collectFacts` 并行、单个来源有超时）                                                  |

@@ -1,6 +1,7 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 
 import {
+  checkExpectSeq,
   ENTRY_VERSION,
   upgradeEntry,
   type Entry,
@@ -148,17 +149,19 @@ function readSchemaVersion(database: DatabaseSync, prefix: string): number | und
  * 拿到写锁再做 `work`。库上没有事务时用 `BEGIN IMMEDIATE`：一开始就要写锁，会等 `busy_timeout`，
  * 不会像先读后升级的延迟事务那样直接 `SQLITE_BUSY`。库上已经有应用的事务时只能用 SAVEPOINT，锁归应用管。
  */
-function withWriteLock(database: DatabaseSync, prefix: string, work: () => void): void {
+function withWriteLock<T>(database: DatabaseSync, name: string, work: () => T): T {
   const savepoint = database.isTransaction;
-  database.exec(savepoint ? `SAVEPOINT ${prefix}migrate` : 'BEGIN IMMEDIATE');
+  database.exec(savepoint ? `SAVEPOINT ${name}` : 'BEGIN IMMEDIATE');
+  let result: T;
   try {
-    work();
+    result = work();
   } catch (error) {
-    database.exec(savepoint ? `ROLLBACK TO ${prefix}migrate` : 'ROLLBACK');
-    if (savepoint) database.exec(`RELEASE ${prefix}migrate`);
+    database.exec(savepoint ? `ROLLBACK TO ${name}` : 'ROLLBACK');
+    if (savepoint) database.exec(`RELEASE ${name}`);
     throw error;
   }
-  database.exec(savepoint ? `RELEASE ${prefix}migrate` : 'COMMIT');
+  database.exec(savepoint ? `RELEASE ${name}` : 'COMMIT');
+  return result;
 }
 
 /** 表上实际有的列和索引。`table_info` 不列生成列，`table_xinfo` 才列。 */
@@ -237,7 +240,7 @@ function migrate(database: DatabaseSync, prefix: string): void {
   check(seen);
   if (complete(seen)) return;
 
-  withWriteLock(database, prefix, () => {
+  withWriteLock(database, `${prefix}migrate`, () => {
     database.exec(`CREATE TABLE IF NOT EXISTS ${prefix}meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
     let version = readSchemaVersion(database, prefix);
     check(version);
@@ -264,7 +267,8 @@ function migrate(database: DatabaseSync, prefix: string): void {
 
 /**
  * 基于 `node:sqlite` 的存储。所有条目在一张表里，按会话和写入序号 `seq` 建索引，事件另按 `kind` 建索引。
- * 写入用 SAVEPOINT，所以和应用共用一个库、处在应用自己的事务里也能用。
+ * 每次写入在 `BEGIN IMMEDIATE` 里做（先拿写锁，再检查 `expectSeq`，再写）；库上已有应用的事务时改用 SAVEPOINT，
+ * 所以和应用共用一个库、处在应用自己的事务里也能用。
  */
 export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionStore {
   const prefix = options.prefix ?? 'ctx_';
@@ -296,23 +300,16 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
   const removeSession = database.prepare(`DELETE FROM ${table} WHERE session = ?`);
   const pollInterval = options.pollIntervalMs ?? 250;
 
-  function run<T>(work: () => T): T {
-    database.exec(`SAVEPOINT ${prefix}write`);
-    try {
-      const result = work();
-      database.exec(`RELEASE ${prefix}write`);
-      return result;
-    } catch (error) {
-      database.exec(`ROLLBACK TO ${prefix}write`);
-      database.exec(`RELEASE ${prefix}write`);
-      throw error;
-    }
-  }
-
   const store: SqliteSessionStore = {
     database,
-    async append(session, drafts) {
-      return run(() => {
+    async append(session, drafts, appendOptions) {
+      // 先拿写锁再检查前提：两个进程读后写不会各自读到同一个末尾、再在升级写锁时撞上 SQLITE_BUSY，
+      // 后到的那个等锁，拿到锁后读到新的末尾，得到 `conflict`。库上已有应用事务时退回 SAVEPOINT。
+      return withWriteLock(database, `${prefix}write`, () => {
+        if (appendOptions?.expectSeq !== undefined) {
+          const head = database.prepare(`SELECT max(seq) AS head FROM ${table} WHERE session = ?`).get(session);
+          checkExpectSeq(Number(head?.['head'] ?? 0), appendOptions);
+        }
         const written: Entry[] = [];
         for (const draft of drafts) {
           const entryId = draft.id ?? id();

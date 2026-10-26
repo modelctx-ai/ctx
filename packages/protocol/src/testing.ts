@@ -17,6 +17,8 @@ import {
   CTX_EVENTS,
   assistantEntry,
   eventEntry,
+  headSeq,
+  isConflict,
   messageEntry,
   userEntry,
   type Entry,
@@ -438,6 +440,63 @@ export function describeSessionStoreContract(
       await store.clear('b');
       assert.deepEqual(await store.sessions({ limit: 2 }), ['a', 'c']);
       assert.deepEqual(await store.sessions({ after: 'a', limit: 1 }), ['c']);
+    });
+
+    test('expectSeq：末尾对得上才写，空会话是 0，对不上整批不写并抛 conflict（retryable）', async () => {
+      const store = await factory({ now: Date.now });
+      assert.equal(await headSeq(store, 's'), 0);
+      const [first] = await store.append('s', [userEntry('一')], { expectSeq: 0 });
+      assert.equal(await headSeq(store, 's'), first!.seq);
+      const failure = await store.append('s', batch('二'), { expectSeq: 0 }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      assert.ok(isConflict(failure), '前提不满足抛 conflict');
+      assert.equal((failure as { retryable?: unknown }).retryable, true);
+      assert.deepEqual(texts(await store.list('s')), ['一'], '整批不写');
+      const [second] = await store.append('s', [userEntry('二')], { expectSeq: first!.seq });
+      assert.deepEqual(texts(await store.list('s')), ['一', '二']);
+      assert.equal(await headSeq(store, 's'), second!.seq);
+    });
+
+    test('expectSeq：只看这个会话的末尾；不给就不检查；clear 之后又是 0', async () => {
+      const store = await factory({ now: Date.now });
+      const [a] = await store.append('a', [userEntry('a1')]);
+      await store.append('b', [userEntry('b1')]);
+      await store.append('a', [userEntry('a2')], { expectSeq: await headSeq(store, 'a') });
+      await assert.rejects(store.append('a', [userEntry('a3')], { expectSeq: a!.seq }), isConflict);
+      await store.append('a', [userEntry('a3')]);
+      assert.equal((await store.list('a')).length, 3);
+      await store.clear('a');
+      assert.equal(await headSeq(store, 'a'), 0);
+      await store.append('a', [userEntry('again')], { expectSeq: 0 });
+      assert.deepEqual(texts(await store.list('a')), ['again']);
+    });
+
+    test('expectSeq：前提的检查先于去重，重复的批在前提对得上时是空操作', async () => {
+      const store = await factory({ now: Date.now });
+      const [first] = await store.append('s', [userEntry('一', { key: 'k1' })], { expectSeq: 0 });
+      await store.append('s', [userEntry('二')]);
+      // 重试一批已经成功的写入，其间别人又写了：仍然是 conflict，不是静默的空操作。
+      await assert.rejects(store.append('s', [userEntry('一', { key: 'k1' })], { expectSeq: 0 }), isConflict);
+      const head = await headSeq(store, 's');
+      assert.notEqual(head, first!.seq);
+      // 前提对得上、整批都是重复的：照旧静默跳过。
+      assert.deepEqual(await store.append('s', [userEntry('一', { key: 'k1' })], { expectSeq: head }), []);
+      assert.deepEqual(texts(await store.list('s')), ['一', '二']);
+    });
+
+    test('expectSeq：同一个前提并发写，恰好一个成功', async () => {
+      const store = await factory({ now: Date.now });
+      const [first] = await store.append('s', [userEntry('起点')]);
+      const results = await Promise.allSettled(
+        ['甲', '乙', '丙'].map((tag) => store.append('s', [userEntry(tag)], { expectSeq: first!.seq })),
+      );
+      assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+      for (const result of results) {
+        if (result.status === 'rejected') assert.ok(isConflict(result.reason));
+      }
+      assert.equal((await store.list('s')).length, 2);
     });
 
     test('clear 删掉整个会话，sessions 只列有内容的', async () => {
@@ -871,6 +930,64 @@ export function describeHarnessContract(
       assert.deepEqual(await store.list('s'), []);
     });
 
+    test('会话里有未结束的运行（最后一个生命周期事件是 started）：run 以 session_busy 结束，什么都不写', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
+      const before = await store.list('s');
+      const result = await harness.run({ session: 's', agent, input: '在吗' });
+      assert.equal(result.stopReason, 'error');
+      assert.equal(result.error?.type, 'session_busy');
+      assert.equal(result.error?.retryable, true);
+      assert.deepEqual(result.recorded, []);
+      assert.deepEqual(await store.list('s'), before, '一条都没写');
+      // 别的会话不受影响；那个运行结束以后就能接着跑。
+      assert.equal((await harness.run({ session: 't', agent, input: '在吗' })).stopReason, 'end_turn');
+    });
+
+    test('上一轮已经 ended：可以接着跑；record: false 的运行不受未结束的运行影响，也不留生命周期事件', async () => {
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'text', text: '一' },
+          { type: 'text', text: '二' },
+        ],
+      });
+      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'old'), lifecycle(CTX_EVENTS.runEnded, 'old')]);
+      assert.equal((await harness.run({ session: 's', agent, input: '1' })).stopReason, 'end_turn');
+      await store.append('t', [lifecycle(CTX_EVENTS.runStarted, 'stuck')]);
+      const quiet = await harness.run({ session: 't', agent, input: '2', record: false });
+      assert.equal(quiet.stopReason, 'end_turn');
+      assert.equal(quiet.text, '二');
+      assert.deepEqual(kinds(await store.list('t')), [CTX_EVENTS.runStarted], '只有原来那一条');
+    });
+
+    test('stream（有时）：会话忙时 run.ended 带 session_busy，不写日志', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      if (!harness.stream) return;
+      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
+      const events: RunEvent[] = [];
+      for await (const event of harness.stream({ session: 's', agent, input: '在吗' })) events.push(event);
+      const ended = events.at(-1);
+      assert.equal(ended?.type === 'run.ended' && ended.result.error?.type, 'session_busy');
+      assert.equal((await store.list('s')).length, 1);
+    });
+
+    test('owner 写进 ctx.run.started；不给就没有这个字段', async () => {
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'text', text: '一' },
+          { type: 'text', text: '二' },
+        ],
+      });
+      await harness.run({ session: 's', agent, input: '1', owner: 'yoyo' });
+      await harness.run({ session: 's', agent, input: '2' });
+      const started = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+      assert.deepEqual(
+        started.map((data) => data['owner']),
+        ['yoyo', undefined],
+      );
+      assert.ok(!('owner' in started[1]!));
+    });
+
     test('signal 已中止：返回 stopReason aborted，写 ctx.run.ended', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '不该说' }] });
       const result = await harness.run({ session: 's', agent, input: '在吗', signal: AbortSignal.abort() });
@@ -1048,6 +1165,22 @@ export function describeOrchestratorContract(
           ended.map((data) => [data['runId'], data['stopReason']]),
           [['lost', 'error']],
         );
+        assert.deepEqual(await orchestrator.recover(), []);
+      });
+    });
+
+    test('recover（有时）：只收 owner 相同的运行，别的实例的断点不动', async () => {
+      await withOrchestrator(factory, answers(0), async ({ orchestrator, store }) => {
+        if (!orchestrator.recover) return;
+        // 夹具里的编排器没配 owner：没有 owner 的算自己的，写了别的 owner 的不是。
+        await store.append('mine', [lifecycle(CTX_EVENTS.runStarted, 'mine-1')]);
+        await store.append('theirs', [
+          eventEntry(CTX_EVENTS.runStarted, {
+            data: { runId: 'theirs-1', agent: { model: 'm' }, owner: 'someone-else' },
+          }),
+        ]);
+        assert.deepEqual(await orchestrator.recover(), [{ session: 'mine', runId: 'mine-1' }]);
+        assert.deepEqual(eventData(await store.list('theirs'), CTX_EVENTS.runEnded), [], '别人的运行没被动');
         assert.deepEqual(await orchestrator.recover(), []);
       });
     });

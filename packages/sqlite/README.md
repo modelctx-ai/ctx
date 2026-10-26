@@ -24,7 +24,7 @@ const context = createContext({ store, session: 'user:42' });
 await context.append(userEntry('你好'));
 store.close();
 
-// 和应用共用一个库：表名带前缀；写入用 SAVEPOINT，可以放进应用自己的事务
+// 和应用共用一个库：表名带前缀；库上已有应用的事务时写入用 SAVEPOINT，可以放进应用自己的事务
 const db = new DatabaseSync('app.db');
 const shared = createSqliteStore({ database: db, prefix: 'ctx_' });
 db.exec('BEGIN');
@@ -57,6 +57,7 @@ watcher.close();
 | `<prefix>meta`    | 结构版本 `schema`                                                                                                                                                                                                                                                                                     |
 
 - `list({ kinds })` 只返回 `type = 'event'` 且 `kind` 在其中的行，靠 `kind` 列和索引；旧版本写的行不用回填，`kind` 自动有值。`sessions({ prefix, after, limit })` 按名字升序，前缀用范围查询（`session >= ? AND session < ?`），不用 `LIKE`，`%`、`_` 不用转义。
+- 每次 `append` 在 `BEGIN IMMEDIATE` 里做：先拿写锁（等 `busy_timeout`），再检查 `expectSeq`，再写。两个进程用同一个 `expectSeq` 并发写，恰好一个成功，另一个得到 `conflict`，不会是 `SQLITE_BUSY`。库上已有应用的事务时改用 SAVEPOINT，锁归应用管。
 - 重复的 `id`、同会话重复的 `key` 由 `ON CONFLICT DO NOTHING` 跳过，同一批的其余照写；只跳过唯一约束冲突，NOT NULL 之类的违例照常报错；一批在一个 SAVEPOINT 里，要么全写要么不写。
 - `watch(session, { after, signal })` 轮询 `list(session, { after })`，先给出已有的再给出新写入的；`signal` 中止后迭代结束。
 - 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），`body` 就是 `JSON.stringify` 的结果，不做编码。有循环引用的条目写入时报错。

@@ -202,10 +202,14 @@ describe('orchestrator', () => {
       ],
       '一页一页读，after 是上一页最后一个名字',
     );
-    assert.equal(lists.length, 230, '每个会话一次 list');
+    const lifecycleReads = lists.filter((options) => options.kinds !== undefined);
+    assert.equal(lifecycleReads.length, 230, '每个会话一次查生命周期事件');
     assert.ok(
-      lists.every((options) => options.last === 1 && options.kinds?.join() === 'ctx.run.started,ctx.run.ended'),
+      lifecycleReads.every(
+        (options) => options.last === 1 && options.kinds?.join() === 'ctx.run.started,ctx.run.ended',
+      ),
     );
+    assert.equal(lists.length - lifecycleReads.length, 3, '只有找到断点的会话多读一次末尾');
     await orchestrator.close();
   });
 });

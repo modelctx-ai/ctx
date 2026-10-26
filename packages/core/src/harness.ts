@@ -1,6 +1,10 @@
 import {
   agentSpecToJson,
+  CTX_EVENTS,
+  CtxError,
   ctxErrorEntry,
+  headSeq,
+  isConflict,
   errorOutput,
   messageEntry,
   runEndedEntry,
@@ -102,6 +106,8 @@ interface RunState {
   readonly request: RunRequest;
   readonly record: boolean;
   readonly recorded: Entry[];
+  /** 本轮最后一次写入之后会话的末尾 `seq`，下一次写入拿它当 `expectSeq`；还没写过时是 `undefined`。 */
+  head: number | undefined;
   /** 写日志失败过：这时 run 要 reject，不能当成模型出错。 */
   logFailed: boolean;
 }
@@ -151,7 +157,12 @@ export function errorInfo(error: unknown): ErrorInfo {
     };
   }
   if (root instanceof Error) {
-    return root.name && root.name !== 'Error' ? { message: root.message, type: root.name } : { message: root.message };
+    const retryable = (root as { retryable?: unknown }).retryable;
+    return {
+      message: root.message,
+      ...(root.name && root.name !== 'Error' ? { type: root.name } : {}),
+      ...(typeof retryable === 'boolean' ? { retryable } : {}),
+    };
   }
   return { message: String(root) };
 }
@@ -179,8 +190,35 @@ function begin(request: RunRequest): RunState {
     request,
     record: request.record !== false,
     recorded: [],
+    head: undefined,
     logFailed: false,
   };
+}
+
+/** 前提冲突时别人已经给这一轮写了 `ctx.run.ended`（被 `recover` 当作断掉的运行收走了）：这一轮停下，不再写。 */
+class Fenced extends Error {
+  constructor() {
+    super('This run was ended by another process (fenced).');
+    this.name = 'Fenced';
+  }
+}
+
+/** 写入冲突后最多重试几次；超过就当写日志失败。冲突只来自应用事件，几次之内必然追上。 */
+const MAX_CONFLICTS = 20;
+
+/** 会话里已有未结束的运行：什么都没写，这一轮以 `error` 结束，稍后重试。 */
+function busy(state: RunState): RunResult {
+  const info = errorInfo(
+    new CtxError('session_busy', `Session "${state.request.session}" already has a run in progress.`, {
+      retryable: true,
+    }),
+  );
+  return { runId: state.runId, text: '', messages: [], recorded: [], stopReason: 'error', error: info };
+}
+
+/** 被围栏：别人已经结束了这一轮，不再写 ended。 */
+function fenced(state: RunState): RunResult {
+  return { runId: state.runId, text: '', messages: [], recorded: state.recorded, stopReason: 'aborted' };
 }
 
 export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
@@ -225,19 +263,81 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     return (await hooks.afterTool?.(actual, output, execution)) ?? output;
   };
 
+  /** 追加并记下新的末尾。 */
+  async function append(state: RunState, entries: readonly NewEntry[], expectSeq: number | undefined) {
+    const written = await store.append(
+      state.request.session,
+      entries,
+      expectSeq === undefined ? undefined : { expectSeq },
+    );
+    state.recorded.push(...written);
+    state.head = written.at(-1)?.seq ?? state.head;
+  }
+
+  /**
+   * 本轮的写入：带 `expectSeq`（上一次写入返回的末尾）。冲突时先看有没有人给自己的 `runId` 写了 `ended`：
+   * 有就是被围栏了，抛 `Fenced`；没有只是别人写了应用事件，用新的末尾重试。
+   */
   async function write(state: RunState, entries: readonly NewEntry[]): Promise<void> {
     if (!state.record || entries.length === 0) return;
     try {
-      state.recorded.push(...(await store.append(state.request.session, entries)));
+      for (let conflicts = 0; ; conflicts += 1) {
+        try {
+          return await append(state, entries, state.head);
+        } catch (error) {
+          if (!isConflict(error) || state.head === undefined || conflicts >= MAX_CONFLICTS) throw error;
+          // 先读末尾再读 ended：中间若又有人写，下一次写入会再冲突，再查一遍。
+          const head = await headSeq(store, state.request.session);
+          const ended = await store.list(state.request.session, { after: state.head, kinds: [CTX_EVENTS.runEnded] });
+          if (
+            ended.some(
+              (entry) =>
+                (entry.type === 'event' ? (entry.data as { runId?: unknown } | undefined)?.runId : undefined) ===
+                state.runId,
+            )
+          ) {
+            throw new Fenced();
+          }
+          state.head = head;
+        }
+      }
     } catch (error) {
-      state.logFailed = true;
+      if (!(error instanceof Fenced)) state.logFailed = true;
       throw error;
     }
   }
 
-  async function writeStarted(state: RunState): Promise<void> {
-    const { agent } = state.request;
-    await write(state, [runStartedEntry({ runId: state.runId, agent: agentSpecToJson(agent) }, { source: 'harness' })]);
+  /**
+   * 开始一轮：会话里最后一个生命周期事件是 `started` 就说明有未结束的运行，返回 false，什么都不写；
+   * 否则带着刚读到的末尾追加 `ctx.run.started`，冲突就重读重判。`record: false` 不碰日志，总是 true。
+   */
+  async function writeStarted(state: RunState): Promise<boolean> {
+    if (!state.record) return true;
+    const { agent, session } = state.request;
+    const started = runStartedEntry(
+      {
+        runId: state.runId,
+        agent: agentSpecToJson(agent),
+        ...(state.request.owner !== undefined ? { owner: state.request.owner } : {}),
+      },
+      { source: 'harness' },
+    );
+    try {
+      for (let conflicts = 0; ; conflicts += 1) {
+        const head = await headSeq(store, session);
+        const [last] = await store.list(session, { kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded], last: 1 });
+        if (last?.type === 'event' && last.kind === CTX_EVENTS.runStarted) return false;
+        try {
+          await append(state, [started], head);
+          return true;
+        } catch (error) {
+          if (!isConflict(error) || conflicts >= MAX_CONFLICTS) throw error;
+        }
+      }
+    } catch (error) {
+      state.logFailed = true;
+      throw error;
+    }
   }
 
   async function setup(state: RunState, extras: RunExtras, signal: AbortSignal): Promise<Setup> {
@@ -347,20 +447,26 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
 
   /** 出错或取消：照样写 `ctx.run.ended`，返回结果而不是抛。 */
   async function fail(state: RunState, error: unknown, signal: AbortSignal): Promise<RunResult> {
+    if (error instanceof Fenced) return fenced(state);
     const stopReason: StopReason = signal.aborted ? 'aborted' : 'error';
     const info = errorInfo(error);
     if (stopReason === 'error') logger.debug?.('run failed', { runId: state.runId, error: info.message });
-    await write(state, [
-      ...(stopReason === 'error'
-        ? [
-            ctxErrorEntry(
-              { runId: state.runId, message: info.message, ...(info.type ? { type: info.type } : {}) },
-              { source: 'harness' },
-            ),
-          ]
-        : []),
-      runEndedEntry({ runId: state.runId, stopReason }, { source: 'harness' }),
-    ]);
+    try {
+      await write(state, [
+        ...(stopReason === 'error'
+          ? [
+              ctxErrorEntry(
+                { runId: state.runId, message: info.message, ...(info.type ? { type: info.type } : {}) },
+                { source: 'harness' },
+              ),
+            ]
+          : []),
+        runEndedEntry({ runId: state.runId, stopReason }, { source: 'harness' }),
+      ]);
+    } catch (writeError) {
+      if (writeError instanceof Fenced) return fenced(state);
+      throw writeError;
+    }
     return {
       runId: state.runId,
       text: '',
@@ -374,7 +480,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   async function run(request: RunRequest, extras: RunExtras = {}): Promise<RunOutcome> {
     const state = begin(request);
     const controller = linked(request.signal);
-    await writeStarted(state);
+    if (!(await writeStarted(state))) return { result: busy(state) };
     try {
       const ready = await setup(state, extras, controller.signal);
       const raw = await generateText(callOptions(state, ready, controller.signal));
@@ -396,7 +502,10 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   async function startStream(request: RunRequest, extras: RunExtras = {}): Promise<StartedStream> {
     const state = begin(request);
     const controller = linked(request.signal);
-    await writeStarted(state);
+    if (!(await writeStarted(state))) {
+      const outcome = Promise.resolve<RunOutcome>({ result: busy(state) });
+      return { runId: state.runId, done: () => outcome };
+    }
     let ready: Setup;
     try {
       ready = await setup(state, extras, controller.signal);
@@ -415,13 +524,19 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     const settle = (work: () => Promise<RunResult>, cause?: unknown): void => {
       if (settled) return;
       settled = true;
-      work().then(
-        (result) => finished.resolve(cause === undefined ? { result } : { result, cause }),
-        (error: unknown) => {
-          logger.warn('failed to record run', { runId: state.runId, error: errorInfo(error).message });
-          finished.reject(error);
-        },
-      );
+      work()
+        .catch((error: unknown) => {
+          // 被围栏：别人已经结束了这一轮，不算写日志失败。
+          if (error instanceof Fenced) return fenced(state);
+          throw error;
+        })
+        .then(
+          (result) => finished.resolve(cause === undefined ? { result } : { result, cause }),
+          (error: unknown) => {
+            logger.warn('failed to record run', { runId: state.runId, error: errorInfo(error).message });
+            finished.reject(error);
+          },
+        );
     };
     const report =
       extras.onError ?? ((error: unknown) => logger.warn('stream failed', { error: errorInfo(error).message }));

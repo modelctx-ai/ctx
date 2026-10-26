@@ -117,7 +117,7 @@ describeSessionStoreContract(
     const memory = createMemoryStore({ now });
     // 去掉 watch：服务端退回轮询 list(after)。
     const store: SessionStore = {
-      append: (session, entries) => memory.append(session, entries),
+      append: (session, entries, options) => memory.append(session, entries, options),
       list: (session, options) => memory.list(session, options),
       clear: (session) => memory.clear(session),
       sessions: (options) => memory.sessions(options),

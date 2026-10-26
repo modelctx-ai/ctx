@@ -1,4 +1,5 @@
 import {
+  checkExpectSeq,
   ENTRY_VERSION,
   filterEntries,
   filterSessions,
@@ -64,8 +65,10 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
   }
 
   return {
-    async append(name, drafts) {
+    async append(name, drafts, appendOptions) {
       const target = session(name);
+      // 前提先于去重；和下面的写入在同一个同步段里，中间不会插进别的写入。
+      checkExpectSeq(target.entries.at(-1)?.seq ?? 0, appendOptions);
       const written: Entry[] = [];
       for (const draft of drafts) {
         if (draft.key !== undefined && target.keys.has(draft.key)) continue;

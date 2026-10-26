@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 
-import { eventEntry, messageEntry, userEntry, type Message } from '@modelctx-ai/ctx-protocol';
+import { eventEntry, isConflict, messageEntry, userEntry, type Message } from '@modelctx-ai/ctx-protocol';
 import { describeSessionStoreContract } from '@modelctx-ai/ctx-protocol/testing';
 import { describe, test } from 'vite-plus/test';
 
@@ -59,6 +59,43 @@ describe('sqlite store', () => {
     await assert.rejects(store.append('t', [userEntry('先写的'), messageEntry(call)]), /circular/i);
     assert.deepEqual(await store.list('t'), []);
     store.close();
+  });
+
+  test('expectSeq：同一个文件的两个句柄用同一个前提并发写，恰好一个成功', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
+    const one = createSqliteStore({ path });
+    const two = createSqliteStore({ path });
+    const [first] = await one.append('s', [userEntry('起点')]);
+    const results = await Promise.allSettled([
+      one.append('s', [userEntry('一')], { expectSeq: first!.seq }),
+      two.append('s', [userEntry('二')], { expectSeq: first!.seq }),
+    ]);
+    assert.deepEqual(results.map((result) => result.status).toSorted(), ['fulfilled', 'rejected']);
+    const rejected = results.find((result) => result.status === 'rejected');
+    assert.ok(rejected?.status === 'rejected' && isConflict(rejected.reason));
+    assert.equal((await two.list('s')).length, 2);
+    // 前提不满足时整批回滚，库上没有留下半截的事务。
+    assert.equal(one.database.isTransaction, false);
+    one.close();
+    two.close();
+  });
+
+  test('expectSeq：应用已经开着事务时也能检查，冲突不弄坏应用的事务', async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec('CREATE TABLE app (x INTEGER)');
+    const store = createSqliteStore({ database });
+    const [first] = await store.append('s', [userEntry('起点')]);
+    database.exec('BEGIN');
+    database.exec('INSERT INTO app (x) VALUES (1)');
+    await assert.rejects(store.append('s', [userEntry('丢')], { expectSeq: first!.seq + 100 }), isConflict);
+    await store.append('s', [userEntry('在事务里')], { expectSeq: first!.seq });
+    assert.equal(database.isTransaction, true, '应用的事务还开着');
+    database.exec('ROLLBACK');
+    assert.deepEqual(
+      (await store.list('s')).map((entry) => entry.type === 'message' && entry.message.content),
+      ['起点'],
+      '应用回滚，在事务里写的一起回滚',
+    );
   });
 
   test('表名前缀只能是标识符', () => {
@@ -460,6 +497,7 @@ describe('busy_timeout', () => {
 describe('多进程', () => {
   const writer = fileURLToPath(new URL('./fixtures/writer.ts', import.meta.url));
   const exec = promisify(execFile);
+  const claimer = fileURLToPath(new URL('./fixtures/claimer.ts', import.meta.url));
   const spawnWriter = (path: string, session: string, count: number) =>
     exec(process.execPath, ['--conditions=@modelctx-ai/source', writer, path, session, String(count)], {
       timeout: 60_000,
@@ -474,6 +512,26 @@ describe('多进程', () => {
     const seqs = store.database.prepare('SELECT count(DISTINCT seq) AS n FROM ctx_entries').get()?.['n'];
     assert.equal(seqs, 160);
     store.close();
+  }, 90_000);
+
+  test('几个进程用同一个 expectSeq 同时写：恰好一个成功，其余是 conflict，不报 SQLITE_BUSY', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
+    const seed = createSqliteStore({ path });
+    const [first] = await seed.append('s', [userEntry('起点')]);
+    const startAt = Date.now() + 1_500;
+    const outcomes = await Promise.all(
+      [1, 2, 3, 4].map(async () => {
+        const { stdout } = await exec(
+          process.execPath,
+          ['--conditions=@modelctx-ai/source', claimer, path, 's', String(first!.seq), String(startAt)],
+          { timeout: 60_000 },
+        );
+        return stdout.trim();
+      }),
+    );
+    assert.deepEqual(outcomes.toSorted(), ['conflict', 'conflict', 'conflict', 'ok']);
+    assert.equal((await seed.list('s')).length, 2, '起点加一条胜出的');
+    seed.close();
   }, 90_000);
 
   test('几个进程同时打开同一个 0.1 旧库：只迁一次，旧数据在', async () => {

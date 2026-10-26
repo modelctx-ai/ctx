@@ -3,7 +3,9 @@
  * 只用 `fetch`、`TextDecoder`、`AbortController`，不用 `node:` 模块，任何运行时都能跑。服务端在 `./server`。
  */
 import {
+  CtxError,
   errorOutput,
+  type AppendOptions,
   type Entry,
   type ErrorInfo,
   type ExecutionContext,
@@ -156,9 +158,19 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
 } {
   const connection = connect(options);
   return {
-    async append(session: string, entries: readonly NewEntry[]): Promise<Entry[]> {
-      const body = await connection.json<{ entries: Entry[] }>('POST', entriesPath(session), { body: { entries } });
-      return body.entries;
+    async append(session: string, entries: readonly NewEntry[], appendOptions?: AppendOptions): Promise<Entry[]> {
+      try {
+        const body = await connection.json<{ entries: Entry[] }>('POST', entriesPath(session), {
+          body: { entries, ...(appendOptions?.expectSeq !== undefined ? { expectSeq: appendOptions.expectSeq } : {}) },
+        });
+        return body.entries;
+      } catch (error) {
+        // 409 + conflict：前提不满足，转成协议的 `conflict`，调用方不必认识 HTTP。
+        if (isRemoteError(error) && error.status === 409 && error.type === 'conflict') {
+          throw new CtxError('conflict', error.message, { retryable: true });
+        }
+        throw error;
+      }
     },
     async list(session: string, listOptions: ListOptions = {}): Promise<Entry[]> {
       const { after, last, types, kinds } = listOptions;

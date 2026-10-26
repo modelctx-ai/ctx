@@ -4,7 +4,7 @@
  */
 import { describe, test } from 'vite-plus/test';
 
-import { filterEntries, filterSessions, type Entry, type SessionStore } from './session.ts';
+import { checkExpectSeq, filterEntries, filterSessions, type Entry, type SessionStore } from './session.ts';
 import { ENTRY_VERSION } from './version.ts';
 import { describeExecutorContract, describeSessionStoreContract, describeToolRegistryContract } from './testing.ts';
 import {
@@ -24,8 +24,9 @@ function fakeStore(now: () => number): SessionStore {
   let nextId = 0;
 
   const store: SessionStore = {
-    async append(session, drafts) {
+    async append(session, drafts, options) {
       const list = sessions.get(session) ?? [];
+      checkExpectSeq(list.at(-1)?.seq ?? 0, options);
       const keys = new Set(list.flatMap((entry) => (entry.key === undefined ? [] : [entry.key])));
       const written: Entry[] = [];
       for (const draft of drafts) {

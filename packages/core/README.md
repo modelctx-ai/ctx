@@ -139,7 +139,8 @@ for await (const event of harness.stream({
 ```ts
 import { createOrchestrator } from '@modelctx-ai/ctx';
 
-const orchestrator = createOrchestrator({ harness, store });
+const orchestrator = createOrchestrator({ harness, store, owner: 'pet' });
+// 用缺省 record（写日志）的应用：启动时先 recover 再 submit，否则崩溃留下的运行会让该会话一直 session_busy
 await orchestrator.recover?.(); // 给崩溃时断掉的运行补 ctx.run.ended（error）
 const handle = await orchestrator.submit({ session: 'user:42', agent: { model: 'deepseek-chat' }, input: '在吗' });
 await orchestrator.status(handle.runId); // queued / running / completed / failed / cancelled
@@ -160,7 +161,7 @@ await orchestrator.close();
 | `toToolSet(definitions, executors, { session?, runId?, dispatch? })`、`dispatchTo(executors)`                                  | 定义包成 AI SDK `ToolSet`，`execute` 转给绑定的执行环境                                                                                                                                                |
 | `createContextBuilder({ store, projection?, sources?, sourceTimeoutMs?, logger?, factsPlacement?, model?, models? })`          | `ContextBuilder`：`build`、`view`、`compact`，另加 `facts(session, signal?)`                                                                                                                           |
 | `createHarness({ store, context, tools?, executors?, models?, hooks?, logger?, source? })`                                     | `Harness`：`run`、`stream`                                                                                                                                                                             |
-| `createOrchestrator({ harness, store?, logger? })`                                                                             | `Orchestrator`：`submit`、`status`、`cancel`、`events`、`close`；给了 `store` 才有 `recover`                                                                                                           |
+| `createOrchestrator({ harness, store?, owner?, logger? })`                                                                     | `Orchestrator`：`submit`、`status`、`cancel`、`events`、`close`；给了 `store` 才有 `recover`                                                                                                           |
 | `createContext(options)`                                                                                                       | 门面：`append`、`entries`、`view`、`facts`、`prepare`、`generate`、`stream`、`compact`，以及 `builder`、`executor`、`harness`                                                                          |
 | `describeError`、`redact`、`errorInfo`                                                                                         | 给日志和界面用的错误摘要；去密钥；`RunResult.error` 的形状                                                                                                                                             |
 | `toModelMessages`、`fromModelMessages`（单条是 `toModelMessage`、`fromModelMessage`）、`toUserContent`、`fromUserContent`      | ctx 的 `Message` 和 AI SDK 的 `ModelMessage`、`UserContent` 互转；遇到子集之外的部件抛 `unsupported_part`，harness 把这一轮以 `error` 结束。`createContext()` 仍收 AI SDK 的 `UserContent`，在边界上转 |

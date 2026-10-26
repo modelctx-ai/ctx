@@ -7,6 +7,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net';
 
 import {
+  isConflict,
   silentLogger,
   type Entry,
   type EntryType,
@@ -87,6 +88,12 @@ interface HttpFailure {
 function fail(status: number, message: string, type?: string): never {
   const failure: HttpFailure = { status, info: { message, type: type ?? typeOf(status) } };
   throw Object.assign(new Error(message), { failure });
+}
+
+/** 写入前提不满足：409，`type: conflict`，带 `retryable`，客户端据此转回协议的 `conflict`。 */
+function conflictFailure(message: string): Error {
+  const failure: HttpFailure = { status: 409, info: { message, type: 'conflict', retryable: true } };
+  return Object.assign(new Error(message), { failure });
 }
 
 function failureOf(error: unknown): HttpFailure | undefined {
@@ -357,7 +364,22 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     const body = await readBody(req, limit);
     const entries = isObject(body) ? body['entries'] : undefined;
     if (!Array.isArray(entries)) fail(400, 'request body must be { "entries": NewEntry[] }');
-    sendJson(res, 200, { entries: await sessionStore.append(session, entries as NewEntry[]) });
+    const expectSeq = isObject(body) ? body['expectSeq'] : undefined;
+    if (expectSeq !== undefined && (typeof expectSeq !== 'number' || !Number.isInteger(expectSeq) || expectSeq < 0)) {
+      fail(400, '`expectSeq` must be a non-negative integer');
+    }
+    try {
+      sendJson(res, 200, {
+        entries: await sessionStore.append(
+          session,
+          entries as NewEntry[],
+          expectSeq === undefined ? undefined : { expectSeq },
+        ),
+      });
+    } catch (error) {
+      if (isConflict(error)) throw conflictFailure(messageOf(error));
+      throw error;
+    }
   }
 
   async function watchEntries(

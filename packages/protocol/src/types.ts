@@ -31,10 +31,13 @@ export interface ErrorInfo {
  */
 export class CtxError extends Error {
   readonly type: string;
+  /** 重试可能成功（例如 `conflict`、`session_busy`）；harness 写进 `ErrorInfo.retryable`。 */
+  readonly retryable?: boolean;
 
-  constructor(type: string, message: string) {
+  constructor(type: string, message: string, options: { readonly retryable?: boolean } = {}) {
     super(message);
     this.name = type;
     this.type = type;
+    if (options.retryable !== undefined) this.retryable = options.retryable;
   }
 }

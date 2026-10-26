@@ -77,6 +77,8 @@ export interface RunRequest {
   readonly record?: boolean;
   /** 不给就由 harness 生成。 */
   readonly runId?: string;
+  /** 写进 `ctx.run.started` 的 `owner`：这一轮属于哪个编排器实例，`recover` 据此只收自己的运行。编排器按自己的 `owner` 填。 */
+  readonly owner?: string;
   readonly signal?: AbortSignal;
 }
 
