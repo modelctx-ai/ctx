@@ -1,5 +1,6 @@
 import {
   collectFacts,
+  CtxError,
   compactedEntry,
   defaultSummaryMessage,
   latestSummary,
@@ -11,6 +12,7 @@ import {
   type CompactOptions,
   type ContextBuilder,
   type ContextSource,
+  type FactsSpec,
   type Entry,
   type Fact,
   type Logger,
@@ -39,6 +41,11 @@ export type FactsPlacement = 'instructions' | 'prompt';
 export interface ContextBuilderOptions {
   readonly store: SessionStore;
   readonly projection?: ProjectionOptions;
+  /**
+   * 按名字注册的其他投影配置，`AgentSpec.context.projection`、`BuildRequest.projection`、`ViewOptions.projection` 按名字选。
+   * `default` 缺省取上面的 `projection`；这里给了 `default` 就以这里的为准。每套配置是完整的，不和 `default` 合并。
+   */
+  readonly projections?: Readonly<Record<string, ProjectionOptions>>;
   readonly sources?: readonly ContextSource[];
   /** 单个上下文来源最多等多久，缺省 2 秒。 */
   readonly sourceTimeoutMs?: number;
@@ -53,7 +60,8 @@ export interface ContextBuilderOptions {
 /** 参考实现另外给出事实收集，`createContext` 的 `facts()` 用它。 */
 export interface LocalContextBuilder extends ContextBuilder {
   readonly store: SessionStore;
-  facts(session: string, signal?: AbortSignal): Promise<Fact[]>;
+  /** 收集事实；`options.sources` 只用这些来源（按名字）。 */
+  facts(session: string, signal?: AbortSignal, options?: { readonly sources?: readonly string[] }): Promise<Fact[]>;
   compact(session: string, options?: CompactOptions): Promise<SummaryEntry | null>;
   /** 对一条 `findLossySummaries` 的结果追加一条取代它的摘要，见 `recompactLossy`。 */
   recompact(finding: LossySummary, options?: CompactOptions): Promise<SummaryEntry | null>;
@@ -129,6 +137,8 @@ export interface AssembleInput {
   /** 是否把事实放进这次调用。`createContext` 的指令或提示是函数时，由函数自己安排，这里给 false。 */
   readonly placeFacts: boolean;
   readonly placement: FactsPlacement;
+  /** 事实前面的标题行。 */
+  readonly heading?: string | undefined;
   readonly instructions?: string | undefined;
   readonly input?: MessageContent | undefined;
   readonly prompt?: MessageContent | undefined;
@@ -140,7 +150,7 @@ export interface AssembleInput {
  * AI SDK 不收 messages 里的 system 消息，按出现的顺序把文字接到指令后面。
  */
 export function assemble(input: AssembleInput): PreparedCall {
-  const factText = input.placeFacts && input.facts.length > 0 ? renderFacts(input.facts) : undefined;
+  const factText = input.placeFacts && input.facts.length > 0 ? renderFacts(input.facts, input.heading) : undefined;
   const system: string[] = [];
   const messages: Message[] = [];
   for (const message of input.projection.messages) {
@@ -180,8 +190,25 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
   const { store } = options;
   const logger = options.logger ?? silentLogger;
   const sources = options.sources ?? [];
-  const projection = options.projection ?? {};
+  const projections: Record<string, ProjectionOptions> = {
+    default: options.projection ?? {},
+    ...options.projections,
+  };
+  const projection = projections['default']!;
   const placement = options.factsPlacement ?? 'instructions';
+
+  /** 按名字取投影配置；缺省 `default`，不认识的名字报 `not_found`，不回退。 */
+  function projectionNamed(name: string | undefined): ProjectionOptions {
+    if (name === undefined) return projection;
+    const found = Object.hasOwn(projections, name) ? projections[name] : undefined;
+    if (!found) {
+      throw new CtxError(
+        'not_found',
+        `Unknown projection "${name}". Registered: ${Object.keys(projections).join(', ')}.`,
+      );
+    }
+    return found;
+  }
 
   /** 只读最近一次摘要之后的部分，长历史不必整段读出来。 */
   async function load(session: string): Promise<Entry[]> {
@@ -193,12 +220,21 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
   }
 
   async function view(session: string, viewOptions: ViewOptions = {}): Promise<Projection> {
-    return project(await load(session), { ...projection, window: viewOptions.window ?? projection.window });
+    const chosen = projectionNamed(viewOptions.projection);
+    return project(await load(session), { ...chosen, window: viewOptions.window ?? chosen.window });
   }
 
-  function facts(session: string, signal?: AbortSignal): Promise<Fact[]> {
-    if (sources.length === 0) return Promise.resolve([]);
-    return collectFacts(sources, {
+  function facts(session: string, signal?: AbortSignal, factsOptions: { readonly sources?: readonly string[] } = {}) {
+    let chosen = sources;
+    if (factsOptions.sources) {
+      const names = new Set(factsOptions.sources);
+      chosen = sources.filter((source) => names.has(source.name));
+      for (const name of names) {
+        if (!sources.some((source) => source.name === name)) logger.warn(`context source "${name}" is not registered`);
+      }
+    }
+    if (chosen.length === 0) return Promise.resolve<Fact[]>([]);
+    return collectFacts(chosen, {
       session,
       ...(signal ? { signal } : {}),
       ...(options.sourceTimeoutMs !== undefined ? { timeoutMs: options.sourceTimeoutMs } : {}),
@@ -207,13 +243,23 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
   }
 
   async function build(request: BuildRequest): Promise<PreparedCall> {
-    const collected = request.facts === false ? [] : await facts(request.session, request.signal);
-    const projected = await view(request.session, request.window ? { window: request.window } : {});
+    // 先认投影名：不认识就在收事实之前失败。
+    projectionNamed(request.projection);
+    const spec: FactsSpec = typeof request.facts === 'object' ? request.facts : {};
+    const collected =
+      request.facts === false
+        ? []
+        : await facts(request.session, request.signal, spec.sources ? { sources: spec.sources } : {});
+    const projected = await view(request.session, {
+      ...(request.window ? { window: request.window } : {}),
+      ...(request.projection !== undefined ? { projection: request.projection } : {}),
+    });
     return assemble({
       projection: projected,
       facts: collected,
       placeFacts: true,
-      placement,
+      placement: spec.placement ?? placement,
+      heading: spec.heading,
       instructions: request.instructions,
       input: request.input,
       prompt: request.prompt,

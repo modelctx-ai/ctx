@@ -357,7 +357,15 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       ...(request.prompt !== undefined ? { prompt: request.prompt } : {}),
       tools: candidates,
       ...(agent.window ? { window: agent.window } : {}),
-      ...(extras.facts !== undefined ? { facts: extras.facts } : {}),
+      // `createContext` 自己收了事实时给 `false`，以它为准；否则按 `agent.context` 选事实和投影。
+      ...(extras.facts === false
+        ? { facts: false }
+        : agent.context?.facts !== undefined
+          ? { facts: agent.context.facts }
+          : extras.facts !== undefined
+            ? { facts: extras.facts }
+            : {}),
+      ...(agent.context?.projection !== undefined ? { projection: agent.context.projection } : {}),
       signal,
     });
     const hookContext: ModelHookContext = { runId: state.runId, session, step: 0, signal };

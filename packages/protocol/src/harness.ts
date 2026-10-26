@@ -1,7 +1,7 @@
 import type { LanguageModel } from 'ai';
 
 import type { Message, MessageContent } from './message.ts';
-import type { PreparedCall, WindowOptions } from './context.ts';
+import type { ContextSpec, PreparedCall, WindowOptions } from './context.ts';
 import type { Entry } from './session.ts';
 import type { ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
 import type { Awaitable, ErrorInfo, JsonObject, JsonValue } from './types.ts';
@@ -43,6 +43,8 @@ export interface AgentSpec {
   /** 工具调用最多走几步。缺省：有工具 5 步，没有工具 1 步。 */
   readonly maxSteps?: number;
   readonly window?: WindowOptions;
+  /** 这个 agent 的上下文怎么组装：事实用哪些来源、放哪，用哪套投影。见 `ContextSpec`。 */
+  readonly context?: ContextSpec;
   readonly settings?: CallSettings;
 }
 
@@ -60,6 +62,7 @@ export function agentSpecToJson(spec: AgentSpec): JsonObject {
   if (spec.tools !== undefined) out['tools'] = spec.tools;
   if (spec.maxSteps !== undefined) out['maxSteps'] = spec.maxSteps;
   if (spec.window !== undefined) out['window'] = spec.window;
+  if (spec.context !== undefined) out['context'] = spec.context;
   if (spec.settings !== undefined) out['settings'] = spec.settings;
   return out as JsonObject;
 }

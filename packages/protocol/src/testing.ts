@@ -988,6 +988,38 @@ export function describeHarnessContract(
       assert.ok(!('owner' in started[1]!));
     });
 
+    test('agent.context 交给 ContextBuilder：不认识的投影名以 not_found 结束，不调模型；facts: false 照常跑', async () => {
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'text', text: '好' },
+          { type: 'text', text: '多余' },
+        ],
+      });
+      // 忽略 `context` 的 builder 会静默回到缺省，在这里被暴露。
+      const unknown = await harness.run({
+        session: 's',
+        agent: { ...agent, context: { projection: 'no-such-projection' } },
+        input: '在吗',
+      });
+      assert.equal(unknown.stopReason, 'error');
+      assert.equal(unknown.error?.type, 'not_found');
+      assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
+      const quiet = await harness.run({ session: 't', agent: { ...agent, context: { facts: false } }, input: '在吗' });
+      assert.equal(quiet.stopReason, 'end_turn');
+      assert.equal(quiet.text, '好');
+    });
+
+    test('agent.context 记进 ctx.run.started 的 agent，能 JSON 往返', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      const context = {
+        facts: { sources: ['clock'], placement: 'prompt', heading: '环境' },
+        projection: 'default',
+      } as const;
+      await harness.run({ session: 's', agent: { ...agent, context }, input: '在吗' });
+      const [started] = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+      assert.deepEqual((started?.['agent'] as Record<string, unknown> | undefined)?.['context'], context);
+    });
+
     test('signal 已中止：返回 stopReason aborted，写 ctx.run.ended', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '不该说' }] });
       const result = await harness.run({ session: 's', agent, input: '在吗', signal: AbortSignal.abort() });

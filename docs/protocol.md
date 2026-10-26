@@ -139,7 +139,8 @@ interface BuildRequest {
   prompt?: MessageContent; // 最后一条临时用户消息，不写日志
   tools?: readonly ToolDefinition[]; // 候选工具，builder 可以再筛
   window?: WindowOptions;
-  facts?: boolean; // 是否收集来源，缺省收集
+  facts?: boolean | FactsSpec; // 是否收集来源，缺省收集；FactsSpec 另选来源、位置、标题
+  projection?: string; // 投影配置名，缺省 default；不认识的名字 build 以 not_found 失败，不回退
   signal?: AbortSignal;
 }
 interface PreparedCall {
@@ -161,7 +162,7 @@ interface CompactOptions {
 interface ContextBuilder {
   build(request: BuildRequest): Promise<PreparedCall>;
   /** 当前视图：摘要 + 之后的条目，按规则渲染。网关用它。 */
-  view(session: string, options?: { window?: WindowOptions }): Promise<Projection>;
+  view(session: string, options?: { window?: WindowOptions; projection?: string }): Promise<Projection>;
   /** 把较早的历史压成一条摘要并追加，同时记 ctx.compacted。历史不够长时返回 null。 */
   compact?(session: string, options?: CompactOptions): Promise<SummaryEntry | null>;
 }
@@ -313,7 +314,17 @@ interface AgentSpec {
   tools?: ToolSelection; // 缺省全部
   maxSteps?: number; // 缺省：有工具 5，没有 1
   window?: WindowOptions;
+  context?: ContextSpec; // 这个 agent 的上下文怎么组装
   settings?: CallSettings;
+}
+interface ContextSpec {
+  facts?: boolean | FactsSpec; // false 不收事实；缺省收
+  projection?: string; // builder 里注册的投影配置名；缺省 default
+}
+interface FactsSpec {
+  sources?: readonly string[]; // 只用这些来源（ContextSource.name）；缺省全部
+  placement?: 'instructions' | 'prompt';
+  heading?: string; // 事实前面的标题行
 }
 interface RunRequest {
   session: string;
@@ -368,6 +379,7 @@ interface Harness {
 }
 ```
 
+- `AgentSpec.context` 按一轮选事实和投影。函数（来源的 `collect`、投影的 `render`）不能序列化，所以只按名字选，和 `ToolSelection` 同一个思路：代码里向 builder 注册（`createContextBuilder({ sources, projection, projections })`），`context` 里引用名字。harness 把 `agent.context` 原样放进 `BuildRequest`；`RunRequest` 不加字段，`agent` 本来就是完整的。`context` 是 JSON，`ctx.run.started` 的 `agent` 会记下这一轮用的配置，远端不用改路由。第三方 builder 忽略 `context` 会静默回到缺省，harness 契约测试用「不认识的投影名必须以 `not_found` 结束」暴露它。
 - 一轮里 harness 做的事：`ctx.run.started` → 记输入 → `ContextBuilder.build` → 调模型 → 对每个工具调用：`beforeTool` → 找到绑定的执行环境 → `execute` → `afterTool` → 工具结果回到模型，直到停下 → 记产出 → `ctx.run.ended`。
 - 模型出错、被取消也写 `ctx.run.ended`，`run` 照常返回，`stopReason` 和 `error` 说明原因；只有写日志本身失败才 reject。远端调用方因此总拿到同一种形状。
 - **一个会话最多一个未结束的运行，跨进程也成立**（只对 `record` 不为 `false` 的运行；`record: false` 的运行不碰日志，不占会话，不会遇到 `session_busy`，也不会被 `recover` 看到）：

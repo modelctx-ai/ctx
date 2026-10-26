@@ -252,6 +252,27 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
 
 // ---- 组装 ----
 
+/** 事实怎么收、放哪。 */
+export interface FactsSpec {
+  /** 只用这些来源（按 `ContextSource.name`）；缺省全部。 */
+  readonly sources?: readonly string[];
+  /** 事实接在指令后面（`instructions`），还是放进最后一条临时用户消息（`prompt`）；缺省用 builder 的 `factsPlacement`。 */
+  readonly placement?: 'instructions' | 'prompt';
+  /** 事实前面的标题行。 */
+  readonly heading?: string;
+}
+
+/**
+ * 按一轮选择事实和投影。函数（来源的 `collect`、投影的 `render`）不能序列化，所以只按名字选：
+ * 代码里向 builder 注册，`AgentSpec.context` 里引用名字，和 `ToolSelection` 同一个思路。
+ */
+export interface ContextSpec {
+  /** `false` 不收事实；缺省收。 */
+  readonly facts?: boolean | FactsSpec;
+  /** builder 里注册的投影配置名；缺省 `default`。不认识的名字，`build`、`view` 以 `not_found` 失败，不回退。 */
+  readonly projection?: string;
+}
+
 export interface BuildRequest {
   readonly session: string;
   /** 这一轮的输入，接在历史后面。已经写进日志时不传。 */
@@ -264,8 +285,10 @@ export interface BuildRequest {
   readonly tools?: readonly ToolDefinition[];
   /** 覆盖 builder 自己的窗口设置。 */
   readonly window?: WindowOptions;
-  /** 是否收集来源，缺省收集。 */
-  readonly facts?: boolean;
+  /** 是否收集来源，缺省收集；给 `FactsSpec` 还能选来源、位置和标题（来自 `AgentSpec.context.facts`）。 */
+  readonly facts?: boolean | FactsSpec;
+  /** 投影配置名，缺省 `default`（来自 `AgentSpec.context.projection`）。不认识的名字以 `not_found` 失败。 */
+  readonly projection?: string;
   readonly signal?: AbortSignal;
 }
 
@@ -282,6 +305,8 @@ export interface PreparedCall {
 
 export interface ViewOptions {
   readonly window?: WindowOptions;
+  /** 投影配置名，缺省 `default`。不认识的名字以 `not_found` 失败。 */
+  readonly projection?: string;
 }
 
 export interface CompactOptions {
