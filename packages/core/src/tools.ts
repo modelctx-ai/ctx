@@ -53,7 +53,10 @@ export function dispatchTo(executors: Executors | undefined): ToolDispatch {
   return async (call, definition, context) => {
     const executor = map.get(definition.executor);
     if (!executor) {
-      return errorOutput(`Tool "${call.name}" is bound to executor "${definition.executor}", which is not available.`);
+      const available = [...map.keys()].join(', ') || 'none';
+      return errorOutput(
+        `Tool "${call.name}" is bound to executor "${definition.executor}", which is not available (available: ${available}).`,
+      );
     }
     try {
       return await executor.execute(call, context);

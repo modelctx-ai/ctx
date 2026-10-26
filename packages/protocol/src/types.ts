@@ -14,10 +14,13 @@ export const silentLogger: Logger = { warn() {} };
 
 /**
  * 跨进程边界时错误的形状：`{ error: ErrorInfo }`。进程内照常抛 `Error`。
- * `type` 是机器可读的类别（例如 `not_found`、`timeout`），`message` 写给人看。
+ * `type` 是机器可读的类别（例如 `not_found`、`timeout`），`message` 写给人看。错误来自上游的 HTTP 接口时，
+ * `statusCode` 是上游响应的状态码，`responseBody` 是响应正文原文（不解析，可能很长，只当诊断信息用）。
  */
 export interface ErrorInfo {
   readonly message: string;
   readonly type?: string;
   readonly retryable?: boolean;
+  readonly statusCode?: number;
+  readonly responseBody?: string;
 }
