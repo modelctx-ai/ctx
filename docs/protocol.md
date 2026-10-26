@@ -86,7 +86,7 @@ interface SessionStore {
 - `append` 对一批条目是原子的：不会只写一半，也不会和并发的另一批交错。崩溃后续跑依赖这一点。
 - `expectSeq` 是写入的前提条件，不是租约：不满足时整批不写，抛 `CtxError('conflict')`（`retryable: true`；HTTP 是 409）。前提的检查先于去重，所以重试一批已经成功的写入，如果其间别人又写了，仍然是 `conflict`，调用方重读就能看到自己的条目已在。不给就不检查。它无状态，崩溃的 harness 什么都不用释放；`seq` 本身就是围栏令牌。纯函数 `headSeq(store, session)`（`list({ last: 1 })`，空会话 0）读当前末尾，`isConflict(error)` 认 `conflict`（本地和远端客户端转出来的都认）。内存存储在同一个同步段里检查和写，`ctx-sqlite` 在 `BEGIN IMMEDIATE` 里（应用已有事务时用 SAVEPOINT）。
 - 去重不算失败：`id` 重复（全局）或 `key` 重复（同一会话，含同一批里的）的那一条静默跳过，同批其余照写；返回值就是真正写入的条目。重试一批时靠它不重复记。
-- `list` 和 `watch` 都按 `seq` 升序返回，也就是写入顺序。带旧 `at` 导入的条目排在写入的位置（所以游标之后一定看得到新写入的），模型看到的逻辑顺序由投影按 `(at, seq)` 重排（`compareEntries`）。`seq` 只要求会话内单调，消费者不能跨会话比较。
+- `list` 和 `watch` 都按 `seq` 升序返回，也就是写入顺序。带旧 `at` 导入的条目排在写入的位置（所以 `after` 之后一定看得到新写入的），模型看到的逻辑顺序由投影按 `(at, seq)` 重排（`compareEntries`）。`seq` 只要求会话内单调，消费者不能跨会话比较。
 - `sessions` 只列有内容的会话，按名字升序（码点序，也就是 UTF-8 字节序）。翻页：`after` 给上一页最后一个名字，`prefix` 按字面匹配，`limit` 限条数。
 - `kinds` 只返回事件，消息和摘要没有 `kind`；和 `types` 取交集，`types` 里没有 `event` 就什么都不返回；`last` 在过滤之后取，所以 `{ kinds: [a, b], last: 1 }` 是这些事件里最后写的一条。
 - 生效的摘要是 `covers` 最大的那条；`covers` 相同时 `seq` 大的（后写的）生效。

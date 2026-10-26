@@ -1,6 +1,7 @@
 # ADR 0005：会话位置、并发写入、消息格式版本、AgentSpec 上下文配置
 
-- 状态：已采纳（2026-10-26 用户审阅后按「决定记录」修订；实施由后续任务做，本 ADR 不改代码）
+- 状态：已采纳（2026-10-26 用户审阅后按「决定记录」修订）
+- 实施状态：已实施（2026-10-26）。阶段 1 位置 `21bad8f`，阶段 5 分页和 `kinds` `197a719`，阶段 3 消息格式和版本 `8fc54dc`，阶段 2 `expectSeq`、围栏、`owner` `b4ebe71`，阶段 4 `AgentSpec.context` `32d91ca`，收尾（所有包升 0.3.0、修订 ADR 0003/0004、文档同步）是本行所在的提交。
 - 日期：2026-10-26
 - 范围：`ctx-protocol`、`@modelctx-ai/ctx`、`ctx-sqlite`、`ctx-remote`、`ctx-gateway`；yoyo 作为实践
 - 依据：对照了 yoyo `main`（5df53c9，含 PR #7、#9）的代码，和 ctx 的 sqlite 迁移分支（`tds/conv-01a1790d-1daf-72c0-9b01-4ffbec5de89e`，`meta.schema` 升到 2）

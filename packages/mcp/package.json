@@ -1,6 +1,6 @@
 {
   "name": "@modelctx-ai/ctx-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "把 MCP 服务器接成 ctx 的执行环境：沿用常见的 mcpServers 配置写法，支持 stdio、HTTP 与 SSE。",
   "keywords": [
     "ai",
