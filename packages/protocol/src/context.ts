@@ -1,14 +1,6 @@
 import type { ModelMessage, UserContent } from 'ai';
 
-import {
-  compareCursor,
-  cursorOf,
-  type Cursor,
-  type Entry,
-  type EventEntry,
-  type MessageEntry,
-  type SummaryEntry,
-} from './session.ts';
+import { compareEntries, type Entry, type EventEntry, type MessageEntry, type SummaryEntry } from './session.ts';
 import type { ModelRef } from './harness.ts';
 import { estimateTokens } from './tokens.ts';
 import type { ToolDefinition } from './tools.ts';
@@ -116,8 +108,12 @@ export interface ProjectionOptions {
 
 export interface ProjectedMessage {
   readonly message: ModelMessage;
-  /** 这条消息覆盖到的最后一个条目的位置，压缩时用来定切点。 */
-  readonly upTo: Cursor;
+  /**
+   * 这条消息来自的条目里最小和最大的 `seq`，压缩时用来定切点（见 `covers`）。摘要消息两者都是它的 `covers`。
+   * 补写的旧记录按 `at` 排在前面，但 `seq` 很大，所以投影里相邻的两项 `seq` 不一定相邻。
+   */
+  readonly from: number;
+  readonly upTo: number;
   /** 摘要消息固定在最前面，不参与裁剪。 */
   readonly pinned: boolean;
   readonly tokens: number;
@@ -136,12 +132,13 @@ export function defaultSummaryMessage(entry: SummaryEntry): ModelMessage {
   return { role: 'user', content: `Summary of the earlier conversation:\n${entry.text}` };
 }
 
-/** 生效的摘要是覆盖范围最大的那一条。 */
+/** 生效的摘要是 `covers` 最大的那一条；`covers` 相同时 `seq` 大的（后写的）生效。 */
 export function latestSummary(entries: readonly Entry[]): SummaryEntry | undefined {
   let found: SummaryEntry | undefined;
   for (const entry of entries) {
     if (entry.type !== 'summary') continue;
-    if (!found || compareCursor(entry.covers, found.covers) > 0) found = entry;
+    if (!found || entry.covers > found.covers || (entry.covers === found.covers && entry.seq > found.seq))
+      found = entry;
   }
   return found;
 }
@@ -198,21 +195,24 @@ function windowed(
  */
 export function project(entries: readonly Entry[], options: ProjectionOptions = {}): Projection {
   const estimate = options.window?.estimate ?? estimateTokens;
-  const sorted = entries.toSorted(compareCursor);
+  const sorted = entries.toSorted(compareEntries);
   const summary = latestSummary(sorted);
-  const visible = sorted.filter(
-    (entry) => entry.type !== 'summary' && (!summary || compareCursor(entry, summary.covers) > 0),
-  ) as (MessageEntry | EventEntry)[];
+  const visible = sorted.filter((entry) => entry.type !== 'summary' && (!summary || entry.seq > summary.covers)) as (
+    | MessageEntry
+    | EventEntry
+  )[];
 
-  const make = (message: ModelMessage, upTo: Cursor, pinned = false): ProjectedMessage => ({
+  const make = (message: ModelMessage, from: number, upTo: number, pinned = false): ProjectedMessage => ({
     message,
+    from,
     upTo,
     pinned,
     tokens: estimate(message),
   });
 
   const pinned: ProjectedMessage[] = [];
-  if (summary) pinned.push(make((options.summary ?? defaultSummaryMessage)(summary), summary.covers, true));
+  if (summary)
+    pinned.push(make((options.summary ?? defaultSummaryMessage)(summary), summary.covers, summary.covers, true));
 
   const rest: ProjectedMessage[] = [];
   const rules = options.events ?? {};
@@ -222,7 +222,7 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
     const entry = shown[i]!;
     if (entry.type === 'message') {
       const message = options.message ? options.message(entry) : entry.message;
-      if (message) rest.push(make(message, cursorOf(entry)));
+      if (message) rest.push(make(message, entry.seq, entry.seq));
       continue;
     }
     const rule = rules[entry.kind]!;
@@ -235,8 +235,9 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
         i += 1;
       }
     }
-    const upTo = cursorOf(group.at(-1)!);
-    for (const message of asList(rule.render(group))) rest.push(make(message, upTo));
+    const from = Math.min(...group.map((member) => member.seq));
+    const upTo = Math.max(...group.map((member) => member.seq));
+    for (const message of asList(rule.render(group))) rest.push(make(message, from, upTo));
   }
 
   const { kept, dropped } = windowed(pinned, rest, options.window);

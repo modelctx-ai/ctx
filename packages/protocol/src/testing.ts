@@ -17,7 +17,6 @@ import type { Orchestrator, OrchestratorEvent } from './orchestrator.ts';
 import {
   CTX_EVENTS,
   assistantEntry,
-  cursorOf,
   eventEntry,
   messageEntry,
   userEntry,
@@ -92,12 +91,31 @@ export function describeSessionStoreContract(
   { describe, test }: ContractTestApi,
 ): void {
   describe(`SessionStore contract: ${name}`, () => {
-    test('按 (at, seq) 排序，导入的旧记录插回原来的位置', async () => {
+    test('list 按 seq 返回：补写的旧记录排在写入的位置，不按 at 插回去', async () => {
       let clock = 1_000;
       const store = await factory({ now: () => clock++ });
       await store.append('s', [userEntry('二'), userEntry('三')]);
       await store.append('s', [userEntry('一', { at: 10 })]);
-      assert.deepEqual(texts(await store.list('s')), ['一', '二', '三']);
+      await store.append('s', [userEntry('四')]);
+      const listed = await store.list('s');
+      assert.deepEqual(texts(listed), ['二', '三', '一', '四']);
+      assert.ok(
+        listed.every((entry, i) => i === 0 || entry.seq > listed[i - 1]!.seq),
+        'seq 在会话内严格递增，按写入顺序分配',
+      );
+      assert.ok(listed[0]!.seq >= 1, 'seq 从 1 起；0 表示会话开头');
+      assert.deepEqual(texts(await store.list('s', { last: 2 })), ['一', '四'], 'last 是 seq 最大的 N 条');
+    });
+
+    test('补写旧记录之后 list(after) 仍然给出它：位置是 seq，不是 at', async () => {
+      let clock = 1_000;
+      const store = await factory({ now: () => clock++ });
+      const [a, b] = await store.append('s', [userEntry('a'), userEntry('b')]);
+      await store.append('s', [{ type: 'summary', text: '摘要', covers: b!.seq }]);
+      await store.append('s', [userEntry('late', { at: a!.at - 1 })]);
+      await store.append('s', [userEntry('c')]);
+      assert.deepEqual(texts(await store.list('s', { after: b!.seq })), ['摘要', 'late', 'c']);
+      assert.deepEqual(texts(await store.list('s', { after: 0 })), ['a', 'b', '摘要', 'late', 'c']);
     });
 
     test('同一时刻按写入先后排', async () => {
@@ -105,6 +123,14 @@ export function describeSessionStoreContract(
       await store.append('s', [eventEntry('pet.whisper', { text: 'a' }), eventEntry('pet.whisper', { text: 'b' })]);
       await store.append('s', [eventEntry('pet.whisper', { text: 'c' })]);
       assert.deepEqual(texts(await store.list('s')), ['a', 'b', 'c']);
+    });
+
+    test('clear 之后 seq 不回退、不复用', async () => {
+      const store = await factory({ now: Date.now });
+      const before = await store.append('s', [userEntry('1'), userEntry('2')]);
+      await store.clear('s');
+      const [after] = await store.append('s', [userEntry('3')]);
+      assert.ok(after!.seq > before[1]!.seq, `${after!.seq} 应大于 ${before[1]!.seq}`);
     });
 
     test('幂等键和 id 重复时跳过，只返回真正写入的', async () => {
@@ -160,7 +186,7 @@ export function describeSessionStoreContract(
         userEntry('3'),
         userEntry('4'),
       ]);
-      assert.deepEqual(texts(await store.list('s', { after: written[1]! })), ['3', '4']);
+      assert.deepEqual(texts(await store.list('s', { after: written[1]!.seq })), ['3', '4']);
       assert.deepEqual(texts(await store.list('s', { types: ['message'], last: 2 })), ['3', '4']);
       assert.deepEqual(texts(await store.list('s', { types: ['event'] })), ['2']);
       assert.deepEqual(await store.list('s', { last: 0 }), []);
@@ -194,7 +220,7 @@ export function describeSessionStoreContract(
       await store.append('s', [
         messageEntry(image),
         eventEntry('pet.reminder', { text: '喝水', data: { id: 's_1', repeat: null } }),
-        { type: 'summary', text: '摘要', covers: { at: 1, seq: 2 } },
+        { type: 'summary', text: '摘要', covers: 2 },
       ]);
       const [first, second, third, fourth] = await store.list('s');
       assert.equal(first?.id, written?.id);
@@ -210,7 +236,7 @@ export function describeSessionStoreContract(
         '喝水',
         { id: 's_1', repeat: null },
       ]);
-      assert.deepEqual(fourth?.type === 'summary' && [fourth.text, fourth.covers], ['摘要', { at: 1, seq: 2 }]);
+      assert.deepEqual(fourth?.type === 'summary' && [fourth.text, fourth.covers], ['摘要', 2]);
       assert.ok((second?.seq ?? 0) > (first?.seq ?? 0));
     });
 
@@ -268,7 +294,7 @@ export function describeSessionStoreContract(
       const [first] = await store.append('s', [userEntry('旧')]);
       await store.append('s', [userEntry('已有')]);
       const controller = new AbortController();
-      const iterator = store.watch('s', { after: cursorOf(first!), signal: controller.signal })[Symbol.asyncIterator]();
+      const iterator = store.watch('s', { after: first!.seq, signal: controller.signal })[Symbol.asyncIterator]();
       try {
         const existing = await nextWithin(iterator, '已有的条目');
         assert.deepEqual(texts(existing.done ? [] : [existing.value]), ['已有']);
@@ -278,6 +304,28 @@ export function describeSessionStoreContract(
         const fresh = await pending;
         assert.deepEqual(texts(fresh.done ? [] : [fresh.value]), ['新']);
         assert.equal(!fresh.done && fresh.value.session, 's');
+      } finally {
+        controller.abort();
+        await iterator.return?.();
+      }
+    });
+
+    test('watch（有时）：已经看过 b 的 watch 也收到之后补写的旧记录', async () => {
+      let clock = 1_000;
+      const store = await factory({ now: () => clock++ });
+      if (!store.watch) return;
+      const [, b] = await store.append('s', [userEntry('a'), userEntry('b')]);
+      const controller = new AbortController();
+      const iterator = store.watch('s', { after: b!.seq, signal: controller.signal })[Symbol.asyncIterator]();
+      try {
+        const pending = nextWithin(iterator, '补写的旧记录');
+        await store.append('s', [userEntry('late', { at: 1 })]);
+        const late = await pending;
+        assert.deepEqual(texts(late.done ? [] : [late.value]), ['late']);
+        const next = nextWithin(iterator, '之后的条目');
+        await store.append('s', [userEntry('c')]);
+        const fresh = await next;
+        assert.deepEqual(texts(fresh.done ? [] : [fresh.value]), ['c']);
       } finally {
         controller.abort();
         await iterator.return?.();

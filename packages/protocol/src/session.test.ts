@@ -4,9 +4,8 @@ import { describe, test } from 'vite-plus/test';
 
 import {
   compactedEntry,
-  compareCursor,
+  compareEntries,
   CTX_EVENTS,
-  cursorOf,
   eventEntry,
   filterEntries,
   isFrameworkKind,
@@ -18,13 +17,15 @@ import {
   type Entry,
 } from './session.ts';
 
-describe('cursor', () => {
-  test('先比 at，再比 seq', () => {
-    assert.ok(compareCursor({ at: 1, seq: 9 }, { at: 2, seq: 1 }) < 0);
-    assert.ok(compareCursor({ at: 2, seq: 2 }, { at: 2, seq: 1 }) > 0);
-    assert.equal(compareCursor({ at: 2, seq: 1 }, { at: 2, seq: 1 }), 0);
-    const entry = { ...userEntry('x'), id: 'e', session: 's', seq: 3, at: 7 } as Entry;
-    assert.deepEqual(cursorOf(entry), { at: 7, seq: 3 });
+function entryAt(seq: number, at: number): Entry {
+  return { ...userEntry('x'), id: `e${seq}`, session: 's', seq, at };
+}
+
+describe('compareEntries', () => {
+  test('投影顺序：先比 at，同一时刻再比 seq；位置不看 at', () => {
+    assert.ok(compareEntries(entryAt(9, 1), entryAt(1, 2)) < 0);
+    assert.ok(compareEntries(entryAt(2, 2), entryAt(1, 2)) > 0);
+    assert.equal(compareEntries(entryAt(1, 2), entryAt(1, 2)), 0);
   });
 });
 
@@ -37,10 +38,10 @@ describe('entries', () => {
       source: 'user',
     });
     assert.deepEqual(eventEntry('pet.whisper'), { type: 'event', kind: 'pet.whisper' });
-    assert.deepEqual(summaryEntry('摘要', { at: 1, seq: 2 }, { source: 'model' }), {
+    assert.deepEqual(summaryEntry('摘要', 2, { source: 'model' }), {
       type: 'summary',
       text: '摘要',
-      covers: { at: 1, seq: 2 },
+      covers: 2,
       source: 'model',
     });
   });
@@ -68,7 +69,8 @@ describe('entries', () => {
       seq: i + 1,
       at: 10,
     }));
-    assert.equal(filterEntries(entries, { after: entries[0]! }).length, 2);
+    assert.equal(filterEntries(entries, { after: 1 }).length, 2);
+    assert.equal(filterEntries(entries, { after: 0 }).length, 3);
     assert.equal(filterEntries(entries, { types: ['event'] }).length, 1);
     assert.deepEqual(
       filterEntries(entries, { types: ['message'], last: 1 }).map((entry) => entry.id),
@@ -96,7 +98,7 @@ describe('framework events', () => {
     });
     const ended = runEndedEntry({ runId: 'r1', stopReason: 'end_turn', usage: undefined });
     assert.deepEqual(ended.data, { runId: 'r1', stopReason: 'end_turn' });
-    const compacted = compactedEntry({ covers: { at: 1, seq: 2 }, summaryId: 's1' });
+    const compacted = compactedEntry({ covers: 2, summaryId: 's1' });
     assert.equal(compacted.kind, CTX_EVENTS.compacted);
     assert.deepEqual(JSON.parse(JSON.stringify(compacted)), compacted);
   });

@@ -23,16 +23,11 @@
 只追加的事件日志。详细语义见 [ADR 0003](adr/0003-context-model.md)。
 
 ```ts
-interface Cursor {
-  at: number;
-  seq: number;
-}
-
 interface EntryBase {
   id: string; // 全局唯一；不给就由存储生成
   session: string; // 由存储填
-  seq: number; // 由存储填
-  at: number; // 逻辑时间（毫秒），缺省写入时刻
+  seq: number; // 会话内位置，由存储按写入顺序填：会话内严格递增、从 1 起，`clear` 后不回退；0 是会话开头
+  at: number; // 逻辑时间（毫秒），缺省写入时刻；只用于投影排序和展示，可以早于已有的条目
   key?: string; // 幂等键：同一会话里键相同的第二条跳过
   source?: string; // 谁写的：user、model、harness、应用名
   meta?: JsonObject;
@@ -50,7 +45,7 @@ interface EventEntry extends EntryBase {
 interface SummaryEntry extends EntryBase {
   type: 'summary';
   text: string;
-  covers: Cursor;
+  covers: number; // seq ≤ covers 的条目由这段摘要代替
 }
 type Entry = MessageEntry | EventEntry | SummaryEntry;
 type EntryType = Entry['type'];
@@ -58,12 +53,12 @@ type EntryType = Entry['type'];
 type NewEntry = NewMessageEntry | NewEventEntry | NewSummaryEntry;
 
 interface ListOptions {
-  after?: Cursor; // 不含
-  last?: number; // 最后 N 条，仍从旧到新；向下取整，不是有限正数时返回空
+  after?: number; // seq，不含
+  last?: number; // seq 最大的 N 条，仍按 seq 升序；向下取整，不是有限正数时返回空
   types?: readonly EntryType[];
 }
 interface WatchOptions {
-  after?: Cursor;
+  after?: number; // seq，不含
   signal?: AbortSignal; // 中止后迭代正常结束
 }
 
@@ -79,7 +74,8 @@ interface SessionStore {
 
 - `append` 对一批条目是原子的：不会只写一半，也不会和并发的另一批交错。崩溃后续跑依赖这一点。
 - 去重不算失败：`id` 重复（全局）或 `key` 重复（同一会话，含同一批里的）的那一条静默跳过，同批其余照写；返回值就是真正写入的条目。重试一批时靠它不重复记。
-- 返回顺序统一是 `(at, seq)` 从旧到新；带旧 `at` 导入的条目排回原来的位置。`sessions()` 只列有内容的会话。
+- `list` 和 `watch` 都按 `seq` 升序返回，也就是写入顺序。带旧 `at` 导入的条目排在写入的位置（所以游标之后一定看得到新写入的），模型看到的逻辑顺序由投影按 `(at, seq)` 重排（`compareEntries`）。`seq` 只要求会话内单调，消费者不能跨会话比较。`sessions()` 只列有内容的会话。
+- 生效的摘要是 `covers` 最大的那条；`covers` 相同时 `seq` 大的（后写的）生效。
 - 事件 `kind` 用 `{domain}.{action}`。框架保留 `ctx.` 前缀，常量是 `CTX_EVENTS`：
 
 | `kind`            | 谁写          | `data`                                                                   |
@@ -91,7 +87,7 @@ interface SessionStore {
 
 这些事件缺省对模型不可见，和应用事件一样由投影规则决定要不要渲染。
 
-纯函数：`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareCursor`、`cursorOf`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，存储可以直接用。
+纯函数：`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareEntries`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，存储可以直接用。
 
 ## 上下文 `ContextBuilder`
 
@@ -417,24 +413,24 @@ harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptSte
 
 `ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON（每行一个值，出错时最后一行是 `{ error }`）；错误正文是 `{ error: ErrorInfo }`，客户端转成带 `status` 的 `Error`。鉴权用 `Authorization: Bearer <token>`，缺省只听本机，Host 只认监听地址，带 `Origin` 的请求缺省 403。消息里的二进制和 `URL` 编码成带标记的对象（`{"\u0000ctx": "bytes", "base64"}`、`{"\u0000ctx": "url", "href"}`），两头还原。路径按组件分组，可以整体挂在一个前缀下：
 
-| 组件     | 方法              | 路径                                                               | 请求体 → 响应                                                       |
-| -------- | ----------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| 会话     | `append`          | `POST /sessions/:session/entries`                                  | `{ entries }` → `{ entries }`                                       |
-|          | `list`            | `GET /sessions/:session/entries?after.at=&after.seq=&last=&types=` | → `{ entries }`；`types` 逗号分隔                                   |
-|          | `watch`           | `GET /sessions/:session/entries/stream?after.at=&after.seq=`       | → NDJSON `Entry`；存储没有 `watch` 时服务端轮询 `list`              |
-|          | `clear`           | `DELETE /sessions/:session`                                        | → `{ deleted }`                                                     |
-|          | `sessions`        | `GET /sessions`                                                    | → `{ sessions }`                                                    |
-| 执行环境 | （列出名字）      | `GET /executors`                                                   | → `{ executors }`                                                   |
-|          | `tools`           | `GET /executors/:name/tools`                                       | → `{ tools }`                                                       |
-|          | `execute`         | `POST /executors/:name/execute`                                    | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止 |
-| Harness  | `run`             | `POST /runs`                                                       | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`     |
-|          | `stream`          | `POST /runs?stream=1`                                              | 同上 → NDJSON `RunEvent`；断开即中止                                |
-|          | 取消（`signal`）  | `DELETE /runs/:runId`                                              | → `{ cancelled }`                                                   |
-| 编排     | `submit`          | `POST /orchestrator/runs`                                          | 同 `POST /runs` → `{ runId, session }`                              |
-|          | `status` / `done` | `GET /orchestrator/runs/:runId?wait=<ms>`                          | → `{ runId, status, result?, error? }`；`wait` 是长轮询             |
-|          | `cancel`          | `DELETE /orchestrator/runs/:runId`                                 | → `{ cancelled }`                                                   |
-|          | `recover`         | `POST /orchestrator/recover`                                       | → `{ recovered }`                                                   |
-|          | `events`          | `GET /orchestrator/events`                                         | → NDJSON `OrchestratorEvent`                                        |
+| 组件     | 方法              | 路径                                                 | 请求体 → 响应                                                       |
+| -------- | ----------------- | ---------------------------------------------------- | ------------------------------------------------------------------- |
+| 会话     | `append`          | `POST /sessions/:session/entries`                    | `{ entries }` → `{ entries }`                                       |
+|          | `list`            | `GET /sessions/:session/entries?after=&last=&types=` | → `{ entries }`；`types` 逗号分隔                                   |
+|          | `watch`           | `GET /sessions/:session/entries/stream?after=`       | → NDJSON `Entry`；存储没有 `watch` 时服务端轮询 `list`              |
+|          | `clear`           | `DELETE /sessions/:session`                          | → `{ deleted }`                                                     |
+|          | `sessions`        | `GET /sessions`                                      | → `{ sessions }`                                                    |
+| 执行环境 | （列出名字）      | `GET /executors`                                     | → `{ executors }`                                                   |
+|          | `tools`           | `GET /executors/:name/tools`                         | → `{ tools }`                                                       |
+|          | `execute`         | `POST /executors/:name/execute`                      | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止 |
+| Harness  | `run`             | `POST /runs`                                         | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`     |
+|          | `stream`          | `POST /runs?stream=1`                                | 同上 → NDJSON `RunEvent`；断开即中止                                |
+|          | 取消（`signal`）  | `DELETE /runs/:runId`                                | → `{ cancelled }`                                                   |
+| 编排     | `submit`          | `POST /orchestrator/runs`                            | 同 `POST /runs` → `{ runId, session }`                              |
+|          | `status` / `done` | `GET /orchestrator/runs/:runId?wait=<ms>`            | → `{ runId, status, result?, error? }`；`wait` 是长轮询             |
+|          | `cancel`          | `DELETE /orchestrator/runs/:runId`                   | → `{ cancelled }`                                                   |
+|          | `recover`         | `POST /orchestrator/recover`                         | → `{ recovered }`                                                   |
+|          | `events`          | `GET /orchestrator/events`                           | → NDJSON `OrchestratorEvent`                                        |
 
 编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 

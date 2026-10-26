@@ -1,7 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 
 import type {
-  Cursor,
   Entry,
   JsonObject,
   JsonValue,
@@ -58,15 +57,17 @@ interface Body {
   kind?: string;
   text?: string;
   data?: JsonValue;
-  covers?: Cursor;
+  /** 0.2 及以前写的是 `{ at, seq }`，读的时候取 `seq`。 */
+  covers?: number | { seq: number };
 }
 
 /**
  * 结构版本，存在 `${prefix}meta` 的 `schema` 里。
  * 1：0.1 和 0.2 都写这个值，但 0.1 的列叫 `thread`，0.2 叫 `session`，所以升到 2 时要看实际的列。
  * 2：列叫 `session`。
+ * 3：位置只用 `seq`，索引是 `(session, seq)`，不再有 `(session, at, seq)`。
  */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /** 自己开库时 `busy_timeout` 的缺省值（毫秒）。 */
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
@@ -135,6 +136,11 @@ function bodyOf(entry: NewEntry): Body {
   return { text: entry.text, covers: entry.covers };
 }
 
+/** 旧行的 `covers` 是 `{ at, seq }`，位置现在只看 `seq`。 */
+function coversOf(covers: number | { seq: number }): number {
+  return typeof covers === 'number' ? covers : covers.seq;
+}
+
 function decode(row: Row): Entry {
   const base = {
     id: row.id,
@@ -147,7 +153,7 @@ function decode(row: Row): Entry {
   };
   const body = JSON.parse(row.body, reviver) as Body;
   if (row.type === 'message') return { ...base, type: 'message', message: body.message! };
-  if (row.type === 'summary') return { ...base, type: 'summary', text: body.text!, covers: body.covers! };
+  if (row.type === 'summary') return { ...base, type: 'summary', text: body.text!, covers: coversOf(body.covers!) };
   return {
     ...base,
     type: 'event',
@@ -190,6 +196,34 @@ function withWriteLock(database: DatabaseSync, prefix: string, work: () => void)
   database.exec(savepoint ? `RELEASE ${prefix}migrate` : 'COMMIT');
 }
 
+/** 表上实际有的列和索引。`table_info` 不列生成列，`table_xinfo` 才列。 */
+function inspect(database: DatabaseSync, table: string): { columns: Set<string>; indexes: Set<string> } {
+  const columns = (database.prepare(`PRAGMA table_xinfo(${table})`).all() as { name: string }[]).map((c) => c.name);
+  const indexes = (
+    database.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?`).all(table) as {
+      name: string;
+    }[]
+  ).map((i) => i.name);
+  return { columns: new Set(columns), indexes: new Set(indexes) };
+}
+
+/**
+ * 当前结构缺的东西，每一项是一条语句；空表示完整。迁移的每一步都先查实际的列和索引再补，
+ * 所以半截的库、别的版本建出来的同一级库（schema 版本号相同、结构不全）都能补齐，重复执行也没有副作用。
+ */
+function repairs(database: DatabaseSync, table: string): string[] {
+  const { indexes } = inspect(database, table);
+  const sql: string[] = [];
+  // 旧的 `(session, at, seq)` 索引：位置只看 `seq` 以后不再需要。
+  if (indexes.has(`${table}_order`)) sql.push(`DROP INDEX ${table}_order`);
+  if (!indexes.has(`${table}_key`)) {
+    sql.push(`CREATE UNIQUE INDEX ${table}_key ON ${table} (session, key) WHERE key IS NOT NULL`);
+  }
+  if (!indexes.has(`${table}_seq`)) sql.push(`CREATE INDEX ${table}_seq ON ${table} (session, seq)`);
+  return sql;
+}
+
+/** 表不在就建，再补上缺的列和索引。 */
 function createSchema(database: DatabaseSync, prefix: string): void {
   const table = `${prefix}entries`;
   database.exec(`
@@ -203,44 +237,49 @@ function createSchema(database: DatabaseSync, prefix: string): void {
       source TEXT,
       body TEXT NOT NULL,
       meta TEXT
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS ${table}_key ON ${table} (session, key) WHERE key IS NOT NULL;
-    CREATE INDEX IF NOT EXISTS ${table}_order ON ${table} (session, at, seq);
+    )
   `);
+  for (const statement of repairs(database, table)) database.exec(statement);
+}
+
+/** 比自己新的结构版本不认识，写进去可能写坏，拒绝打开。 */
+function check(version: number | undefined): void {
+  if (version !== undefined && version > SCHEMA_VERSION) {
+    throw new Error(
+      `The ctx schema in this database is version ${version}, newer than the version ${SCHEMA_VERSION} this ctx-sqlite supports. Upgrade @modelctx-ai/ctx-sqlite.`,
+    );
+  }
 }
 
 /**
  * 把库带到 `SCHEMA_VERSION`：没有表就建；旧版本按序升级；比自己新的版本拒绝打开（旧代码不知道新结构，写进去可能写坏）。
  * 升级在写锁里做，进程同时打开同一个旧库时只有一个真的在迁，别的拿到锁后重读版本发现已经是新的。
+ * 版本号相同不等于结构完整：同一级的结构可能是之前的提交建的，所以每次打开都查一遍实际的列和索引，缺的在锁里补。
  */
 function migrate(database: DatabaseSync, prefix: string): void {
   const table = `${prefix}entries`;
-  const check = (version: number | undefined): void => {
-    if (version !== undefined && version > SCHEMA_VERSION) {
-      throw new Error(
-        `The ctx schema in this database is version ${version}, newer than the version ${SCHEMA_VERSION} this ctx-sqlite supports. Upgrade @modelctx-ai/ctx-sqlite.`,
-      );
-    }
-  };
+  const complete = (version: number | undefined): boolean =>
+    version === SCHEMA_VERSION && hasTable(database, table) && repairs(database, table).length === 0;
   const seen = readSchemaVersion(database, prefix);
   check(seen);
-  if (seen === SCHEMA_VERSION) return;
+  if (complete(seen)) return;
 
   withWriteLock(database, prefix, () => {
     database.exec(`CREATE TABLE IF NOT EXISTS ${prefix}meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
     let version = readSchemaVersion(database, prefix);
     check(version);
-    if (version === SCHEMA_VERSION) return;
+    if (complete(version)) return;
     // 没有版本记录但有数据表：只可能是更早的写法，按 1 处理。
     version ??= hasTable(database, table) ? 1 : 0;
     if (version < 2) {
       // 0.1 的列叫 `thread`；0.2 改成 `session` 时没升版本，所以 1 里两种库都有，要看实际的列。
       // yoyo 之前自己改过名的库也是 `session`，这里跳过。RENAME COLUMN 会把索引定义一起改掉。
-      const columns = (database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
-      if (columns.includes('thread') && !columns.includes('session')) {
+      const columns = inspect(database, table).columns;
+      if (columns.has('thread') && !columns.has('session')) {
         database.exec(`ALTER TABLE ${table} RENAME COLUMN thread TO session`);
       }
     }
+    // 3：`(session, at, seq)` 索引换成 `(session, seq)`。`seq` 是主键，行的顺序本来就是它，`createSchema` 换索引。
     createSchema(database, prefix);
     database
       .prepare(
@@ -251,7 +290,7 @@ function migrate(database: DatabaseSync, prefix: string): void {
 }
 
 /**
- * 基于 `node:sqlite` 的存储。所有条目在一张表里，按会话、时间、写入序号建索引。
+ * 基于 `node:sqlite` 的存储。所有条目在一张表里，按会话和写入序号 `seq` 建索引。
  * 写入用 SAVEPOINT，所以和应用共用一个库、处在应用自己的事务里也能用。
  * 消息里的二进制（Uint8Array、Buffer、ArrayBuffer、其他 TypedArray）读回来都是 Uint8Array，URL 读回来还是 URL。
  */
@@ -326,9 +365,9 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
     async list(session, listOptions: ListOptions = {}) {
       const where = ['session = ?'];
       const params: SQLInputValue[] = [session];
-      if (listOptions.after) {
-        where.push('(at > ? OR (at = ? AND seq > ?))');
-        params.push(listOptions.after.at, listOptions.after.at, listOptions.after.seq);
+      if (listOptions.after !== undefined) {
+        where.push('seq > ?');
+        params.push(listOptions.after);
       }
       if (listOptions.types) {
         if (listOptions.types.length === 0) return [];
@@ -340,10 +379,10 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
         // 和内存存储一样：小数向下取整，不是有限正数时返回空。
         const last = Number.isFinite(listOptions.last) ? Math.floor(listOptions.last) : 0;
         if (last <= 0) return [];
-        sql = `SELECT * FROM (${sql} ORDER BY at DESC, seq DESC LIMIT ?) ORDER BY at, seq`;
+        sql = `SELECT * FROM (${sql} ORDER BY seq DESC LIMIT ?) ORDER BY seq`;
         params.push(last);
       } else {
-        sql += ' ORDER BY at, seq';
+        sql += ' ORDER BY seq';
       }
       const rows = database.prepare(sql).all(...params) as unknown as Row[];
       return rows.map(decode);
@@ -364,7 +403,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
         for (const entry of fresh) {
           if (signal?.aborted) return;
           yield entry;
-          after = entry;
+          after = entry.seq;
         }
         if (fresh.length === 0) await sleep(pollInterval, signal);
       }

@@ -33,7 +33,7 @@ flowchart TB
 | ----------------------- | ------------------------------------------------------------------------------------------------------ |
 | 会话 `session`          | 一个 agent 实例的日志的名字，例如 `pet:main`、`user:42`。条目按会话存放                                |
 | 条目 `Entry`            | 会话里的一条记录，分 `message`、`event`、`summary` 三种，写入后不再修改                                |
-| 游标 `Cursor`           | `{ at, seq }`。`at` 是逻辑时间（毫秒），`seq` 是存储分配的写入序号，同一时刻靠它排先后                 |
+| 位置 `seq`              | 存储按写入顺序分配的序号，会话内严格递增、从 1 起。`at` 是逻辑时间（毫秒），只用于投影排序和展示       |
 | 会话存储 `SessionStore` | 只追加的持久化边界：`append`、`list`、`clear`、`sessions`、`watch`                                     |
 | 投影 `project()`        | 把条目渲染成这一次交给模型的 `ModelMessage[]`，每次调用重新计算，不改日志                              |
 | 来源 `ContextSource`    | 调用那一刻才去取的上下文，取到的文字叫事实 `Fact`，不写日志                                            |
@@ -136,7 +136,7 @@ sequenceDiagram
 | --------- | ----------------------------------- | ------------------------------------------------------------------ |
 | `message` | `message: ModelMessage`             | AI SDK 消息原样保存（文字、图片、工具调用和结果），投影时原样带上  |
 | `event`   | `kind`、`text?`、`data?: JsonValue` | 应用自己的事件。缺省不可见，`projection.events[kind]` 有规则才渲染 |
-| `summary` | `text`、`covers: Cursor`            | 压缩点：代替 `covers` 及之前的全部条目，固定在第一条               |
+| `summary` | `text`、`covers: number`            | 压缩点：代替 `seq` ≤ `covers` 的全部条目，固定在第一条             |
 
 公共字段：
 
@@ -153,13 +153,13 @@ sequenceDiagram
 
 ## 存储
 
-| 方法                                    | 行为                                                                                                                          |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `append(session, entries)`              | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）        |
-| `list(session, { after, last, types })` | 按 `(at, seq)` 从旧到新。`after` 不含该位置；`last` 取最后 N 条，仍从旧到新，小数向下取整，不是有限正数时返回空；三者可以组合 |
-| `clear(session)`                        | 删掉整个会话，返回条数                                                                                                        |
-| `sessions()`                            | 有内容的会话                                                                                                                  |
-| `watch(session, { after, signal })`     | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                         |
+| 方法                                    | 行为                                                                                                                                     |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `append(session, entries)`              | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）                   |
+| `list(session, { after, last, types })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；三者可以组合 |
+| `clear(session)`                        | 删掉整个会话，返回条数                                                                                                                   |
+| `sessions()`                            | 有内容的会话                                                                                                                             |
+| `watch(session, { after, signal })`     | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                    |
 
 实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，缺省每 250ms，别的进程写进同一个库的也能读到）。条目只追加；除了 `clear`，没有删除和修改。
 
@@ -167,15 +167,15 @@ sequenceDiagram
 
 `project(entries, options)` 按顺序做五步：
 
-1. 按 `(at, seq)` 排序。
-2. 选摘要：`covers` 最大的那条生效。`covers` 及之前的条目不再出现；摘要用 `options.summary` 渲染（缺省是一条用户消息 `Summary of the earlier conversation:\n…`），固定在第一条，不参与裁剪。
+1. 按 `(at, seq)` 排序（`compareEntries`）：补写的旧记录排回逻辑上的位置。
+2. 选摘要：`covers` 最大的那条生效，相同时后写（`seq` 大）的生效。`seq` ≤ `covers` 的条目不再出现，摘要之后补写的旧记录（`seq` > `covers`）仍然可见；摘要用 `options.summary` 渲染（缺省是一条用户消息 `Summary of the earlier conversation:\n…`），固定在第一条，不参与裁剪。
 3. 消息条目原样带上。`options.message(entry)` 可以改写，返回空就丢掉。
 4. 事件条目：没有规则的 `kind` 跳过，也不打断前后同类事件的合并。`fold: true` 的规则把连续的同类事件合成一组交给 `render(events)`；`render` 返回一条消息、多条消息，或者空（丢掉）。
 5. 窗口：开头孤立的工具结果（它的调用已经被摘要盖住或被裁掉）总是丢掉。设了 `maxMessages` 或 `maxTokens` 时，从最旧的消息开始整组丢弃直到不超；带工具调用的助手消息和紧跟的工具结果是一组。至少留下最后一组，宁可超预算也不交出空上下文。
 
 例子：`whisper` 有 `fold` 规则，`clipboard` 没有规则。
 
-| 日志（按 `at, seq`）           | 投影                                                        |
+| 日志（按 `seq`）               | 投影                                                        |
 | ------------------------------ | ----------------------------------------------------------- |
 | `user` 早先的问题              | 被摘要代替                                                  |
 | `assistant` 早先的回答         | 被摘要代替                                                  |
@@ -198,7 +198,7 @@ sequenceDiagram
 
 投影照常输出 `system` 消息（例如摘要渲染成 `system`）；组装调用时 builder 把它们从消息里拿出来，接到指令后面（见[调用](#调用)）。
 
-结果 `Projection`：`messages`；`items`，每条带 `upTo`（覆盖到的最后一个条目的游标）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`summary` 生效的摘要条目。
+结果 `Projection`：`messages`；`items`，每条带 `from`、`upTo`（它来自的条目里最小和最大的 `seq`）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`summary` 生效的摘要条目。
 
 缺省的 token 估算不依赖分词器：中日韩文字一个字约 1 token，其他字符约 4 个 1 token，每条消息另加 4，图片、文件每个按 256（工具结果里的也一样，不去数 base64）。只用于预算和裁剪，不用于计费。
 
@@ -297,7 +297,7 @@ await context.append(eventEntry('whisper', { text }));
 2. 最近 `keep`（缺省 12）条原样保留。切点往前挪，保留的部分不以工具结果开头。
 3. 切点之前没有消息，或者不到 `minimum`（缺省 8）条，就不压缩、不调模型，返回 `null`。
 4. 把旧摘要和切点之前的消息转成纯文本记录（图片、文件只写占位，例如 `[image image/png]`，不带数据），用 `instructions`（缺省是内置的压缩指令）、`temperature: 0`、`maxOutputTokens`（缺省 1024）调一次模型。`model` 缺省用上下文的模型。
-5. 摘要被 `maxOutputTokens` 截断（`finishReason` 是 `length`）时不写，告警并返回 `null`；否则在同一批里追加一条 `summary`（`covers` 是最后一条被压缩消息的 `upTo`）和一条 `ctx.compacted`（`covers`、`summaryId`）。
+5. 摘要被 `maxOutputTokens` 截断（`finishReason` 是 `length`）时不写，告警并返回 `null`；否则在同一批里追加一条 `summary`（`covers` 是被保留的消息里最小的 `from` 减 1，即日志顺序上的切点；输入是投影里 `upTo` ≤ `covers` 的消息，补写的旧记录 `seq` 在切点之后，不进这次摘要，压缩后仍然可见。`fold` 合并的事件组里混进补写的旧记录时，组的 `from` ≤ `covers` < `upTo`，整组进摘要会重复，所以 `covers` 退到这一组的 `from` 减 1，整组留在视图里；退到不再有横跨的组为止，退到 0 就返回 `null`）和一条 `ctx.compacted`（`covers`、`summaryId`）。
 
 新摘要已经包含旧摘要，所以只有最新的一条生效；之后 `view()` 从它读起。什么时候压缩由应用决定（例如定时、超过阈值），ctx 不自动压缩。
 
@@ -575,7 +575,7 @@ describeSessionStoreContract('pg', ({ now }) => createPgStore({ url: 'postgres:/
 
 | 用例            | 要求                                                                                                                                                   |
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 排序            | 按 `(at, seq)`；带旧 `at` 导入的条目排回原来的位置                                                                                                     |
+| 位置            | `list` 按 `seq` 升序；补写的旧记录排在写入的位置，`list(after)`、`watch(after)` 仍然给出它；`seq` 会话内递增、从 1 起，`clear` 后不回退                |
 | 同一时刻        | 按写入先后                                                                                                                                             |
 | 去重            | 同会话重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按会话隔离；一批里有重复的，其余照写                                                     |
 | 原子            | 并发追加的两批不交错                                                                                                                                   |

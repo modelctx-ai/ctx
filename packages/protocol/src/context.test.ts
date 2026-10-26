@@ -38,7 +38,7 @@ function summaryOf(id: string, covers: Entry, seq: number): SummaryEntry {
   return {
     type: 'summary',
     text: id,
-    covers: { at: covers.at, seq: covers.seq },
+    covers: covers.seq,
     id,
     session: 's',
     seq,
@@ -79,7 +79,7 @@ describe('project', () => {
     const summary: SummaryEntry = {
       type: 'summary',
       text: '聊过早先的事',
-      covers: { at: entries[1]!.at, seq: entries[1]!.seq },
+      covers: entries[1]!.seq,
       id: 's',
       session: 's',
       seq: 99,
@@ -102,6 +102,45 @@ describe('project', () => {
     assert.deepEqual(
       project([...entries, narrow, wide]).messages.map((message) => message.content),
       ['Summary of the earlier conversation:\nwide', '3'],
+    );
+  });
+
+  test('覆盖范围相同时后写的摘要生效，不看出现的先后', async () => {
+    const entries = await seed(userEntry('1'), userEntry('2'), userEntry('3'));
+    const first = summaryOf('first', entries[1]!, 10);
+    const second = summaryOf('second', entries[1]!, 11);
+    assert.equal(latestSummary([first, second])?.id, 'second');
+    assert.equal(latestSummary([second, first])?.id, 'second');
+  });
+
+  test('补写的旧记录：位置按 seq，投影顺序按 (at, seq)；摘要之后补写的仍然可见', async () => {
+    // a、b 之后压缩（摘要 covers = b.seq），再补写 at 早于 b 的 late，再写 c。
+    const entries = await seed(
+      userEntry('a', { at: 10 }),
+      userEntry('b', { at: 20 }),
+      { type: 'summary', text: 'sum of a,b', covers: 2, id: 'sum', at: 30 },
+      userEntry('late', { at: 15 }),
+      userEntry('c', { at: 40 }),
+    );
+    assert.deepEqual(
+      project(entries).messages.map((message) => message.content),
+      ['Summary of the earlier conversation:\nsum of a,b', 'late', 'c'],
+    );
+  });
+
+  test('投影项带它覆盖的条目的 seq 范围：from 是最小的，upTo 是最大的', async () => {
+    const entries = await seed(
+      eventEntry('pet.whisper', { text: '甲' }),
+      eventEntry('pet.whisper', { text: '乙' }),
+      userEntry('丙'),
+    );
+    const { items } = project(entries, { events: { 'pet.whisper': whisper } });
+    assert.deepEqual(
+      items.map((item) => [item.from, item.upTo]),
+      [
+        [1, 2],
+        [3, 3],
+      ],
     );
   });
 

@@ -16,7 +16,7 @@ Node ≥22。
 
 | 协议             | 方法                                                            | 一句话                                                        |
 | ---------------- | --------------------------------------------------------------- | ------------------------------------------------------------- |
-| `SessionStore`   | `append`、`list`、`clear`、`sessions`、`watch?`                 | 只追加的事件日志，按 `(at, seq)` 排序                         |
+| `SessionStore`   | `append`、`list`、`clear`、`sessions`、`watch?`                 | 只追加的事件日志，按 `seq`（写入顺序）排序                    |
 | `ContextBuilder` | `build`、`view`、`compact?`                                     | 日志 + 事实 + 输入 → 一次调用的指令、消息、工具名单           |
 | `ToolRegistry`   | `add`、`remove`、`removeSource`、`has`、`get`、`list`、`select` | 工具目录：JSON Schema 定义，每个绑一个执行环境的名字          |
 | `Executor`       | `execute`、`tools?`、`provision?`、`dispose?`                   | 工具调用真正发生的地方；出错返回 `{ type: 'error' }` 而不是抛 |
@@ -33,7 +33,7 @@ Node ≥22。
 | ---------------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | `userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry`              | 构造新条目                                              |
 | `runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`isFrameworkKind` | 框架事件                                                |
-| `compareCursor`、`cursorOf`、`filterEntries`、`textOf`                                   | 游标、`ListOptions` 的语义、消息文字                    |
+| `compareEntries`、`filterEntries`、`textOf`                                              | 投影顺序、`ListOptions` 的语义、消息文字                |
 | `project`、`latestSummary`、`defaultSummaryMessage`                                      | 条目渲染成 `ModelMessage[]`：摘要、事件规则、窗口       |
 | `defineSource`、`collectFacts`、`renderFacts`                                            | 上下文来源和事实（`collectFacts` 并行、单个来源有超时） |
 | `estimateTokens`、`estimateTextTokens`                                                   | 不依赖分词器的 token 估算                               |

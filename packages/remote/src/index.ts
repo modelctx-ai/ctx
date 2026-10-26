@@ -163,8 +163,7 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
       const { after, last, types } = listOptions;
       const body = await connection.json<{ entries: Entry[] }>('GET', entriesPath(session), {
         query: {
-          'after.at': after ? String(after.at) : undefined,
-          'after.seq': after ? String(after.seq) : undefined,
+          after: after !== undefined ? String(after) : undefined,
           last: last !== undefined ? String(last) : undefined,
           types: types ? types.join(',') : undefined,
         },
@@ -183,8 +182,7 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
       try {
         const response = await connection.request('GET', `${entriesPath(session)}/stream`, {
           query: {
-            'after.at': after ? String(after.at) : undefined,
-            'after.seq': after ? String(after.seq) : undefined,
+            after: after !== undefined ? String(after) : undefined,
           },
           ...(signal ? { signal } : {}),
         });

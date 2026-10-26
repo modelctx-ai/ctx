@@ -8,7 +8,6 @@ import type { AddressInfo } from 'node:net';
 
 import {
   silentLogger,
-  type Cursor,
   type Entry,
   type EntryType,
   type ErrorInfo,
@@ -247,19 +246,18 @@ function runRequestOf(body: unknown): WireRunRequest {
 
 const ENTRY_TYPES: readonly EntryType[] = ['message', 'event', 'summary'];
 
-function cursorParam(query: URLSearchParams): Cursor | undefined {
-  const at = query.get('after.at');
-  const seq = query.get('after.seq');
-  if (at === null && seq === null) return undefined;
-  const cursor = { at: Number(at), seq: Number(seq ?? 0) };
-  if (!Number.isFinite(cursor.at) || !Number.isFinite(cursor.seq)) fail(400, 'after.at and after.seq must be numbers');
-  return cursor;
+function afterParam(query: URLSearchParams): number | undefined {
+  const raw = query.get('after');
+  if (raw === null) return undefined;
+  const after = Number(raw);
+  if (raw === '' || !Number.isFinite(after)) fail(400, 'after must be a number (a seq)');
+  return after;
 }
 
 function listOptionsOf(query: URLSearchParams): ListOptions {
-  const options: { after?: Cursor; last?: number; types?: EntryType[] } = {};
-  const after = cursorParam(query);
-  if (after) options.after = after;
+  const options: { after?: number; last?: number; types?: EntryType[] } = {};
+  const after = afterParam(query);
+  if (after !== undefined) options.after = after;
   const last = query.get('last');
   if (last !== null) options.last = Number(last);
   const types = query.get('types');
@@ -330,7 +328,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     if (sub !== 'entries' || extra !== undefined) fail(404, `not found: ${url.pathname}`);
     if (tail === 'stream') {
       if (method !== 'GET') fail(405, 'use GET /sessions/:session/entries/stream');
-      await watchEntries(sessionStore, session, cursorParam(url.searchParams), res);
+      await watchEntries(sessionStore, session, afterParam(url.searchParams), res);
       return;
     }
     if (tail !== undefined) fail(404, `not found: ${url.pathname}`);
@@ -348,7 +346,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   async function watchEntries(
     sessionStore: SessionStore,
     session: string,
-    after: Cursor | undefined,
+    after: number | undefined,
     res: ServerResponse,
   ): Promise<void> {
     const controller = new AbortController();
@@ -357,16 +355,16 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     const write = startStream(res);
     try {
       if (sessionStore.watch) {
-        for await (const entry of sessionStore.watch(session, { ...(after ? { after } : {}), signal })) {
+        for await (const entry of sessionStore.watch(session, { ...(after !== undefined ? { after } : {}), signal })) {
           await write(entry);
         }
       } else {
-        let cursor = after;
+        let position = after;
         while (!signal.aborted) {
-          const entries: Entry[] = await sessionStore.list(session, cursor ? { after: cursor } : {});
+          const entries: Entry[] = await sessionStore.list(session, position !== undefined ? { after: position } : {});
           for (const entry of entries) await write(entry);
           const last = entries.at(-1);
-          if (last) cursor = { at: last.at, seq: last.seq };
+          if (last) position = last.seq;
           await sleep(pollIntervalMs, signal);
         }
       }

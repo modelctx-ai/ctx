@@ -1,6 +1,7 @@
 import {
   collectFacts,
   compactedEntry,
+  latestSummary,
   project,
   renderFacts,
   summaryEntry,
@@ -171,8 +172,9 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
 
   /** 只读最近一次摘要之后的部分，长历史不必整段读出来。 */
   async function load(session: string): Promise<Entry[]> {
-    const [summary] = await store.list(session, { types: ['summary'], last: 1 });
-    if (summary?.type !== 'summary') return store.list(session);
+    // 生效的摘要是 covers 最大的，不一定是最后写的（两个进程同时压缩时），所以读全部摘要再挑。
+    const summary = latestSummary(await store.list(session, { types: ['summary'] }));
+    if (!summary) return store.list(session);
     const after = await store.list(session, { after: summary.covers });
     return after.some((entry) => entry.id === summary.id) ? after : [summary, ...after];
   }
@@ -220,7 +222,25 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     while (cut > 0 && rest[cut]?.message.role === 'tool') cut -= 1;
     if (cut <= 0 || cut < (compactOptions.minimum ?? 8)) return null;
 
-    const older = rest.slice(0, cut);
+    // 切点按日志顺序定：被保留的条目里最小的 seq 减 1。补写的旧记录按 `at` 排在前面，但 seq 在后面，
+    // 不在这次摘要里，压缩后仍然可见；seq 在 covers 之内的条目一定都进摘要。
+    const kept = rest.slice(cut);
+    let covers =
+      kept.length > 0 ? Math.min(...kept.map((item) => item.from)) - 1 : Math.max(...rest.map((item) => item.upTo));
+    // fold 合并的事件组可能混进补写的旧记录：组的 seq 范围横跨切点（from ≤ covers < upTo）时，
+    // 整组进摘要会让 seq > covers 的成员留在视图里重复，整组留下又会让 seq ≤ covers 的成员被盖住。
+    // 只能把 covers 退到这一组的第一条之前，让整组都留在视图里。退一次可能让别的组横跨，所以退到不再有为止。
+    for (let moved = true; moved;) {
+      moved = false;
+      for (const item of rest.slice(0, cut)) {
+        if (item.from <= covers && covers < item.upTo) {
+          covers = item.from - 1;
+          moved = true;
+        }
+      }
+    }
+    const older = rest.slice(0, cut).filter((item) => item.upTo <= covers);
+    if (older.length === 0) return null;
     const maxOutputTokens = compactOptions.maxOutputTokens ?? 1024;
     const { text, finishReason } = await generateText({
       model,
@@ -238,7 +258,6 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     }
     const summary = text.trim();
     if (!summary) return null;
-    const covers = older.at(-1)!.upTo;
     const id = crypto.randomUUID();
     const [entry] = await store.append(session, [
       summaryEntry(summary, covers, { id, source: 'model' }),

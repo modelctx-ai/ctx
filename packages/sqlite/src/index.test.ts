@@ -148,6 +148,33 @@ const OLD_DDL = (column: string): string => `
     VALUES ('old-1', 'user:1', 1, 'message', 'k', '{"message":{"role":"user","content":"旧的"}}');
 `;
 
+/** ADR 0005 阶段 1 的提交建出来的 schema 3：只有 `(session, seq)` 索引，没有后面阶段加的列和索引。 */
+const PHASE1_DDL = `
+  CREATE TABLE ctx_entries (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    session TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    key TEXT,
+    source TEXT,
+    body TEXT NOT NULL,
+    meta TEXT
+  );
+  CREATE UNIQUE INDEX ctx_entries_key ON ctx_entries (session, key) WHERE key IS NOT NULL;
+  CREATE INDEX ctx_entries_seq ON ctx_entries (session, seq);
+  CREATE TABLE ctx_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+  INSERT INTO ctx_meta (key, value) VALUES ('schema', '3');
+  INSERT INTO ctx_entries (id, session, at, type, key, body)
+    VALUES ('p1-1', 'user:1', 1, 'message', 'k', '{"message":{"role":"user","content":"阶段 1 写的"}}'),
+           ('p1-2', 'user:1', 2, 'event', NULL, '{"kind":"note","text":"事件"}');
+`;
+
+function indexNames(database: DatabaseSync): string[] {
+  const rows = database.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'ctx_entries'`);
+  return (rows.all() as { name: string }[]).map((row) => row.name).filter((name) => name.startsWith('ctx_entries_'));
+}
+
 function schemaVersion(database: DatabaseSync): unknown {
   return database.prepare(`SELECT value FROM ctx_meta WHERE key = 'schema'`).get()?.['value'];
 }
@@ -156,14 +183,14 @@ describe('schema 迁移', () => {
   test('新库直接是当前版本', () => {
     const database = new DatabaseSync(':memory:');
     createSqliteStore({ database });
-    assert.equal(schemaVersion(database), '2');
+    assert.equal(schemaVersion(database), '3');
   });
 
   test('0.1 的库（thread 列、schema=1）能直接打开：旧数据在，索引随列改名，可以接着写', async () => {
     const database = new DatabaseSync(':memory:');
     database.exec(OLD_DDL('thread'));
     const store = createSqliteStore({ database });
-    assert.equal(schemaVersion(database), '2');
+    assert.equal(schemaVersion(database), '3');
     const [old] = await store.list('user:1');
     assert.equal(old?.id, 'old-1');
     assert.equal(old?.session, 'user:1');
@@ -177,19 +204,60 @@ describe('schema 迁移', () => {
     const database = new DatabaseSync(':memory:');
     database.exec(OLD_DDL('session'));
     const store = createSqliteStore({ database });
-    assert.equal(schemaVersion(database), '2');
+    assert.equal(schemaVersion(database), '3');
     assert.equal((await store.list('user:1')).length, 1);
+  });
+
+  test('schema 2 的库升到 3：旧的 (session, at, seq) 索引换成 (session, seq)，数据和旧摘要的 covers 照读', async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec(OLD_DDL('session'));
+    database.exec(`UPDATE ctx_meta SET value = '2' WHERE key = 'schema'`);
+    database.exec(`
+      INSERT INTO ctx_entries (id, session, at, type, body)
+        VALUES ('old-2', 'user:1', 2, 'message', '{"message":{"role":"assistant","content":"旧回答"}}'),
+               ('old-s', 'user:1', 3, 'summary', '{"text":"旧摘要","covers":{"at":2,"seq":2}}');
+    `);
+    const store = createSqliteStore({ database });
+    assert.equal(schemaVersion(database), '3');
+    const indexes = (database.prepare(`PRAGMA index_list(ctx_entries)`).all() as { name: string }[]).map((i) => i.name);
+    assert.ok(indexes.includes('ctx_entries_seq'));
+    assert.ok(!indexes.includes('ctx_entries_order'));
+    const entries = await store.list('user:1');
+    assert.deepEqual(
+      entries.map((entry) => entry.id),
+      ['old-1', 'old-2', 'old-s'],
+    );
+    assert.equal(entries[2]?.type === 'summary' && entries[2].covers, 2, '旧的 { at, seq } 读成 seq');
+    assert.equal((await store.append('user:1', [userEntry('新的')]))[0]?.seq, 4);
+  });
+
+  test('schema 3 同一级的结构不全也能补齐：索引缺了补上，留着的旧索引删掉，重复打开不变', async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec(PHASE1_DDL);
+    database.exec(`DROP INDEX ctx_entries_seq; CREATE INDEX ctx_entries_order ON ctx_entries (session, at, seq);`);
+    createSqliteStore({ database });
+    const first = indexNames(database).toSorted();
+    assert.ok(first.includes('ctx_entries_seq'));
+    assert.ok(first.includes('ctx_entries_key'));
+    assert.ok(!first.includes('ctx_entries_order'));
+    assert.equal(schemaVersion(database), '3');
+    const store = createSqliteStore({ database });
+    assert.deepEqual(indexNames(database).toSorted(), first);
+    assert.deepEqual(
+      (await store.list('user:1')).map((entry) => entry.id),
+      ['p1-1', 'p1-2'],
+    );
   });
 
   test('比自己新的版本拒绝打开，库原样不动；自己开的库也关掉', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
     createSqliteStore({ path }).close();
     const raw = new DatabaseSync(path);
-    raw.exec(`UPDATE ctx_meta SET value = '3' WHERE key = 'schema'`);
+    raw.exec(`UPDATE ctx_meta SET value = '4' WHERE key = 'schema'`);
     raw.close();
-    assert.throws(() => createSqliteStore({ path }), /version 3, newer than/);
+    assert.throws(() => createSqliteStore({ path }), /version 4, newer than/);
     const check = new DatabaseSync(path);
-    assert.equal(schemaVersion(check), '3');
+    assert.equal(schemaVersion(check), '4');
     check.close();
   });
 
@@ -202,7 +270,7 @@ describe('schema 迁移', () => {
       1,
     );
     createSqliteStore({ database });
-    assert.equal(schemaVersion(database), '2');
+    assert.equal(schemaVersion(database), '3');
   });
 
   test('在应用的事务里打开旧库也能迁，回滚后版本回到 1', () => {
@@ -210,7 +278,7 @@ describe('schema 迁移', () => {
     database.exec(OLD_DDL('thread'));
     database.exec('BEGIN');
     createSqliteStore({ database });
-    assert.equal(schemaVersion(database), '2');
+    assert.equal(schemaVersion(database), '3');
     database.exec('ROLLBACK');
     assert.equal(schemaVersion(database), '1');
     assert.equal(
@@ -292,7 +360,7 @@ describe('多进程', () => {
     raw.close();
     await Promise.all(['a', 'b', 'c', 'd'].map((session) => spawnWriter(path, session, 5)));
     const store = createSqliteStore({ path });
-    assert.equal(schemaVersion(store.database), '2');
+    assert.equal(schemaVersion(store.database), '3');
     assert.equal((await store.list('user:1')).length, 1);
     assert.equal((await store.sessions()).length, 5);
     store.close();

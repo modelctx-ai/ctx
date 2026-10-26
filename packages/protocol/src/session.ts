@@ -3,20 +3,17 @@ import type { ModelMessage, UserContent } from 'ai';
 import type { StopReason, Usage } from './harness.ts';
 import type { JsonObject, JsonValue } from './types.ts';
 
-/** 条目在会话里的位置：先按 `at`，同一时刻再按存储分配的 `seq`。 */
-export interface Cursor {
-  readonly at: number;
-  readonly seq: number;
-}
-
 interface EntryBase {
   /** 全局唯一。没给就由存储生成。 */
   readonly id: string;
   /** 所属会话，由存储填。 */
   readonly session: string;
-  /** 存储分配的写入序号，只用来给同一时刻的条目排先后。 */
+  /**
+   * 条目在会话里的位置：存储按写入顺序分配，会话内严格递增、从 1 开始，`(session, seq)` 唯一。不要求连续，
+   * 不要求跨会话递增，`clear` 之后不回退、不复用。0 表示会话开头。`list`、`watch`、`covers` 都按它。
+   */
   readonly seq: number;
-  /** 逻辑时间（毫秒）。缺省是写入时刻；导入的旧记录保留原来的时间。 */
+  /** 逻辑时间（毫秒），只用于投影排序和展示。缺省是写入时刻；导入的旧记录保留原来的时间，所以可以早于已有的条目。 */
   readonly at: number;
   /** 幂等键。同一会话里键相同的第二条会被跳过。 */
   readonly key?: string;
@@ -40,11 +37,11 @@ export interface EventEntry extends EntryBase {
   readonly data?: JsonValue;
 }
 
-/** 压缩点：`covers` 之前（含）的条目由这段摘要代替。 */
+/** 压缩点：`seq` 小于等于 `covers` 的条目由这段摘要代替。 */
 export interface SummaryEntry extends EntryBase {
   readonly type: 'summary';
   readonly text: string;
-  readonly covers: Cursor;
+  readonly covers: number;
 }
 
 export type Entry = MessageEntry | EventEntry | SummaryEntry;
@@ -62,24 +59,24 @@ export type NewSummaryEntry = Draft<SummaryEntry>;
 export type NewEntry = NewMessageEntry | NewEventEntry | NewSummaryEntry;
 
 export interface ListOptions {
-  /** 只要这个位置之后（不含）的条目。 */
-  readonly after?: Cursor;
-  /** 只要最后 N 条，仍按从旧到新返回。小数向下取整，不是有限正数时返回空。 */
+  /** 只要 `seq` 大于它的条目（不含）。0 是会话开头。 */
+  readonly after?: number;
+  /** 只要最后写入的 N 条（`seq` 最大的 N 条），仍按 `seq` 升序返回。小数向下取整，不是有限正数时返回空。 */
   readonly last?: number;
   /** 只要这些类型。 */
   readonly types?: readonly EntryType[];
 }
 
 export interface WatchOptions {
-  /** 从这个位置之后（不含）开始；不给就从头。 */
-  readonly after?: Cursor;
+  /** 从 `seq` 大于它的条目开始；不给就从头。 */
+  readonly after?: number;
   /** 中止后迭代正常结束，不抛错。 */
   readonly signal?: AbortSignal;
 }
 
 /**
  * 会话：只追加的事件日志，放在模型的上下文窗口之外。写进来的条目不再修改，压缩靠追加摘要条目完成。
- * 返回顺序统一是 `(at, seq)` 从旧到新。
+ * `list` 和 `watch` 都按 `seq` 升序返回，也就是写入顺序；模型看到的逻辑顺序是投影的事（`compareEntries`）。
  */
 export interface SessionStore {
   /**
@@ -141,27 +138,24 @@ export function eventEntry(kind: string, init?: EventInit): NewEventEntry {
   return entry;
 }
 
-export function summaryEntry(text: string, covers: Cursor, options?: EntryOptions): NewSummaryEntry {
+export function summaryEntry(text: string, covers: number, options?: EntryOptions): NewSummaryEntry {
   return { type: 'summary', text, covers, ...common(options) };
 }
 
-// ---- 游标和读取 ----
+// ---- 顺序和读取 ----
 
-export function compareCursor(a: Cursor, b: Cursor): number {
+/** 投影里的逻辑顺序：先按 `at`，同一时刻再按 `seq`。日志顺序只看 `seq`。 */
+export function compareEntries(a: Pick<Entry, 'at' | 'seq'>, b: Pick<Entry, 'at' | 'seq'>): number {
   return a.at - b.at || a.seq - b.seq;
-}
-
-export function cursorOf(entry: Entry): Cursor {
-  return { at: entry.at, seq: entry.seq };
 }
 
 /**
  * `ListOptions` 的语义写成纯函数：存储可以直接用它过滤，也可以在查询里做同样的事。
- * 输入应当已按 `(at, seq)` 排好。
+ * 输入应当已按 `seq` 升序排好。
  */
 export function filterEntries(entries: readonly Entry[], options: ListOptions | undefined): Entry[] {
   let out = entries.filter((entry) => {
-    if (options?.after && compareCursor(entry, options.after) <= 0) return false;
+    if (options?.after !== undefined && entry.seq <= options.after) return false;
     if (options?.types && !options.types.includes(entry.type)) return false;
     return true;
   });
@@ -210,7 +204,7 @@ export interface RunEndedData {
 
 /** `ctx.compacted` 的 `data`。 */
 export interface CompactedData {
-  readonly covers: Cursor;
+  readonly covers: number;
   readonly summaryId: string;
 }
 

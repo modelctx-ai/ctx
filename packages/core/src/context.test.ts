@@ -265,7 +265,7 @@ describe('createContext', () => {
       },
     });
     const [, covered] = await context.append(userEntry('很早的话'), assistantEntry('很早的回答'));
-    await context.append({ type: 'summary', text: '聊过早先的事', covers: { at: covered!.at, seq: covered!.seq } });
+    await context.append({ type: 'summary', text: '聊过早先的事', covers: covered!.seq });
     await context.append(
       messageEntry({ role: 'system', content: '说话简短' }),
       eventEntry('note', { text: '主人在开会' }),
@@ -345,6 +345,95 @@ describe('createContext', () => {
 
     await context.append(userEntry('新的一句'));
     assert.equal(await context.compact({ keep: 4, minimum: 4 }), null, '摘要之后的历史不够长');
+  });
+
+  test('补写旧记录：摘要之后补写的 late 仍然可见，watch 也收得到', async () => {
+    const summarizer = new MockLanguageModelV4({ doGenerate: textResult('sum of a,b') });
+    let clock = 100;
+    const store = createMemoryStore({ now: () => (clock += 1) });
+    const context = createContext({ store, session: 't', model: summarizer });
+    const [, b] = await context.append(userEntry('a'), assistantEntry('b'));
+    const summary = await context.compact({ keep: 0, minimum: 1 });
+    assert.equal(summary?.covers, b!.seq, 'covers 是被压缩的最后一条的 seq');
+    const controller = new AbortController();
+    const seen: string[] = [];
+    const watching = (async () => {
+      for await (const entry of store.watch!('t', { after: b!.seq, signal: controller.signal })) {
+        seen.push(entry.type === 'message' ? textOf(entry.message) : entry.type);
+        if (seen.length === 4) controller.abort();
+      }
+    })();
+    await context.append(userEntry('late', { at: 1 }));
+    await context.append(userEntry('c'));
+    await watching;
+    assert.deepEqual(seen, ['summary', 'event', 'late', 'c']);
+    const view = await context.view();
+    assert.deepEqual(
+      view.messages.map((message) => message.content),
+      ['Summary of the earlier conversation:\nsum of a,b', 'late', 'c'],
+    );
+  });
+
+  test('compact 按日志顺序定切点：seq ≤ covers 的都进摘要，被保留的最小 seq 之前的补写条目不丢', async () => {
+    const summarizer = new MockLanguageModelV4({ doGenerate: textResult('旧事摘要') });
+    let clock = 100;
+    const context = createContext({
+      store: createMemoryStore({ now: () => (clock += 1) }),
+      session: 't',
+      model: summarizer,
+    });
+    for (let i = 0; i < 10; i += 1) await context.append(userEntry(`问题${i}`), assistantEntry(`回答${i}`));
+    // at 很早，所以投影里排在最前；seq 最大，所以不在这次摘要的范围里。
+    const [late] = await context.append(userEntry('补写的旧记录', { at: 1 }));
+    const summary = await context.compact({ keep: 4, minimum: 4 });
+    assert.equal(summary?.covers, 16, '保留的最后 4 条 seq 是 17–20，covers 取 17 − 1');
+    assert.ok(summary.covers < late!.seq);
+    const sent = JSON.stringify(summarizer.doGenerateCalls[0]!.prompt);
+    assert.match(sent, /问题7/);
+    assert.doesNotMatch(sent, /补写的旧记录/, 'seq 大于 covers 的不进这次摘要');
+    assert.deepEqual(
+      (await context.view()).messages.map((message) => message.content),
+      ['Summary of the earlier conversation:\n旧事摘要', '补写的旧记录', '问题8', '回答8', '问题9', '回答9'],
+    );
+  });
+
+  test('compact：fold 合并的事件组里混进补写的旧记录时，整组不进摘要，covers 退到组的第一条之前', async () => {
+    const summarizer = new MockLanguageModelV4({ doGenerate: textResult('旧事摘要') });
+    let clock = 100;
+    const context = createContext({
+      store: createMemoryStore({ now: () => (clock += 1) }),
+      session: 't',
+      model: summarizer,
+      projection: {
+        events: {
+          whisper: {
+            fold: true,
+            render: (events) => ({ role: 'assistant', content: events.map((event) => event.text).join('\n') }),
+          },
+        },
+      },
+    });
+    for (let i = 0; i < 3; i += 1) await context.append(userEntry(`问题${i}`), assistantEntry(`回答${i}`));
+    const [, second] = await context.append(
+      eventEntry('whisper', { text: '在呢' }),
+      eventEntry('whisper', { text: '喝水' }),
+    );
+    for (let i = 3; i < 9; i += 1) await context.append(userEntry(`问题${i}`), assistantEntry(`回答${i}`));
+    // at 和第二条碎碎念相同，所以和前两条合成一组：组的 seq 范围是 7–21，横跨保留部分的切点（16）。
+    await context.append(eventEntry('whisper', { text: '补写', at: second!.at }));
+
+    const summary = await context.compact({ keep: 4, minimum: 4 });
+    assert.equal(summary?.covers, 6, 'covers 退到组的第一条（seq 7）之前');
+    const sent = JSON.stringify(summarizer.doGenerateCalls[0]!.prompt);
+    assert.match(sent, /问题2/);
+    assert.doesNotMatch(sent, /在呢|喝水|补写/, '这一组整个不进摘要');
+    const view = await context.view();
+    assert.deepEqual(
+      view.messages.slice(0, 3).map((message) => message.content),
+      ['Summary of the earlier conversation:\n旧事摘要', '在呢\n喝水\n补写', '问题3'],
+    );
+    const text = JSON.stringify(view.messages);
+    assert.equal(text.split('补写').length - 1, 1, '补写的内容只出现一次');
   });
 
   test('compact：没有可压的就不调模型；摘要被截断时不写', async () => {
