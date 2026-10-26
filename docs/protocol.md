@@ -385,7 +385,7 @@ interface Harness {
 - **一个会话最多一个未结束的运行，跨进程也成立**（只对 `record` 不为 `false` 的运行；`record: false` 的运行不碰日志，不占会话，不会遇到 `session_busy`，也不会被 `recover` 看到）：
   1. 开始：读最后一个生命周期事件（`list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`）。是 `started` 就说明有未结束的运行，`run` 以 `ErrorInfo.type: 'session_busy'`（`retryable: true`）结束，不写任何东西；否则带 `expectSeq` 追加 `ctx.run.started`，冲突就重读重判。
   2. 运行中：每次写入带 `expectSeq`（本轮上一次写入之后的末尾）。冲突时读 `after` 之后的 `ctx.run.ended`：自己的 `runId` 已经有了，说明被别人当作断掉的运行收走了（围栏），停下，`stopReason: 'aborted'`，不再写 `ctx.run.ended`、`ctx.error` 和产出；没有就只是别人写了应用事件，用新的末尾重试。
-  3. 同一进程内编排器的每会话队列保留，它只是少打一次冲突。
+  3. 同一个 harness 实例自己维护一条进程内的每会话串行队列（只排 `record` 不为 `false` 的运行）：同一进程里的第二个运行等前一个结束再开始，所以 `session_busy` 只会在跨进程或别的 harness 实例上出现。排队时 `signal` 中止，这一轮直接以 `aborted` 结束，什么都不写。队列只是少打一次冲突；编排器自己的队列保留，两层串行不冲突。
   4. 进程崩溃留下的未结束运行会让该会话一直 `session_busy`，直到有编排器 `recover` 它。**所以用 `record` 缺省（写日志）的应用，进程启动时要先 `recover()` 再接新的 `submit`。** 不写日志的运行没有这个要求。
   5. `RunRequest.owner` 写进 `ctx.run.started` 的 `owner`（编排器按自己的 `owner` 填）。
 - `text.delta` 不落日志，像 Managed Agents 的 event delta；其余事件各有对应的日志条目。

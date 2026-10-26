@@ -485,8 +485,65 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     };
   }
 
+  /** 进程内每会话一条队列，队尾是前一个记录型运行结束的时刻。队列里的 promise 永远 resolve，不会 reject。 */
+  const tails = new Map<string, Promise<void>>();
+
+  /**
+   * 排进这个会话的队：同一个 harness 里记录型运行（`record` 不为 `false`）一个接一个，第二个等前一个结束再开始，
+   * 所以 `session_busy` 只会出现在跨进程（或别的 harness 实例）的时候。`record: false` 不排。
+   * 前面有人在跑、自己在排队时 `signal` 中止，就退出队列，返回 `undefined`，调用方以 `aborted` 结束，什么都没写。
+   * 返回的 `release` 在运行结束时调；可以重复调。
+   */
+  async function enter(state: RunState): Promise<(() => void) | undefined> {
+    if (!state.record) return () => {};
+    const { session } = state.request;
+    const { signal } = state.request;
+    const queued = tails.has(session);
+    const previous = tails.get(session) ?? Promise.resolve();
+    const turn = Promise.withResolvers<void>();
+    const tail = previous.then(() => turn.promise);
+    tails.set(session, tail);
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      turn.resolve();
+      void tail.finally(() => {
+        if (tails.get(session) === tail) tails.delete(session);
+      });
+    };
+    // 没人排在前面就直接开始：`signal` 已经中止的运行照常写 started 和 ended（见契约）。
+    if (!queued) return release;
+    if (signal) {
+      const aborted = new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+      let waited = false;
+      await Promise.race([previous.then(() => (waited = true)), aborted]);
+      if (signal.aborted || !waited) {
+        release();
+        return undefined;
+      }
+    } else {
+      await previous;
+    }
+    return release;
+  }
+
   async function run(request: RunRequest, extras: RunExtras = {}): Promise<RunOutcome> {
     const state = begin(request);
+    const release = await enter(state);
+    if (!release) return { result: fenced(state) };
+    try {
+      return await runLocked(state, extras);
+    } finally {
+      release();
+    }
+  }
+
+  async function runLocked(state: RunState, extras: RunExtras): Promise<RunOutcome> {
+    const { request } = state;
     const controller = linked(request.signal);
     if (!(await writeStarted(state))) return { result: busy(state) };
     try {
@@ -509,8 +566,25 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
 
   async function startStream(request: RunRequest, extras: RunExtras = {}): Promise<StartedStream> {
     const state = begin(request);
+    const release = await enter(state);
+    if (!release) {
+      const outcome = Promise.resolve<RunOutcome>({ result: fenced(state) });
+      return { runId: state.runId, done: () => outcome };
+    }
+    try {
+      return await startStreamLocked(state, extras, release);
+    } catch (error) {
+      release();
+      throw error;
+    }
+  }
+
+  /** 流式的一轮；队列的位置在这一轮真正结束（结果落定）时才交出去，由 `release` 负责。 */
+  async function startStreamLocked(state: RunState, extras: RunExtras, release: () => void): Promise<StartedStream> {
+    const { request } = state;
     const controller = linked(request.signal);
     if (!(await writeStarted(state))) {
+      release();
       const outcome = Promise.resolve<RunOutcome>({ result: busy(state) });
       return { runId: state.runId, done: () => outcome };
     }
@@ -521,12 +595,14 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       if (state.logFailed) throw error;
       const outcome = fail(state, error, controller.signal).then((result) => ({ result, cause: error }));
       outcome.catch(() => {});
+      void outcome.then(release, release);
       return { runId: state.runId, done: () => outcome };
     }
 
     const finished = Promise.withResolvers<RunOutcome>();
     // 没人等结果时，写日志失败也不能变成未处理的 rejection。
     finished.promise.catch(() => {});
+    void finished.promise.then(release, release);
     let settled = false;
     let failure: unknown;
     const settle = (work: () => Promise<RunResult>, cause?: unknown): void => {

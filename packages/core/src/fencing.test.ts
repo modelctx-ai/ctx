@@ -250,3 +250,132 @@ describe('recover 的前提', () => {
     await orchestrator.close();
   });
 });
+
+describe('同一进程内每会话串行', () => {
+  test('同一个 harness 并发两个记录型运行：都成功，两组 started/ended 不交错', async () => {
+    const { store, harness } = setup();
+    const [a, b] = await Promise.all([
+      harness.run({ session: 's', agent: { model: answerModel() }, input: '一', runId: 'r1' }),
+      harness.run({ session: 's', agent: { model: answerModel() }, input: '二', runId: 'r2' }),
+    ]);
+    assert.equal(a.stopReason, 'end_turn');
+    assert.equal(b.stopReason, 'end_turn');
+    assert.deepEqual(roles(await store.list('s')), [
+      CTX_EVENTS.runStarted,
+      'user',
+      'assistant',
+      CTX_EVENTS.runEnded,
+      CTX_EVENTS.runStarted,
+      'user',
+      'assistant',
+      CTX_EVENTS.runEnded,
+    ]);
+  });
+
+  test('stream 和 run 混着并发也是一个接一个；record: false 不排队', async () => {
+    const { store, harness } = setup();
+    const first = gatedModel();
+    const running = harness.run({ session: 's', agent: { model: first.model }, input: '一', runId: 'r1' });
+    await first.entered;
+    const streamed = (async () => {
+      const types: string[] = [];
+      for await (const event of harness.stream({
+        session: 's',
+        agent: { model: answerModel() },
+        input: '二',
+        runId: 'r2',
+      })) {
+        types.push(event.type);
+      }
+      return types;
+    })();
+    // 不记录的运行不受影响，前一个还卡着也能跑。
+    const quiet = await harness.run({ session: 's', agent: { model: answerModel() }, input: '不记', record: false });
+    assert.equal(quiet.stopReason, 'end_turn');
+    assert.equal((await store.list('s')).length, 2, '第二个记录型运行还没开始');
+    first.release();
+    await running;
+    assert.equal((await streamed).at(-1), 'run.ended');
+    assert.deepEqual(
+      lifecycleOf(await store.list('s'), CTX_EVENTS.runEnded).map((data) => data.runId),
+      ['r1', 'r2'],
+    );
+  });
+
+  test('两个 harness 实例共用一个 store 并发：第二个拿到 session_busy', async () => {
+    const store = createMemoryStore();
+    const one = setup(store).harness;
+    const two = setup(store).harness;
+    const { model, entered, release } = gatedModel();
+    const running = one.run({ session: 's', agent: { model }, input: '一', runId: 'r1' });
+    await entered;
+    const blocked = await two.run({ session: 's', agent: { model: answerModel() }, input: '二', runId: 'r2' });
+    assert.equal(blocked.stopReason, 'error');
+    assert.equal(blocked.error?.type, 'session_busy');
+    release();
+    assert.equal((await running).stopReason, 'end_turn');
+    assert.deepEqual(
+      lifecycleOf(await store.list('s'), CTX_EVENTS.runStarted).map((data) => data.runId),
+      ['r1'],
+    );
+  });
+
+  test('排队时 signal 中止：以 aborted 结束，什么都不写，也不挡住后面的运行', async () => {
+    const { store, harness } = setup();
+    const { model, entered, release } = gatedModel();
+    const running = harness.run({ session: 's', agent: { model }, input: '一', runId: 'r1' });
+    await entered;
+    const controller = new AbortController();
+    const queued = harness.run({
+      session: 's',
+      agent: { model: answerModel() },
+      input: '二',
+      runId: 'r2',
+      signal: controller.signal,
+    });
+    const third = harness.run({ session: 's', agent: { model: answerModel() }, input: '三', runId: 'r3' });
+    controller.abort();
+    const result = await queued;
+    assert.equal(result.stopReason, 'aborted');
+    assert.deepEqual(result.recorded, []);
+    assert.equal((await store.list('s')).length, 2, '只有 r1 的 started 和 user');
+    release();
+    assert.equal((await running).stopReason, 'end_turn');
+    assert.equal((await third).stopReason, 'end_turn');
+    assert.deepEqual(
+      lifecycleOf(await store.list('s'), CTX_EVENTS.runEnded).map((data) => data.runId),
+      ['r1', 'r3'],
+    );
+  });
+
+  test('排队时 signal 已经中止（stream）：直接 aborted，不写', async () => {
+    const { store, harness } = setup();
+    const { model, entered, release } = gatedModel();
+    const running = harness.run({ session: 's', agent: { model }, input: '一' });
+    await entered;
+    let stopReason: string | undefined;
+    for await (const event of harness.stream({
+      session: 's',
+      agent: { model: answerModel() },
+      input: '二',
+      signal: AbortSignal.abort(),
+    })) {
+      if (event.type === 'run.ended') stopReason = event.result.stopReason;
+    }
+    assert.equal(stopReason, 'aborted');
+    release();
+    await running;
+    assert.equal(lifecycleOf(await store.list('s'), CTX_EVENTS.runStarted).length, 1);
+  });
+
+  test('编排器的队列和 harness 的队列叠在一起不冲突', async () => {
+    const { store, harness } = setup();
+    const orchestrator = createOrchestrator({ harness, store });
+    const handles = await Promise.all(
+      ['一', '二', '三'].map((input) => orchestrator.submit({ session: 's', agent: { model: answerModel() }, input })),
+    );
+    for (const handle of handles) assert.equal((await handle.done).stopReason, 'end_turn');
+    assert.equal(lifecycleOf(await store.list('s'), CTX_EVENTS.runEnded).length, 3);
+    await orchestrator.close();
+  });
+});
