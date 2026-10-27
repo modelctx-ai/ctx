@@ -102,7 +102,7 @@ describe('mcp hub', () => {
       ['web__search@mcp:web→mcp', 'local__read_file@mcp:local→mcp'],
     );
 
-    const registry = createToolRegistry().add('local_only', fake('x'));
+    const registry = createToolRegistry().addTool('local_only', fake('x'));
     assert.equal(hub.registerInto(registry), 2);
     assert.deepEqual(
       registry.list().map((info) => `${info.name}@${info.source}`),
@@ -210,7 +210,7 @@ describe('mcp hub', () => {
     ]);
     assert.equal(hub.toolSet()['my_srv__read_file']?.description, 'A1');
 
-    const registry = createToolRegistry().add('my_srv__search', fake('local'));
+    const registry = createToolRegistry().addTool('my_srv__search', fake('local'));
     assert.equal(hub.registerInto(registry), 1);
     assert.deepEqual(describedTools(registry), ['my_srv__search@local:local', 'my_srv__read_file@mcp:my.srv:A1']);
     assert.deepEqual(warned, ['MCP tool "my_srv__search" from server "my_srv" skipped: name already registered']);
@@ -224,7 +224,7 @@ describe('mcp hub', () => {
       { connector: async () => ({ tools: async () => ({ search: fake('s') }), close: async () => {} }) },
     );
     await hub.connect();
-    const one = createToolRegistry().add('local', fake('l'));
+    const one = createToolRegistry().addTool('local', fake('l'));
     const two = createToolRegistry();
     assert.equal(hub.registerInto(one), 1);
     assert.equal(hub.registerInto(two), 1);

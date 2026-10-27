@@ -186,7 +186,6 @@ await orchestrator.close();
 | `findLossySummaries(store, { session? })`、`recompactLossy(builder, finding, options)`                                              | 升级后修复：列出 0.2 写的、有条目被新规则盖住的摘要，再用模型重新压缩一次（见[协议层](https://github.com/modelctx-ai/ctx/blob/main/docs/protocol.md#消息格式和版本)）                                  |
 | `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`asSchema`、`stepCountIs`，`ModelMessage`、`LanguageModel`、`ToolSet` 等类型      | 从 `ai` 转出，应用不用单独依赖 `ai`                                                                                                                                                                    |
 | `@modelctx-ai/ctx/testing`                                                                                                          | 原样转出协议包的契约测试（`describeSessionStoreContract` 等），加 `createScriptedModel(script, { tool? })`：按剧本回答的假模型                                                                         |
-| 弃用：`ContextStore`、`ContextEntry`、`createContext({ thread })`、`context.thread`、`describeStoreContract`                        | 0.1 的名字，下一个 minor 删掉                                                                                                                                                                          |
 
 `createContext` 的选项：`store`、`session`、`projection`、`sources`、`sourceTimeoutMs`、`factsPlacement`、`tools`、`executors`、`hooks`、`model`、`source`、`logger`。
 

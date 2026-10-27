@@ -109,8 +109,6 @@ export interface LocalToolRegistry extends ToolRegistry {
   /** `addTool` 加进来的执行函数放在这里。harness 要把它列进执行环境。 */
   readonly executor: FunctionExecutor;
   add(definition: ToolDefinition, options?: AddToolOptions): LocalToolRegistry;
-  /** @deprecated 用 `addTool(name, tool, meta)`。 */
-  add(name: string, tool: Tool, meta?: ToolMeta): LocalToolRegistry;
   /**
    * 加一个 AI SDK 工具（`tool({ inputSchema, execute })`）：输入结构转成 JSON Schema 定义，
    * 执行函数放进注册表自带的函数执行环境。没有 `execute` 的工具（服务商工具、只声明的工具）不收。
@@ -218,9 +216,8 @@ export function createToolRegistry(options: ToolRegistryOptions = {}): LocalTool
     get size() {
       return tools.size;
     },
-    add(first: ToolDefinition | string, second?: AddToolOptions | Tool, meta?: ToolMeta): LocalToolRegistry {
-      if (typeof first === 'string') return addTool(first, second as Tool, meta);
-      addDefinition(first, (second as AddToolOptions | undefined)?.replace);
+    add(definition, addOptions) {
+      addDefinition(definition, addOptions?.replace);
       return registry;
     },
     addTool,

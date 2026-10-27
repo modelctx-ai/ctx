@@ -39,9 +39,6 @@ export interface SqliteSessionStore extends SessionStore {
   close(): void;
 }
 
-/** @deprecated 改名为 `SqliteSessionStore`，下一个 minor 删掉。 */
-export type SqliteContextStore = SqliteSessionStore;
-
 interface Row {
   seq: number | bigint;
   id: string;

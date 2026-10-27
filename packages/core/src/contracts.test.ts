@@ -11,7 +11,6 @@ import {
   describeHarnessContract,
   describeOrchestratorContract,
   describeSessionStoreContract,
-  describeStoreContract,
   describeToolRegistryContract,
   type ModelScript,
 } from './testing.ts';
@@ -20,7 +19,6 @@ import { createToolRegistry } from './tools.ts';
 const api = { describe, test };
 
 describeSessionStoreContract('memory', ({ now }) => createMemoryStore({ now }), api);
-describeStoreContract('memory（弃用的别名）', ({ now }) => createMemoryStore({ now }), api);
 
 describeExecutorContract(
   'function',

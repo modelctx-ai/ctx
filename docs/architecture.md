@@ -118,18 +118,18 @@ sequenceDiagram
 
 `Context` 的方法：
 
-| 方法 / 字段                        | 作用                                                                                |
-| ---------------------------------- | ----------------------------------------------------------------------------------- |
-| `append(...entries)`               | 追加条目，返回真正写入的那些                                                        |
-| `entries(options?)`                | 读原始条目，参数同 `SessionStore.list`                                              |
-| `view({ window? })`                | 当前交给模型的历史：最近一条摘要和它之后的条目，按投影规则渲染                      |
-| `facts(signal?)`                   | 收集一次事实                                                                        |
-| `prepare(options)`                 | 组装指令、消息和工具（包成 AI SDK `ToolSet`），不调用模型                           |
-| `generate(options)`                | 经 harness 跑一轮（`generateText`）；模型出错或被取消时抛出原来的错误               |
-| `stream(options)`                  | 经 harness 跑一轮（`streamText`），流结束后记录；返回 `{ runId, result, recorded }` |
-| `compact(options)`                 | 把较早的历史压成一条摘要                                                            |
-| `builder`、`executor`、`harness`   | 内部的 `ContextBuilder`、函数执行环境和 harness，直接用就是协议的接口               |
-| `session`（`thread` 是弃用的别名） | 会话名                                                                              |
+| 方法 / 字段                      | 作用                                                                                |
+| -------------------------------- | ----------------------------------------------------------------------------------- |
+| `append(...entries)`             | 追加条目，返回真正写入的那些                                                        |
+| `entries(options?)`              | 读原始条目，参数同 `SessionStore.list`                                              |
+| `view({ window? })`              | 当前交给模型的历史：最近一条摘要和它之后的条目，按投影规则渲染                      |
+| `facts(signal?)`                 | 收集一次事实                                                                        |
+| `prepare(options)`               | 组装指令、消息和工具（包成 AI SDK `ToolSet`），不调用模型                           |
+| `generate(options)`              | 经 harness 跑一轮（`generateText`）；模型出错或被取消时抛出原来的错误               |
+| `stream(options)`                | 经 harness 跑一轮（`streamText`），流结束后记录；返回 `{ runId, result, recorded }` |
+| `compact(options)`               | 把较早的历史压成一条摘要                                                            |
+| `builder`、`executor`、`harness` | 内部的 `ContextBuilder`、函数执行环境和 harness，直接用就是协议的接口               |
+| `session`                        | 会话名                                                                              |
 
 ## 条目
 
@@ -563,7 +563,7 @@ sequenceDiagram
 
 ### 自定义存储
 
-实现 `SessionStore`，再用契约测试验证行为和内置存储一致（`@modelctx-ai/ctx/testing` 原样转出 `@modelctx-ai/ctx-protocol/testing`，`describeStoreContract` 是弃用的别名）。工厂要用传进来的 `now` 作为缺省的 `at`。
+实现 `SessionStore`，再用契约测试验证行为和内置存储一致（`@modelctx-ai/ctx/testing` 原样转出 `@modelctx-ai/ctx-protocol/testing`）。工厂要用传进来的 `now` 作为缺省的 `at`。
 
 ```ts
 // pg-store.test.ts。describe、test 从你用的测试框架取：vitest、node:test、Jest、Bun 都行

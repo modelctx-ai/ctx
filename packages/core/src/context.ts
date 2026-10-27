@@ -56,15 +56,9 @@ interface ContextBaseOptions {
   readonly factsPlacement?: FactsPlacement;
 }
 
-export type ContextOptions = ContextBaseOptions &
-  (
-    | { readonly session: string; readonly thread?: never }
-    | {
-        /** @deprecated 改名为 `session`，下一个 minor 删掉。 */
-        readonly thread: string;
-        readonly session?: never;
-      }
-  );
+export interface ContextOptions extends ContextBaseOptions {
+  readonly session: string;
+}
 
 /** 可以直接给值，也可以给一个拿到本次上下文事实再决定的函数。 */
 export type FactAware<T> = T | ((facts: readonly Fact[]) => T | undefined);
@@ -148,8 +142,6 @@ export interface ContextStream {
 
 export interface Context {
   readonly session: string;
-  /** @deprecated 改名为 `session`。 */
-  readonly thread: string;
   readonly store: SessionStore;
   readonly tools: ToolRegistry | undefined;
   /** 组装上下文的 builder，`view`、`prepare`、`compact` 走它。 */
@@ -197,9 +189,8 @@ function settingsOf(call: GenerateSettings): CallSettings {
  * 内部是 `createContextBuilder`、传入的工具注册表、函数执行环境和 `createHarness`。
  */
 export function createContext(options: ContextOptions): Context {
-  const given = options.session ?? options.thread;
-  if (typeof given !== 'string') throw new Error('Pass `session` to createContext().');
-  const session: string = given;
+  const { session } = options;
+  if (typeof session !== 'string') throw new Error('Pass `session` to createContext().');
   const { store, tools } = options;
   const builder = createContextBuilder({
     store,
@@ -355,7 +346,6 @@ export function createContext(options: ContextOptions): Context {
 
   return {
     session,
-    thread: session,
     store,
     tools,
     builder,

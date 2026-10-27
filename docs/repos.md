@@ -10,7 +10,7 @@ yoyo 和 ctx 组件的对应：
 | 上下文   | `yoyoProjection`：碎碎念事件折叠成一条助手消息；来源是工作状态和粘贴板                                                                                              |
 | 工具     | `web_search`、`weather_forecast`、`list_alarms`、`add_alarm`，加 `mcpServers` 的工具                                                                                |
 | 执行环境 | 进程内函数；MCP 服务器                                                                                                                                              |
-| Harness  | `createHarness`：碎碎念和回复是同一个 harness 跑的两份 `AgentSpec`（`record: false`，说出口以后才记）                                                               |
+| Harness  | `createHarness`：碎碎念和回复是同一个 harness 跑的两份 `AgentSpec`（`record: false`，说出口以后才记）；事实放哪写在各自的 `AgentSpec.context` 里                    |
 | 编排     | `createYoyoOrchestrator` 实现 ctx 的 `Orchestrator`：排队、让路、收件箱、定时压缩；导演只剩舞台动作（让桌宠说话、做动作），常驻循环只管进程（启动、每秒一拍、退出） |
 | 模型     | `ctx-models` 按 `llm` 配置造                                                                                                                                        |
 
@@ -24,17 +24,18 @@ yoyo 和 ctx 组件的对应：
 
 ## 产物
 
-| 仓库    | 产物                                                                                                              | 去向                                                                                                                                                         | 现状                                                                                               |
-| ------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| ctx     | 5 个 npm 包：`@modelctx-ai/ctx`、`ctx-sqlite`、`ctx-models`、`ctx-mcp`、`ctx-gateway`                             | npmjs 的 `@modelctx-ai` 作用域；和同组织的 `@modelctx-ai/via` 一样，由 GitHub Actions 经 OIDC trusted publishing 发布（见 [ADR 0002](adr/0002-packages.md)） | 0.1.0，未发布                                                                                      |
-| yoyo    | 应用本身：`bin/yoyo.js` 命令行、`src/main.ts` 常驻进程；内部包 `@yoyo/dsh-pet`（dsh-pet HTTP 接口的类型化客户端） | 不发布，从仓库直接运行 `.ts`（Node ≥22.18，不构建）                                                                                                          | TypeScript pnpm workspace，重构见 [modelctx-ai/yoyo#1](https://github.com/modelctx-ai/yoyo/pull/1) |
-| dsh-pet | DSH 插件包 `dsh-pet`、独立模式命令 `dsh-pet-standalone`                                                           | 上游维护                                                                                                                                                     | 只读                                                                                               |
+| 仓库    | 产物                                                                                                                            | 去向                                                                                                                                                         | 现状                                                                                                                                                                                   |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ctx     | 8 个 npm 包：`@modelctx-ai/ctx`、`ctx-protocol`、`ctx-sqlite`、`ctx-models`、`ctx-mcp`、`ctx-gateway`、`ctx-exec`、`ctx-remote` | npmjs 的 `@modelctx-ai` 作用域；和同组织的 `@modelctx-ai/via` 一样，由 GitHub Actions 经 OIDC trusted publishing 发布（见 [ADR 0002](adr/0002-packages.md)） | 0.3.0，未发布                                                                                                                                                                          |
+| yoyo    | 应用本身：`bin/yoyo.js` 命令行、`src/main.ts` 常驻进程；内部包 `@yoyo/dsh-pet`（dsh-pet HTTP 接口的类型化客户端）               | 不发布，从仓库直接运行 `.ts`（Node ≥22.18，不构建）                                                                                                          | TypeScript pnpm workspace，重构见 [modelctx-ai/yoyo#1](https://github.com/modelctx-ai/yoyo/pull/1)，跟到 ctx 0.3 见 [modelctx-ai/yoyo#11](https://github.com/modelctx-ai/yoyo/pull/11) |
+| dsh-pet | DSH 插件包 `dsh-pet`、独立模式命令 `dsh-pet-standalone`                                                                         | 上游维护                                                                                                                                                     | 只读                                                                                                                                                                                   |
 
 ## 契约
 
 | 边界           | 契约                                                                                                                                                                                 |
 | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| yoyo → ctx     | 5 个包的公开 API（`dist/*.d.ts`），版本范围 `^0.1.0`                                                                                                                                 |
+| yoyo → ctx     | 6 个包的公开 API（`dist/*.d.ts`）：`@modelctx-ai/ctx`、`ctx-protocol`、`ctx-sqlite`、`ctx-mcp`、`ctx-gateway`、`ctx-models`，版本范围 `^0.3.0`；`ctx-exec`、`ctx-remote` 不用        |
+| yoyo → ctx     | `~/.yoyo/yoyo.db` 里 `ctx_` 前缀的表，`ctx-sqlite` 结构版本 3；常驻进程和命令行共用这个库，要用同一个 ctx 版本，不支持滚动升级                                                       |
 | yoyo → dsh-pet | `openapi.yaml` 描述的 HTTP 接口，前缀 `/dsh-pet-7340`：`/state`（长轮询）、`/lock` 和 `/lock/release`、`/broadcast`、`/anim`、`/chat`（对话记忆）、`/menu/item` 和 `/menu/events` 等 |
 | yoyo → dsh-pet | 独立模式的运行状态文件 `~/.dsh/dsh-pet/standalone-runtime.json`：端口和本机令牌，写接口带请求头 `x-dsh-pet-token`                                                                    |
 | yoyo → dsh-pet | `POST /standalone-ai/settings`：把桌宠右键对话的模型地址指向 yoyo 里的 ctx-gateway，密钥填一次性的本机令牌                                                                           |
@@ -46,27 +47,29 @@ yoyo 和 ctx 组件的对应：
 ```mermaid
 flowchart LR
   subgraph ctxrepo["modelctx-ai/ctx"]
-    core["@modelctx-ai/ctx"]
-    sqlite["ctx-sqlite"] --> core
-    mcp["ctx-mcp"] --> core
-    gateway["ctx-gateway"] --> core
+    protocol["ctx-protocol"]
+    core["@modelctx-ai/ctx"] --> protocol
+    sqlite["ctx-sqlite"] --> protocol
+    mcp["ctx-mcp"] --> protocol
+    gateway["ctx-gateway"] --> protocol
     models["ctx-models"]
   end
   subgraph yoyorepo["modelctx-ai/yoyo"]
     app["yoyo 应用"] --> client["@yoyo/dsh-pet"]
   end
-  app -- "现在 link:../ctx/packages/*<br/>发布后 npm ^0.1.0" --> ctxrepo
-  core --> ai["ai@7"]
+  app -- "现在 link:../ctx/packages/*<br/>发布后 npm ^0.3.0" --> ctxrepo
+  protocol --> ai["ai@7"]
+  core --> ai
   models --> ai
   client -. "HTTP，按 openapi.yaml" .-> pet["ticoAg/dsh-pet"]
 ```
 
-箭头指向被依赖的一方；虚线是运行时的 HTTP 调用，没有代码依赖。
+箭头指向被依赖的一方；虚线是运行时的 HTTP 调用，没有代码依赖。实现包之间不互相依赖，都只依赖协议包；`ctx-exec`、`ctx-remote` yoyo 不用，图里没画。
 
-| 阶段   | yoyo 怎么拿到 ctx                                                                                                                                                        |
-| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 现在   | ctx 克隆在 yoyo 旁边，先在 ctx 里 `pnpm install && pnpm build`；yoyo 的 `pnpm-workspace.yaml` 用 `overrides` 把 5 个包指到 `link:../ctx/packages/<name>`，读的是 `dist/` |
-| 发布后 | 删掉 `overrides`，`package.json` 里的 `^0.1.0` 从 npm 解析                                                                                                               |
+| 阶段   | yoyo 怎么拿到 ctx                                                                                                                                                              |
+| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 现在   | ctx 克隆在 yoyo 旁边，先在 ctx 里 `pnpm install && pnpm build`；yoyo 的 `pnpm-workspace.yaml` 用 `overrides` 把用到的 6 个包指到 `link:../ctx/packages/<name>`，读的是 `dist/` |
+| 发布后 | 删掉 `overrides`，`package.json` 里的 `^0.3.0` 从 npm 解析                                                                                                                     |
 
 ## 运行时拓扑
 
@@ -114,32 +117,36 @@ flowchart LR
 
 ## yoyo 怎么用 ctx
 
-| 方面     | 做法                                                                                                                      |
-| -------- | ------------------------------------------------------------------------------------------------------------------------- |
-| 存储     | `createSqliteStore({ database, prefix: 'ctx_' })`，和 yoyo 自己的表一起放在 `~/.yoyo/yoyo.db`                             |
-| 线程     | `pet:<petId>`                                                                                                             |
-| 投影     | `whisper` 事件 `fold`，渲染成一条助手消息「碎碎念：\n…」；用户话和回复原样保存，不截断；没配 `context.maxTokens` 就不裁剪 |
-| 来源     | 当前任务、粘贴板                                                                                                          |
-| 生成     | 碎碎念和回复都用 `record: false`：语音合成、投喂给桌宠之后，导演再把说出口的那句写进上下文                                |
-| 桌宠对话 | 每拍按幂等键导入 `GET /chat` 的对话记忆                                                                                   |
-| 工具     | yoyo 的本地工具，加上 `mcpServers` 配置里的 MCP 服务器（ctx-mcp）                                                         |
-| 压缩     | 配了 `context.compactAt` 时，每 10 分钟最多压缩一次                                                                       |
-| 模型     | ctx-models 的 `createModel()`，协议名和 dsh-pet 独立模式一致：`openai-compatible`、`anthropic`                            |
+| 方面     | 做法                                                                                                                                                                 |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 存储     | `createSqliteStore({ database, prefix: 'ctx_' })`，和 yoyo 自己的表一起放在 `~/.yoyo/yoyo.db`                                                                        |
+| 会话     | `pet:<petId>`（`sessionFor`）                                                                                                                                        |
+| 投影     | `whisper` 事件 `fold`，渲染成一条助手消息「碎碎念：\n…」；用户话和回复原样保存，不截断；没配 `context.maxTokens` 就不裁剪                                            |
+| 来源     | 当前任务、粘贴板                                                                                                                                                     |
+| agent    | 碎碎念和回复是两份 `AgentSpec`（`agents.ts`）；`context.facts.placement` 分别是 `prompt`（最后一条临时用户消息）和 `instructions`（指令后面），来源和投影用缺省      |
+| 生成     | 编排器把 `RunRequest` `submit` 给 harness，事实由 builder 按 agent 的 `context` 收。都用 `record: false`：语音合成、投喂给桌宠之后，导演再把说出口的那句写进上下文   |
+| 恢复     | `record: false` 的运行不写 `ctx.run.*`、不占会话，没有断掉的运行，所以不配 `owner`、不调 `recover`；以后打开 `record` 要配 `owner: 'yoyo'`，并在开拍子前 `recover()` |
+| 桌宠对话 | 每拍按幂等键导入 `GET /chat` 的对话记忆                                                                                                                              |
+| 工具     | yoyo 的本地工具，加上 `mcpServers` 配置里的 MCP 服务器（ctx-mcp）                                                                                                    |
+| 压缩     | 配了 `context.compactAt` 时，每 10 分钟最多压缩一次                                                                                                                  |
+| 旧摘要   | 常驻进程启动时、开拍子之前跑一次 `findLossySummaries`，有结果且有模型就 `recompactLossy`；没有模型记警告，命令行不做                                                 |
+| 排序     | `yoyo context tail` 按 `compareEntries`（`(at, seq)`）排，补写进来的桌宠对话回到原来的位置                                                                           |
+| 模型     | ctx-models 的 `createModel()`，协议名和 dsh-pet 独立模式一致：`openai-compatible`、`anthropic`                                                                       |
 
 ## yoyo 的分层
 
 右边的层依赖左边的层，不许反过来：`kernel` ← `ports` ← `features` / `brain` / `adapters` ← `runtime` ← `cli` / `app/container` ← 入口。
 
-| 层       | 目录                              | 内容                                                            |
-| -------- | --------------------------------- | --------------------------------------------------------------- |
-| kernel   | `src/kernel`                      | 纯领域：语气、时间、节奏、台词                                  |
-| ports    | `src/ports`                       | 接口：`PetHost`、`Synthesizer`、`Transcriber`、`Repos` 等       |
-| features | `src/features`                    | 预制台词、天气、日程、表情包、联系人、粘贴板、听写规则          |
-| brain    | `src/brain`                       | ctx 接线：上下文、来源、提示词、生成、模型、工具、MCP、对话渠道 |
-| adapters | `src/adapters/*`、`src/storage`   | dsh-pet、控制台、语音、平台、搜索、存储                         |
-| runtime  | `src/runtime`                     | 导演、常驻循环、收件箱                                          |
-| cli、app | `src/cli`、`src/app/container.ts` | 命令表、组装根                                                  |
-| 入口     | `bin/yoyo.js`、`src/main.ts`      | 命令行、常驻进程                                                |
+| 层       | 目录                              | 内容                                                                                       |
+| -------- | --------------------------------- | ------------------------------------------------------------------------------------------ |
+| kernel   | `src/kernel`                      | 纯领域：语气、时间、节奏、台词                                                             |
+| ports    | `src/ports`                       | 接口：`PetHost`、`Synthesizer`、`Transcriber`、`Repos` 等                                  |
+| features | `src/features`                    | 预制台词、天气、日程、表情包、联系人、粘贴板、听写规则                                     |
+| brain    | `src/brain`                       | ctx 接线：上下文、来源、提示词、agent 配置、一轮的请求、harness、模型、工具、MCP、对话渠道 |
+| adapters | `src/adapters/*`、`src/storage`   | dsh-pet、控制台、语音、平台、搜索、存储                                                    |
+| runtime  | `src/runtime`                     | 编排器（实现 `Orchestrator`）、导演、常驻循环、收件箱、压缩                                |
+| cli、app | `src/cli`、`src/app/container.ts` | 命令表、组装根                                                                             |
+| 入口     | `bin/yoyo.js`、`src/main.ts`      | 命令行、常驻进程                                                                           |
 
 `features` 和 `brain` 只依赖端口，不依赖 `adapters`；`adapters` 不依赖 `features`、`brain`、`runtime`；`packages/dsh-pet` 不依赖 yoyo 的任何东西。
 

@@ -7,20 +7,10 @@
  * describeSessionStoreContract('my-store', ({ now }) => createMyStore({ now }), { describe, test });
  * ```
  */
-import {
-  describeSessionStoreContract,
-  type ModelScriptStep,
-  type SessionStoreFactory,
-} from '@modelctx-ai/ctx-protocol/testing';
+import type { ModelScriptStep } from '@modelctx-ai/ctx-protocol/testing';
 import { convertArrayToReadableStream, MockLanguageModelV4 } from 'ai/test';
 
 export * from '@modelctx-ai/ctx-protocol/testing';
-
-/** @deprecated 改名为 `describeSessionStoreContract`，下一个 minor 删掉。 */
-export const describeStoreContract: typeof describeSessionStoreContract = describeSessionStoreContract;
-
-/** @deprecated 改名为 `SessionStoreFactory`，下一个 minor 删掉。 */
-export type StoreFactory = SessionStoreFactory;
 
 type GenerateResult = Awaited<ReturnType<MockLanguageModelV4['doGenerate']>>;
 type StreamResult = Awaited<ReturnType<MockLanguageModelV4['doStream']>>;
