@@ -233,7 +233,7 @@ overrides:
 
 ## 文档
 
-[docs/index.md](docs/index.md)：概念、协议层、参考实现的架构、实践、决策记录。
+[docs/index.md](docs/index.md)：概念、协议层、参考实现的架构、实践、决策记录。在这个仓库里改代码和文档的约定见 [AGENTS.md](AGENTS.md)。
 
 ## 许可
 
