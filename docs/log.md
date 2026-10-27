@@ -2,6 +2,10 @@
 
 ## 2026-10-27
 
+- **新增** [记忆](memory.md)（提案，未实现）：记忆作为第八个组件。四层记忆（工作、情节、语义、程序）加画像和 ctx 组件的对应（会话日志就是情节记忆，不动）；五个决策（什么值得记、什么时候想起、怎么并入、怎么忘、怎么纠错）和对应的操作；协议草案 `MemoryStore`（笔记、事实、程序、画像四个集合，事实不 UPDATE、证据必填、归档不删除）、`DecisionModel`、`ExtractionModel`（System One 模型，形状跟 Cloudflare Clef / Clairic，类型是 ctx 自己的 JSON）；参考实现 `createMemory` 的门控、召回、巩固（提取 → 决策 → 推理模型只做反思）、遗忘（ACT-R 激活度）；只用已有扩展点接入（`Memory` 是 `Executor`，`source()` 是 `ContextSource`）；托管矩阵、契约测试、模型实例化示例（Cloudflare、TypeSafe、启发式、`LanguageModel` 装成的）、预算、失败模式、没有采用。
+- **新增** [ADR 0006](adr/0006-memory.md)（提案）：七条决定和依据、包布局（新包 `ctx-memory`，`ctx-sqlite`、`ctx-models`、`ctx-remote` 各加一点）、代价、没有采用（知识图谱、Agent 自主改记忆、在线提取、记忆作为日志事件、并进 `LanguageModel`）。
+- **更新** [概念](concepts.md)加第八个组件一段和一行，术语表加笔记、`MemoryFact`（和来源的 `Fact` 区分）、程序、画像、激活度、决策和提取模型；[索引](index.md)加记忆和 ADR 0006；[实践：yoyo](repos.md)的对应表和职责表加记忆一行（ctx 管机制，yoyo 管主题和节律）。
+
 - **删除** 0.1、0.2 留下的弃用别名，版本仍是 0.3.0：`ContextStore`、`ContextEntry`、`createContext({ thread })` 和 `context.thread`、`describeStoreContract` 和 `StoreFactory`（`@modelctx-ai/ctx/testing`）、`SqliteContextStore`、`LocalToolRegistry.add(name, tool, meta)`（改用 `addTool`）。yoyo 不用这些名字。[核心包](../packages/core/README.md)、[ctx-sqlite](../packages/sqlite/README.md)、[架构](architecture.md)、[协议层](protocol.md)去掉对应的说法，[ADR 0004](adr/0004-protocol-and-implementation.md) 注明别名已删。
 - **更新** [实践：yoyo](repos.md)跟上 ctx 0.3 和 yoyo#11：产物改成八个包、0.3.0；yoyo 依赖的是六个包（多了 `ctx-protocol`），版本范围 `^0.3.0`，契约加上共用的 `yoyo.db`（`ctx-sqlite` 结构版本 3，不支持滚动升级）；依赖图按实际画，实现包只依赖协议包；「yoyo 怎么用 ctx」的线程改成会话，加上 agent（`AgentSpec.context` 的事实位置）、经编排器提交、恢复（`record: false` 不配 `owner`）、旧摘要（启动时 `recompactLossy`）、排序（`compareEntries`）；分层表的 brain、runtime 跟上 harness、agent 配置和编排器。
 
