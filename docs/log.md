@@ -1,5 +1,9 @@
 # 文档更新记录
 
+## 2026-10-27
+
+- **更新** [实践：yoyo](repos.md)跟上 ctx 0.3 和 yoyo#11：产物改成八个包、0.3.0；yoyo 依赖的是六个包（多了 `ctx-protocol`），版本范围 `^0.3.0`，契约加上共用的 `yoyo.db`（`ctx-sqlite` 结构版本 3，不支持滚动升级）；依赖图按实际画，实现包只依赖协议包；「yoyo 怎么用 ctx」的线程改成会话，加上 agent（`AgentSpec.context` 的事实位置）、经编排器提交、恢复（`record: false` 不配 `owner`）、旧摘要（启动时 `recompactLossy`）、排序（`compareEntries`）；分层表的 brain、runtime 跟上 harness、agent 配置和编排器。
+
 ## 2026-10-26
 
 - **新增** [ADR 0005](adr/0005-session-position-writes-format.md)（已采纳，不改代码）：会话位置改用 `seq`（补写旧记录会被摘要盖掉）、写入前提条件 `expectSeq` 和围栏、`recover` 的 `owner`、ctx 自己的带版本 JSON 消息格式（读时升级，部件逐项对照 `ai@7.0.150`）、`AgentSpec.context`、会话分页和事件 `kinds` 过滤；`ctx-sqlite` 结构版本 2 → 3；对内存、sqlite、remote、gateway 的破坏面，和对照 yoyo `main` 代码核对出的 yoyo 影响。
