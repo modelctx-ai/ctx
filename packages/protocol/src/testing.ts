@@ -17,6 +17,8 @@ import {
   CTX_EVENTS,
   assistantEntry,
   eventEntry,
+  filterEntries,
+  filterSessions,
   headSeq,
   isConflict,
   messageEntry,
@@ -27,7 +29,28 @@ import {
 } from './session.ts';
 import { ENTRY_VERSION } from './version.ts';
 import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type ToolRegistry } from './tools.ts';
-import type { JsonObject } from './types.ts';
+import { CtxError, type JsonObject, type JsonValue } from './types.ts';
+import {
+  MAX_DECISION_QUESTIONS,
+  MEMORY_RECALL_TOOL,
+  checkSourceRef,
+  filterFacts,
+  inSourceRef,
+  sourceRef,
+  type DecisionAnswer,
+  type DecisionModel,
+  type DecisionQuestion,
+  type DecisionRequest,
+  type ExtractionAnswer,
+  type ExtractionField,
+  type ExtractionModel,
+  type ExtractionRequest,
+  type Memory,
+  type MemoryFact,
+  type MemoryStore,
+  type NewMemoryFact,
+  type SourceRef,
+} from './memory.ts';
 
 /**
  * 契约测试用到的最小测试框架接口。Vitest、`node:test`、Jest、Bun 的 `describe` / `test` 都满足，
@@ -1245,6 +1268,1094 @@ export function describeOrchestratorContract(
       const { orchestrator, agent } = await factory(answers(0));
       await orchestrator.close();
       await assert.rejects(Promise.resolve().then(() => orchestrator.submit({ session: 's', agent, input: '在吗' })));
+    });
+  });
+}
+
+// ---- MemoryStore ----
+
+/** 每个用例调一次，拿到一个空的存储。存储的时刻都由调用方给；`now` 只给要用时钟生成 `id` 的实现。 */
+export type MemoryStoreFactory = (options: { readonly now: () => number }) => MemoryStore | Promise<MemoryStore>;
+
+const MEMORY_NOW = Date.UTC(2026, 9, 27);
+const MEMORY_STORE_SETUP = { now: (): number => MEMORY_NOW };
+
+function ref(from: number, upTo: number = from, session = 's'): SourceRef {
+  return { session, from, upTo };
+}
+
+function newFact(text: string, extra: Partial<NewMemoryFact> = {}): NewMemoryFact {
+  return {
+    subject: 'user',
+    text,
+    validFrom: MEMORY_NOW,
+    confidence: 0.9,
+    salience: 0.6,
+    sources: [ref(1)],
+    ...extra,
+  };
+}
+
+/** 错误的 `type` 是它：本地的 `CtxError` 和远端客户端转出来的错误都认。 */
+function hasType(type: string): (error: unknown) => boolean {
+  return (error) => typeof error === 'object' && error !== null && (error as { type?: unknown }).type === type;
+}
+
+function ids(items: readonly { readonly id: string }[]): string[] {
+  return items.map((item) => item.id);
+}
+
+async function factById(store: MemoryStore, id: string): Promise<MemoryFact | undefined> {
+  return (await store.facts.list()).find((fact) => fact.id === id);
+}
+
+export function describeMemoryStoreContract(
+  name: string,
+  factory: MemoryStoreFactory,
+  { describe, test }: ContractTestApi,
+): void {
+  describe(`MemoryStore contract: ${name}`, () => {
+    test('notes：add 按输入顺序返回并生成 id；list 按写入顺序，session、pending、limit 可组合', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const [a, b] = await store.notes.add([
+        { session: 's', from: 1, upTo: 3, at: 10, salience: 0.8, kind: 'pref', topic: 'user' },
+        { session: 't', from: 2, upTo: 2, at: 11, salience: 0.4 },
+      ]);
+      assert.ok(a && b);
+      assert.deepEqual(a, {
+        id: a.id,
+        session: 's',
+        from: 1,
+        upTo: 3,
+        at: 10,
+        salience: 0.8,
+        kind: 'pref',
+        topic: 'user',
+      });
+      assert.deepEqual(b, { id: b.id, session: 't', from: 2, upTo: 2, at: 11, salience: 0.4 });
+      assert.ok(a.id.length > 0 && b.id.length > 0 && a.id !== b.id, 'id 非空、不重复');
+      const [c] = await store.notes.add([{ session: 's', from: 4, upTo: 6, at: 12, salience: 0.1, settledAt: 12 }]);
+      assert.ok(c);
+      assert.equal(c.settledAt, 12, '可以直接写一条处理过的笔记');
+      const all = await store.notes.list();
+      assert.deepEqual(all, [a, b, c], '按写入顺序，原样读回');
+      assert.ok(roundTrips(all), '笔记能 JSON 往返：可选字段不给时不出现');
+      assert.deepEqual(ids(await store.notes.list({ session: 's' })), [a.id, c.id]);
+      assert.deepEqual(ids(await store.notes.list({ pending: true })), [a.id, b.id]);
+      assert.deepEqual(ids(await store.notes.list({ pending: false })), [c.id]);
+      assert.deepEqual(ids(await store.notes.list({ session: 's', pending: true })), [a.id]);
+      assert.deepEqual(ids(await store.notes.list({ limit: 2 })), [a.id, b.id], 'limit 取最早写入的');
+      assert.deepEqual(ids(await store.notes.list({ limit: 1.9 })), [a.id], 'limit 向下取整');
+      assert.deepEqual(await store.notes.list({ limit: 0 }), []);
+      assert.deepEqual(await store.notes.list({ session: 'nope' }), []);
+    });
+
+    test('notes：settle 只标待处理的，返回真正标上的条数，可重复调；不改已有的 settledAt', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const [a, b] = await store.notes.add([
+        { session: 's', from: 1, upTo: 2, at: 1, salience: 0.9 },
+        { session: 's', from: 3, upTo: 4, at: 2, salience: 0.9 },
+      ]);
+      assert.equal(await store.notes.settle([a!.id, 'missing'], 100), 1, '认不得的 id 跳过');
+      assert.equal(await store.notes.settle([a!.id, b!.id], 200), 1, '已经处理过的不算');
+      assert.equal(await store.notes.settle([a!.id, b!.id], 300), 0);
+      assert.equal(await store.notes.settle([], 400), 0);
+      assert.deepEqual(
+        (await store.notes.list()).map((note) => note.settledAt),
+        [100, 200],
+      );
+      assert.deepEqual(await store.notes.list({ pending: true }), []);
+    });
+
+    test('notes：head 是这个会话的笔记（含处理过的）覆盖到的最大 seq，没有是 0', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      assert.equal(await store.notes.head('s'), 0);
+      await store.notes.add([
+        { session: 's', from: 1, upTo: 3, at: 1, salience: 0.9 },
+        { session: 's', from: 7, upTo: 9, at: 2, salience: 0.1, settledAt: 2 },
+        { session: 't', from: 2, upTo: 20, at: 3, salience: 0.5 },
+        { session: 's', from: 4, upTo: 5, at: 4, salience: 0.5 },
+      ]);
+      assert.equal(await store.notes.head('s'), 9);
+      assert.equal(await store.notes.head('t'), 20);
+      assert.equal(await store.notes.head('u'), 0);
+    });
+
+    test('notes：区间不合法时整批不写，抛 invalid_request', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const good = { session: 's', from: 1, upTo: 2, at: 1, salience: 0.5 };
+      await assert.rejects(store.notes.add([good, { ...good, from: 5, upTo: 4 }]), hasType('invalid_request'));
+      await assert.rejects(store.notes.add([{ ...good, from: 0 }]), hasType('invalid_request'));
+      assert.deepEqual(await store.notes.list(), []);
+      assert.equal(await store.notes.head('s'), 0);
+    });
+
+    test('facts：add 生成 id，recalls 从空开始，没有有效期终点、取代和归档；字段原样读回', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const input = newFact('主人喜欢乌龙茶', {
+        predicate: 'likes',
+        topic: 'user',
+        sources: [ref(1, 2), ref(5, 5, 't')],
+      });
+      const fact = await store.facts.add(input);
+      assert.ok(typeof fact.id === 'string' && fact.id.length > 0);
+      assert.deepEqual(fact, { ...input, id: fact.id, recalls: [] });
+      assert.deepEqual(await store.facts.list(), [fact]);
+      assert.ok(roundTrips(fact), '事实能 JSON 往返：可选字段不给时不出现');
+      const other = await store.facts.add(newFact('主人住在台北'));
+      assert.notEqual(other.id, fact.id);
+    });
+
+    test('facts：没有证据或证据区间不合法时不写，抛 invalid_request', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      await assert.rejects(store.facts.add(newFact('编造的', { sources: [] })), hasType('invalid_request'));
+      await assert.rejects(store.facts.add(newFact('编造的', { sources: [ref(3, 2)] })), hasType('invalid_request'));
+      await assert.rejects(
+        store.facts.add(newFact('编造的', { sources: [ref(1), ref(0, 1)] })),
+        hasType('invalid_request'),
+      );
+      assert.deepEqual(await store.facts.list(), []);
+    });
+
+    test('facts：close 关闭有效期并记 supersededBy，文字不变；已关闭的不再改；认不得的 id 抛 not_found', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const old = await store.facts.add(newFact('项目用 MySQL', { topic: 'work' }));
+      const next = await store.facts.add(newFact('项目用 PostgreSQL', { topic: 'work' }));
+      await store.facts.close(old.id, MEMORY_NOW + 500, { supersededBy: next.id });
+      const closed = await factById(store, old.id);
+      assert.deepEqual(
+        closed,
+        { ...old, validTo: MEMORY_NOW + 500, supersededBy: next.id },
+        '只多了 validTo 和 supersededBy',
+      );
+      await store.facts.close(old.id, MEMORY_NOW + 900);
+      assert.deepEqual(await factById(store, old.id), closed, '第二次 close 什么都不做');
+      await assert.rejects(store.facts.close('missing', 1), hasType('not_found'));
+      await assert.rejects(store.facts.close(next.id, 1, { supersededBy: 'missing' }), hasType('not_found'));
+      assert.equal((await factById(store, next.id))?.validTo, undefined, 'supersededBy 认不得时不关闭');
+      await store.facts.close(next.id, MEMORY_NOW + 600);
+      const plain = await factById(store, next.id);
+      assert.equal(plain?.validTo, MEMORY_NOW + 600);
+      assert.ok(plain && !('supersededBy' in plain), '不给 supersededBy 就没有这个字段');
+      assert.deepEqual(await store.facts.list({ open: true }), []);
+      assert.equal((await store.facts.list()).length, 2, '关闭不删');
+    });
+
+    test('facts：cite 追加证据，文字和有效期不变；相同的区间跳过；没有证据抛 invalid_request，认不得的 id 抛 not_found', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const fact = await store.facts.add(newFact('主人喜欢乌龙茶', { sources: [ref(1, 2)] }));
+      const cited = await store.facts.cite(fact.id, [ref(5, 6), ref(1, 2)]);
+      assert.deepEqual(cited, { ...fact, sources: [ref(1, 2), ref(5, 6)] });
+      assert.deepEqual(await store.facts.cite(fact.id, [ref(5, 6)]), cited, '重复的证据不再记');
+      assert.deepEqual(await factById(store, fact.id), cited);
+      await assert.rejects(store.facts.cite(fact.id, []), hasType('invalid_request'));
+      await assert.rejects(store.facts.cite(fact.id, [ref(4, 3)]), hasType('invalid_request'));
+      await assert.rejects(store.facts.cite('missing', [ref(1)]), hasType('not_found'));
+      assert.deepEqual(await factById(store, fact.id), cited, '失败的调用什么都不改');
+    });
+
+    test('facts：touch 按先后追加召回时刻，跳过认不得的 id', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.facts.add(newFact('甲'));
+      const b = await store.facts.add(newFact('乙'));
+      await store.facts.touch([a.id, 'missing'], 100);
+      await store.facts.touch([a.id, b.id], 200);
+      await store.facts.touch([a.id], 300);
+      await store.facts.touch([], 400);
+      assert.deepEqual((await factById(store, a.id))?.recalls, [100, 200, 300]);
+      assert.deepEqual((await factById(store, b.id))?.recalls, [200]);
+    });
+
+    test('facts：archive 退出 open 的查询但不删，返回真正归档的条数', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.facts.add(newFact('甲'));
+      const b = await store.facts.add(newFact('乙'));
+      const c = await store.facts.add(newFact('丙'));
+      assert.equal(await store.facts.archive([a.id, 'missing'], 100), 1);
+      assert.equal(await store.facts.archive([a.id, b.id], 200), 1, '已经归档的不算，也不改 archivedAt');
+      assert.deepEqual(await factById(store, a.id), { ...a, archivedAt: 100 });
+      assert.equal((await factById(store, b.id))?.archivedAt, 200);
+      assert.deepEqual(ids(await store.facts.list({ open: true })), [c.id]);
+      assert.equal((await store.facts.list()).length, 3);
+    });
+
+    test('facts：forget 真删，并清掉别的事实里指向它的 supersededBy', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const old = await store.facts.add(newFact('项目用 MySQL'));
+      const next = await store.facts.add(newFact('项目用 PostgreSQL'));
+      await store.facts.close(old.id, MEMORY_NOW + 5, { supersededBy: next.id });
+      assert.equal(await store.facts.forget([next.id, 'missing']), 1);
+      assert.equal(await store.facts.forget([next.id]), 0);
+      assert.deepEqual(
+        await store.facts.list(),
+        [{ ...old, validTo: MEMORY_NOW + 5 }],
+        '有效期还在，supersededBy 没了',
+      );
+      assert.deepEqual(await store.facts.search({ text: 'PostgreSQL', open: false }), [], '搜也搜不到');
+    });
+
+    test('facts：list 按 id 码点序；subject、topic、open 筛选和 filterFacts 一致；after、limit 翻页不重不漏', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const added: MemoryFact[] = [];
+      for (const [i, extra] of [
+        { subject: 'user', topic: 'user' },
+        { subject: 'user', topic: 'work' },
+        { subject: 'project:x', topic: 'work' },
+        { subject: 'user' },
+        { subject: 'project:x' },
+        { subject: 'user', topic: 'work' },
+        { subject: 'user', topic: 'user' },
+      ].entries()) {
+        added.push(await store.facts.add(newFact(`事实 ${i}`, extra)));
+      }
+      await store.facts.close(added[1]!.id, MEMORY_NOW + 1);
+      await store.facts.archive([added[4]!.id], MEMORY_NOW + 1);
+      const all = await store.facts.list();
+      assert.equal(all.length, added.length);
+      assert.deepEqual(ids(all), ids(filterFacts(all)), '按 id 码点序');
+      const queries = [
+        { subject: 'user' },
+        { topic: 'work' },
+        { open: true },
+        { open: false },
+        { subject: 'user', topic: 'work', open: true },
+        { after: all[2]!.id },
+        { after: all[2]!.id, limit: 2 },
+        { limit: 3 },
+        { limit: 2.5 },
+        { limit: 0 },
+        { subject: 'nobody' },
+      ];
+      for (const query of queries) {
+        assert.deepEqual(ids(await store.facts.list(query)), ids(filterFacts(all, query)), JSON.stringify(query));
+      }
+      for (const base of [{}, { open: true }, { subject: 'user' }]) {
+        const pages: string[] = [];
+        for (let after: string | undefined; ;) {
+          const page = await store.facts.list({ ...base, limit: 2, ...(after !== undefined ? { after } : {}) });
+          if (page.length === 0) break;
+          pages.push(...ids(page));
+          after = page.at(-1)!.id;
+        }
+        assert.deepEqual(pages, ids(filterFacts(all, base)), `翻页 ${JSON.stringify(base)}`);
+      }
+    });
+
+    test('facts：search 至少全文命中（英文词、三个字以上的中文子串）；缺省只看 open，open: false 不限；topic、k 生效；score 在 0..1 从高到低', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const pg = await store.facts.add(newFact('主人的项目用 PostgreSQL 存数据', { topic: 'work' }));
+      const tea = await store.facts.add(newFact('主人的饮料是乌龙茶', { topic: 'user' }));
+      const mysql = await store.facts.add(newFact('以前的项目用 MySQL', { topic: 'work' }));
+      const backup = await store.facts.add(newFact('MySQL 备份在周五', { topic: 'work' }));
+      await store.facts.close(mysql.id, MEMORY_NOW + 1);
+      await store.facts.archive([backup.id], MEMORY_NOW + 1);
+      const all = await store.facts.list();
+      const hits = async (query: Parameters<MemoryStore['facts']['search']>[0]): Promise<string[]> => {
+        const found = await store.facts.search(query);
+        assert.ok(roundTrips(found), '命中能 JSON 往返');
+        for (const [i, hit] of found.entries()) {
+          assert.ok(hit.score >= 0 && hit.score <= 1, `score ${hit.score} 在 0..1`);
+          if (i > 0) assert.ok(hit.score <= found[i - 1]!.score, '按 score 从高到低');
+          assert.deepEqual(
+            hit.fact,
+            all.find((fact) => fact.id === hit.fact.id),
+            '命中的事实和 list 读到的一样',
+          );
+        }
+        return found.map((hit) => hit.fact.id);
+      };
+      assert.ok((await hits({ text: 'PostgreSQL' })).includes(pg.id), '英文词');
+      assert.ok((await hits({ text: '乌龙茶' })).includes(tea.id), '中文子串');
+      const open = await hits({ text: 'MySQL' });
+      assert.ok(!open.includes(mysql.id) && !open.includes(backup.id), '缺省不看关闭的和归档的');
+      const any = await hits({ text: 'MySQL', open: false });
+      assert.ok(any.includes(mysql.id) && any.includes(backup.id), 'open: false 连同关闭、归档的一起搜');
+      assert.ok(!(await hits({ text: 'PostgreSQL', topic: 'user' })).includes(pg.id), 'topic 不对不命中');
+      assert.ok((await hits({ text: 'PostgreSQL', topic: 'work' })).includes(pg.id));
+      const work = await store.facts.search({ text: '项目', topic: 'work', open: false });
+      assert.ok(work.every((hit) => hit.fact.topic === 'work'));
+      assert.equal((await hits({ text: '主人的', k: 1 })).length, 1, 'k 限制条数');
+      assert.ok((await hits({ text: '主人的' })).length >= 2);
+      assert.deepEqual(await hits({ text: '主人的', k: 0 }), []);
+    });
+
+    test('procedures：add 的 confirmations 是 1；confirm 加 1 并追加证据，相同的证据不算；没有证据抛 invalid_request；认不得的 id 抛 not_found', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const input = {
+        topic: 'work',
+        when: '构建失败且提示缺少依赖',
+        do: '先跑 pnpm install',
+        evidence: [ref(3, 4)],
+        at: 100,
+      };
+      const procedure = await store.procedures.add(input);
+      assert.deepEqual(procedure, { ...input, id: procedure.id, confirmations: 1 });
+      assert.ok(roundTrips(procedure));
+      const confirmed = await store.procedures.confirm(procedure.id, [ref(9, 10)]);
+      assert.deepEqual(confirmed, { ...procedure, confirmations: 2, evidence: [ref(3, 4), ref(9, 10)] });
+      assert.deepEqual(
+        await store.procedures.confirm(procedure.id, [ref(9, 10), ref(3, 4)]),
+        confirmed,
+        '同一段证据不算又一次确认',
+      );
+      assert.deepEqual(await store.procedures.list(), [confirmed]);
+      await assert.rejects(store.procedures.add({ ...input, evidence: [] }), hasType('invalid_request'));
+      await assert.rejects(store.procedures.confirm(procedure.id, []), hasType('invalid_request'));
+      await assert.rejects(store.procedures.confirm(procedure.id, [ref(2, 1)]), hasType('invalid_request'));
+      await assert.rejects(store.procedures.confirm('missing', [ref(1)]), hasType('not_found'));
+      assert.deepEqual(await store.procedures.list(), [confirmed], '失败的调用什么都不改');
+    });
+
+    test('procedures：retire 只记第一次；list 按写入顺序，topic、active 筛选', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.procedures.add({ topic: 'work', when: '甲', do: '一', evidence: [ref(1)], at: 1 });
+      const b = await store.procedures.add({ topic: 'user', when: '乙', do: '二', evidence: [ref(2)], at: 2 });
+      const c = await store.procedures.add({ when: '丙', do: '三', evidence: [ref(3)], at: 3 });
+      await store.procedures.retire(a.id, 50);
+      await store.procedures.retire(a.id, 60);
+      await assert.rejects(store.procedures.retire('missing', 1), hasType('not_found'));
+      const all = await store.procedures.list();
+      assert.deepEqual(all, [{ ...a, retiredAt: 50 }, b, c]);
+      assert.deepEqual(ids(await store.procedures.list({ active: true })), [b.id, c.id]);
+      assert.deepEqual(ids(await store.procedures.list({ active: false })), ids(all), 'active: false 不限');
+      assert.deepEqual(ids(await store.procedures.list({ topic: 'work' })), [a.id]);
+      assert.deepEqual(await store.procedures.list({ topic: 'work', active: true }), []);
+    });
+
+    test('core：没写过是 null；set 追加版本，get 是最后一个，history 按写入顺序保留全部，last 取最后几个', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      assert.equal(await store.core.get(), null);
+      assert.deepEqual(await store.core.history(), []);
+      await store.core.set('一', 1);
+      await store.core.set('二', 2);
+      await store.core.set('三', 3);
+      assert.deepEqual(await store.core.get(), { text: '三', at: 3 });
+      assert.deepEqual(await store.core.history(), [
+        { text: '一', at: 1 },
+        { text: '二', at: 2 },
+        { text: '三', at: 3 },
+      ]);
+      assert.deepEqual(await store.core.history({ last: 2 }), [
+        { text: '二', at: 2 },
+        { text: '三', at: 3 },
+      ]);
+      assert.deepEqual(await store.core.history({ last: 1.5 }), [{ text: '三', at: 3 }]);
+      assert.deepEqual(await store.core.history({ last: 0 }), []);
+      await store.core.set('一', 4);
+      assert.deepEqual(await store.core.get(), { text: '一', at: 4 }, '回滚就是把旧文字再 set 一次');
+    });
+  });
+}
+
+// ---- 剧本式决策、提取模型 ----
+
+/**
+ * 剧本式决策模型的回答规则。按问题名给了答案就原样返回；其余按题型：`noul` 回 `noul`，`score` 落在离 `score` 最近的档，
+ * `choice` 按 `prefer` 的顺序选第一个在 `criteria` 里的选项，都不在就选第一个选项。
+ */
+export interface DecisionScript {
+  readonly answers?: Readonly<Record<string, DecisionAnswer>>;
+  /** `noul` 题的 P(是)，缺省 0.5。 */
+  readonly noul?: number;
+  /** `score` 题的分数（0..1），落到最近的档，缺省 0.5。 */
+  readonly score?: number;
+  readonly prefer?: readonly string[];
+}
+
+export interface ScriptedDecisionModel extends DecisionModel {
+  /** 收到过的请求（不含 `signal`），按先后。 */
+  readonly requests: readonly DecisionRequest[];
+}
+
+function scriptedDecision(question: DecisionQuestion, script: DecisionScript): DecisionAnswer {
+  switch (question.type) {
+    case 'noul':
+      return { type: 'noul', noul: script.noul ?? 0.5 };
+    case 'choice': {
+      const keys = Object.keys(question.criteria);
+      if (keys.length === 0) throw new CtxError('invalid_request', 'A choice question needs at least one option.');
+      const choice = script.prefer?.find((key) => keys.includes(key)) ?? keys[0]!;
+      const top = keys.length === 1 ? 1 : 0.9;
+      const rest = keys.length === 1 ? 0 : 0.1 / (keys.length - 1);
+      return {
+        type: 'choice',
+        choice,
+        probabilities: Object.fromEntries(keys.map((key) => [key, key === choice ? top : rest])),
+        confidence: top,
+      };
+    }
+    default: {
+      const n = question.criteria.length;
+      if (n < 2) throw new CtxError('invalid_request', 'A score question needs at least two levels.');
+      const level = Math.round(Math.min(1, Math.max(0, script.score ?? 0.5)) * (n - 1));
+      return {
+        type: 'score',
+        score: level / (n - 1),
+        probabilities: question.criteria.map((_, i) => (i === level ? 1 : 0)),
+      };
+    }
+  }
+}
+
+/**
+ * 按剧本回答的决策模型，给契约测试和 `Memory` 的测试用：不联网、确定。`signal` 已中止时 reject，
+ * 问题超过 `MAX_DECISION_QUESTIONS` 个、`choice` 没有选项、`score` 少于两档时抛 `invalid_request`。
+ */
+export function createScriptedDecisionModel(
+  script: DecisionScript = {},
+  options: { readonly name?: string } = {},
+): ScriptedDecisionModel {
+  const requests: DecisionRequest[] = [];
+  return {
+    name: options.name ?? 'scripted-decision',
+    requests,
+    async decide(request) {
+      request.signal?.throwIfAborted();
+      requests.push({ state: request.state, questions: request.questions });
+      const entries = Object.entries(request.questions);
+      if (entries.length > MAX_DECISION_QUESTIONS)
+        throw new CtxError('invalid_request', `At most ${MAX_DECISION_QUESTIONS} questions per call.`);
+      return Object.fromEntries(
+        entries.map(([key, question]) => [key, script.answers?.[key] ?? scriptedDecision(question, script)]),
+      );
+    },
+  };
+}
+
+/**
+ * 剧本式提取模型的回答规则。按字段名给了值就用它；其余按字段类型取 `byType`，再取缺省
+ * （`text` 是 `scripted`，`number` 是 1，`date` 是 `2026-01-01`，`datetime` 是 `2026-01-01T00:00:00Z`，`duration` 是 60，
+ * `list` 按 `items` 是 `['scripted']` 或 `[1]`）。输入是空的（null 或空白文字）时全部没找到。值是 null 表示没找到。
+ */
+export interface ExtractionScript {
+  readonly values?: Readonly<Record<string, JsonValue>>;
+  readonly byType?: Readonly<Partial<Record<ExtractionField['type'], JsonValue>>>;
+}
+
+export interface ScriptedExtractionModel extends ExtractionModel {
+  /** 收到过的请求（不含 `signal`），按先后。 */
+  readonly requests: readonly ExtractionRequest[];
+}
+
+function scriptedValue(field: ExtractionField): JsonValue {
+  switch (field.type) {
+    case 'text':
+      return 'scripted';
+    case 'number':
+      return 1;
+    case 'date':
+      return '2026-01-01';
+    case 'datetime':
+      return '2026-01-01T00:00:00Z';
+    case 'duration':
+      return 60;
+    default:
+      return field.items === 'text' ? ['scripted'] : [1];
+  }
+}
+
+function isEmptyState(state: JsonValue): boolean {
+  return state === null || (typeof state === 'string' && state.trim() === '');
+}
+
+/** 按剧本回答的提取模型，给契约测试和 `Memory` 的测试用：不联网、确定。`signal` 已中止时 reject。 */
+export function createScriptedExtractionModel(
+  script: ExtractionScript = {},
+  options: { readonly name?: string } = {},
+): ScriptedExtractionModel {
+  const requests: ExtractionRequest[] = [];
+  return {
+    name: options.name ?? 'scripted-extraction',
+    requests,
+    async extract(request) {
+      request.signal?.throwIfAborted();
+      requests.push({ state: request.state, fields: request.fields });
+      const empty = isEmptyState(request.state);
+      return Object.fromEntries(
+        Object.entries(request.fields).map(([key, field]): [string, ExtractionAnswer] => {
+          let value: JsonValue = null;
+          if (!empty) {
+            if (script.values && key in script.values) value = script.values[key]!;
+            else if (script.byType && field.type in script.byType) value = script.byType[field.type]!;
+            else value = scriptedValue(field);
+          }
+          return [key, { value, pNull: value === null ? 0.95 : 0.05, confidence: 0.9 }];
+        }),
+      );
+    },
+  };
+}
+
+// ---- DecisionModel ----
+
+/** 每个用例调一次。 */
+export type DecisionModelFactory = () => DecisionModel | Promise<DecisionModel>;
+
+/** 概率的和、期望档位允许的误差：服务商的概率可能四舍五入过。 */
+const PROBABILITY_TOLERANCE = 0.01;
+
+function inUnit(value: unknown): boolean {
+  return typeof value === 'number' && value >= 0 && value <= 1;
+}
+
+function sumsToOne(values: readonly number[]): boolean {
+  return Math.abs(values.reduce((sum, value) => sum + value, 0) - 1) <= PROBABILITY_TOLERANCE;
+}
+
+function checkDecisionAnswer(question: DecisionQuestion, answer: DecisionAnswer | undefined, label: string): void {
+  assert.ok(answer, `${label}：没有回答`);
+  assert.equal(answer.type, question.type, `${label}：回答的 type 和问题一样`);
+  if (question.type === 'noul' && answer.type === 'noul') {
+    assert.ok(inUnit(answer.noul), `${label}：noul ${answer.noul} 在 0..1`);
+  } else if (question.type === 'choice' && answer.type === 'choice') {
+    const keys = Object.keys(question.criteria).toSorted();
+    assert.deepEqual(Object.keys(answer.probabilities).toSorted(), keys, `${label}：概率覆盖所有选项`);
+    const values = Object.values(answer.probabilities);
+    assert.ok(values.every(inUnit) && sumsToOne(values), `${label}：概率在 0..1、和为 1`);
+    assert.ok(keys.includes(answer.choice), `${label}：choice 是选项之一`);
+    assert.ok(answer.probabilities[answer.choice]! >= Math.max(...values), `${label}：choice 是概率最大的`);
+    assert.ok(inUnit(answer.confidence), `${label}：confidence 在 0..1`);
+  } else if (question.type === 'score' && answer.type === 'score') {
+    const n = question.criteria.length;
+    assert.equal(answer.probabilities.length, n, `${label}：概率逐档`);
+    assert.ok(answer.probabilities.every(inUnit) && sumsToOne(answer.probabilities), `${label}：概率在 0..1、和为 1`);
+    assert.ok(inUnit(answer.score), `${label}：score 在 0..1`);
+    const expected = answer.probabilities.reduce((sum, p, i) => sum + (p * i) / (n - 1), 0);
+    assert.ok(Math.abs(answer.score - expected) <= PROBABILITY_TOLERANCE, `${label}：score 是期望档位 ${expected}`);
+  }
+}
+
+const DECISION_STATE = '用户：以后回答都用中文，记住了吗？\n助手：记住了，以后都用中文回答。';
+
+const DECISION_QUESTIONS: Readonly<Record<string, DecisionQuestion>> = {
+  keep: { type: 'noul', instructions: '这段里有没有值得长期记住的信息：偏好、事实变化、决定、教训？' },
+  kind: {
+    type: 'choice',
+    instructions: '主要属于哪一类？',
+    criteria: { pref: '主人的偏好', obs: '观察到的事实', fail: '失败的经验', ok: '成功的经验' },
+  },
+  salience: {
+    type: 'score',
+    instructions: '对未来的任务有多重要？',
+    criteria: ['无关', '顺带提到', '有用', '必须记住'],
+  },
+};
+
+export function describeDecisionModelContract(
+  name: string,
+  factory: DecisionModelFactory,
+  { describe, test }: ContractTestApi,
+): void {
+  describe(`DecisionModel contract: ${name}`, () => {
+    test('有名字', async () => {
+      const model = await factory();
+      assert.equal(typeof model.name, 'string');
+      assert.ok(model.name.length > 0);
+    });
+
+    for (const [key, question] of Object.entries(DECISION_QUESTIONS)) {
+      test(`${question.type}：回答的形状、概率`, async () => {
+        const model = await factory();
+        const replies = await model.decide({ state: DECISION_STATE, questions: { [key]: question } });
+        assert.deepEqual(Object.keys(replies), [key], '键和问题一样');
+        checkDecisionAnswer(question, replies[key], key);
+      });
+    }
+
+    test('三种问题一次问，state 是 JSON 也行；结果能序列化', async () => {
+      const model = await factory();
+      for (const state of [DECISION_STATE, { messages: [{ role: 'user', text: '以后回答都用中文' }] }]) {
+        const replies = await model.decide({ state, questions: DECISION_QUESTIONS });
+        assert.deepEqual(Object.keys(replies).toSorted(), Object.keys(DECISION_QUESTIONS).toSorted());
+        for (const [key, question] of Object.entries(DECISION_QUESTIONS))
+          checkDecisionAnswer(question, replies[key], key);
+        assert.ok(roundTrips(replies), '回答能 JSON 往返');
+      }
+    });
+
+    test(`一次 ${MAX_DECISION_QUESTIONS} 个问题都答`, async () => {
+      const model = await factory();
+      const questions: Record<string, DecisionQuestion> = Object.fromEntries(
+        Array.from({ length: MAX_DECISION_QUESTIONS }, (_, i) => [
+          `q${i}`,
+          { type: 'noul', instructions: `这段里提到数字 ${i} 了吗？` },
+        ]),
+      );
+      const replies = await model.decide({ state: DECISION_STATE, questions });
+      assert.equal(Object.keys(replies).length, MAX_DECISION_QUESTIONS);
+      for (const [key, question] of Object.entries(questions)) checkDecisionAnswer(question, replies[key], key);
+    });
+
+    test('signal 已中止时 reject', async () => {
+      const model = await factory();
+      await assert.rejects(
+        model.decide({ state: DECISION_STATE, questions: DECISION_QUESTIONS, signal: AbortSignal.abort() }),
+      );
+    });
+  });
+}
+
+// ---- ExtractionModel ----
+
+/** 每个用例调一次。 */
+export type ExtractionModelFactory = () => ExtractionModel | Promise<ExtractionModel>;
+
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})?$/;
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+/** 找到时 `value` 的形状对不对（见 `ExtractionField`）。null 总是对的。 */
+function extractionShapeOk(field: ExtractionField, value: JsonValue): boolean {
+  if (value === null) return true;
+  switch (field.type) {
+    case 'text':
+      return typeof value === 'string';
+    case 'number': {
+      if (!isFiniteNumber(value)) return false;
+      if (field.integer && !Number.isInteger(value)) return false;
+      if (field.decimals !== undefined) {
+        const scaled = value * 10 ** field.decimals;
+        if (Math.abs(scaled - Math.round(scaled)) > 1e-6) return false;
+      }
+      return true;
+    }
+    case 'date':
+      return typeof value === 'string' && DATE.test(value) && !Number.isNaN(Date.parse(value));
+    case 'datetime':
+      return typeof value === 'string' && DATETIME.test(value) && !Number.isNaN(Date.parse(value));
+    case 'duration':
+      return isFiniteNumber(value) && value >= 0;
+    default:
+      return (
+        Array.isArray(value) &&
+        value.every((item) => (field.items === 'text' ? typeof item === 'string' : isFiniteNumber(item)))
+      );
+  }
+}
+
+const EXTRACTION_STATE =
+  '周三（2026-11-04）下午两点在台北开会，开 90 分钟，预算 1200.5 元，参会的有小明、小红，一共 2 人。';
+
+const EXTRACTION_FIELDS: Readonly<Record<string, ExtractionField>> = {
+  place: { type: 'text', instructions: '开会的地点' },
+  budget: { type: 'number', instructions: '预算', unit: '元', decimals: 1 },
+  people: { type: 'number', instructions: '参会人数', integer: true },
+  day: { type: 'date', instructions: '开会的日期' },
+  start: { type: 'datetime', instructions: '开始的时间' },
+  length: { type: 'duration', instructions: '开多久' },
+  names: { type: 'list', items: 'text', instructions: '参会的人' },
+  amounts: { type: 'list', items: 'number', instructions: '文中出现的金额' },
+};
+
+export function describeExtractionModelContract(
+  name: string,
+  factory: ExtractionModelFactory,
+  { describe, test }: ContractTestApi,
+): void {
+  describe(`ExtractionModel contract: ${name}`, () => {
+    test('有名字', async () => {
+      const model = await factory();
+      assert.equal(typeof model.name, 'string');
+      assert.ok(model.name.length > 0);
+    });
+
+    test('每种字段：键和 fields 一样，value 是 null 或对应的形状，pNull、confidence 在 0..1；结果能序列化', async () => {
+      const model = await factory();
+      const replies = await model.extract({ state: EXTRACTION_STATE, fields: EXTRACTION_FIELDS });
+      assert.deepEqual(Object.keys(replies).toSorted(), Object.keys(EXTRACTION_FIELDS).toSorted());
+      for (const [key, field] of Object.entries(EXTRACTION_FIELDS)) {
+        const answer = replies[key];
+        assert.ok(answer, `${key}：没有回答`);
+        assert.ok(extractionShapeOk(field, answer.value), `${key}：value ${JSON.stringify(answer.value)} 的形状`);
+        assert.ok(inUnit(answer.pNull), `${key}：pNull 在 0..1`);
+        assert.ok(inUnit(answer.confidence), `${key}：confidence 在 0..1`);
+      }
+      assert.ok(roundTrips(replies), '回答能 JSON 往返');
+    });
+
+    test('输入里没有的值：value 是 null，pNull 高', async () => {
+      const model = await factory();
+      const fields: Record<string, ExtractionField> = {
+        email: { type: 'text', instructions: '对方的电子邮件地址' },
+        amount: { type: 'number', instructions: '发票金额' },
+        due: { type: 'date', instructions: '截止日期' },
+      };
+      const replies = await model.extract({ state: '', fields });
+      for (const key of Object.keys(fields)) {
+        assert.equal(replies[key]?.value, null, `${key}：没找到是 null`);
+        assert.ok((replies[key]?.pNull ?? 0) >= 0.5, `${key}：pNull ${replies[key]?.pNull} 应当高`);
+      }
+    });
+
+    test('signal 已中止时 reject', async () => {
+      const model = await factory();
+      await assert.rejects(
+        model.extract({ state: EXTRACTION_STATE, fields: EXTRACTION_FIELDS, signal: AbortSignal.abort() }),
+      );
+    });
+  });
+}
+
+// ---- Memory ----
+
+/** 契约测试交给 `Memory` 工厂的东西。 */
+export interface MemorySetup {
+  /** 会话日志：用例往里写，memory 只读它。是契约测试自带的最小内存实现。 */
+  readonly sessions: SessionStore;
+  /** 剧本式决策模型（`createScriptedDecisionModel`），门控和并入都用它。 */
+  readonly decision: DecisionModel;
+  /** 剧本式提取模型（`createScriptedExtractionModel`）。 */
+  readonly extraction: ExtractionModel;
+  /** 时钟：门控的 `at`、召回的 `touch` 都用它。 */
+  readonly now: () => number;
+}
+
+export interface MemoryFixture {
+  readonly memory: Memory;
+  /** memory 用的存储，开始时是空的；用例直接读写它。 */
+  readonly store: MemoryStore;
+}
+
+/**
+ * 每个用例调一次。memory 要读 `setup.sessions`、用 `setup.decision` 和 `setup.extraction`、按 `setup.now` 取时刻；
+ * 门控阈值要固定（0.1..0.9 之间：剧本里该记的打 0.95 分左右，不该记的 0.02 左右），`LanguageModel` 可以不给。
+ * 用例开始时调 `provision`（有的话），结束时调 `dispose`（有的话）。
+ */
+export type MemoryFactory = (setup: MemorySetup) => MemoryFixture | Promise<MemoryFixture>;
+
+interface MemoryScript {
+  readonly decision?: DecisionScript;
+  readonly extraction?: ExtractionScript;
+}
+
+interface MemoryCase extends MemoryFixture {
+  readonly sessions: SessionStore;
+  readonly decision: ScriptedDecisionModel;
+  readonly now: number;
+}
+
+/** 契约测试自带的会话日志：只够这些用例（不去重、不检查 expectSeq、没有 watch）。 */
+function contractSessionStore(now: () => number): SessionStore {
+  const logs = new Map<string, Entry[]>();
+  let seq = 0;
+  let id = 0;
+  return {
+    async append(session, drafts) {
+      const written = drafts.map((draft) => ({
+        ...draft,
+        id: draft.id ?? `e${(id += 1)}`,
+        session,
+        seq: (seq += 1),
+        at: draft.at ?? now(),
+        v: ENTRY_VERSION,
+      }));
+      logs.set(session, [...(logs.get(session) ?? []), ...written]);
+      return written;
+    },
+    async list(session, options) {
+      return filterEntries(logs.get(session) ?? [], options);
+    },
+    async clear(session) {
+      const count = logs.get(session)?.length ?? 0;
+      logs.delete(session);
+      return count;
+    },
+    async sessions(options) {
+      return filterSessions([...logs.keys()], options);
+    },
+  };
+}
+
+async function withMemory(
+  factory: MemoryFactory,
+  script: MemoryScript,
+  fn: (fixture: MemoryCase) => Promise<void>,
+): Promise<void> {
+  const now = MEMORY_NOW;
+  const sessions = contractSessionStore(() => now);
+  const decision = createScriptedDecisionModel(script.decision);
+  const extraction = createScriptedExtractionModel(script.extraction);
+  const fixture = await factory({ sessions, decision, extraction, now: () => now });
+  try {
+    await fixture.memory.provision?.();
+    await fn({ ...fixture, sessions, decision, now });
+  } finally {
+    await fixture.memory.dispose?.();
+  }
+}
+
+/** 该记：`keep` 和 `score` 都打满。 */
+const KEEP: DecisionScript = { noul: 0.95, score: 1 };
+/** 不该记。 */
+const SKIP: DecisionScript = { noul: 0.02, score: 0 };
+
+const EXTRACTED = '主人的项目改用 PostgreSQL';
+/** 文字字段都提取出同一句话，日期、数字都当没找到（`validFrom` 回到这段的第一条 `at`）。 */
+const EXTRACT: ExtractionScript = {
+  byType: { text: EXTRACTED, list: [EXTRACTED], number: null, date: null, datetime: null, duration: null },
+};
+
+/** 每段证据都合法，并且日志里真有这一段。 */
+async function assertEvidence(sessions: SessionStore, refs: readonly SourceRef[], label: string): Promise<void> {
+  assert.ok(refs.length > 0, `${label}：证据不能为空`);
+  for (const source of refs) {
+    assert.doesNotThrow(() => checkSourceRef(source), `${label}：证据区间 ${JSON.stringify(source)}`);
+    const entries = await sessions.list(source.session);
+    assert.ok(
+      entries.some((entry) => inSourceRef(entry, source)),
+      `${label}：证据 ${JSON.stringify(source)} 在日志里找不到`,
+    );
+  }
+}
+
+async function seedFact(
+  { sessions, store, now }: MemoryCase,
+  text: string,
+  extra: Partial<NewMemoryFact> = {},
+): Promise<MemoryFact> {
+  const written = await sessions.append('s', [userEntry(text)]);
+  return store.facts.add(newFact(text, { validFrom: now, sources: [sourceRef('s', written)], ...extra }));
+}
+
+function checkReport(report: Awaited<ReturnType<Memory['consolidate']>>): void {
+  const counts = [
+    report.notes,
+    report.facts.added,
+    report.facts.merged,
+    report.facts.superseded,
+    report.facts.archived,
+    report.procedures.added,
+    report.procedures.confirmed,
+    report.escalated,
+  ];
+  assert.ok(
+    counts.every((count) => Number.isInteger(count) && count >= 0),
+    `报告的计数是非负整数：${JSON.stringify(report)}`,
+  );
+  assert.equal(typeof report.core, 'boolean');
+  assert.ok(roundTrips(report), '报告能 JSON 往返');
+}
+
+export function describeMemoryContract(
+  name: string,
+  factory: MemoryFactory,
+  { describe, test }: ContractTestApi,
+): void {
+  describe(`Memory contract: ${name}`, () => {
+    test('gate：笔记指向新条目的 seq 区间，不改日志；同一段不重复打分，下一次从 head 之后读', async () => {
+      await withMemory(factory, { decision: KEEP }, async ({ memory, store, sessions, decision }) => {
+        const first = await sessions.append('s', [
+          userEntry('以后回答都用中文，记住'),
+          assistantEntry('好的，以后都用中文'),
+        ]);
+        const log = await sessions.list('s');
+        const notes = await memory.gate('s');
+        assert.deepEqual(await sessions.list('s'), log, 'gate 不改日志');
+        assert.ok(decision.requests.length > 0, '给了决策模型就用它打分');
+        assert.ok(notes.length > 0, '该记的写了笔记');
+        for (const note of notes) {
+          assert.equal(note.session, 's');
+          assert.ok(
+            note.from <= note.upTo && note.from >= first[0]!.seq && note.upTo <= first[1]!.seq,
+            JSON.stringify(note),
+          );
+          assert.equal(note.settledAt, undefined, '该记的是待处理');
+          assert.ok(inUnit(note.salience));
+        }
+        assert.equal(Math.min(...notes.map((note) => note.from)), first[0]!.seq, '从第一条新条目开始');
+        assert.equal(Math.max(...notes.map((note) => note.upTo)), first[1]!.seq, '到最后一条新条目');
+        assert.deepEqual(ids(await store.notes.list({ session: 's' })), ids(notes), '返回的就是写进存储的');
+        assert.ok(roundTrips(notes));
+        assert.equal(await store.notes.head('s'), first[1]!.seq);
+        assert.deepEqual(await memory.gate('s'), [], '没有新条目时什么都不写');
+        assert.equal((await store.notes.list()).length, notes.length);
+
+        const second = await sessions.append('s', [userEntry('我换到台北住了'), assistantEntry('记下了')]);
+        const more = await memory.gate('s');
+        assert.ok(more.length > 0);
+        assert.equal(Math.min(...more.map((note) => note.from)), second[0]!.seq, '只读 head 之后的');
+        assert.equal(await store.notes.head('s'), second[1]!.seq);
+      });
+    });
+
+    test('gate：没过阈值的那段也记下（已处理），head 照样前进，不留待处理的笔记', async () => {
+      await withMemory(factory, { decision: SKIP }, async ({ memory, store, sessions }) => {
+        const written = await sessions.append('s', [userEntry('嗯'), assistantEntry('嗯嗯')]);
+        const notes = await memory.gate('s');
+        assert.ok(
+          notes.every((note) => note.settledAt !== undefined),
+          '没过阈值的笔记是处理过的',
+        );
+        assert.deepEqual(await store.notes.list({ pending: true }), []);
+        assert.equal(await store.notes.head('s'), written[1]!.seq, 'head 前进到读过的最后一条');
+        assert.deepEqual(await memory.gate('s'), [], '同一段不再打分');
+      });
+    });
+
+    test('gate：空会话返回空，什么都不写', async () => {
+      await withMemory(factory, { decision: KEEP }, async ({ memory, store }) => {
+        assert.deepEqual(await memory.gate('empty'), []);
+        assert.deepEqual(await store.notes.list(), []);
+        assert.equal(await store.notes.head('empty'), 0);
+      });
+    });
+
+    test('consolidate：处理待处理的笔记；写下的事实和程序都有指回日志的证据；不改日志', async () => {
+      await withMemory(factory, { decision: KEEP, extraction: EXTRACT }, async ({ memory, store, sessions, now }) => {
+        await sessions.append('s', [userEntry('项目的数据库换成 PostgreSQL 了，记住'), assistantEntry('记下了')]);
+        await memory.gate('s');
+        const pending = await store.notes.list({ pending: true });
+        assert.ok(pending.length > 0);
+        const log = await sessions.list('s');
+        const report = await memory.consolidate({ now });
+        checkReport(report);
+        assert.deepEqual(await sessions.list('s'), log, 'consolidate 不改日志');
+        assert.equal(report.notes, pending.length, '处理了全部待处理的笔记');
+        assert.deepEqual(await store.notes.list({ pending: true }), []);
+        const facts = await store.facts.list();
+        assert.ok(facts.length > 0 && report.facts.added > 0, '提取出的事实写进去了');
+        for (const fact of facts) await assertEvidence(sessions, fact.sources, `事实 ${fact.text}`);
+        for (const procedure of await store.procedures.list())
+          await assertEvidence(sessions, procedure.evidence, `程序 ${procedure.when}`);
+      });
+    });
+
+    test('consolidate 幂等：再跑一次不再处理笔记，事实和程序都不变', async () => {
+      await withMemory(factory, { decision: KEEP, extraction: EXTRACT }, async ({ memory, store, sessions, now }) => {
+        await sessions.append('s', [userEntry('项目的数据库换成 PostgreSQL 了，记住'), assistantEntry('记下了')]);
+        await memory.gate('s');
+        await memory.consolidate({ now });
+        const facts = await store.facts.list();
+        const procedures = await store.procedures.list();
+        const again = await memory.consolidate({ now });
+        checkReport(again);
+        assert.equal(again.notes, 0);
+        assert.deepEqual(
+          [
+            again.facts.added,
+            again.facts.merged,
+            again.facts.superseded,
+            again.procedures.added,
+            again.procedures.confirmed,
+          ],
+          [0, 0, 0, 0, 0],
+        );
+        assert.deepEqual(await store.facts.list(), facts);
+        assert.deepEqual(await store.procedures.list(), procedures);
+      });
+    });
+
+    test('consolidate：取代不覆盖，旧事实的文字和证据不变，关闭了就指向一条存在的事实', async () => {
+      const script = { decision: { ...KEEP, prefer: ['supersede'] }, extraction: EXTRACT };
+      await withMemory(factory, script, async (fixture) => {
+        const { memory, store, sessions, now } = fixture;
+        const old = await seedFact(fixture, '主人的项目用 MySQL', { topic: 'work' });
+        await sessions.append('s', [userEntry('项目从 MySQL 换成 PostgreSQL 了，记住'), assistantEntry('记下了')]);
+        await memory.gate('s');
+        checkReport(await memory.consolidate({ now }));
+        const facts = await store.facts.list();
+        const kept = facts.find((fact) => fact.id === old.id);
+        assert.ok(kept, '旧事实还在：取代是 close + add，不删');
+        const { validTo, supersededBy, recalls, archivedAt, ...rest } = kept;
+        const { recalls: oldRecalls, ...oldRest } = old;
+        assert.deepEqual(rest, oldRest, '文字、主语、证据、validFrom 都没改');
+        assert.ok(recalls.length >= oldRecalls.length && validTo !== null && archivedAt !== null);
+        for (const fact of facts) {
+          await assertEvidence(sessions, fact.sources, `事实 ${fact.text}`);
+          if (fact.supersededBy === undefined) continue;
+          assert.notEqual(fact.validTo, undefined, '被取代的事实是关闭的');
+          assert.ok(
+            facts.some((other) => other.id === fact.supersededBy),
+            `supersededBy ${fact.supersededBy} 指向一条存在的事实`,
+          );
+        }
+        if (supersededBy !== undefined) assert.ok(facts.length >= 2);
+      });
+    });
+
+    test('recall：按文字找回仍然成立的事实，每条的 recalls 多一个（时刻取 now）；不改日志；evidence 只在要时带', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory, store, sessions, now } = fixture;
+        const pg = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据', { topic: 'work' });
+        const closed = await seedFact(fixture, '主人以前的项目用 PostgreSQL 9', { topic: 'work' });
+        await store.facts.close(closed.id, now);
+        const log = await sessions.list('s');
+        const recalled = await memory.recall('PostgreSQL');
+        assert.deepEqual(await sessions.list('s'), log, 'recall 不改日志');
+        assert.ok(ids(recalled.facts).includes(pg.id), '找回了仍然成立的事实');
+        assert.ok(!ids(recalled.facts).includes(closed.id), '关闭的不召回');
+        assert.equal(recalled.evidence, undefined, '没要证据就不带');
+        assert.ok(roundTrips(recalled));
+        assert.deepEqual((await factById(store, pg.id))?.recalls, [now], '记了一次 touch');
+        assert.deepEqual((await factById(store, closed.id))?.recalls, [], '没召回的不 touch');
+
+        const withEvidence = await memory.recall('PostgreSQL', { evidence: true });
+        assert.equal((await factById(store, pg.id))?.recalls.length, 2, '每次召回多一个');
+        const evidence = withEvidence.evidence ?? [];
+        assert.ok(
+          evidence.some((entry) => pg.sources.some((source) => inSourceRef(entry, source))),
+          '证据里有这条事实指向的原文',
+        );
+        assert.ok(roundTrips(withEvidence));
+      });
+    });
+
+    test('source：名字缺省 memory；collect 带出 core 和按最近一条用户消息召回的事实；什么都没有时是空', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory, store, sessions, now } = fixture;
+        const empty = memory.source();
+        assert.equal(empty.name, 'memory');
+        const nothing = await empty.collect({ session: 'nobody' });
+        assert.ok(!nothing || nothing.trim() === '', `没有记忆时是空：${JSON.stringify(nothing)}`);
+
+        const pg = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据');
+        await store.core.set('主人叫小明，住在台北', now);
+        await sessions.append('chat', [userEntry('PostgreSQL')]);
+        const text = await memory.source().collect({ session: 'chat' });
+        assert.equal(typeof text, 'string');
+        assert.ok(text!.includes('小明'), `带出 core：${text}`);
+        assert.ok(text!.includes(pg.text), `带出召回的事实：${text}`);
+
+        const named = memory.source({ name: 'memory2', query: async () => 'PostgreSQL', k: 1 });
+        assert.equal(named.name, 'memory2');
+        assert.ok((await named.collect({ session: 'nobody' }))?.includes(pg.text), '用给的 query 召回');
+      });
+    });
+
+    test('tools 和 execute：recall 工具绑定到自己、能序列化；结果带事实；不认识的工具、坏输入、已中止都返回 error', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory } = fixture;
+        assert.ok(typeof memory.name === 'string' && memory.name.length > 0);
+        const tools = await memory.tools();
+        const recall = tools.find((tool) => tool.name === MEMORY_RECALL_TOOL);
+        assert.ok(recall, `tools() 里没有 ${MEMORY_RECALL_TOOL}`);
+        assert.equal(recall.executor, memory.name);
+        const properties = recall.inputSchema['properties'] as Record<string, unknown> | undefined;
+        assert.ok(properties && 'query' in properties, '输入里有 query');
+        assert.ok(roundTrips(tools), 'tools() 能 JSON 往返');
+
+        const pg = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据');
+        const context = { session: 's', runId: 'run-memory' };
+        const output = await memory.execute(
+          { id: 'c1', name: MEMORY_RECALL_TOOL, input: { query: 'PostgreSQL' } },
+          context,
+        );
+        assert.notEqual(output.type, 'error', JSON.stringify(output));
+        assert.ok(JSON.stringify(output).includes(pg.text), `结果里有事实：${JSON.stringify(output)}`);
+        assert.ok(roundTrips(output));
+        const unknown = await memory.execute({ id: 'c2', name: 'no_such_tool_for_contract', input: {} }, context);
+        assert.equal(unknown.type, 'error');
+        const bad = await memory.execute({ id: 'c3', name: MEMORY_RECALL_TOOL, input: { nope: 1 } }, context);
+        assert.equal(bad.type, 'error', '没有 query 是错误');
+        const aborted = await memory.execute(
+          { id: 'c4', name: MEMORY_RECALL_TOOL, input: { query: 'PostgreSQL' } },
+          { ...context, signal: AbortSignal.abort() },
+        );
+        assert.equal(aborted.type, 'error');
+      });
     });
   });
 }

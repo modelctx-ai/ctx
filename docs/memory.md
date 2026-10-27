@@ -65,7 +65,7 @@ flowchart LR
 记忆的存储。四个集合，每个集合几个方法；全部只收发 JSON，可以放到进程边界另一侧。身份是字符串。
 
 ```ts
-/** 指向会话日志里的一段，证据永远指向原文。 */
+/** 指向会话日志里的一段，证据永远指向原文。1 ≤ from ≤ upTo。 */
 interface SourceRef {
   session: string;
   from: number; // seq，含
@@ -83,7 +83,13 @@ interface Note {
   topic?: string; // 应用定义的主题名
   settledAt?: number; // 夜里处理过的时刻；没有就是待处理
 }
-type NewNote = Omit<Note, 'id' | 'settledAt'>;
+/** 门控没过的那段也写一条，settledAt 等于 at：head 照样前进，打过的分留作阈值的分布。 */
+type NewNote = Omit<Note, 'id'>;
+interface NoteQuery {
+  session?: string;
+  pending?: boolean; // true 只要待处理的，false 只要处理过的；缺省不限
+  limit?: number; // 最早写入的 N 条
+}
 
 interface MemoryFact {
   id: string;
@@ -98,9 +104,13 @@ interface MemoryFact {
   salience: number; // 0..1，激活度公式里的 s
   sources: readonly SourceRef[]; // 必填，不允许没有证据的事实
   recalls: readonly number[]; // 每次被召回的时刻，激活度公式里的 t_i
-  archived: boolean;
+  archivedAt?: number; // 归档的时刻；没有就是没归档
 }
-type NewMemoryFact = Omit<MemoryFact, 'id' | 'validTo' | 'supersededBy' | 'recalls' | 'archived'>;
+type NewMemoryFact = Omit<MemoryFact, 'id' | 'validTo' | 'supersededBy' | 'recalls' | 'archivedAt'>;
+interface FactHit {
+  fact: MemoryFact;
+  score: number; // 0..1，越大越相关；recall 用它当相似度
+}
 
 interface Procedure {
   id: string;
@@ -108,56 +118,72 @@ interface Procedure {
   when: string; // 触发条件
   do: string; // 动作
   evidence: readonly SourceRef[];
-  confirmations: number; // 独立确认次数；应用决定几次算生效
+  confirmations: number; // 独立确认次数，add 时是 1；应用决定几次算生效
   at: number;
   retiredAt?: number;
 }
 type NewProcedure = Omit<Procedure, 'id' | 'confirmations' | 'retiredAt'>;
+interface ProcedureQuery {
+  topic?: string;
+  active?: boolean; // true 只要没退役的；false 或缺省不限
+}
 
+/** 结果按 id 升序（码点序），翻页和 SessionStore.sessions 一样。 */
 interface FactQuery {
   subject?: string;
   topic?: string;
-  open?: boolean; // true 只要 validTo 为空且未归档；缺省不限
-  after?: string; // 上一页最后一个 id
+  open?: boolean; // true 只要 validTo 为空且未归档；false 或缺省不限
+  after?: string; // 上一页最后一个 id，不含
   limit?: number;
 }
 interface SearchQuery {
-  text: string; // 实现决定用全文、向量还是两者
+  text: string; // 实现决定用全文、向量还是两者；至少子串（3 个字符以上）命中
   topic?: string;
-  k?: number;
-  open?: boolean; // 缺省 true
+  k?: number; // 缺省 10
+  open?: boolean; // 缺省 true；false 连同关闭、归档的一起搜
+}
+
+interface CoreVersion {
+  text: string;
+  at: number;
 }
 
 interface MemoryStore {
   notes: {
     add(notes: readonly NewNote[]): Promise<Note[]>;
-    list(options?: { session?: string; pending?: boolean; limit?: number }): Promise<Note[]>;
+    list(query?: NoteQuery): Promise<Note[]>; // 按写入顺序
+    /** 返回这次真正标上的条数；处理过的不改。 */
     settle(ids: readonly string[], at: number): Promise<number>;
-    /** 这个会话上一条笔记覆盖到的 seq；没有就是 0。gate 从它之后读。 */
+    /** 这个会话的笔记（含处理过的）覆盖到的最大 seq；没有就是 0。gate 从它之后读。 */
     head(session: string): Promise<number>;
   };
   facts: {
     add(fact: NewMemoryFact): Promise<MemoryFact>;
-    /** 关闭有效期。事实的文字永不改写：变了就 close 旧的、add 新的。 */
+    /** 关闭有效期。事实的文字永不改写：变了就 add 新的、close 旧的。已关闭的不改。 */
     close(id: string, at: number, options?: { supersededBy?: string }): Promise<void>;
+    /** 追加证据（并入时用），文字不变；相同的区间跳过。 */
+    cite(id: string, sources: readonly SourceRef[]): Promise<MemoryFact>;
     /** 记一次召回。 */
     touch(ids: readonly string[], at: number): Promise<void>;
     archive(ids: readonly string[], at: number): Promise<number>;
     /** 真删除，连同指向它的 supersededBy 一起清掉。主人的权利。 */
     forget(ids: readonly string[]): Promise<number>;
     list(query?: FactQuery): Promise<MemoryFact[]>;
-    search(query: SearchQuery): Promise<MemoryFact[]>;
+    search(query: SearchQuery): Promise<FactHit[]>; // 按 score 从高到低
   };
   procedures: {
     add(procedure: NewProcedure): Promise<Procedure>;
+    /** confirmations 加 1；相同的证据不算又一次确认。 */
     confirm(id: string, evidence: readonly SourceRef[]): Promise<Procedure>;
     retire(id: string, at: number): Promise<void>;
-    list(options?: { topic?: string; active?: boolean }): Promise<Procedure[]>;
+    list(query?: ProcedureQuery): Promise<Procedure[]>; // 按写入顺序
   };
   core: {
-    get(): Promise<{ text: string; at: number } | null>;
-    /** 保留历史版本，能回滚。 */
+    get(): Promise<CoreVersion | null>;
+    /** 追加一个版本，旧版本保留；回滚就是把旧文字再 set 一次。 */
     set(text: string, at: number): Promise<void>;
+    /** 按写入顺序；last 和 ListOptions.last 一样。 */
+    history(options?: { last?: number }): Promise<CoreVersion[]>;
   };
 }
 ```
@@ -165,42 +191,46 @@ interface MemoryStore {
 - **事实不 UPDATE。** 变了就 `close` 旧的、`add` 新的，`supersededBy` 连起来。「上个月用的是哪个数据库」永远能查。
 - **证据必填。** `MemoryFact.sources`、`Procedure.evidence` 指向会话日志的 `seq` 区间。没有证据的事实不进存储，这是防编造的第一道闸。
 - **归档不删除。** `archive` 只是让它退出 `open` 的查询，`forget` 才删。
+- **错误。** 参数不合法（没有证据、`from > upTo`）是 `CtxError` 的 `invalid_request`，认不得的 `id` 是 `not_found`；批量方法（`settle`、`touch`、`archive`、`forget`）跳过认不得的 `id`。存储不看钟，时刻都由调用方给。
 - **记忆不写会话日志。** 记忆是日志的读者。应用要在日志里留痕（例如「今晚整理了 12 条」）自己追加事件，这是明确的选择。
 - `search` 的实现自定：全文、向量、两者混合。协议只约定输入是文字。
 - 记忆里的事实叫 `MemoryFact`，和来源取到的事实 `Fact`（`{ source, text }`，只用于一次调用）是两回事：前者持久、有有效期，后者是「现在」。
-- 纯函数：`activation(fact, now, options)`（见[遗忘](#遗忘)）、`rankFacts(facts, scores, options)`、`renderCore(facts, budget)` 的缺省写法、`sourceRef(session, entries)`。
+- 纯函数：`activation(fact, now, options?)`（见[遗忘](#遗忘)）、`rankFacts(facts, scores, options?)`（`scores` 是事实 `id` → 相似度，一般取 `FactHit.score`）、`renderCore(facts, budget, options?)` 的缺省写法、`sourceRef(session, entries)`；另有存储实现用的 `checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`、`isOpenFact`、`filterFacts`。
 
 ## 协议 `DecisionModel`、`ExtractionModel`
 
 记忆回路里的多数判断不是开放生成，而是分类、打分、填字段。这些交给单次前向、返回概率的模型（Cloudflare 叫 System One：决策模型 Clef、Jev，提取模型 Clairic），只有归纳和措辞留给 `LanguageModel`。ctx 为它们各定一个协议，形状跟着 System One API 走，适配器因此很薄；但类型是 ctx 自己的，全是 JSON，不依赖任何服务商的 SDK。
 
 ```ts
+const MAX_DECISION_QUESTIONS = 64;
+
 type DecisionQuestion =
   | { type: 'noul'; instructions: string } // 是 / 否，返回 P(是)
-  | { type: 'choice'; instructions: string; criteria: Record<string, string> } // 选一个
-  | { type: 'score'; instructions: string; criteria: readonly string[] }; // 有序量表
+  | { type: 'choice'; instructions: string; criteria: Record<string, string> } // 选一个，至少一个选项
+  | { type: 'score'; instructions: string; criteria: readonly string[] }; // 有序量表，从低到高，至少两档
 type DecisionAnswer =
   | { type: 'noul'; noul: number }
   | { type: 'choice'; choice: string; probabilities: Record<string, number>; confidence: number }
-  | { type: 'score'; score: number; probabilities: readonly number[] }; // score 归一到 0..1
+  | { type: 'score'; score: number; probabilities: readonly number[] }; // score = Σ pᵢ · i / (n − 1)
 
 interface DecisionRequest {
   state: JsonValue; // 文字或 JSON
   questions: Record<string, DecisionQuestion>; // 一次最多 64 个，并行
-  signal?: AbortSignal;
+  signal?: AbortSignal; // 中止后 reject
 }
 interface DecisionModel {
   name: string;
   decide(request: DecisionRequest): Promise<Record<string, DecisionAnswer>>;
 }
 
+// 找到时 value 的形状：text 字符串；number 数；date 'YYYY-MM-DD'；datetime ISO 8601；duration 秒数；list 数组
 type ExtractionField =
   | { type: 'text'; instructions?: string }
   | { type: 'number'; instructions?: string; integer?: boolean; decimals?: number; unit?: string }
   | { type: 'date' | 'datetime' | 'duration'; instructions?: string }
   | { type: 'list'; items: 'text' | 'number'; instructions?: string };
 interface ExtractionAnswer {
-  value: JsonValue | null; // 没找到是 null
+  value: JsonValue; // 没找到是 null
   pNull: number; // 输入里不存在这个值的概率
   confidence: number;
 }
@@ -241,22 +271,32 @@ interface MemoryOptions {
 }
 
 interface Memory extends Executor {
-  /** 白天：读 session 里 notes.head 之后的新条目，打分，写笔记。不改日志。 */
+  /**
+   * 白天：读 session 里 notes.head 之后的新条目，打分，写笔记。不改日志。
+   * 没过阈值的那段也写一条已处理的笔记（settledAt = at），head 照样前进。
+   */
   gate(session: string, options?: { signal?: AbortSignal }): Promise<Note[]>;
   /** 白天：按文字召回，按相似度和激活度排序，记一次 touch。 */
-  recall(query: string, options?: { topic?: string; k?: number; budgetTokens?: number }): Promise<Recalled>;
+  recall(query: string, options?: RecallOptions): Promise<Recalled>;
   /** 夜里：处理待处理的笔记，衰减归档，重写 core。整体可重复执行。 */
   consolidate(options?: { now?: number; signal?: AbortSignal }): Promise<ConsolidateReport>;
   /** 作为来源：core 加按 query 召回的事实。query 缺省取会话最近一条用户消息。 */
   source(options?: { name?: string; query?: (session: string) => Promise<string>; k?: number }): ContextSource;
-  /** 作为工具：recall(query, since_days?)，绑定到这个执行环境。 */
+  /** 作为工具：recall(query, since_days?)（MEMORY_RECALL_TOOL），绑定到这个执行环境。 */
   tools(): Promise<ToolDefinition[]>;
   execute(call: ToolCall, context: ExecutionContext): Promise<ToolOutput>;
+}
+interface RecallOptions {
+  topic?: string;
+  k?: number;
+  budgetTokens?: number;
+  evidence?: boolean; // 带回证据原文；工具调用时带，作为来源时不带
+  signal?: AbortSignal;
 }
 interface Recalled {
   facts: readonly MemoryFact[];
   procedures: readonly Procedure[];
-  evidence?: readonly Entry[]; // 工具调用时才带原文
+  evidence?: readonly Entry[]; // 只在 evidence 时有：证据区间里的条目，按 id 去重，按会话、seq 排
 }
 interface ConsolidateReport {
   notes: number;
@@ -336,7 +376,7 @@ sequenceDiagram
 ```
 
 - 提取：`pNull > 0.3` 的字段当作没说；`since` 为空时 `validFrom` 取这段的第一条 `at`。
-- 并入：有对照的事实放进 `state`，这就是分类问题。`merge` 是 `touch` 加 `sources` 合并；`supersede` 是 `close` 旧的、`add` 新的。
+- 并入：有对照的事实放进 `state`，这就是分类问题。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是 `close` 旧的、`add` 新的。
 - 反思是唯一的开放生成。规则要 `confirmations ≥ 2` 才算生效（应用在 `procedures.list` 后自己筛）。
 - 幂等：笔记 `settle` 之后不再处理；中途失败下一夜接着做，白天不受影响。
 - 什么时候跑由编排器定：每天固定时刻、空闲时、待处理笔记够多时。框架不替应用决定。
@@ -376,14 +416,14 @@ SQLite 存储和 `ctx-sqlite` 一样可以和应用共用一个库，表前缀�
 
 ## 契约测试
 
-| 契约测试                          | 工厂                       | 覆盖                                                                                                                                                                                         |
-| --------------------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeMemoryStoreContract`     | `({ now }) => MemoryStore` | 笔记的 `head`、`pending`、`settle`；事实不可改写、`close` 和 `supersededBy`、`touch` 追加、`archive` 退出 `open`、`forget` 真删；`search` 至少全文命中；程序 `confirm` 计数；`core` 保留历史 |
-| `describeDecisionModelContract`   | `() => DecisionModel`      | 三种问题的形状、概率和为 1、`choice` 的 `choice` 是概率最大的那个、`signal` 中止                                                                                                             |
-| `describeExtractionModelContract` | `() => ExtractionModel`    | 每种字段类型的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                             |
-| `describeMemoryContract`          | `({ script }) => Memory`   | `gate` 不改日志、笔记指向正确的 `seq` 区间；`consolidate` 幂等、取代不覆盖、没有证据不写；`recall` 后 `recalls` 多一个；`source` 和 `tools` 的形状                                           |
+| 契约测试                          | 工厂                                                             | 覆盖                                                                                                                                                                                         |
+| --------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                       | 笔记的 `head`、`pending`、`settle`；事实不可改写、`close` 和 `supersededBy`、`touch` 追加、`archive` 退出 `open`、`forget` 真删；`search` 至少全文命中；程序 `confirm` 计数；`core` 保留历史 |
+| `describeDecisionModelContract`   | `() => DecisionModel`                                            | 三种问题的形状、概率和为 1、`choice` 的 `choice` 是概率最大的那个、`signal` 中止                                                                                                             |
+| `describeExtractionModelContract` | `() => ExtractionModel`                                          | 每种字段类型的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                             |
+| `describeMemoryContract`          | `({ sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间；`consolidate` 幂等、取代不覆盖、没有证据不写；`recall` 后 `recalls` 多一个；`source` 和 `tools` 的形状                                           |
 
-决策、提取模型的契约用剧本实现跑（`createScriptedDecisionModel`、`createScriptedExtractionModel`），和 `createScriptedModel` 同一个思路。
+决策、提取模型的契约用剧本实现跑（`createScriptedDecisionModel`、`createScriptedExtractionModel`，在协议包的 `/testing` 里），和 `createScriptedModel` 同一个思路。`describeMemoryContract` 自己造好剧本模型和一个内存会话日志交给工厂，工厂用它们造 `Memory`，门控阈值固定在 0.1..0.9 之间。
 
 ## 模型实例化
 
