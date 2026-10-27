@@ -1,20 +1,26 @@
 /**
- * `ctx-remote` 的客户端：经 HTTP 用别处的会话存储、执行环境、harness、编排器，拿到的仍是协议的接口。
+ * `ctx-remote` 的客户端：经 HTTP 用别处的会话存储、执行环境、harness、编排器、记忆存储，拿到的仍是协议的接口。
  * 只用 `fetch`、`TextDecoder`、`AbortController`，不用 `node:` 模块，任何运行时都能跑。服务端在 `./server`。
  */
 import {
   CtxError,
   errorOutput,
   type AppendOptions,
+  type CoreVersion,
   type Entry,
   type ErrorInfo,
   type ExecutionContext,
   type Executor,
+  type FactHit,
   type Harness,
   type ListOptions,
+  type MemoryFact,
+  type MemoryStore,
   type NewEntry,
+  type Note,
   type Orchestrator,
   type OrchestratorEvent,
+  type Procedure,
   type RecoveredRun,
   type RunEvent,
   type RunHandle,
@@ -478,4 +484,130 @@ export function createRemoteOrchestrator(options: RemoteOrchestratorOptions): Or
     },
   };
   return orchestrator;
+}
+
+// ---- 记忆 ----
+
+/** 服务端原样转发的协议错误：转回 `CtxError`。 */
+const CTX_ERROR_TYPES: readonly string[] = ['invalid_request', 'not_found', 'conflict'];
+
+function flag(value: boolean | undefined): string | undefined {
+  return value === undefined ? undefined : String(value);
+}
+
+function count(value: number | undefined): string | undefined {
+  return value === undefined ? undefined : String(value);
+}
+
+/**
+ * 远端的记忆存储。服务端存储抛的 `CtxError`（`invalid_request`、`not_found`、`conflict`）转回同 `type` 的 `CtxError`，
+ * 调用方不必认识 HTTP；连不上、服务端没挂记忆（404 `not_found_error`）等仍是 `RemoteError` 或 `fetch` 的错误。
+ */
+export function createRemoteMemoryStore(options: RemoteClientOptions): MemoryStore {
+  const connection = connect(options);
+  async function call<T>(method: string, path: string, init?: RequestInit): Promise<T> {
+    try {
+      return await connection.json<T>(method, `/memory${path}`, init);
+    } catch (error) {
+      if (isRemoteError(error) && error.type !== undefined && CTX_ERROR_TYPES.includes(error.type)) {
+        throw new CtxError(
+          error.type,
+          error.message,
+          error.retryable !== undefined ? { retryable: error.retryable } : {},
+        );
+      }
+      throw error;
+    }
+  }
+  return {
+    notes: {
+      async add(notes) {
+        return (await call<{ notes: Note[] }>('POST', '/notes', { body: { notes } })).notes;
+      },
+      async list(query = {}) {
+        const { session, pending, limit } = query;
+        return (
+          await call<{ notes: Note[] }>('GET', '/notes', {
+            query: { session, pending: flag(pending), limit: count(limit) },
+          })
+        ).notes;
+      },
+      async settle(ids, at) {
+        return (await call<{ settled: number }>('POST', '/notes/settle', { body: { ids, at } })).settled;
+      },
+      async head(session) {
+        return (await call<{ head: number }>('GET', '/notes/head', { query: { session } })).head;
+      },
+    },
+    facts: {
+      async add(fact) {
+        return (await call<{ fact: MemoryFact }>('POST', '/facts', { body: { fact } })).fact;
+      },
+      async close(id, at, closeOptions) {
+        const supersededBy = closeOptions?.supersededBy;
+        await call('POST', `/facts/${segment(id)}/close`, {
+          body: { at, ...(supersededBy !== undefined ? { supersededBy } : {}) },
+        });
+      },
+      async cite(id, sources) {
+        return (await call<{ fact: MemoryFact }>('POST', `/facts/${segment(id)}/cite`, { body: { sources } })).fact;
+      },
+      async touch(ids, at) {
+        await call('POST', '/facts/touch', { body: { ids, at } });
+      },
+      async archive(ids, at) {
+        return (await call<{ archived: number }>('POST', '/facts/archive', { body: { ids, at } })).archived;
+      },
+      async forget(ids) {
+        return (await call<{ forgotten: number }>('POST', '/facts/forget', { body: { ids } })).forgotten;
+      },
+      async list(query = {}) {
+        const { subject, topic, open, after, limit } = query;
+        return (
+          await call<{ facts: MemoryFact[] }>('GET', '/facts', {
+            query: { subject, topic, open: flag(open), after, limit: count(limit) },
+          })
+        ).facts;
+      },
+      async search(query) {
+        return (await call<{ hits: FactHit[] }>('POST', '/facts/search', { body: query })).hits;
+      },
+    },
+    procedures: {
+      async add(procedure) {
+        return (await call<{ procedure: Procedure }>('POST', '/procedures', { body: { procedure } })).procedure;
+      },
+      async confirm(id, evidence) {
+        return (
+          await call<{ procedure: Procedure }>('POST', `/procedures/${segment(id)}/confirm`, { body: { evidence } })
+        ).procedure;
+      },
+      async retire(id, at) {
+        await call('POST', `/procedures/${segment(id)}/retire`, { body: { at } });
+      },
+      async list(query = {}) {
+        const { topic, active } = query;
+        return (
+          await call<{ procedures: Procedure[] }>('GET', '/procedures', {
+            query: { topic, active: flag(active) },
+          })
+        ).procedures;
+      },
+    },
+    core: {
+      async get() {
+        return (await call<{ core: CoreVersion | null }>('GET', '/core')).core;
+      },
+      async set(text, at) {
+        await call('PUT', '/core', { body: { text, at } });
+      },
+      async history(historyOptions = {}) {
+        return (
+          await call<{ versions: CoreVersion[] }>('GET', '/core/history', {
+            query: { last: count(historyOptions.last) },
+          })
+        ).versions;
+      },
+    },
+  };
 }

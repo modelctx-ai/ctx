@@ -125,6 +125,9 @@ importers:
       '@modelctx-ai/ctx-exec':
         specifier: workspace:^
         version: link:../exec
+      '@modelctx-ai/ctx-memory':
+        specifier: workspace:^
+        version: link:../memory
       '@modelctx-ai/ctx-protocol':
         specifier: workspace:^
         version: link:../protocol
