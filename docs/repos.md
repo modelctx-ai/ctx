@@ -2,18 +2,7 @@
 
 ctx 是框架，yoyo 是用它做出来的第一个程序：一个常驻的桌宠导演。yoyo 的存在是为了检验协议够不够用、参考实现好不好组合；ctx 里不出现任何桌宠的东西。
 
-yoyo 和 ctx 组件的对应：
-
-| ctx 组件 | yoyo 里是什么                                                                                                                                                                                                                                                                                                                            |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 会话     | `~/.yoyo/yoyo.db` 里的 `ctx_entries`，每只宠物一个会话 `pet:<id>`                                                                                                                                                                                                                                                                        |
-| 上下文   | `yoyoProjection`：碎碎念事件折叠成一条助手消息；来源是工作状态和粘贴板                                                                                                                                                                                                                                                                   |
-| 工具     | `web_search`、`weather_forecast`、`list_alarms`、`add_alarm`，加 `mcpServers` 的工具                                                                                                                                                                                                                                                     |
-| 执行环境 | 进程内函数；MCP 服务器                                                                                                                                                                                                                                                                                                                   |
-| Harness  | `createHarness`：碎碎念和回复是同一个 harness 跑的两份 `AgentSpec`（`record: false`，说出口以后才记）；事实放哪写在各自的 `AgentSpec.context` 里                                                                                                                                                                                         |
-| 编排     | `createYoyoOrchestrator` 实现 ctx 的 `Orchestrator`：排队、让路、收件箱、定时压缩；导演只剩舞台动作（让桌宠说话、做动作），常驻循环只管进程（启动、每秒一拍、退出）                                                                                                                                                                      |
-| 模型     | `ctx-models` 按 `llm` 配置造                                                                                                                                                                                                                                                                                                             |
-| 记忆     | ctx 侧已实现（`ctx-memory`、`createSqliteMemoryStore`，未发布）；yoyo 的用法见 [yoyo 的记忆](https://github.com/modelctx-ai/yoyo/blob/main/docs/tech/memory.md)：`yoyo.db` 里 `memory_` 前缀的表；来源 `memory` 给两个 agent 带画像和召回的事实，`recall` 工具只给回复；门控在每拍末尾，巩固在夜里的一拍；主题和「什么值得记」由 yoyo 定 |
+这一篇只写三个仓库之间的事：各管什么、产物、边界上的契约、依赖和运行时拓扑、本地联调。yoyo 内部怎么分层、八个 ctx 组件在 yoyo 里各是什么、yoyo 怎么用 ctx，都写在 yoyo 仓库的[架构](https://github.com/modelctx-ai/yoyo/blob/main/docs/tech/architecture.md)（「分层」「和 ctx 组件的对应」「怎么用 ctx」三节）和[记忆](https://github.com/modelctx-ai/yoyo/blob/main/docs/tech/memory.md)里，这里不另抄一份。
 
 ## 职责
 
@@ -33,15 +22,15 @@ yoyo 和 ctx 组件的对应：
 
 ## 契约
 
-| 边界           | 契约                                                                                                                                                                                 |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| yoyo → ctx     | 6 个包的公开 API（`dist/*.d.ts`）：`@modelctx-ai/ctx`、`ctx-protocol`、`ctx-sqlite`、`ctx-mcp`、`ctx-gateway`、`ctx-models`，版本范围 `^0.3.0`；`ctx-exec`、`ctx-remote` 不用        |
-| yoyo → ctx     | `~/.yoyo/yoyo.db` 里 `ctx_` 前缀的表，`ctx-sqlite` 结构版本 3；常驻进程和命令行共用这个库，要用同一个 ctx 版本，不支持滚动升级                                                       |
-| yoyo → dsh-pet | `openapi.yaml` 描述的 HTTP 接口，前缀 `/dsh-pet-7340`：`/state`（长轮询）、`/lock` 和 `/lock/release`、`/broadcast`、`/anim`、`/chat`（对话记忆）、`/menu/item` 和 `/menu/events` 等 |
-| yoyo → dsh-pet | 独立模式的运行状态文件 `~/.dsh/dsh-pet/standalone-runtime.json`：端口和本机令牌，写接口带请求头 `x-dsh-pet-token`                                                                    |
-| yoyo → dsh-pet | `POST /standalone-ai/settings`：把桌宠右键对话的模型地址指向 yoyo 里的 ctx-gateway，密钥填一次性的本机令牌                                                                           |
-| dsh-pet → yoyo | OpenAI Chat Completions：`POST /v1/chat/completions`，SSE 流式                                                                                                                       |
-| yoyo → LLM     | 导演经 ctx 和 AI SDK 调模型；网关原样转发到 OpenAI 兼容的上游                                                                                                                        |
+| 边界           | 契约                                                                                                                                                                                        |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| yoyo → ctx     | 7 个包的公开 API（`dist/*.d.ts`）：`@modelctx-ai/ctx`、`ctx-protocol`、`ctx-sqlite`、`ctx-mcp`、`ctx-gateway`、`ctx-models`、`ctx-memory`，版本范围 `^0.3.0`；`ctx-exec`、`ctx-remote` 不用 |
+| yoyo → ctx     | `~/.yoyo/yoyo.db` 里 `ctx_` 前缀的表（`ctx-sqlite` 会话存储，结构版本 3）和 `memory_` 前缀的表（记忆存储，结构版本 1）；常驻进程和命令行共用这个库，要用同一个 ctx 版本，不支持滚动升级     |
+| yoyo → dsh-pet | `openapi.yaml` 描述的 HTTP 接口，前缀 `/dsh-pet-7340`：`/state`（长轮询）、`/lock` 和 `/lock/release`、`/broadcast`、`/anim`、`/chat`（对话记忆）、`/menu/item` 和 `/menu/events` 等        |
+| yoyo → dsh-pet | 独立模式的运行状态文件 `~/.dsh/dsh-pet/standalone-runtime.json`：端口和本机令牌，写接口带请求头 `x-dsh-pet-token`                                                                           |
+| yoyo → dsh-pet | `POST /standalone-ai/settings`：把桌宠右键对话的模型地址指向 yoyo 里的 ctx-gateway，密钥填一次性的本机令牌                                                                                  |
+| dsh-pet → yoyo | OpenAI Chat Completions：`POST /v1/chat/completions`，SSE 流式                                                                                                                              |
+| yoyo → LLM     | 导演经 ctx 和 AI SDK 调模型；网关原样转发到 OpenAI 兼容的上游                                                                                                                               |
 
 ## 依赖和使用
 
@@ -54,6 +43,7 @@ flowchart LR
     mcp["ctx-mcp"] --> protocol
     gateway["ctx-gateway"] --> protocol
     models["ctx-models"] --> protocol
+    memory["ctx-memory"] --> protocol
   end
   subgraph yoyorepo["modelctx-ai/yoyo"]
     app["yoyo 应用"] --> client["@yoyo/dsh-pet"]
@@ -62,14 +52,15 @@ flowchart LR
   protocol --> ai["ai@7"]
   core --> ai
   models --> ai
+  memory --> ai
   client -. "HTTP，按 openapi.yaml" .-> pet["ticoAg/dsh-pet"]
 ```
 
-箭头指向被依赖的一方；虚线是运行时的 HTTP 调用，没有代码依赖。实现包之间不互相依赖，都只依赖协议包（ctx-models 另依赖 `ai`）；`ctx-exec`、`ctx-remote` yoyo 不用，`ctx-memory` 是新包、yoyo 还没接，图里都没画。
+箭头指向被依赖的一方；虚线是运行时的 HTTP 调用，没有代码依赖。实现包之间不互相依赖，都只依赖协议包（ctx-models、ctx-memory 另把 `ai` 当 peer）；`ctx-exec`、`ctx-remote` yoyo 不用，图里没画。
 
 | 阶段   | yoyo 怎么拿到 ctx                                                                                                                                                              |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 现在   | ctx 克隆在 yoyo 旁边，先在 ctx 里 `pnpm install && pnpm build`；yoyo 的 `pnpm-workspace.yaml` 用 `overrides` 把用到的 6 个包指到 `link:../ctx/packages/<name>`，读的是 `dist/` |
+| 现在   | ctx 克隆在 yoyo 旁边，先在 ctx 里 `pnpm install && pnpm build`；yoyo 的 `pnpm-workspace.yaml` 用 `overrides` 把用到的 7 个包指到 `link:../ctx/packages/<name>`，读的是 `dist/` |
 | 发布后 | 删掉 `overrides`，`package.json` 里的 `^0.3.0` 从 npm 解析                                                                                                                     |
 
 ## 运行时拓扑
@@ -115,41 +106,6 @@ flowchart LR
 4. 桌宠把问答写进自己的对话记忆。yoyo 每拍读一次 `GET /chat`，按幂等键 `pet:<ts>:<role>:<text>` 并进 ctx，重复的跳过。
 
 上游不是 OpenAI 兼容（`llm.provider` 不是 `openai-compatible`）时不开对话渠道，只记一行日志。
-
-## yoyo 怎么用 ctx
-
-| 方面     | 做法                                                                                                                                                                 |
-| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 存储     | `createSqliteStore({ database, prefix: 'ctx_' })`，和 yoyo 自己的表一起放在 `~/.yoyo/yoyo.db`                                                                        |
-| 会话     | `pet:<petId>`（`sessionFor`）                                                                                                                                        |
-| 投影     | `whisper` 事件 `fold`，渲染成一条助手消息「碎碎念：\n…」；用户话和回复原样保存，不截断；没配 `context.maxTokens` 就不裁剪                                            |
-| 来源     | 当前任务、粘贴板                                                                                                                                                     |
-| agent    | 碎碎念和回复是两份 `AgentSpec`（`agents.ts`）；`context.facts.placement` 分别是 `prompt`（最后一条临时用户消息）和 `instructions`（指令后面），来源和投影用缺省      |
-| 生成     | 编排器把 `RunRequest` `submit` 给 harness，事实由 builder 按 agent 的 `context` 收。都用 `record: false`：语音合成、投喂给桌宠之后，导演再把说出口的那句写进上下文   |
-| 恢复     | `record: false` 的运行不写 `ctx.run.*`、不占会话，没有断掉的运行，所以不配 `owner`、不调 `recover`；以后打开 `record` 要配 `owner: 'yoyo'`，并在开拍子前 `recover()` |
-| 桌宠对话 | 每拍按幂等键导入 `GET /chat` 的对话记忆                                                                                                                              |
-| 工具     | yoyo 的本地工具，加上 `mcpServers` 配置里的 MCP 服务器（ctx-mcp）                                                                                                    |
-| 压缩     | 配了 `context.compactAt` 时，每 10 分钟最多压缩一次                                                                                                                  |
-| 旧摘要   | 常驻进程启动时、开拍子之前跑一次 `findLossySummaries`，有结果且有模型就 `recompactLossy`；没有模型记警告，命令行不做                                                 |
-| 排序     | `yoyo context tail` 按 `compareEntries`（`(at, seq)`）排，补写进来的桌宠对话回到原来的位置                                                                           |
-| 模型     | ctx-models 的 `createModel()`，协议名和 dsh-pet 独立模式一致：`openai-compatible`、`anthropic`                                                                       |
-
-## yoyo 的分层
-
-右边的层依赖左边的层，不许反过来：`kernel` ← `ports` ← `features` / `brain` / `adapters` ← `runtime` ← `cli` / `app/container` ← 入口。
-
-| 层       | 目录                              | 内容                                                                                       |
-| -------- | --------------------------------- | ------------------------------------------------------------------------------------------ |
-| kernel   | `src/kernel`                      | 纯领域：语气、时间、节奏、台词                                                             |
-| ports    | `src/ports`                       | 接口：`PetHost`、`Synthesizer`、`Transcriber`、`Repos` 等                                  |
-| features | `src/features`                    | 预制台词、天气、日程、表情包、联系人、粘贴板、听写规则                                     |
-| brain    | `src/brain`                       | ctx 接线：上下文、来源、提示词、agent 配置、一轮的请求、harness、模型、工具、MCP、对话渠道 |
-| adapters | `src/adapters/*`、`src/storage`   | dsh-pet、控制台、语音、平台、搜索、存储                                                    |
-| runtime  | `src/runtime`                     | 编排器（实现 `Orchestrator`）、导演、常驻循环、收件箱、压缩                                |
-| cli、app | `src/cli`、`src/app/container.ts` | 命令表、组装根                                                                             |
-| 入口     | `bin/yoyo.js`、`src/main.ts`      | 命令行、常驻进程                                                                           |
-
-`features` 和 `brain` 只依赖端口，不依赖 `adapters`；`adapters` 不依赖 `features`、`brain`、`runtime`；`packages/dsh-pet` 不依赖 yoyo 的任何东西。
 
 ## 本地联调
 
