@@ -81,7 +81,7 @@ TypeScript 里用接口和工厂函数表达，不用类继承：协议是 `inte
 
 ### 4. 命名
 
-- 日志的名字从 `thread` 改成 `session`，`ContextStore` 改成 `SessionStore`，`threads()` 改成 `sessions()`。协议包里不保留旧名；`@modelctx-ai/ctx` 保留 `ContextStore`、`thread` 作为弃用别名到下一个 minor，给 yoyo 迁移的时间。
+- 日志的名字从 `thread` 改成 `session`，`ContextStore` 改成 `SessionStore`，`threads()` 改成 `sessions()`。协议包里不保留旧名；`@modelctx-ai/ctx` 保留 `ContextStore`、`thread` 作为弃用别名到下一个 minor，给 yoyo 迁移的时间（0.3 里已删掉）。
 - 执行环境的英文是 `Executor`，不叫 sandbox：它不一定隔离，可以只是本机的一个子进程。
 - 协议包叫 `@modelctx-ai/ctx-protocol`；实现包沿用 [ADR 0002](0002-packages.md) 的 `ctx-<名字>`。
 - `createContext()` 保留，含义变成「在一个会话上把会话存储、上下文组装、工具、执行环境和 harness 组合成一个进程内对象」。它是糖，不是协议。

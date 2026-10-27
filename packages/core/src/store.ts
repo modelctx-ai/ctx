@@ -8,12 +8,6 @@ import {
   type WatchOptions,
 } from '@modelctx-ai/ctx-protocol';
 
-/** @deprecated 改名为 `SessionStore`，下一个 minor 删掉。 */
-export type ContextStore = SessionStore;
-
-/** @deprecated 改名为 `Entry`，下一个 minor 删掉。 */
-export type ContextEntry = Entry;
-
 export interface MemoryStoreOptions {
   readonly now?: () => number;
   readonly id?: () => string;

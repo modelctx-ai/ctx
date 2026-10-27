@@ -44,7 +44,7 @@ describe('tool registry', () => {
 
   test('按名字、来源、标签或函数挑工具；toolSet 包回 AI SDK 工具', () => {
     const registry = createToolRegistry()
-      .add('echo', echo)
+      .addTool('echo', echo)
       .addAll({ search: echo, fetch: echo }, { source: 'mcp:web', tags: ['net'] });
     assert.equal(registry.size, 3);
     const names = (filter?: Parameters<typeof registry.select>[0]) => registry.select(filter).map((item) => item.name);
@@ -61,19 +61,19 @@ describe('tool registry', () => {
   });
 
   test('非法名字和重名会报错，replace 可以覆盖；不收没有 execute 的工具', () => {
-    const registry = createToolRegistry().add('echo', echo);
-    assert.throws(() => registry.add('echo', echo), /already registered/);
-    assert.throws(() => registry.add('有空格 的名字', echo), /Invalid tool name/);
-    registry.add('echo', echo, { replace: true, source: 'x' });
+    const registry = createToolRegistry().addTool('echo', echo);
+    assert.throws(() => registry.addTool('echo', echo), /already registered/);
+    assert.throws(() => registry.addTool('有空格 的名字', echo), /Invalid tool name/);
+    registry.addTool('echo', echo, { replace: true, source: 'x' });
     assert.equal(registry.list()[0]?.source, 'x');
     assert.throws(() => registry.addTool('bare', tool({ inputSchema: z.object({}) })), /no execute function/);
   });
 
   test('按来源整批移除，函数执行环境里的也一起拿掉', () => {
     const registry = createToolRegistry()
-      .add('a', echo, { source: 'mcp:one' })
-      .add('b', echo, { source: 'mcp:one' })
-      .add('c', echo);
+      .addTool('a', echo, { source: 'mcp:one' })
+      .addTool('b', echo, { source: 'mcp:one' })
+      .addTool('c', echo);
     assert.equal(registry.removeSource('mcp:one'), 2);
     assert.deepEqual(
       registry.list().map((info) => info.name),

@@ -236,7 +236,7 @@ interface ToolRegistry {
 
 - `add` 在名字不合法、或同名已存在且没给 `replace` 时抛错。目录是同步的：它跟着 harness 走，不单独跨边界。
 - 纯函数：`isValidToolName`、`matchesTool`、`selectTools`。
-- 参考实现另给糖：`registry.add(name, aiSdkTool, meta)` 把 zod 工具转成 JSON Schema 定义，执行函数放进一个进程内的函数执行环境。
+- 参考实现另给糖：`registry.addTool(name, aiSdkTool, meta)` 把 zod 工具转成 JSON Schema 定义，执行函数放进一个进程内的函数执行环境。
 - 命名约定来自 Anthropic 的工具设计文章：按服务和资源加前缀（MCP 工具是 `<server>__<tool>`），参数名不含糊（`user_id` 不是 `user`），说明写给新同事看。
 
 ## 执行环境 `Executor`

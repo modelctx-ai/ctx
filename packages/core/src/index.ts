@@ -1,7 +1,7 @@
 // 协议包的全部导出：类型、纯函数、框架事件。应用只装核心包也能拿到。
 export * from '@modelctx-ai/ctx-protocol';
 
-export { createMemoryStore, type ContextEntry, type ContextStore, type MemoryStoreOptions } from './store.ts';
+export { createMemoryStore, type MemoryStoreOptions } from './store.ts';
 export {
   createFunctionExecutor,
   type FunctionExecutor,

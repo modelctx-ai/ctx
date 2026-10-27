@@ -84,4 +84,4 @@ watcher.close();
 | 导出                                       | 说明                                                                                |
 | ------------------------------------------ | ----------------------------------------------------------------------------------- |
 | `createSqliteStore(options)`               | 返回 `SqliteSessionStore`：`SessionStore`（含 `watch`）加上 `database` 和 `close()` |
-| `SqliteStoreOptions`、`SqliteSessionStore` | 类型；`SqliteContextStore` 是弃用的别名                                             |
+| `SqliteStoreOptions`、`SqliteSessionStore` | 类型\1                                                                              |

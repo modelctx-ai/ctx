@@ -156,7 +156,7 @@ describe('createContext', () => {
         textResult('台北晴。'),
       ],
     });
-    const tools = createToolRegistry().add(
+    const tools = createToolRegistry().addTool(
       'weather',
       tool({
         description: '查天气',
@@ -534,12 +534,11 @@ describe('createContext', () => {
     assert.ok(!JSON.stringify(await context.entries()).includes('当前任务'), '事实不写日志');
   });
 
-  test('thread 是 session 的弃用别名；门面暴露 builder、executor、harness', async () => {
+  test('门面暴露 builder、executor、harness', async () => {
     const model = new MockLanguageModelV4({ doGenerate: textResult('在的') });
     const tools = createToolRegistry();
-    const context = createContext({ store: createMemoryStore(), thread: 'old', model, tools });
+    const context = createContext({ store: createMemoryStore(), session: 'old', model, tools });
     assert.equal(context.session, 'old');
-    assert.equal(context.thread, 'old');
     assert.equal(context.executor, tools.executor);
     const result = await context.harness.run({ session: 'old', agent: { model }, input: '在吗' });
     assert.equal(result.text, '在的');
