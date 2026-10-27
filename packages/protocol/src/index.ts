@@ -8,3 +8,4 @@ export * from './context.ts';
 export * from './tools.ts';
 export * from './harness.ts';
 export * from './orchestrator.ts';
+export * from './memory.ts';

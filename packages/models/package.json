@@ -1,7 +1,7 @@
 {
   "name": "@modelctx-ai/ctx-models",
   "version": "0.3.0",
-  "description": "按配置创建 Vercel AI SDK 语言模型：内置 openai-compatible 与 anthropic，可注册更多服务商。",
+  "description": "按配置创建 Vercel AI SDK 语言模型（内置 openai-compatible 与 anthropic）和 System One 决策、提取模型（内置 cloudflare 与 typesafe），都可以注册更多服务商。",
   "keywords": [
     "ai",
     "ai-sdk",
@@ -42,9 +42,11 @@
     "@ai-sdk/openai-compatible": "^3.0.77"
   },
   "peerDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^",
     "ai": "^7.0.150"
   },
   "devDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^",
     "ai": "^7.0.150",
     "zod": "^4.6.7"
   }

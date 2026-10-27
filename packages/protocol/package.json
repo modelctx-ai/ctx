@@ -1,7 +1,7 @@
 {
   "name": "@modelctx-ai/ctx-protocol",
   "version": "0.3.0",
-  "description": "ctx 的协议层：会话、上下文、工具、执行环境、harness、编排六个协议的接口、JSON 形状、纯函数和契约测试，不含实现。",
+  "description": "ctx 的协议层：会话、上下文、工具、执行环境、harness、编排、记忆存储、决策模型、提取模型九个协议的接口、JSON 形状、纯函数和契约测试，不含实现。",
   "keywords": [
     "ai",
     "llm",

@@ -80,6 +80,18 @@ importers:
         specifier: ^4.6.7
         version: 4.6.7
 
+  packages/memory:
+    devDependencies:
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
+      ai:
+        specifier: ^7.0.150
+        version: 7.0.150(zod@4.6.7)
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+
   packages/models:
     dependencies:
       '@ai-sdk/anthropic':
@@ -89,6 +101,9 @@ importers:
         specifier: ^3.0.77
         version: 3.0.77(zod@4.6.7)
     devDependencies:
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
       ai:
         specifier: ^7.0.150
         version: 7.0.150(zod@4.6.7)
@@ -110,6 +125,9 @@ importers:
       '@modelctx-ai/ctx-exec':
         specifier: workspace:^
         version: link:../exec
+      '@modelctx-ai/ctx-memory':
+        specifier: workspace:^
+        version: link:../memory
       '@modelctx-ai/ctx-protocol':
         specifier: workspace:^
         version: link:../protocol

@@ -1,0 +1,50 @@
+{
+  "name": "@modelctx-ai/ctx-memory",
+  "version": "0.3.0",
+  "description": "ctx 记忆的参考实现：createMemory 的门控、召回、巩固、遗忘，内存 MemoryStore，启发式决策模型，以及用 LanguageModel 装成的决策、提取模型。",
+  "keywords": [
+    "ai",
+    "llm",
+    "agent",
+    "memory",
+    "context"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/memory"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "vp pack"
+  },
+  "peerDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^",
+    "ai": "^7.0.150"
+  },
+  "devDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^",
+    "ai": "^7.0.150",
+    "zod": "^4.6.7"
+  }
+}

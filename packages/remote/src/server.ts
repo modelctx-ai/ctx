@@ -17,7 +17,11 @@ import {
   type Harness,
   type ListOptions,
   type Logger,
+  type MemoryStore,
   type NewEntry,
+  type NewMemoryFact,
+  type NewNote,
+  type NewProcedure,
   type Orchestrator,
   type RunEvent,
   type RunRequest,
@@ -25,6 +29,7 @@ import {
   type RunStatus,
   type SessionsOptions,
   type SessionStore,
+  type SourceRef,
   type ToolCall,
 } from '@modelctx-ai/ctx-protocol';
 
@@ -39,6 +44,8 @@ export interface RemoteHandlerOptions {
   readonly harness?: Harness;
   /** 挂在 `/orchestrator` 下。 */
   readonly orchestrator?: Orchestrator;
+  /** 挂在 `/memory` 下：`/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core`。 */
+  readonly memory?: MemoryStore;
   /** 要求调用方带 `Authorization: Bearer <accessToken>`。 */
   readonly accessToken?: string;
   /**
@@ -94,6 +101,24 @@ function fail(status: number, message: string, type?: string): never {
 function conflictFailure(message: string): Error {
   const failure: HttpFailure = { status: 409, info: { message, type: 'conflict', retryable: true } };
   return Object.assign(new Error(message), { failure });
+}
+
+/** 协议错误的 `type` → 状态码。 */
+const CTX_ERROR_STATUS: Readonly<Record<string, number>> = { invalid_request: 400, not_found: 404, conflict: 409 };
+
+/**
+ * 记忆存储抛的 `CtxError`（只看 `type`，和 `isConflict` 一样）：`invalid_request` 400、`not_found` 404、`conflict` 409，
+ * 正文的 `type` 原样保留，客户端据此转回 `CtxError`。别的错误不管。
+ */
+function ctxFailure(error: unknown): Error | undefined {
+  const type = (error as { type?: unknown } | undefined)?.type;
+  if (!(error instanceof Error) || typeof type !== 'string') return undefined;
+  const status = CTX_ERROR_STATUS[type];
+  if (status === undefined) return undefined;
+  const retryable = (error as { retryable?: unknown }).retryable;
+  const info: ErrorInfo = { message: error.message, type, ...(typeof retryable === 'boolean' ? { retryable } : {}) };
+  const failure: HttpFailure = { status, info };
+  return Object.assign(new Error(error.message), { failure });
 }
 
 function failureOf(error: unknown): HttpFailure | undefined {
@@ -300,6 +325,77 @@ function executorTable(executors: RemoteHandlerOptions['executors']): Map<string
   return new Map(Object.entries(executors));
 }
 
+function notFoundPath(url: URL): never {
+  return fail(404, `not found: ${url.pathname}`);
+}
+
+/** 记忆路由的输入不对：400，`type: invalid_request`，客户端转回协议的 `CtxError`。 */
+function invalid(message: string): never {
+  return fail(400, message, 'invalid_request');
+}
+
+function bodyObject(body: unknown, shape: string): Record<string, unknown> {
+  if (!isObject(body)) invalid(`request body must be ${shape}`);
+  return body;
+}
+
+function numberField(body: Record<string, unknown>, key: string): number {
+  const value = body[key];
+  if (typeof value !== 'number' || !Number.isFinite(value)) invalid(`\`${key}\` must be a number`);
+  return value;
+}
+
+function stringField(body: Record<string, unknown>, key: string): string {
+  const value = body[key];
+  if (typeof value !== 'string') invalid(`\`${key}\` must be a string`);
+  return value;
+}
+
+function idsField(body: Record<string, unknown>): string[] {
+  const ids = body['ids'];
+  if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string')) invalid('`ids` must be a string array');
+  return ids;
+}
+
+/** 对象数组；里面的字段由存储校验。 */
+function objectsField<T>(body: Record<string, unknown>, key: string): T[] {
+  const items = body[key];
+  if (!Array.isArray(items) || !items.every(isObject)) invalid(`\`${key}\` must be an array of objects`);
+  return items as T[];
+}
+
+/** 一个对象，带证据数组 `refs`；其余字段由存储校验。 */
+function itemField(body: Record<string, unknown>, key: string, refs: string): Record<string, unknown> {
+  const item = body[key];
+  if (!isObject(item)) invalid(`\`${key}\` must be an object`);
+  objectsField(item, refs);
+  return item;
+}
+
+function textParam(query: URLSearchParams, key: string): string | undefined {
+  return query.get(key) ?? undefined;
+}
+
+function numberParam(query: URLSearchParams, key: string): number | undefined {
+  const raw = query.get(key);
+  if (raw === null) return undefined;
+  const value = Number(raw);
+  if (raw === '' || Number.isNaN(value)) invalid(`${key} must be a number`);
+  return value;
+}
+
+function booleanParam(query: URLSearchParams, key: string): boolean | undefined {
+  const raw = query.get(key);
+  if (raw === null) return undefined;
+  if (raw !== 'true' && raw !== 'false') invalid(`${key} must be true or false`);
+  return raw === 'true';
+}
+
+/** 去掉值是 `undefined` 的键：查询参数没给就不出现在传给存储的选项里。 */
+function defined<T extends object>(value: T): T {
+  return Object.fromEntries(Object.entries(value).filter((pair) => pair[1] !== undefined)) as T;
+}
+
 const TERMINAL: readonly RunStatus[] = ['completed', 'failed', 'cancelled'];
 /** 一次长轮询最多挂多久。 */
 const MAX_WAIT_MS = 30_000;
@@ -318,7 +414,7 @@ interface SubmittedRun {
  * 可以挂到已有 HTTP 服务上的处理函数。给了哪些组件就挂哪些路径，其余 404。路径见包说明和 docs/protocol.md「线上形态」。
  */
 export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandler {
-  const { store, harness, orchestrator } = options;
+  const { store, harness, orchestrator, memory } = options;
   const executors = executorTable(options.executors);
   const basePath = normalizePath(options.basePath ?? '');
   const limit = options.maxBodyBytes ?? 4 * 1024 * 1024;
@@ -626,6 +722,193 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     });
   }
 
+  // ---- 记忆 ----
+
+  async function memoryRoutes(method: string, rest: string[], url: URL, req: IncomingMessage, res: ServerResponse) {
+    const memoryStore = need(memory, 'a memory store');
+    const [collection, ...tail] = rest;
+    const query = url.searchParams;
+    const body = async (shape: string): Promise<Record<string, unknown>> =>
+      bodyObject(await readBody(req, limit), shape);
+    const only = (expected: string, route: string): void => {
+      if (method !== expected) fail(405, `use ${expected} ${route}`);
+    };
+    try {
+      switch (collection) {
+        case 'notes': {
+          const [action, extra] = tail;
+          if (extra !== undefined) notFoundPath(url);
+          if (action === undefined) {
+            if (method === 'GET') {
+              const noteQuery = defined({
+                session: textParam(query, 'session'),
+                pending: booleanParam(query, 'pending'),
+                limit: numberParam(query, 'limit'),
+              });
+              sendJson(res, 200, { notes: await memoryStore.notes.list(noteQuery) });
+              return;
+            }
+            if (method !== 'POST') fail(405, 'use GET or POST /memory/notes');
+            const notes = objectsField<NewNote>(await body('{ "notes": NewNote[] }'), 'notes');
+            sendJson(res, 200, { notes: await memoryStore.notes.add(notes) });
+            return;
+          }
+          if (action === 'settle') {
+            only('POST', '/memory/notes/settle');
+            const input = await body('{ "ids": string[], "at": number }');
+            sendJson(res, 200, { settled: await memoryStore.notes.settle(idsField(input), numberField(input, 'at')) });
+            return;
+          }
+          if (action === 'head') {
+            only('GET', '/memory/notes/head');
+            const session = textParam(query, 'session');
+            if (session === undefined) invalid('session is required');
+            sendJson(res, 200, { head: await memoryStore.notes.head(session) });
+            return;
+          }
+          notFoundPath(url);
+        }
+        case 'facts': {
+          const [first, second, extra] = tail;
+          if (extra !== undefined) notFoundPath(url);
+          if (first === undefined) {
+            if (method === 'GET') {
+              const factQuery = defined({
+                subject: textParam(query, 'subject'),
+                topic: textParam(query, 'topic'),
+                open: booleanParam(query, 'open'),
+                after: textParam(query, 'after'),
+                limit: numberParam(query, 'limit'),
+              });
+              sendJson(res, 200, { facts: await memoryStore.facts.list(factQuery) });
+              return;
+            }
+            if (method !== 'POST') fail(405, 'use GET or POST /memory/facts');
+            const fact = itemField(await body('{ "fact": NewMemoryFact }'), 'fact', 'sources');
+            sendJson(res, 200, { fact: await memoryStore.facts.add(fact as unknown as NewMemoryFact) });
+            return;
+          }
+          if (second === undefined) {
+            switch (first) {
+              case 'search': {
+                only('POST', '/memory/facts/search');
+                const input = await body('a SearchQuery { "text", "topic"?, "k"?, "open"? }');
+                const open = input['open'];
+                if (open !== undefined && typeof open !== 'boolean') invalid('`open` must be a boolean');
+                const search = defined({
+                  text: stringField(input, 'text'),
+                  topic: input['topic'] === undefined ? undefined : stringField(input, 'topic'),
+                  k: input['k'] === undefined ? undefined : numberField(input, 'k'),
+                  open,
+                });
+                sendJson(res, 200, { hits: await memoryStore.facts.search(search) });
+                return;
+              }
+              case 'touch': {
+                only('POST', '/memory/facts/touch');
+                const input = await body('{ "ids": string[], "at": number }');
+                await memoryStore.facts.touch(idsField(input), numberField(input, 'at'));
+                sendJson(res, 200, {});
+                return;
+              }
+              case 'archive': {
+                only('POST', '/memory/facts/archive');
+                const input = await body('{ "ids": string[], "at": number }');
+                sendJson(res, 200, {
+                  archived: await memoryStore.facts.archive(idsField(input), numberField(input, 'at')),
+                });
+                return;
+              }
+              case 'forget': {
+                only('POST', '/memory/facts/forget');
+                const input = await body('{ "ids": string[] }');
+                sendJson(res, 200, { forgotten: await memoryStore.facts.forget(idsField(input)) });
+                return;
+              }
+              default:
+                notFoundPath(url);
+            }
+          }
+          const id = first;
+          if (second === 'close') {
+            only('POST', '/memory/facts/:id/close');
+            const input = await body('{ "at": number, "supersededBy"?: string }');
+            const at = numberField(input, 'at');
+            const supersededBy = input['supersededBy'] === undefined ? undefined : stringField(input, 'supersededBy');
+            await memoryStore.facts.close(id, at, supersededBy === undefined ? undefined : { supersededBy });
+            sendJson(res, 200, {});
+            return;
+          }
+          if (second === 'cite') {
+            only('POST', '/memory/facts/:id/cite');
+            const sources = objectsField<SourceRef>(await body('{ "sources": SourceRef[] }'), 'sources');
+            sendJson(res, 200, { fact: await memoryStore.facts.cite(id, sources) });
+            return;
+          }
+          notFoundPath(url);
+        }
+        case 'procedures': {
+          const [id, action, extra] = tail;
+          if (extra !== undefined) notFoundPath(url);
+          if (id === undefined) {
+            if (method === 'GET') {
+              const procedureQuery = defined({
+                topic: textParam(query, 'topic'),
+                active: booleanParam(query, 'active'),
+              });
+              sendJson(res, 200, { procedures: await memoryStore.procedures.list(procedureQuery) });
+              return;
+            }
+            if (method !== 'POST') fail(405, 'use GET or POST /memory/procedures');
+            const procedure = itemField(await body('{ "procedure": NewProcedure }'), 'procedure', 'evidence');
+            sendJson(res, 200, { procedure: await memoryStore.procedures.add(procedure as unknown as NewProcedure) });
+            return;
+          }
+          if (action === 'confirm') {
+            only('POST', '/memory/procedures/:id/confirm');
+            const evidence = objectsField<SourceRef>(await body('{ "evidence": SourceRef[] }'), 'evidence');
+            sendJson(res, 200, { procedure: await memoryStore.procedures.confirm(id, evidence) });
+            return;
+          }
+          if (action === 'retire') {
+            only('POST', '/memory/procedures/:id/retire');
+            await memoryStore.procedures.retire(id, numberField(await body('{ "at": number }'), 'at'));
+            sendJson(res, 200, {});
+            return;
+          }
+          notFoundPath(url);
+        }
+        case 'core': {
+          const [action, extra] = tail;
+          if (extra !== undefined) notFoundPath(url);
+          if (action === undefined) {
+            if (method === 'GET') {
+              sendJson(res, 200, { core: await memoryStore.core.get() });
+              return;
+            }
+            if (method !== 'PUT') fail(405, 'use GET or PUT /memory/core');
+            const input = await body('{ "text": string, "at": number }');
+            await memoryStore.core.set(stringField(input, 'text'), numberField(input, 'at'));
+            sendJson(res, 200, {});
+            return;
+          }
+          if (action === 'history') {
+            only('GET', '/memory/core/history');
+            sendJson(res, 200, {
+              versions: await memoryStore.core.history(defined({ last: numberParam(query, 'last') })),
+            });
+            return;
+          }
+          notFoundPath(url);
+        }
+        default:
+          notFoundPath(url);
+      }
+    } catch (error) {
+      throw ctxFailure(error) ?? error;
+    }
+  }
+
   return async (req, res) => {
     if (hosts && !hosts.has(req.headers.host?.toLowerCase() ?? '')) {
       sendError(res, 403, { message: 'host not allowed', type: 'permission_error' });
@@ -674,6 +957,9 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
           break;
         case 'orchestrator':
           await orchestratorRoutes(method, rest, url, req, res);
+          break;
+        case 'memory':
+          await memoryRoutes(method, rest, url, req, res);
           break;
         default:
           fail(404, `not found: ${url.pathname}`);
