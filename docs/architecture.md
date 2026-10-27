@@ -1,6 +1,6 @@
 # 架构：进程内参考实现
 
-ctx 分三层：协议（`@modelctx-ai/ctx-protocol`，只有接口）、实现（`@modelctx-ai/ctx` 和 `ctx-*`）、实践（yoyo）。组件和协议的说明见[概念](concepts.md)和[协议层](protocol.md)。本文写的是实现层里进程内的那一份：`@modelctx-ai/ctx` 的会话存储、上下文（投影、来源、压缩）、工具注册表、函数执行环境、harness、编排器和组合门面 `createContext()`，以及 sqlite、models、mcp、gateway 四个适配包。
+ctx 分三层：协议（`@modelctx-ai/ctx-protocol`，只有接口）、实现（`@modelctx-ai/ctx` 和 `ctx-*`）、实践（yoyo）。组件和协议的说明见[概念](concepts.md)和[协议层](protocol.md)。本文写的是实现层里进程内的那一份：`@modelctx-ai/ctx` 的会话存储、上下文（投影、来源、压缩）、工具注册表、函数执行环境、harness、编排器和组合门面 `createContext()`，以及 sqlite、models、mcp、gateway 四个适配包。记忆（`ctx-memory`，及 sqlite、models、remote 里的记忆部分）不在本文，见[记忆](memory.md)。
 
 ```mermaid
 flowchart TB
@@ -9,6 +9,7 @@ flowchart TB
     p2["ContextBuilder"]
     p3["ToolRegistry · Executor"]
     p4["Harness · Orchestrator"]
+    p5["MemoryStore · DecisionModel · ExtractionModel"]
   end
   subgraph impl["实现"]
     core["@modelctx-ai/ctx<br/>内存存储、投影、来源、注册表、函数执行器、AI SDK harness、进程内编排器、createContext()"]
@@ -18,6 +19,7 @@ flowchart TB
     remote["ctx-remote"]
     gateway["ctx-gateway"]
     models["ctx-models"]
+    memorypkg["ctx-memory"]
   end
   subgraph practice["实践"]
     yoyo["modelctx-ai/yoyo"]
@@ -631,13 +633,13 @@ export const projection: ProjectionOptions = {
 
 ## 设计约束
 
-| 约束                        | 落在哪                                                                                                                                                                                                                                                                                                                                      |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 核心包只依赖 `ai`           | `@modelctx-ai/ctx` 的 dependencies 只有 `ai`（`zod` 是 `ai` 要的 peer）。主入口不用 `node:` 模块，只用 `crypto.randomUUID`、`setTimeout`、`AbortSignal` 这类标准全局对象                                                                                                                                                                    |
-| Node 专属的东西放在适配包   | `node:sqlite` 在 ctx-sqlite；`node:http`、`node:crypto`、`node:stream` 在 ctx-gateway；stdio 子进程在 ctx-mcp；`node:assert` 在 `@modelctx-ai/ctx/testing` 子路径（测试框架由调用方传入）                                                                                                                                                   |
-| 实现包只依赖协议包          | ctx-sqlite、ctx-mcp、ctx-gateway 的 `peerDependencies` 是 `@modelctx-ai/ctx-protocol`，测试要用内存存储时才把 `@modelctx-ai/ctx` 放进 devDependencies；核心包把协议包当 peer，并原样转出它的全部导出。ctx-models 不依赖协议包，把 `ai` 当 peer。应用里只有一份协议包、一份 `ai`，`SessionStore`、`Executor`、`LanguageModel` 都是同一个类型 |
-| AI SDK 的工具函数从核心包拿 | `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`stepCountIs` 和 `ModelMessage`、`LanguageModel`、`ToolSet` 等类型从 `@modelctx-ai/ctx` 转出，应用不用单独依赖 `ai`                                                                                                                                                                       |
-| 只追加                      | 条目写入后不改；压缩是追加摘要；只有 `clear(session)` 删除                                                                                                                                                                                                                                                                                  |
-| 存储和渲染分开              | 存储只存原始条目，怎么交给模型由投影决定；改规则不用迁移数据，对旧条目同样生效                                                                                                                                                                                                                                                              |
-| 局部失败不打断调用          | 来源出错或超时跳过；MCP 服务器连不上或超时只记状态；工具出错变成给模型看的错误；模型出错 harness 照常返回；流式回复写日志失败只告警（`recorded` reject）                                                                                                                                                                                    |
-| 函数加接口                  | 公开 API 是函数（`createX()` / `startX()` 工厂和 `project()` 这类纯函数）和接口，没有要继承或 `new` 的类                                                                                                                                                                                                                                    |
+| 约束                        | 落在哪                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 核心包只依赖 `ai`           | `@modelctx-ai/ctx` 的 dependencies 只有 `ai`（`zod` 是 `ai` 要的 peer）。主入口不用 `node:` 模块，只用 `crypto.randomUUID`、`setTimeout`、`AbortSignal` 这类标准全局对象                                                                                                                                                                                                                                                              |
+| Node 专属的东西放在适配包   | `node:sqlite` 在 ctx-sqlite；`node:http`、`node:crypto`、`node:stream` 在 ctx-gateway；stdio 子进程在 ctx-mcp；`node:assert` 在 `@modelctx-ai/ctx/testing` 子路径（测试框架由调用方传入）                                                                                                                                                                                                                                             |
+| 实现包只依赖协议包          | ctx-sqlite、ctx-mcp、ctx-gateway、ctx-exec、ctx-remote 的 `peerDependencies` 是 `@modelctx-ai/ctx-protocol`，测试要用内存存储时才把 `@modelctx-ai/ctx` 放进 devDependencies；核心包把协议包当 peer，并原样转出它的全部导出。ctx-models、ctx-memory 把协议包和 `ai` 都当 peer（ctx-models 返回协议的 `DecisionModel`、`ExtractionModel`）。应用里只有一份协议包、一份 `ai`，`SessionStore`、`Executor`、`LanguageModel` 都是同一个类型 |
+| AI SDK 的工具函数从核心包拿 | `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`stepCountIs` 和 `ModelMessage`、`LanguageModel`、`ToolSet` 等类型从 `@modelctx-ai/ctx` 转出，应用不用单独依赖 `ai`                                                                                                                                                                                                                                                                 |
+| 只追加                      | 条目写入后不改；压缩是追加摘要；只有 `clear(session)` 删除                                                                                                                                                                                                                                                                                                                                                                            |
+| 存储和渲染分开              | 存储只存原始条目，怎么交给模型由投影决定；改规则不用迁移数据，对旧条目同样生效                                                                                                                                                                                                                                                                                                                                                        |
+| 局部失败不打断调用          | 来源出错或超时跳过；MCP 服务器连不上或超时只记状态；工具出错变成给模型看的错误；模型出错 harness 照常返回；流式回复写日志失败只告警（`recorded` reject）                                                                                                                                                                                                                                                                              |
+| 函数加接口                  | 公开 API 是函数（`createX()` / `startX()` 工厂和 `project()` 这类纯函数）和接口，没有要继承或 `new` 的类                                                                                                                                                                                                                                                                                                                              |

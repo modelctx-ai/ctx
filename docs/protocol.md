@@ -1,6 +1,6 @@
 # 协议层
 
-`@modelctx-ai/ctx-protocol` 定义六个协议、随它们走的 JSON 形状、只依赖这些形状的纯函数，以及每个协议的契约测试。它不含实现。模型用 AI SDK 的 `LanguageModel`，不另定义；消息是 ctx 自己的 JSON 格式（见[消息格式和版本](#消息格式和版本)），协议包不依赖 AI SDK 的消息类型。
+`@modelctx-ai/ctx-protocol` 定义九个协议（七个组件的六个，加记忆的 `MemoryStore`、`DecisionModel`、`ExtractionModel`）、随它们走的 JSON 形状、只依赖这些形状的纯函数，以及每个协议的契约测试。它不含实现。模型用 AI SDK 的 `LanguageModel`，不另定义；消息是 ctx 自己的 JSON 格式（见[消息格式和版本](#消息格式和版本)），协议包不依赖 AI SDK 的消息类型。
 
 本文是协议的说明；类型以包里的 `.d.ts` 为准，下面的签名省略了 `readonly` 和注释。包的用法和契约测试一览见 [`packages/protocol`](../packages/protocol/README.md)。
 
@@ -430,33 +430,92 @@ interface Orchestrator {
 - yoyo 的 `createYoyoOrchestrator` 是一个应用级的编排器，实现这个协议：定时、让路、收件箱。碎碎念和回复是同一个 harness 跑的两份 `AgentSpec`，导演只剩舞台动作，常驻循环只管进程。
 - 远端编排器（`ctx-remote`）：路径放在 `/orchestrator` 下，和 harness 的 `/runs` 分开：`POST /orchestrator/runs`、`GET /orchestrator/runs/:id`（`?wait=` 长轮询，结束后带 `result`，客户端的 `done` 靠它）、`DELETE /orchestrator/runs/:id`、`POST /orchestrator/recover`、`GET /orchestrator/events`（NDJSON）。
 
+## 记忆 `MemoryStore`、`DecisionModel`、`ExtractionModel`
+
+第八个组件。设计、JSON 形状的全文、参考实现的五个操作见[记忆](memory.md)和 [ADR 0006](adr/0006-memory.md)；这里只列方法。
+
+```ts
+interface MemoryStore {
+  notes: {
+    add(notes: readonly NewNote[]): Promise<Note[]>; // NewNote 可以带 settledAt
+    list(query?: NoteQuery): Promise<Note[]>; // 按写入顺序
+    settle(ids: readonly string[], at: number): Promise<number>;
+    head(session: string): Promise<number>; // 这个会话所有笔记的最大 upTo，没有是 0
+  };
+  facts: {
+    add(fact: NewMemoryFact): Promise<MemoryFact>; // sources 必填
+    close(id: string, at: number, options?: CloseFactOptions): Promise<void>; // { supersededBy? }
+    cite(id: string, sources: readonly SourceRef[]): Promise<MemoryFact>;
+    touch(ids: readonly string[], at: number): Promise<void>;
+    archive(ids: readonly string[], at: number): Promise<number>;
+    forget(ids: readonly string[]): Promise<number>;
+    list(query?: FactQuery): Promise<MemoryFact[]>; // 按 id 码点序，after、limit 翻页
+    search(query: SearchQuery): Promise<FactHit[]>; // { fact, score }，score 0..1 从高到低
+  };
+  procedures: {
+    add(procedure: NewProcedure): Promise<Procedure>; // confirmations 从 1 起
+    confirm(id: string, evidence: readonly SourceRef[]): Promise<Procedure>; // 相同的证据不计数
+    retire(id: string, at: number): Promise<void>;
+    list(query?: ProcedureQuery): Promise<Procedure[]>;
+  };
+  core: {
+    get(): Promise<CoreVersion | null>;
+    set(text: string, at: number): Promise<void>; // 追加版本
+    history(options?: CoreHistoryOptions): Promise<CoreVersion[]>; // { last? }
+  };
+}
+
+interface DecisionModel {
+  name: string;
+  decide(request: DecisionRequest): Promise<Record<string, DecisionAnswer>>; // 问题 noul / choice / score，一次最多 MAX_DECISION_QUESTIONS（64）个
+}
+interface ExtractionModel {
+  name: string;
+  extract(request: ExtractionRequest): Promise<Record<string, ExtractionAnswer>>; // { value, pNull, confidence }
+}
+```
+
+- 时刻都由调用方给，存储不看钟。参数不合法（没有证据、`from > upTo`）是 `invalid_request`，认不得的 `id` 是 `not_found`；批量方法跳过认不得的 `id`。
+- 事实不 UPDATE：变了就 `add` 新的、`close` 旧的，`supersededBy` 连起来；`archive` 只退出 `open` 的查询，`forget` 才删。
+- 记忆只读会话日志，存储从不写它。
+- 门面 `Memory`（`gate`、`recall`、`consolidate`、`source`、`tools`、`execute`）也定义在协议包里，它本身是一个 `Executor`；参考实现是 `@modelctx-ai/ctx-memory` 的 `createMemory`。
+- 纯函数：`activation`、`rankFacts`、`renderCore`、`sourceRef`，存储实现用的 `checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`、`isOpenFact`、`filterFacts`；缺省参数 `ACTIVATION_DEFAULTS`。
+- 决策、提取模型的输出总是合法的，但未必正确，调用方用 `confidence`、`pNull` 决定自动化到哪一步。跨边界时用名字字符串，和 `ModelRef` 一样。
+- 远端记忆存储（`ctx-remote`）：服务端挂 `memory`，路径在 `/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core` 下；客户端是 `createRemoteMemoryStore`。决策、提取模型没有线上形态，按名字在各自的进程里造。
+
 ## 契约测试
 
 `@modelctx-ai/ctx-protocol/testing`，用法见[包说明](../packages/protocol/README.md#实现一个协议)。
 
-| 契约测试                       | 工厂                                             | 覆盖                                                                                                                                                                                                                                                           |
-| ------------------------------ | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeSessionStoreContract` | `({ now }) => SessionStore`                      | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、`sessions` 的升序和翻页、`watch?` 的读已有、读新写入、中止 |
-| `describeExecutorContract`     | `() => { executor, echo }`                       | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                        |
-| `describeToolRegistryContract` | `() => ToolRegistry`                             | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                |
-| `describeHarnessContract`      | `({ script }) => { harness, store, agent }`      | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                    |
-| `describeOrchestratorContract` | `({ script }) => { orchestrator, store, agent }` | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                               |
+| 契约测试                          | 工厂                                                                    | 覆盖                                                                                                                                                                                                                                                           |
+| --------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、`sessions` 的升序和翻页、`watch?` 的读已有、读新写入、中止 |
+| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                        |
+| `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                |
+| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                    |
+| `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                               |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                               |
+| `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                               |
+| `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                   |
+| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                  |
 
-harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里。
+harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。记忆的契约用协议包 `/testing` 里的剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel`：`describeMemoryContract` 自己造好它们和一个内存会话日志交给工厂。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里。
 
 ## 托管矩阵
 
 每个组件三种形态。「进程内」是 `@modelctx-ai/ctx` 和各适配包；「本机另一进程 / 远端」靠 `ctx-remote` 的 HTTP 服务端和客户端，或者别人按协议实现的服务。
 
-| 组件     | 进程内                          | 另一进程 / 远端                                                                              | 第三方托管                         |
-| -------- | ------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------- |
-| 会话     | 内存、SQLite                    | `ctx-remote`：服务端挂 `store` / `createRemoteSessionStore`（含 `watch`）                    | 实现 `SessionStore` 的任何存储服务 |
-| 上下文   | 投影 + 来源                     | 跟着 harness 走；也可单独成服务                                                              | —                                  |
-| 工具     | 注册表                          | 跟着 harness 走；远端执行环境的 `tools()` 报定义，加进本地注册表                             | —                                  |
-| 执行环境 | 函数、子进程（`ctx-exec`）、MCP | `ctx-remote`：服务端挂 `executors` / `createRemoteExecutor`；worker 拉取模式之后加           | 容器平台、Managed Agents 的沙箱    |
-| Harness  | AI SDK 循环                     | `ctx-remote`：服务端挂 `harness` / `createRemoteHarness`（含 `stream`）                      | Managed Agents（之后）             |
-| 编排     | 进程内队列                      | `ctx-remote`：服务端挂 `orchestrator` / `createRemoteOrchestrator`（含 `recover`、`events`） | 任何任务队列                       |
-| 模型     | AI SDK                          | 名字 → 远端 harness 自己造                                                                   | 各服务商                           |
+| 组件           | 进程内                                                            | 另一进程 / 远端                                                                              | 第三方托管                                                           |
+| -------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 会话           | 内存、SQLite                                                      | `ctx-remote`：服务端挂 `store` / `createRemoteSessionStore`（含 `watch`）                    | 实现 `SessionStore` 的任何存储服务                                   |
+| 上下文         | 投影 + 来源                                                       | 跟着 harness 走；也可单独成服务                                                              | —                                                                    |
+| 工具           | 注册表                                                            | 跟着 harness 走；远端执行环境的 `tools()` 报定义，加进本地注册表                             | —                                                                    |
+| 执行环境       | 函数、子进程（`ctx-exec`）、MCP                                   | `ctx-remote`：服务端挂 `executors` / `createRemoteExecutor`；worker 拉取模式之后加           | 容器平台、Managed Agents 的沙箱                                      |
+| Harness        | AI SDK 循环                                                       | `ctx-remote`：服务端挂 `harness` / `createRemoteHarness`（含 `stream`）                      | Managed Agents（之后）                                               |
+| 编排           | 进程内队列                                                        | `ctx-remote`：服务端挂 `orchestrator` / `createRemoteOrchestrator`（含 `recover`、`events`） | 任何任务队列                                                         |
+| 模型           | AI SDK                                                            | 名字 → 远端 harness 自己造                                                                   | 各服务商                                                             |
+| 记忆           | 内存（`ctx-memory`）、SQLite（`ctx-sqlite`）；门面 `createMemory` | `ctx-remote`：服务端挂 `memory` / `createRemoteMemoryStore`                                  | 实现 `MemoryStore` 的记忆服务                                        |
+| 决策、提取模型 | 启发式、`LanguageModel` 装成的（`ctx-memory`）                    | 名字 → 各进程自己造                                                                          | `ctx-models`：Cloudflare（Clef、Clairic）、TypeSafe（Jev，只做决策） |
 
 服务端是 `@modelctx-ai/ctx-remote/server` 的 `startRemote(options)` 或 `createRemoteHandler(options)`：给了哪些组件就挂哪些路径，一个服务可以同时挂几样。
 
@@ -484,6 +543,10 @@ harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptSte
 |          | `cancel`          | `DELETE /orchestrator/runs/:runId`                          | → `{ cancelled }`                                                                          |
 |          | `recover`         | `POST /orchestrator/recover`                                | → `{ recovered }`                                                                          |
 |          | `events`          | `GET /orchestrator/events`                                  | → NDJSON `OrchestratorEvent`                                                               |
+| 记忆     | `notes.*`         | `/memory/notes` 下                                          | 每个方法一条路径，逐条见 [`packages/remote`](../packages/remote/README.md)                 |
+|          | `facts.*`         | `/memory/facts` 下                                          | 同上                                                                                       |
+|          | `procedures.*`    | `/memory/procedures` 下                                     | 同上                                                                                       |
+|          | `core.*`          | `/memory/core` 下                                           | 同上                                                                                       |
 
 编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 

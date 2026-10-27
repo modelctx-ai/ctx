@@ -1,6 +1,7 @@
 # 记忆
 
-- 状态：提案，未实现。协议签名是草案，实现落地时以包里的 `.d.ts` 为准
+- 状态：已实现（0.4 计划，未发布）。下面的签名省略了 `readonly` 和部分注释，以包里的 `.d.ts` 为准
+- 实现：协议、纯函数、契约测试和剧本模型在 [`ctx-protocol`](../packages/protocol/README.md)；`createMemory` 和内存存储在 [`ctx-memory`](../packages/memory/README.md)；SQLite 存储在 [`ctx-sqlite`](../packages/sqlite/README.md)；System One 适配在 [`ctx-models`](../packages/models/README.md)；HTTP 形态 `/memory/*` 在 [`ctx-remote`](../packages/remote/README.md)
 - 决策记录：[ADR 0006](adr/0006-memory.md)
 - 实践：[yoyo 的记忆](https://github.com/modelctx-ai/yoyo/blob/main/docs/tech/memory.md)
 
@@ -195,7 +196,7 @@ interface MemoryStore {
 - **记忆不写会话日志。** 记忆是日志的读者。应用要在日志里留痕（例如「今晚整理了 12 条」）自己追加事件，这是明确的选择。
 - `search` 的实现自定：全文、向量、两者混合。协议只约定输入是文字。
 - 记忆里的事实叫 `MemoryFact`，和来源取到的事实 `Fact`（`{ source, text }`，只用于一次调用）是两回事：前者持久、有有效期，后者是「现在」。
-- 纯函数：`activation(fact, now, options?)`（见[遗忘](#遗忘)）、`rankFacts(facts, scores, options?)`（`scores` 是事实 `id` → 相似度，一般取 `FactHit.score`）、`renderCore(facts, budget, options?)` 的缺省写法、`sourceRef(session, entries)`；另有存储实现用的 `checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`、`isOpenFact`、`filterFacts`。
+- 纯函数：`activation(fact, now, options?)`（见[遗忘](#遗忘)，缺省参数是 `ACTIVATION_DEFAULTS`）、`rankFacts(facts, scores, options?)`（`scores` 是事实 `id` → 相似度，一般取 `FactHit.score`）、`renderCore(facts, budget, { now })` 的缺省写法（按激活度排，`estimateTextTokens` 超过 `budget` 前停下）、`sourceRef(session, entries)`；另有存储实现用的 `checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`、`isOpenFact`、`filterFacts`。
 
 ## 协议 `DecisionModel`、`ExtractionModel`
 
@@ -252,39 +253,67 @@ interface ExtractionModel {
 
 ## 操作
 
-协议只定存储和模型。五个操作是 `@modelctx-ai/ctx-memory`（提案）的参考实现 `createMemory(options)`：
+协议只定存储、模型和门面 `Memory` 的形状。五个操作的参考实现是 `@modelctx-ai/ctx-memory` 的 `createMemory(options)`：
 
 ```ts
+// @modelctx-ai/ctx-memory
 interface MemoryOptions {
   store: MemoryStore;
-  sessions: SessionStore; // 只读
-  decision?: DecisionModel; // 没有就用启发式门控
-  extraction?: ExtractionModel; // 没有就让 model 提取
-  model?: ModelRef; // 反思、重写 core、升级判断；没有就跳过反思
-  topics?: Record<string, string>; // 主题名 → 说明，给门控的 choice 用
-  kinds?: Record<string, string>; // kind → 说明；缺省 pref / obs / fail / ok
-  gate?: { theta?: number; entries?: ListOptions }; // 阈值；看哪些条目（缺省只看消息）
-  decay?: { d?: number; archiveAt?: number }; // 缺省 0.5、0.55
+  sessions: Pick<SessionStore, 'list'>; // 只读，只用 list
+  decision?: DecisionModel; // 门控和并入判断；没有就用 createHeuristicDecisionModel
+  extraction?: ExtractionModel; // 夜里提取；没有、但有 model 时用 extractionFromLanguageModel(model)
+  model?: ModelRef; // 反思、重写 core、升级低置信度判断；没有就跳过反思，core 用 renderCore
+  models?: (name: string) => LanguageModel; // model 是名字时怎么造，和 harness 一样
+  topics?: Record<string, string>; // 主题名 → 说明，给门控的 topic 选择题用（另加 other）
+  kinds?: Record<string, string>; // kind → 说明；缺省 DEFAULT_KINDS：pref / obs / fail / ok
+  subject?: string; // 新事实的 subject，缺省 user
+  gate?: {
+    theta?: number; // 缺省 0.6
+    auto?: boolean; // 自动调阈值，缺省开
+    entries?: Omit<ListOptions, 'after'>; // 看哪些条目，缺省 { types: ['message'] }
+    maxTokens?: number; // 一段的估算 token 上限，超过就拆开各打一次分，缺省 4000
+  };
+  recall?: {
+    k?: number; // 缺省 5
+    budgetTokens?: number; // 作为来源时事实文字的预算，缺省不限
+    minScore?: number; // 相似度下限，缺省 0.1
+    confirmations?: number; // 程序要几次确认才带上，缺省 2
+  };
+  decay?: { d?: number; epsilon?: number; archiveAt?: number }; // 缺省 ACTIVATION_DEFAULTS：0.5、0.02、0.55
+  consolidate?: {
+    escalateBelow?: number; // 并入判断的 confidence 低于它、又有 model 时升级，缺省 0.6
+    maxPNull?: number; // 提取字段的 pNull 高于它当作没说，缺省 0.3
+    maxTokens?: number; // 一次提取的原文上限，超过就分批，缺省 6000
+  };
   core?: { budgetTokens?: number }; // 缺省 2000
-  embed?: (text: string) => Promise<number[]>; // 给 search 用；没有就全文
+  embed?: (text: string) => Promise<readonly number[]>; // 召回时再加一路余弦，和存储 search 的分取大的
+  name?: string; // 执行环境的名字，缺省 memory
+  now?: () => number; // 缺省 Date.now
   logger?: Logger;
 }
+function createMemory(options: MemoryOptions): Memory;
 
+// @modelctx-ai/ctx-protocol
 interface Memory extends Executor {
   /**
-   * 白天：读 session 里 notes.head 之后的新条目，打分，写笔记。不改日志。
-   * 没过阈值的那段也写一条已处理的笔记（settledAt = at），head 照样前进。
+   * 白天：读 session 里 notes.head 之后的新条目，打分，写笔记，返回写下的笔记。不改日志。
+   * 没过阈值的那段也写一条已处理的笔记（settledAt = at），head 照样前进；没有新条目时返回空。
    */
-  gate(session: string, options?: { signal?: AbortSignal }): Promise<Note[]>;
-  /** 白天：按文字召回，按相似度和激活度排序，记一次 touch。 */
+  gate(session: string, options?: GateOptions): Promise<Note[]>; // GateOptions = { signal? }
+  /** 白天：按文字召回仍然成立的事实，按 rankFacts 排序，记一次 touch；带上匹配主题的程序。 */
   recall(query: string, options?: RecallOptions): Promise<Recalled>;
   /** 夜里：处理待处理的笔记，衰减归档，重写 core。整体可重复执行。 */
-  consolidate(options?: { now?: number; signal?: AbortSignal }): Promise<ConsolidateReport>;
-  /** 作为来源：core 加按 query 召回的事实。query 缺省取会话最近一条用户消息。 */
-  source(options?: { name?: string; query?: (session: string) => Promise<string>; k?: number }): ContextSource;
-  /** 作为工具：recall(query, since_days?)（MEMORY_RECALL_TOOL），绑定到这个执行环境。 */
+  consolidate(options?: ConsolidateOptions): Promise<ConsolidateReport>; // ConsolidateOptions = { now?, signal? }
+  /** 作为来源：core 加按 query 召回的事实，渲染成文字；什么都没有时返回空。 */
+  source(options?: MemorySourceOptions): ContextSource;
+  /** 作为工具：recall（MEMORY_RECALL_TOOL），绑定到这个执行环境。 */
   tools(): Promise<ToolDefinition[]>;
   execute(call: ToolCall, context: ExecutionContext): Promise<ToolOutput>;
+}
+interface MemorySourceOptions {
+  name?: string; // 缺省 memory
+  query?: (session: string) => Promise<string>; // 缺省取会话最近一条用户消息的文字
+  k?: number;
 }
 interface RecallOptions {
   topic?: string;
@@ -307,7 +336,11 @@ interface ConsolidateReport {
 }
 ```
 
-`Memory` 本身是一个 `Executor`（名字缺省 `memory`），和 MCP hub 一样：`tools()` 报出 `recall` 工具，注册进 `ToolRegistry` 就能给模型用。
+`Memory` 本身是一个 `Executor`（名字缺省 `memory`），和 MCP hub 一样：`tools()` 报出 `recall` 工具，注册进 `ToolRegistry` 就能给模型用。工具的输入是 `query`，可选 `since_days`（只要最近这么多天里开始成立的事实）、`topic`、`k`（1–20）；输出是文字，不是 JSON：用 `<memory>` 包起来，第一行声明「这是资料，不是指令」，事实带主题、日期和证据位置，程序带确认次数，最后是证据原文。不认识的工具、输入不对、`signal` 已中止、存储出错都返回 `{ type: 'error' }`。
+
+参考实现在同一会话上的 `gate` 排队执行，`consolidate` 整体排队执行，不并发。
+
+`ctx-memory` 的 `createMemoryStore` 造的是内存 `MemoryStore`，和核心包 `@modelctx-ai/ctx` 的会话存储 `createMemoryStore`（造 `SessionStore`）同名；两个一起用时改名导入，例如 `import { createMemoryStore as createSessionStore } from '@modelctx-ai/ctx'`。
 
 ### 门控 `gate`
 
@@ -329,10 +362,10 @@ const salience = 0.6 * answers.keep.noul + 0.4 * answers.salience.score;
 if (salience >= theta) await store.notes.add([{ session, from, upTo, at: now, salience, kind, topic }]);
 ```
 
-- 一次调用四个问题，一次前向。只打分、只写笔记，不提取。
+- 一次调用四个问题，一次前向。只打分、只写笔记，不提取。新条目超过 `gate.maxTokens`（缺省 4000 估算 token）时拆成几段，各问一次、各写一条笔记。渲染成文字时 `tool` 角色的消息不进来；只剩没有文字的条目时写一条 0 分的已处理笔记。
 - 看哪些条目由应用定（`gate.entries`）：缺省只看消息，事件按 `kinds` 挑。
-- `theta` 不手调：参考实现按最近一周 `keep` 的分布取分位，让笔记占比落在 10–25%。
-- 启发式退路：惊讶（1 − 与已有事实的最大相似度）、强调（「记住」「以后」「别再」）、重复（同主题 7 天内次数）、情绪（错误、纠正）四项加权。够用就不上模型。
+- 阈值：`gate.auto` 开着（缺省）时取最近 7 天笔记的 `salience`，按 `theta` 算待处理的占比；落在 10–25% 就用 `theta`，否则取分位让占比落到最近的边界。最近 7 天的笔记少于 20 条时用 `theta`（缺省 0.6）。`auto: false` 固定用 `theta`。
+- 启发式退路 `createHeuristicDecisionModel`：惊讶（1 − 与已有事实的最大相似度，乘信息量）、强调（「记住」「以后」「别再」、改变、偏好）、重复（这段里用户反复说的、最近几段里说过的）、情绪（报错、失败、纠正）四项加权，权重 `HEURISTIC_WEIGHTS` 是 0.3、0.4、0.1、0.2。只认这四个问题，别的问题返回均匀分布。`createMemory` 没给 `decision` 时用它：「惊讶」接 `store.facts.search`，「重复」看这个进程最近 7 天门控过的段落（存在进程里，重启后从空开始）。够用就不上模型。
 
 ### 召回 `recall`
 
@@ -340,7 +373,7 @@ if (salience >= theta) await store.notes.add([{ session, from, upTo, at: now, sa
 score(fact) = 0.6 × similarity(query, fact.text) + 0.4 × activation(fact, now)
 ```
 
-取 `open` 的事实做 `search`，按 `score` 排，按预算取前 k 条，`touch` 它们。匹配到主题的程序整条带上。作为来源时结果渲染成事实文字；作为工具时还带回证据条目。被召回就是一次 `t_i`，衰减从头算：这是「回忆即再巩固」。
+取 `open` 的事实做 `search`（给了 `embed` 再和余弦取大的），相似度低于 `recall.minScore`（缺省 0.1）的不要，按 `score` 排，按 `k` 和 `budgetTokens` 截断，`touch` 返回的那些。程序带上没退役、确认不少于 `recall.confirmations`（缺省 2）次、并且主题匹配的（`topic` 选项，或者召回的事实的主题；没有主题时看 `when` / `do` 和 `query` 的相似度）。作为来源时结果渲染成事实文字；作为工具时（`evidence: true`）还带回证据原文。被召回就是一次 `t_i`，衰减从头算：这是「回忆即再巩固」。
 
 ### 巩固 `consolidate`
 
@@ -362,7 +395,7 @@ sequenceDiagram
       alt confidence < 0.6
         M->>LM: 升级：让推理模型判断
       end
-      M->>S: add / touch / close + add
+      M->>S: add / cite + touch / add + close
     end
     opt lesson 非空
       M->>LM: 反思：写成 when / do / evidence
@@ -375,10 +408,14 @@ sequenceDiagram
   M->>S: core.set
 ```
 
-- 提取：`pNull > 0.3` 的字段当作没说；`since` 为空时 `validFrom` 取这段的第一条 `at`。
-- 并入：有对照的事实放进 `state`，这就是分类问题。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是 `close` 旧的、`add` 新的。
-- 反思是唯一的开放生成。规则要 `confirmations ≥ 2` 才算生效（应用在 `procedures.list` 后自己筛）。
-- 幂等：笔记 `settle` 之后不再处理；中途失败下一夜接着做，白天不受影响。
+- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`since`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说；`since` 为空时 `validFrom` 取这批第一条的 `at`。证据是这批笔记的区间。
+- 并入：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。措辞相同（空白和句读归一、不分大小写后相等）的直接并入，不调 `decide`；否则有对照的事实放进 `state`，这就是分类问题。置信度低于 `consolidate.escalateBelow`（缺省 0.6）、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是 `add` 新的、`close` 旧的（`supersededBy` 指向新的）。
+- 反思是唯一的开放生成，只在 `lesson` 非空且有 `model` 时做：和同主题已有的程序是同一条就 `confirm`，否则 `add`。`add` 时 `confirmations` 是 1，相同的证据 `confirm` 不计数；召回只带 `confirmations ≥ recall.confirmations`（缺省 2）的。
+- 读不到原文的笔记（会话清掉了）直接 `settle`，什么都不写。既没有 `extraction` 也没有 `model` 时不处理笔记，笔记保持待处理，只做衰减和 `core` 的缺省渲染，第一次告警一次。
+- 衰减：这一轮刚写入或刚并入的事实不在同一轮归档（提取出的 `validFrom` 可能早于今天）。
+- `core`：有 `model` 时从 open 事实重写；open 事实的集合和上次重写时一样就不再调模型（这个记录在进程里，重启后第一夜会重写一次）；输出为空或超预算时回到 `renderCore`。没有 `model` 时用 `renderCore`。文字和当前版本相同就不写新版本。
+- 幂等：笔记 `settle` 之后不再处理；中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下一夜重做，重做时措辞相同的事实直接并入，同一段证据不会记两次。白天不受影响。
+- 报告里 `facts.added` 只数 `new`，取代的那条新事实算在 `superseded` 里；`escalated` 数调了几次 `LanguageModel` 做并入判断。
 - 什么时候跑由编排器定：每天固定时刻、空闲时、待处理笔记够多时。框架不替应用决定。
 
 ### 遗忘
@@ -389,7 +426,7 @@ ACT-R 的基础激活。每次召回都是一个 `t_i`，近的权重大，远�
 A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = (now − t_i) / 1 天，t_i ∈ {validFrom, ...recalls}
 ```
 
-缺省 `d = 0.5`、`ε = 0.02`、`archiveAt = 0.55`。一条 `s = 0.6`、从未被召回的事实两三天后归档；被召回一次约再撑一周。注入排序和夜间归档用同一个 `A`。`activation` 是协议包里的纯函数。
+缺省 `d = 0.5`、`ε = 0.02`、`archiveAt = 0.55`（`ACTIVATION_DEFAULTS`）。一条 `s = 0.6`、从未被召回的事实在 `validFrom` 之后约 1.09 天低于阈值，也就是下一次夜间巩固时归档（协议包的单元测试固定了「1 天时还在、1.2 天时已低于」）；`validFrom` 之后一天内被召回一次，约到第 4.4–4.9 天才低于阈值。注入排序和夜间归档用同一个 `A`。`activation` 是协议包里的纯函数。缺省值来自个人助理的量级，要按应用调。
 
 ## 接进其余组件
 
@@ -407,32 +444,38 @@ A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = (now − t_i) / 1 �
 
 ## 托管
 
-| 组件           | 进程内                                                    | 另一进程 / 远端                                                                      | 第三方托管                                                          |
-| -------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| 记忆           | 内存、SQLite（`ctx-sqlite` 加 `createSqliteMemoryStore`） | `ctx-remote`：`/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core` | Mem0、Zep 这类记忆服务，实现 `MemoryStore` 接进来                   |
-| 决策、提取模型 | 启发式、`LanguageModel` 装成的                            | 名字 → 远端自己造                                                                    | Cloudflare Workers AI（Clef、Clef-flash、Clairic）、TypeSafe（Jev） |
+| 组件     | 进程内                                                                                     | 另一进程 / 远端                                                                                                                      | 第三方托管                                                                                                 |
+| -------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| 记忆存储 | 内存 `createMemoryStore`（`ctx-memory`）、SQLite `createSqliteMemoryStore`（`ctx-sqlite`） | `ctx-remote`：服务端挂 `memory`（`/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core`）/ `createRemoteMemoryStore` | Mem0、Zep 这类记忆服务，实现 `MemoryStore` 接进来                                                          |
+| 门面     | `createMemory`（`ctx-memory`）                                                             | 存储放远端，`createMemory` 在调用方；也可以把 `Memory` 当执行环境挂到 `ctx-remote` 的 `executors`                                    | —                                                                                                          |
+| 决策模型 | `createHeuristicDecisionModel`、`decisionFromLanguageModel`（`ctx-memory`）                | 名字 → 远端自己造                                                                                                                    | `createDecisionModel`（`ctx-models`）：`cloudflare`（Clef、Clef-flash）、`typesafe`（Jev）                 |
+| 提取模型 | `extractionFromLanguageModel`（`ctx-memory`）                                              | 名字 → 远端自己造                                                                                                                    | `createExtractionModel`（`ctx-models`）：`cloudflare`（Clairic）。TypeSafe 的公开 API 没有提取接口，不内置 |
 
-SQLite 存储和 `ctx-sqlite` 一样可以和应用共用一个库，表前缀自定（例如 `memory_`）。
+SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，前缀缺省 `memory_`；结构版本 1 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。`search` 不用 FTS5（Node 22.13 自带的 SQLite 没编进去），用 `instr(lower(text))` 做子串匹配：整句命中的分数是 `0.5 + 0.5 × 查询长度 / 文字长度`，否则按空白切出的词里命中的那些的长度占比乘 0.5。内存存储的 `search` 是子串命中记 1 分，否则按词重叠打分，给了 `embed` 再和余弦取大的。
 
 ## 契约测试
 
-| 契约测试                          | 工厂                                                             | 覆盖                                                                                                                                                                                         |
-| --------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                       | 笔记的 `head`、`pending`、`settle`；事实不可改写、`close` 和 `supersededBy`、`touch` 追加、`archive` 退出 `open`、`forget` 真删；`search` 至少全文命中；程序 `confirm` 计数；`core` 保留历史 |
-| `describeDecisionModelContract`   | `() => DecisionModel`                                            | 三种问题的形状、概率和为 1、`choice` 的 `choice` 是概率最大的那个、`signal` 中止                                                                                                             |
-| `describeExtractionModelContract` | `() => ExtractionModel`                                          | 每种字段类型的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                             |
-| `describeMemoryContract`          | `({ sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间；`consolidate` 幂等、取代不覆盖、没有证据不写；`recall` 后 `recalls` 多一个；`source` 和 `tools` 的形状                                           |
+`@modelctx-ai/ctx-protocol/testing`，核心包的 `@modelctx-ai/ctx/testing` 原样转出。
 
-决策、提取模型的契约用剧本实现跑（`createScriptedDecisionModel`、`createScriptedExtractionModel`，在协议包的 `/testing` 里），和 `createScriptedModel` 同一个思路。`describeMemoryContract` 自己造好剧本模型和一个内存会话日志交给工厂，工厂用它们造 `Memory`，门控阈值固定在 0.1..0.9 之间。
+| 契约测试                          | 工厂                                                                                        | 覆盖                                                                                                                                                                                                                                 | 谁跑                                                                                              |
+| --------------------------------- | ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore \| Promise<MemoryStore>`，每例一个空的                            | 笔记的 `head`、`pending`、`settle`；事实不可改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 按 `id` 码点序翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 保留历史 | `ctx-memory` 的内存存储（带和不带 `embed`）、`createSqliteMemoryStore`、`createRemoteMemoryStore` |
+| `describeDecisionModelContract`   | `() => DecisionModel \| Promise<DecisionModel>`                                             | 三种问题的形状、概率和为 1、`choice` 的 `choice` 是概率最大的那个、`signal` 中止                                                                                                                                                     | 剧本模型、启发式、`decisionFromLanguageModel`、`ctx-models` 的两个 provider（假 `fetch`）         |
+| `describeExtractionModelContract` | `() => ExtractionModel \| Promise<ExtractionModel>`                                         | 每种字段类型的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                     | 剧本模型、`extractionFromLanguageModel`、`ctx-models` 的 `cloudflare`（假 `fetch`）               |
+| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }`（可以是 `Promise`） | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source` 和 `tools` 的形状                                                                      | `createMemory` + 内存存储                                                                         |
+
+决策、提取模型的契约用剧本实现跑：`createScriptedDecisionModel(script?, { name? })`、`createScriptedExtractionModel(script?, { name? })` 在协议包的 `/testing` 里（不在 `ctx-memory`），和 `createScriptedModel` 同一个思路，`requests` 记下收到的请求。`describeMemoryContract` 自己造好剧本模型和一个内存会话日志交给工厂，工厂用它们造 `Memory`，门控阈值固定在 0.1..0.9 之间，`LanguageModel` 可以不给。
 
 ## 模型实例化
 
-`ctx-models`（提案）按配置造 System One 模型，`ModelSpec` 的写法和 `createModel` 一致，可以直接写进配置文件。
+`ctx-models` 按配置造 System One 模型：`createDecisionModel(spec, options?)`、`createExtractionModel(spec, options?)`。`SystemOneSpec` 的写法和 `createModel` 的 `ModelSpec` 一致，可以直接写进配置文件；差别是 `provider` 必填、没有缺省，`cloudflare` 另要 `accountId`。第二个参数 `options` 不进配置文件，只有 `fetch`（测试里注入）。决策模型内置 `cloudflare`、`typesafe`；提取模型只内置 `cloudflare`，因为 TypeSafe 的公开 API（OpenAPI 只有 `/v1/systemone`）没有提取接口。别的服务商用 `createDecisionModelRegistry`、`createExtractionModelRegistry` 注册。非 2xx 抛 `SystemOneError`（继承 `CtxError`，带 `statusCode`、`responseBody`，408、429、5xx 可重试）。
+
+请求、响应的映射依据两家的公开文档写成，**没有对真实服务验证过**；测试用的是假 `fetch`。
 
 ```ts
 import { createDecisionModel, createExtractionModel } from '@modelctx-ai/ctx-models';
 
-// Cloudflare Workers AI：REST，POST /accounts/{id}/ai/run/@cf/cloudflare/<model>
+// Cloudflare Workers AI：POST <baseUrl>/accounts/{accountId}/ai/run/@cf/cloudflare/<model>，baseUrl 缺省 https://api.cloudflare.com/client/v4
 const gate = createDecisionModel({
   provider: 'cloudflare',
   model: 'clef-flash', // 9B，在线门控；夜间并入判断用 'clef'（27B）
@@ -446,13 +489,8 @@ const extractor = createExtractionModel({
   apiKey: process.env.CF_API_TOKEN,
 });
 
-// TypeSafe Jev：和 Clef 同一套 System One API，换 endpoint 和 model 名
-const jev = createDecisionModel({
-  provider: 'typesafe',
-  model: 'jev',
-  baseUrl: 'https://api.typesafe.ai',
-  apiKey: '…',
-});
+// TypeSafe Jev：只有决策模型。POST <baseUrl>/v1/systemone，baseUrl 缺省 https://api.typesafe.ai
+const jev = createDecisionModel({ provider: 'typesafe', model: 'jev-latest', apiKey: process.env.TYPESAFE_API_KEY });
 ```
 
 没有 System One 服务时：
@@ -465,8 +503,9 @@ import {
 } from '@modelctx-ai/ctx-memory';
 import { createModel } from '@modelctx-ai/ctx-models';
 
-// 启发式：不联网，惊讶 / 强调 / 重复 / 情绪加权；只认 gate 用的那四个问题，别的问题返回均匀分布
-const offline = createHeuristicDecisionModel({ similarity: (a, b) => jaccard(a, b) });
+// 启发式：不联网，惊讶 / 强调 / 重复 / 情绪加权；只认 gate 用的那四个问题，别的问题返回均匀分布。
+// 选项都可选：similarity（缺省 textSimilarity）、known（已有事实，算惊讶）、recent（最近的段落，算重复）、weights、name
+const offline = createHeuristicDecisionModel();
 
 // 用推理模型装成决策、提取模型：接口一样，慢、贵，但任何服务商都能用
 const llm = createModel({ provider: 'anthropic', apiKey: process.env.ANTHROPIC_API_KEY, model: 'claude-sonnet-4-5' });
@@ -477,6 +516,7 @@ const slowExtractor = extractionFromLanguageModel(llm);
 组装：
 
 ```ts
+import { createContextBuilder, createHarness, createToolRegistry } from '@modelctx-ai/ctx';
 import { createMemory } from '@modelctx-ai/ctx-memory';
 import { createSqliteMemoryStore, createSqliteStore } from '@modelctx-ai/ctx-sqlite';
 
@@ -494,7 +534,7 @@ const memory = createMemory({
 const builder = createContextBuilder({ store: sessions, sources: [memory.source({ k: 5 })] });
 const registry = createToolRegistry();
 for (const tool of await memory.tools()) registry.add(tool);
-const harness = createHarness({ builder, registry, executors: [memory] });
+const harness = createHarness({ store: sessions, context: builder, tools: registry, executors: [memory] });
 
 // 编排器里
 await memory.gate(session); // 一轮结束后
@@ -514,7 +554,7 @@ await memory.consolidate(); // 夜里
 }
 ```
 
-`decision` 不配就是启发式，`extraction` 不配就让 `model` 提取；两个都不配、`model` 也没有，记忆退化成一张手写的事实表加全文检索，`recall` 和 `source` 照常工作。
+`decision` 不配就是启发式，`extraction` 不配就让 `model` 提取。`extraction` 和 `model` 都没有时，`gate` 照常写笔记，`consolidate` 不处理笔记（笔记保持待处理）、只做衰减和 `core` 的缺省渲染；记忆退化成一张手写的事实表加全文检索，`recall` 和 `source` 照常工作。
 
 ## 预算
 
@@ -536,7 +576,7 @@ await memory.consolidate(); // 夜里
 | ------------------------- | ----------------------------------------------------------------------- |
 | 记了不存在的事实          | `sources` 必填；提取字段的 `pNull` 阈值；主人可 `forget`                |
 | 旧事实盖掉新事实          | 不 UPDATE，只 `close` + `add`；`search` 缺省只看 `open`                 |
-| 记忆无限膨胀              | 门控、衰减归档、`core` 预算；`open` 事实数告警                          |
+| 记忆无限膨胀              | 门控、衰减归档、`core` 预算；`open` 事实数由应用监控（参考实现不告警）  |
 | 记忆里藏着指令            | 来源渲染时用 `<memory>` 包裹并声明是数据；`tool` 角色的条目不进事实文字 |
 | 错误经验被固化            | `confirmations ≥ 2` 才生效；程序带 `evidence`；可 `retire`              |
 | System One 输出合法但不对 | `confidence`、`pNull` 定自动化阈值，低于就升级；每周抽样复核并入结果    |

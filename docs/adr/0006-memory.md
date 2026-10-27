@@ -1,7 +1,7 @@
 # ADR 0006：记忆作为第八个组件，只读日志、夜里改写、System One 做判断
 
-- 状态：提案
-- 实施状态：未实施。协议和参考实现的草案见[记忆](../memory.md)
+- 状态：已采纳（2026-10-27 实施时按「决定记录」修订）
+- 实施状态：已实施，未发布（0.4 计划）。阶段 1 协议 `3807576`（`ctx-protocol`：接口、纯函数、契约测试、剧本模型）；阶段 2 `ctx-sqlite` `68c8e2c`、`ctx-models` `990aaae`、新包 `ctx-memory` `363fce4`；`ctx-remote` 的 `/memory/*` 待合并，见 `claude/memory` 分支；文档同步是本行所在的提交。协议和参考实现见[记忆](../memory.md)
 - 日期：2026-10-27
 - 范围：`ctx-protocol`（`MemoryStore`、`DecisionModel`、`ExtractionModel`）、新包 `ctx-memory`、`ctx-sqlite`（记忆存储）、`ctx-models`（System One 工厂）、`ctx-remote`（`/memory/*`）；yoyo 作为实践
 - 依据：2026 年 Agent Memory 方案的调研（Mem0、Zep / Graphiti、Letta、Hindsight、LongMemEval-V2、Redis 的混合存储实验），互补学习系统（CLS）和 ACT-R 的激活模型，Cloudflare 的 System One 模型（Clef、Clairic）
@@ -64,20 +64,20 @@ ACT-R 的基础激活 `A = ln Σ (Δt_i + ε)^(−d) + s`：每次召回是一�
 
 ## 包布局
 
-| 包                 | 加什么                                                                                                                        |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
-| `ctx-protocol`     | `MemoryStore`、`DecisionModel`、`ExtractionModel` 的接口和 JSON 形状；纯函数 `activation`、`rankFacts`、`sourceRef`；契约测试 |
-| `ctx-memory`（新） | `createMemory`、内存 `MemoryStore`、启发式决策模型、`decisionFromLanguageModel`、`extractionFromLanguageModel`、剧本模型      |
-| `ctx-sqlite`       | `createSqliteMemoryStore({ database, prefix })`，可以和 `ctx_` 表共用一个库                                                   |
-| `ctx-models`       | `createDecisionModel`、`createExtractionModel`：`cloudflare`、`typesafe` 两个 provider，可注册                                |
-| `ctx-remote`       | `/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core`                                                        |
+| 包                 | 加什么                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ctx-protocol`     | `MemoryStore`、`DecisionModel`、`ExtractionModel`、门面 `Memory` 的接口和 JSON 形状；常量 `MAX_DECISION_QUESTIONS`、`MEMORY_RECALL_TOOL`、`ACTIVATION_DEFAULTS`；纯函数 `activation`、`rankFacts`、`renderCore`、`sourceRef` 和存储实现用的校验函数；`/testing` 的四个契约测试和剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel` |
+| `ctx-memory`（新） | `createMemory`、内存 `MemoryStore`（`createMemoryStore`，和核心包的会话存储同名）、启发式决策模型 `createHeuristicDecisionModel`、`decisionFromLanguageModel`、`extractionFromLanguageModel`、`textSimilarity`、`cosine`、缺省值 `MEMORY_DEFAULTS`、`DEFAULT_KINDS`、`HEURISTIC_WEIGHTS`                                                                |
+| `ctx-sqlite`       | `createSqliteMemoryStore({ database \| path, prefix = 'memory_', busyTimeoutMs, id })`，可以和 `ctx_` 表共用一个库；结构版本独立（`memory_schema`）                                                                                                                                                                                                     |
+| `ctx-models`       | `createDecisionModel`、`createExtractionModel` 和各自的注册表：决策模型内置 `cloudflare`（Clef）、`typesafe`（Jev），提取模型只内置 `cloudflare`（Clairic）；`SystemOneError`                                                                                                                                                                           |
+| `ctx-remote`       | 服务端挂 `memory`：`/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core`；客户端 `createRemoteMemoryStore`                                                                                                                                                                                                                             |
 
-`ctx-memory` 只依赖协议包；要 `LanguageModel` 时经 `ModelRef`，和 harness 一样。
+`ctx-memory` 只依赖协议包，`ai` 是 peer（`generateText`）；要 `LanguageModel` 时经 `ModelRef`，名字靠 `models` 解析，和 harness 一样。`ctx-models` 因为返回协议的 `DecisionModel`、`ExtractionModel`，从此也把协议包当 peer。
 
 ## 代价
 
 - 多一个存储、多两类模型、多一个夜间任务。单进程的最小用法（`createContext()` 三行）不受影响：不建 `Memory` 就什么都没有。
-- System One 模型目前只有少数服务商（Cloudflare、TypeSafe），Clairic 还是预览版。协议是 ctx 自己的，适配器薄，但服务商换接口要跟。
+- System One 模型目前只有少数服务商（Cloudflare、TypeSafe），Clairic 还是预览版，TypeSafe 没有提取接口。协议是 ctx 自己的，适配器薄，但服务商换接口要跟；适配器按公开文档写成，没有对真实服务验证过。
 - 提取和并入的质量取决于模型，输出总是合法但未必正确。靠 `confidence`、`pNull` 阈值和抽样复核兜底，不能靠协议保证。
 - `core` 每夜重写一次，`LanguageModel` 的开销固定存在；没有模型就不重写，`core` 退化成手写。
 - 激活度的参数要按应用调；缺省值来自个人助理的量级。
@@ -93,3 +93,28 @@ ACT-R 的基础激活 `A = ln Σ (Δt_i + ε)^(−d) + s`：每次召回是一�
 ## 决定记录
 
 - 2026-10-27：按调研、Plate VII / VIII 的方案和 Cloudflare System One 的接口写成提案。等 yoyo 侧的应用设计（[yoyo 的记忆](https://github.com/modelctx-ai/yoyo/blob/main/docs/tech/memory.md)）过一遍协议够不够用，再定实施阶段。
+- 2026-10-27：实施，状态改为已采纳。分两个阶段：阶段 1 协议包，阶段 2 `ctx-sqlite`、`ctx-models`、`ctx-memory`、`ctx-remote` 并行。上面七条决定不变；对草案的修订如下，已并入[记忆](../memory.md)：
+  1. **事实的归档**：`MemoryFact.archived` 改成 `archivedAt?: number`，和 `validTo`、`settledAt` 一样记时刻。
+  2. **笔记**：`NewNote = Omit<Note, 'id'>`，可以带 `settledAt`。门控没过的段落写成已 settle 的笔记，`head` 照样前进；`head` 是这个会话所有笔记（含处理过的）的最大 `upTo`。
+  3. **事实的方法**：新增 `facts.cite(id, sources)`（并入时追加证据，相同的区间跳过）；`facts.search` 返回 `FactHit[]`（`{ fact, score }`，`score` 0..1），`recall` 用它当相似度；`facts.list` 按 `id` 码点序，`after`、`limit` 翻页，和 `sessions` 一样。
+  4. **程序**：`procedures.add` 的 `confirmations` 从 1 起；`confirm` 时相同的证据不计数。
+  5. **画像**：新增 `core.history({ last? })`。
+  6. **召回**：`RecallOptions` 加 `evidence`（带回证据原文，工具调用时带）、`signal`。
+  7. **纯函数和常量**：`renderCore(facts, budget, { now })` 用 `estimateTextTokens` 计预算；常量 `MAX_DECISION_QUESTIONS`（64）、`MEMORY_RECALL_TOOL`（`recall`）、`ACTIVATION_DEFAULTS`（`d` 0.5、`epsilon` 0.02、`archiveAt` 0.55）。
+  8. **契约测试**：`describeMemoryContract` 的工厂签名是 `(setup: { sessions, decision, extraction, now }) => { memory, store }`；剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel` 放在协议包的 `/testing`，不在 `ctx-memory`（包布局表已改）。
+  9. **`MemoryOptions`** 比草案多 `models`、`subject`（缺省 `user`）、`recall`（`k` 5、`budgetTokens`、`minScore` 0.1、`confirmations` 2）、`consolidate`（`escalateBelow` 0.6、`maxPNull` 0.3、`maxTokens` 6000）、`gate.auto`（自动调阈值，最近 7 天笔记少于 20 条时用 `theta`）、`gate.maxTokens`（4000，超长的段落拆开各 `decide` 一次）、`decay.epsilon`、`name`、`now`；`sessions` 的类型收窄成 `Pick<SessionStore, 'list'>`。
+  10. **`consolidate` 的细节**：`decisions` 也写成事实；措辞相同的事实不经 `decide` 直接合并；这一轮写入或合并的事实不在同一轮归档；读不到原文的笔记直接 settle；既没有 `extraction` 也没有 `model` 时笔记保持待处理；open 事实的集合没变时不调模型重写 `core`。
+  11. **`recall` 工具**：输出是 `<memory>` 包起来的文字，不是 JSON；输入除 `query`、`since_days` 外加 `topic`、`k`。
+  12. **System One**：TypeSafe 的公开 API 只有 `/v1/systemone`（决策），没有提取接口，所以 TypeSafe（Jev）只做决策模型，提取模型只内置 `cloudflare`（Clairic）。`SystemOneSpec.provider` 必填、没有缺省。两家的映射依据公开文档，没有对真实服务验证。
+  13. **遗忘的量级**：缺省参数下 `s = 0.6`、从未召回的事实约 1.09 天后低于 `archiveAt`（提案写的是两三天），协议包的单元测试固定了这个数。
+  14. **SQLite 的检索**：Node 22.13 自带的 SQLite 没有编进 FTS5，`search` 改用 `instr(lower(text))` 子串匹配。
+
+  实施中发现、留给后续版本的协议待办：
+  - `RecallOptions` 没有 `since`：工具的 `since_days` 只能在参考实现内部处理，走协议的调用方做不到。
+  - `NoteQuery` 没有时间过滤：自动调阈值要读全部笔记再筛最近 7 天。
+  - `activation` 以 `validFrom` 起算：提取出的 `since` 很早的事实，写入后的下一夜就会归档（参考实现只保证不在写入的同一轮归档）；可能需要单独的写入时间。
+  - `SessionStore.list` 没有上界：按 `SourceRef` 读原文只能 `after: from - 1` 读到末尾再截。
+  - `score` 回答没有 `confidence`：Clef / Jev 的响应里有，适配器丢掉了。
+  - `ExtractionRequest` 传不了 Clairic 的 `reference_date`、`null_threshold`。
+  - `score` 的档数协议不设上限，Clef / Jev 的文档写最多 10 档；适配器不检查。
+  - `ExtractionField` 的 `list.items` 没有 `date`。
