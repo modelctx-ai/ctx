@@ -1,7 +1,7 @@
 {
   "name": "@modelctx-ai/ctx-sqlite",
   "version": "0.3.0",
-  "description": "ctx 的 SQLite 存储，基于 Node 自带的 node:sqlite，不需要原生依赖。",
+  "description": "ctx 的 SQLite 存储：会话存储和记忆存储，基于 Node 自带的 node:sqlite，不需要原生依赖。",
   "keywords": [
     "ai",
     "context",

@@ -1,4 +1,4 @@
-import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 
 import {
   checkExpectSeq,
@@ -14,6 +14,9 @@ import {
   type SessionsOptions,
   type WatchOptions,
 } from '@modelctx-ai/ctx-protocol';
+
+export { createSqliteMemoryStore, type SqliteMemoryStore, type SqliteMemoryStoreOptions } from './memory.ts';
+import { hasTable, inspect, openDatabase, readSchemaVersion, withWriteLock, writeSchemaVersion } from './shared.ts';
 
 export interface SqliteStoreOptions {
   /** 数据库文件；也可以是 `:memory:`。和 `database` 二选一。 */
@@ -71,9 +74,6 @@ interface Body {
  */
 const SCHEMA_VERSION = 3;
 
-/** 自己开库时 `busy_timeout` 的缺省值（毫秒）。 */
-const DEFAULT_BUSY_TIMEOUT_MS = 5000;
-
 /** 等一会儿；`signal` 中止时提前醒。 */
 function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve) => {
@@ -124,52 +124,6 @@ function prefixEnd(prefix: string): string | undefined {
     if (last < 0x10ffff) return points.join('') + String.fromCodePoint(last === 0xd7ff ? 0xe000 : last + 1);
   }
   return undefined;
-}
-
-function hasTable(database: DatabaseSync, name: string): boolean {
-  return database.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name) !== undefined;
-}
-
-/** 读 `${prefix}meta` 里的结构版本；没有 meta 表或没有这一行时返回 `undefined`。 */
-function readSchemaVersion(database: DatabaseSync, prefix: string): number | undefined {
-  if (!hasTable(database, `${prefix}meta`)) return undefined;
-  const row = database.prepare(`SELECT value FROM ${prefix}meta WHERE key = 'schema'`).get() as
-    | { value: string }
-    | undefined;
-  if (!row) return undefined;
-  const version = Number(row.value);
-  if (!Number.isInteger(version) || version < 1) throw new Error(`Unrecognized ctx schema version "${row.value}".`);
-  return version;
-}
-
-/**
- * 拿到写锁再做 `work`。库上没有事务时用 `BEGIN IMMEDIATE`：一开始就要写锁，会等 `busy_timeout`，
- * 不会像先读后升级的延迟事务那样直接 `SQLITE_BUSY`。库上已经有应用的事务时只能用 SAVEPOINT，锁归应用管。
- */
-function withWriteLock<T>(database: DatabaseSync, name: string, work: () => T): T {
-  const savepoint = database.isTransaction;
-  database.exec(savepoint ? `SAVEPOINT ${name}` : 'BEGIN IMMEDIATE');
-  let result: T;
-  try {
-    result = work();
-  } catch (error) {
-    database.exec(savepoint ? `ROLLBACK TO ${name}` : 'ROLLBACK');
-    if (savepoint) database.exec(`RELEASE ${name}`);
-    throw error;
-  }
-  database.exec(savepoint ? `RELEASE ${name}` : 'COMMIT');
-  return result;
-}
-
-/** 表上实际有的列和索引。`table_info` 不列生成列，`table_xinfo` 才列。 */
-function inspect(database: DatabaseSync, table: string): { columns: Set<string>; indexes: Set<string> } {
-  const columns = (database.prepare(`PRAGMA table_xinfo(${table})`).all() as { name: string }[]).map((c) => c.name);
-  const indexes = (
-    database.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?`).all(table) as {
-      name: string;
-    }[]
-  ).map((i) => i.name);
-  return { columns: new Set(columns), indexes: new Set(indexes) };
 }
 
 /**
@@ -254,11 +208,7 @@ function migrate(database: DatabaseSync, prefix: string): void {
     }
     // 3：`(session, at, seq)` 索引换成 `(session, seq)`。`seq` 是主键，行的顺序本来就是它，`createSchema` 换索引。
     createSchema(database, prefix);
-    database
-      .prepare(
-        `INSERT INTO ${prefix}meta (key, value) VALUES ('schema', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
-      )
-      .run(String(SCHEMA_VERSION));
+    writeSchemaVersion(database, prefix, 'schema', SCHEMA_VERSION);
   });
 }
 
@@ -269,26 +219,10 @@ function migrate(database: DatabaseSync, prefix: string): void {
  */
 export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionStore {
   const prefix = options.prefix ?? 'ctx_';
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(prefix)) throw new Error(`Invalid table prefix "${prefix}".`);
-  if (!options.database && !options.path) throw new Error('Pass `path` or `database` to createSqliteStore().');
-  const owned = !options.database;
-  const database = options.database ?? new DatabaseSync(options.path!);
+  const { database, owned } = openDatabase(options, prefix, 'createSqliteStore', (opened) => migrate(opened, prefix));
   const now = options.now ?? Date.now;
   const id = options.id ?? (() => crypto.randomUUID());
   const table = `${prefix}entries`;
-
-  try {
-    if (options.busyTimeoutMs !== undefined || owned) {
-      const timeout = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
-      if (!Number.isInteger(timeout) || timeout < 0) throw new Error(`Invalid busyTimeoutMs ${timeout}.`);
-      database.exec(`PRAGMA busy_timeout = ${timeout}`);
-    }
-    if (owned) database.exec('PRAGMA journal_mode = WAL');
-    migrate(database, prefix);
-  } catch (error) {
-    if (owned) database.close();
-    throw error;
-  }
 
   const insert = database.prepare(
     // ON CONFLICT DO NOTHING 只跳过唯一约束冲突；NOT NULL 之类的违例照常报错。INSERT OR IGNORE 会把它们一起吞掉。

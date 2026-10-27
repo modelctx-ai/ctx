@@ -1,6 +1,6 @@
 # @modelctx-ai/ctx-sqlite
 
-ctx 的 SQLite 会话存储（协议的 `SessionStore`），基于 Node 自带的 `node:sqlite`，没有原生依赖。只依赖 `@modelctx-ai/ctx-protocol`。可以自己开库，也可以和应用共用已经打开的 `DatabaseSync`。
+ctx 的 SQLite 会话存储（协议的 `SessionStore`）和记忆存储（协议的 `MemoryStore`），基于 Node 自带的 `node:sqlite`，没有原生依赖。只依赖 `@modelctx-ai/ctx-protocol`。可以自己开库，也可以和应用共用已经打开的 `DatabaseSync`。
 
 ## 安装
 
@@ -79,9 +79,35 @@ watcher.close();
 
 自己开库时设 `journal_mode = WAL` 和 `busy_timeout`（缺省 5000 毫秒），几个进程可以同时写同一个库，等锁而不是报 `SQLITE_BUSY`。传进来的 `database` 归应用管：本包缺省不改它的 `journal_mode` 和 `busy_timeout`，要多进程写请应用自己设（或传 `busyTimeoutMs`）。写入每批第一条语句就是 INSERT，所以拿写锁时会等 `busy_timeout`；应用自己的事务如果先读后写，升级写锁时仍可能直接 `SQLITE_BUSY`，应该用 `BEGIN IMMEDIATE`。
 
+## 记忆存储
+
+`createSqliteMemoryStore(options)` 实现协议的 `MemoryStore`（笔记、事实、程序、画像），返回 `SqliteMemoryStore`：`MemoryStore` 加上 `database` 和 `close()`。选项和会话存储一样：`path` 或 `database`、`busyTimeoutMs`、`id`；`prefix` 缺省 `memory_`。可以和会话存储共用同一个 `DatabaseSync`：
+
+```ts
+const db = new DatabaseSync('yoyo.db');
+const sessions = createSqliteStore({ database: db, prefix: 'ctx_' });
+const memory = createSqliteMemoryStore({ database: db, prefix: 'memory_' });
+```
+
+| 表                   | 内容                                                                                                                                                                                                                                                                                                                             |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `<prefix>notes`      | 每行一条笔记：`seq`（自增，写入顺序）、`id`、`session`、`from_seq`、`up_to`、`at`、`salience`、`kind`、`topic`、`settled_at`。索引 `(session, up_to)`（`head`）；部分索引 `(seq) WHERE settled_at IS NULL`（待处理的）                                                                                                           |
+| `<prefix>facts`      | 每行一条事实：`id`（主键）、`subject`、`predicate`、`text`、`topic`、`valid_from`、`valid_to`、`superseded_by`、`confidence`、`salience`、`sources`（JSON）、`recalls`（JSON）、`archived_at`。索引 `(subject, id)`、`(topic, id)`；部分索引 `(id) WHERE valid_to IS NULL AND archived_at IS NULL`（`open`）和 `(superseded_by)` |
+| `<prefix>procedures` | 每行一条程序：`seq`、`id`、`topic`、`when_text`、`do_text`、`evidence`（JSON）、`confirmations`、`at`、`retired_at`。索引 `(topic, seq)`                                                                                                                                                                                         |
+| `<prefix>core`       | 每次 `core.set` 一行：`seq`、`text`、`at`；最后一行是当前版本                                                                                                                                                                                                                                                                    |
+| `<prefix>meta`       | 结构版本 `memory_schema`                                                                                                                                                                                                                                                                                                         |
+
+- `facts.list` 按 `id` 升序（BINARY 比较 UTF-8 字节，和码点序一致），`subject`、`topic`、`open`、`after` 都走索引。
+- `facts.search` 是子串匹配（`instr(lower(text), ?)`，只折叠 ASCII 大小写，`%`、`_` 按字面），不用 FTS5：Node 22 自带的 SQLite 没有编译 FTS5。整个查询是文字的子串时分数是 `0.5 + 0.5 × 查询长度 / 文字长度`（码点数），在 [0.5, 1]；否则按空白切出的词里命中的那些的长度占比打分，在 (0, 0.5)。从高到低，同分按 `id`。
+- 每个写方法在一个 `BEGIN IMMEDIATE` 里做完（库上已有应用的事务时用 SAVEPOINT），单个方法是原子的；跨方法的组合（先 `add` 新事实再 `close` 旧的）由调用方负责。`touch` 用 `json_insert` 在库里追加，`cite`、`confirm` 在写锁里读后写，几个进程同时写不丢。
+- 结构版本独立于会话存储：`<prefix>meta` 里的键是 `memory_schema`，当前是 `1`，和会话存储的 `schema` 不同，所以两边用同一个前缀也不冲突。打开时的规则和会话存储一样：版本等于 1 时查实际的表和索引，缺什么在写锁里补什么；比 1 高时抛错，不打开。
+- 通过协议包的契约测试 `describeMemoryStoreContract`。
+
 ## 导出
 
-| 导出                                       | 说明                                                                                |
-| ------------------------------------------ | ----------------------------------------------------------------------------------- |
-| `createSqliteStore(options)`               | 返回 `SqliteSessionStore`：`SessionStore`（含 `watch`）加上 `database` 和 `close()` |
-| `SqliteStoreOptions`、`SqliteSessionStore` | 类型\1                                                                              |
+| 导出                                            | 说明                                                                                |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `createSqliteStore(options)`                    | 返回 `SqliteSessionStore`：`SessionStore`（含 `watch`）加上 `database` 和 `close()` |
+| `SqliteStoreOptions`、`SqliteSessionStore`      | 类型                                                                                |
+| `createSqliteMemoryStore(options)`              | 返回 `SqliteMemoryStore`：`MemoryStore` 加上 `database` 和 `close()`                |
+| `SqliteMemoryStoreOptions`、`SqliteMemoryStore` | 类型                                                                                |
