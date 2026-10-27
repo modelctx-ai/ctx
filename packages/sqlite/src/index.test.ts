@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -494,6 +494,9 @@ describe('busy_timeout', () => {
   });
 });
 
+/** 等子进程退出。 */
+const exited = (child: ChildProcess) => new Promise<void>((resolve) => child.once('exit', () => resolve()));
+
 describe('多进程', () => {
   const writer = fileURLToPath(new URL('./fixtures/writer.ts', import.meta.url));
   const exec = promisify(execFile);
@@ -533,6 +536,33 @@ describe('多进程', () => {
     assert.equal((await seed.list('s')).length, 2, '起点加一条胜出的');
     seed.close();
   }, 90_000);
+
+  const holder = fileURLToPath(new URL('./fixtures/holder.ts', import.meta.url));
+  /** 起一个子进程在新库上拿着写锁 `ms` 毫秒；它拿到锁（打印 `ready`）以后才返回。 */
+  const holdWriteLock = (path: string, ms: number) =>
+    new Promise<ChildProcess>((resolve, reject) => {
+      const child = spawn(process.execPath, [holder, path, String(ms)], { stdio: ['ignore', 'pipe', 'inherit'] });
+      child.stdout.once('data', () => resolve(child));
+      child.once('error', reject);
+    });
+
+  test('开一个新库时别的进程正占着写锁：切 WAL 等锁，不立刻报 database is locked', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
+    const child = await holdWriteLock(path, 1_000);
+    const started = Date.now();
+    const store = createSqliteStore({ path });
+    assert.ok(Date.now() - started >= 500, '等到对方提交才开成');
+    assert.equal(store.database.prepare('PRAGMA journal_mode').get()?.['journal_mode'], 'wal');
+    store.close();
+    await exited(child);
+  }, 30_000);
+
+  test('等够 busyTimeoutMs 还拿不到锁才报错', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
+    const child = await holdWriteLock(path, 1_500);
+    assert.throws(() => createSqliteStore({ path, busyTimeoutMs: 100 }), /locked/);
+    await exited(child);
+  }, 30_000);
 
   test('几个进程同时打开同一个 0.1 旧库：只迁一次，旧数据在', async () => {
     const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
