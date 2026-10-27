@@ -20,7 +20,7 @@
 ## 改代码时
 
 - 实现一个协议就跑它的 `describeXContract`，新加的协议要在 `packages/protocol/src/testing` 里给契约测试，内存实现和 sqlite、remote 都要过。
-- 依赖方向和放置规则（核心包只依赖 `ai`，实现包只依赖协议包，Node 专属模块只进适配包）见[架构](docs/architecture.md#设计约束)，新代码不打破。
+- 依赖方向和放置规则（核心包只依赖 `ai`，实现包只依赖协议包，Node 专属模块只进适配包）见[架构](docs/architecture.md#实现约束)，新代码不打破。
 - yoyo 经 `link:../ctx/packages/*` 读这里的 `dist/`，它的 CI 检出 ctx `main` 的最新提交。改公开 API 之前先在 `../yoyo` 里 grep 用法：会让 yoyo 编不过的改动，合并前要有对应的 yoyo PR 在等。
 - 对真实服务（模型提供商、MCP 服务器）的映射没有在线验证时，在文档里写明「没有对真实服务验证」，不要删掉这句。
 
