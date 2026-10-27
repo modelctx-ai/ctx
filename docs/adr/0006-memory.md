@@ -1,7 +1,7 @@
 # ADR 0006：记忆作为第八个组件，只读日志、夜里改写、System One 做判断
 
 - 状态：已采纳（2026-10-27 实施时按「决定记录」修订）
-- 实施状态：已实施，未发布（0.4 计划）。阶段 1 协议 `3807576`（`ctx-protocol`：接口、纯函数、契约测试、剧本模型）；阶段 2 `ctx-sqlite` `68c8e2c`、`ctx-models` `990aaae`、新包 `ctx-memory` `363fce4`；`ctx-remote` 的 `/memory/*` 待合并，见 `claude/memory` 分支；文档同步是本行所在的提交。协议和参考实现见[记忆](../memory.md)
+- 实施状态：已实施，未发布（0.4 计划）。阶段 1 协议 `3807576`（`ctx-protocol`：接口、纯函数、契约测试、剧本模型）；阶段 2 `ctx-sqlite` `68c8e2c`、`ctx-models` `990aaae`、新包 `ctx-memory` `363fce4`；`ctx-remote` `af0a889`（`/memory/*`、`createRemoteMemoryStore`）；文档同步 `591b4dc`。协议和参考实现见[记忆](../memory.md)
 - 日期：2026-10-27
 - 范围：`ctx-protocol`（`MemoryStore`、`DecisionModel`、`ExtractionModel`）、新包 `ctx-memory`、`ctx-sqlite`（记忆存储）、`ctx-models`（System One 工厂）、`ctx-remote`（`/memory/*`）；yoyo 作为实践
 - 依据：2026 年 Agent Memory 方案的调研（Mem0、Zep / Graphiti、Letta、Hindsight、LongMemEval-V2、Redis 的混合存储实验），互补学习系统（CLS）和 ACT-R 的激活模型，Cloudflare 的 System One 模型（Clef、Clairic）
