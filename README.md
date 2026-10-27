@@ -18,6 +18,7 @@
 | [`@modelctx-ai/ctx`](packages/core)              | 进程内参考实现：内存会话存储、投影和来源、工具注册表、函数执行环境、基于 AI SDK 的 harness、进程内编排器、`createContext()` | Node ≥22；主入口不用 `node:` 模块 |
 | [`@modelctx-ai/ctx-sqlite`](packages/sqlite)     | 基于 `node:sqlite` 的 `SessionStore`，可以和应用共用一个库                                                                  | Node ≥22.13                       |
 | [`@modelctx-ai/ctx-models`](packages/models)     | 按配置创建 `LanguageModel`：内置 `openai-compatible`、`anthropic`，可注册更多服务商                                         | Node ≥22                          |
+| [`@modelctx-ai/ctx-memory`](packages/memory)     | 记忆的参考实现：`createMemory` 的门控、召回、巩固、遗忘，内存 `MemoryStore`，启发式和 `LanguageModel` 装成的决策、提取模型  | Node ≥22                          |
 | [`@modelctx-ai/ctx-mcp`](packages/mcp)           | MCP 服务器作为执行环境：按常见的 `mcpServers` 配置连接（stdio、Streamable HTTP、SSE），工具写进注册表                       | Node ≥22                          |
 | [`@modelctx-ai/ctx-exec`](packages/exec)         | 本机子进程执行环境：跑命令行、读写工作目录里的文件，环境变量白名单、超时、输出截断                                          | Node ≥22                          |
 | [`@modelctx-ai/ctx-remote`](packages/remote)     | 会话存储、执行环境、harness、编排器的 HTTP 服务端和客户端：把组件放到进程边界另一侧                                         | 客户端任何运行时；服务端 Node ≥22 |
@@ -194,6 +195,7 @@ overrides:
   '@modelctx-ai/ctx-exec': link:../ctx/packages/exec
   '@modelctx-ai/ctx-gateway': link:../ctx/packages/gateway
   '@modelctx-ai/ctx-mcp': link:../ctx/packages/mcp
+  '@modelctx-ai/ctx-memory': link:../ctx/packages/memory
   '@modelctx-ai/ctx-models': link:../ctx/packages/models
   '@modelctx-ai/ctx-protocol': link:../ctx/packages/protocol
   '@modelctx-ai/ctx-remote': link:../ctx/packages/remote
@@ -224,10 +226,10 @@ overrides:
 
 ## 要求
 
-| 场景 | 要求                                                                                                                                             |
-| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 开发 | Node ≥22.18（直接运行 `.ts`）；pnpm 10，版本由 `packageManager` 固定                                                                             |
-| 使用 | Node 版本见包表；peer dependency：`@modelctx-ai/ctx-protocol`、`zod`（核心包）、`ai@^7`（ctx-models）、`@modelctx-ai/ctx-protocol`（其余实现包） |
+| 场景 | 要求                                                                                                                                                         |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 开发 | Node ≥22.18（直接运行 `.ts`）；pnpm 10，版本由 `packageManager` 固定                                                                                         |
+| 使用 | Node 版本见包表；peer dependency：`@modelctx-ai/ctx-protocol`、`zod`（核心包）、`ai@^7`（ctx-models、ctx-memory）、`@modelctx-ai/ctx-protocol`（其余实现包） |
 
 ## 文档
 
