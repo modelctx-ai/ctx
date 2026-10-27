@@ -4,6 +4,7 @@
 
 ## 2026-10-27
 
+- **更新** [实践：yoyo](repos.md)只留跨仓库的事：删掉「yoyo 和 ctx 组件的对应」表、「yoyo 怎么用 ctx」「yoyo 的分层」两节（和 yoyo 仓库 `docs/tech/architecture.md` 的三节是同一份内容的两个副本，这里的已经落后），开头一句改成链接过去。顺带改正落后的事实：yoyo 依赖的是 7 个包（加 `ctx-memory`），`yoyo.db` 的契约加 `memory_` 前缀的表（结构版本 1），依赖图加 `ctx-memory`，去掉「yoyo 还没接记忆」。
 - **新增** [CHANGELOG.md](../CHANGELOG.md)：代码变更按版本倒序（未发布、0.3.0、0.2.0、0.1.0）。这里原来以「实现 / 发布 / 修复 / 删除」开头的条目原文搬了过去，这里只留文档的变更；[索引](index.md)的「其他」加一行，[AGENTS.md](../AGENTS.md) 的「记录」写明两处各记什么。
 - **新增** [AGENTS.md](../AGENTS.md)：给人和 coding agent 的工作约定。文档各管什么（协议层是规范、架构只写参考实现、`repos.md` 只写跨仓库契约、ADR 的状态和修订方式、包 README 要全覆盖导出）、记录（`log.md` 记什么、版本按 ADR 0002）、改代码时的契约测试和对 yoyo 的影响、格式和提交信息。根 README「文档」一节加链接。
 - **更新** [记忆](memory.md)、[ADR 0006](adr/0006-memory.md) 从提案改为已实现 / 已采纳：签名按 `.d.ts` 对齐（`MemoryOptions`、`Memory`、`MemorySourceOptions`），组装示例的 `createHarness` 选项改成实际的 `store`、`context`、`tools`，托管表写实际的包和函数名（TypeSafe 只在决策模型一栏），契约测试表写实际的工厂签名和谁跑，模型实例化写明未对真实服务验证，衰减的量级改成约 1.09 天；ADR 0006 加实施状态、修订后的包布局（剧本模型在协议包 `/testing`）、「决定记录」里的实施修订和协议待办（`RecallOptions` 没有 `since`、`NoteQuery` 没有时间过滤、`activation` 以 `validFrom` 起算、`SessionStore.list` 没有上界、`score` 回答没有 `confidence`、`ExtractionRequest` 传不了 `reference_date` / `null_threshold`、`score` 档数不设上限、`list.items` 没有 `date`）。[协议层](protocol.md)改成九个协议，加记忆一节、契约测试、托管矩阵和线上形态的行；[索引](index.md)、[概念](concepts.md)、[实践：yoyo](repos.md)去掉「提案」，索引的包表加 `ctx-memory`；[ADR 0002](adr/0002-packages.md)、[架构](architecture.md)加 `ctx-memory`，改正 `ctx-models` 的 peer（现在也有协议包）；根 README、[核心包](../packages/core/README.md)跟上。
