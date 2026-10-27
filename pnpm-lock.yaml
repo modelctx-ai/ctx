@@ -89,6 +89,9 @@ importers:
         specifier: ^3.0.77
         version: 3.0.77(zod@4.6.7)
     devDependencies:
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
       ai:
         specifier: ^7.0.150
         version: 7.0.150(zod@4.6.7)

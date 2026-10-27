@@ -101,3 +101,5 @@ const defaults: ModelRegistry = createModelRegistry();
 export function createModel(spec: ModelSpec): LanguageModel {
   return defaults.create(spec);
 }
+
+export * from './system-one.ts';
