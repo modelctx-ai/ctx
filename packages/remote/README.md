@@ -1,11 +1,11 @@
 # @modelctx-ai/ctx-remote
 
-把 ctx 的协议搬到 HTTP 上：会话存储、执行环境、harness、编排器都能放到进程边界的另一侧。服务端把进程内的协议对象挂成 HTTP 路径，客户端把这些路径还原成协议的接口。两头都只认协议：服务端挂的可以是核心包、`ctx-sqlite`、`ctx-exec` 或你自己的实现，客户端拿到的就是 `SessionStore`、`Executor`、`Harness`、`Orchestrator`，交给任何认协议的代码用。只依赖 `@modelctx-ai/ctx-protocol`。
+把 ctx 的协议搬到 HTTP 上：会话存储、执行环境、harness、编排器、记忆存储都能放到进程边界的另一侧。服务端把进程内的协议对象挂成 HTTP 路径，客户端把这些路径还原成协议的接口。两头都只认协议：服务端挂的可以是核心包、`ctx-sqlite`、`ctx-exec` 或你自己的实现，客户端拿到的就是 `SessionStore`、`Executor`、`Harness`、`Orchestrator`、`MemoryStore`，交给任何认协议的代码用。只依赖 `@modelctx-ai/ctx-protocol`。
 
-| 入口                             | 内容                                                                                                          | 运行环境                                                                       |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `@modelctx-ai/ctx-remote`        | 客户端：`createRemoteSessionStore`、`createRemoteExecutor`、`createRemoteHarness`、`createRemoteOrchestrator` | 任何有 `fetch` 的运行时（Node、Deno、Bun、浏览器、Workers），不用 `node:` 模块 |
-| `@modelctx-ai/ctx-remote/server` | 服务端：`createRemoteHandler`、`startRemote`                                                                  | Node ≥22（`node:http`）                                                        |
+| 入口                             | 内容                                                                                                                                     | 运行环境                                                                       |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `@modelctx-ai/ctx-remote`        | 客户端：`createRemoteSessionStore`、`createRemoteExecutor`、`createRemoteHarness`、`createRemoteOrchestrator`、`createRemoteMemoryStore` | 任何有 `fetch` 的运行时（Node、Deno、Bun、浏览器、Workers），不用 `node:` 模块 |
+| `@modelctx-ai/ctx-remote/server` | 服务端：`createRemoteHandler`、`startRemote`                                                                                             | Node ≥22（`node:http`）                                                        |
 
 ## 安装
 
@@ -85,6 +85,7 @@ createServer((req, res) => {
 | `executors`       | —                | `Executor[]` 或 `{ 名字: Executor }`，挂在 `/executors/:name`                                                                                      |
 | `harness`         | —                | `Harness`，挂在 `/runs`                                                                                                                            |
 | `orchestrator`    | —                | `Orchestrator`，挂在 `/orchestrator`                                                                                                               |
+| `memory`          | —                | `MemoryStore`，挂在 `/memory`（见「记忆」）                                                                                                        |
 | `accessToken`     | —                | 要求 `Authorization: Bearer <token>`，常量时间比较；方案名不分大小写                                                                               |
 | `allowedHosts`    | 监听地址         | 只接受这些 `Host`（`host:port`），挡 DNS rebinding。`startRemote` 监听本机时认 `localhost`、`127.0.0.1`、`[::1]`；`createRemoteHandler` 不给就不查 |
 | `allowedOrigins`  | 无               | 带 `Origin` 的请求只放行这些来源；缺省浏览器网页发来的请求一律 403                                                                                 |
@@ -135,6 +136,52 @@ await orchestrator.close(); // 只关这个客户端
 
 服务端返回的 `{ error }` 变成抛出的 `RemoteError`：一个 `Error`，带 `status`（HTTP 状态码）、`type`、`retryable?`、`statusCode?`、`responseBody?`（后两个是上游接口的状态码和响应正文，服务端有才带；`status` 仍是本次 HTTP 响应的）；`isRemoteError(error)` 判断。NDJSON 流中途出错时最后一行是 `{ error }`，客户端同样抛出。
 
+## 记忆
+
+服务端给了 `memory`（任何 `MemoryStore`，例如 `@modelctx-ai/ctx-memory` 的 `createMemoryStore()`）就挂 `/memory/*`，没给就是 404。客户端 `createRemoteMemoryStore(options)` 返回 `MemoryStore`，选项和 `createRemoteSessionStore` 一样（`baseUrl`、`accessToken?`、`headers?`、`fetch?`）。
+
+```ts
+import { createMemoryStore } from '@modelctx-ai/ctx-memory';
+import { createRemoteMemoryStore } from '@modelctx-ai/ctx-remote';
+import { startRemote } from '@modelctx-ai/ctx-remote/server';
+
+const server = await startRemote({ memory: createMemoryStore(), accessToken });
+
+const memory = createRemoteMemoryStore({ baseUrl: server.baseUrl, accessToken }); // MemoryStore
+const hits = await memory.facts.search({ text: '乌龙茶', k: 5 });
+await memory.facts.touch(
+  hits.map((hit) => hit.fact.id),
+  Date.now(),
+);
+console.log((await memory.core.get())?.text);
+```
+
+每个协议方法恰好一个端点。路径里的 `:id` 用 `encodeURIComponent` 转义；查询参数不给就不传给存储，布尔是 `true` / `false`，数字原样（`limit=1.9` 由存储向下取整）。
+
+| 集合 | 协议方法  | HTTP                                                    | 请求体                                         | 响应                            |
+| ---- | --------- | ------------------------------------------------------- | ---------------------------------------------- | ------------------------------- |
+| 笔记 | `add`     | `POST /memory/notes`                                    | `{ notes: NewNote[] }`                         | `{ notes: Note[] }`             |
+|      | `list`    | `GET /memory/notes?session=&pending=&limit=`            | —                                              | `{ notes: Note[] }`             |
+|      | `settle`  | `POST /memory/notes/settle`                             | `{ ids: string[], at }`                        | `{ settled: number }`           |
+|      | `head`    | `GET /memory/notes/head?session=`（必填）               | —                                              | `{ head: number }`              |
+| 事实 | `add`     | `POST /memory/facts`                                    | `{ fact: NewMemoryFact }`                      | `{ fact: MemoryFact }`          |
+|      | `list`    | `GET /memory/facts?subject=&topic=&open=&after=&limit=` | —                                              | `{ facts: MemoryFact[] }`       |
+|      | `search`  | `POST /memory/facts/search`                             | `SearchQuery`（`{ text, topic?, k?, open? }`） | `{ hits: FactHit[] }`           |
+|      | `close`   | `POST /memory/facts/:id/close`                          | `{ at, supersededBy? }`                        | `{}`                            |
+|      | `cite`    | `POST /memory/facts/:id/cite`                           | `{ sources: SourceRef[] }`                     | `{ fact: MemoryFact }`          |
+|      | `touch`   | `POST /memory/facts/touch`                              | `{ ids: string[], at }`                        | `{}`                            |
+|      | `archive` | `POST /memory/facts/archive`                            | `{ ids: string[], at }`                        | `{ archived: number }`          |
+|      | `forget`  | `POST /memory/facts/forget`                             | `{ ids: string[] }`                            | `{ forgotten: number }`         |
+| 程序 | `add`     | `POST /memory/procedures`                               | `{ procedure: NewProcedure }`                  | `{ procedure: Procedure }`      |
+|      | `list`    | `GET /memory/procedures?topic=&active=`                 | —                                              | `{ procedures: Procedure[] }`   |
+|      | `confirm` | `POST /memory/procedures/:id/confirm`                   | `{ evidence: SourceRef[] }`                    | `{ procedure: Procedure }`      |
+|      | `retire`  | `POST /memory/procedures/:id/retire`                    | `{ at }`                                       | `{}`                            |
+| 画像 | `get`     | `GET /memory/core`                                      | —                                              | `{ core: CoreVersion \| null }` |
+|      | `set`     | `PUT /memory/core`                                      | `{ text, at }`                                 | `{}`                            |
+|      | `history` | `GET /memory/core/history?last=`                        | —                                              | `{ versions: CoreVersion[] }`   |
+
+错误：存储抛的 `CtxError` 按 `type` 映射状态码，正文的 `type` 原样保留：`invalid_request` 400、`not_found` 404、`conflict` 409。服务端自己查出的输入不对（缺字段、`limit` 不是数、`pending` 不是 `true` / `false`、`head` 没给 `session`）也是 400 `invalid_request`。客户端把这三种 `type` 转回同 `type` 的 `CtxError`（批量方法照协议跳过认不得的 `id`，不报错）；别的错误照常是 `RemoteError`，例如服务端没挂记忆是 404 `not_found_error`、方法不对是 405 `method_not_allowed`，调用方据此区分「这个 `id` 不存在」和「这个服务没有记忆」。
+
 ## 线上形态
 
 JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个值）。路径里的会话名、执行环境名、`runId` 用 `encodeURIComponent` 转义。
@@ -174,7 +221,7 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 - `Host` 只认监听地址（`allowedHosts`），挡 DNS rebinding；不对 403。
 - 带 `Origin` 的请求一律 403，除非在 `allowedOrigins` 里：浏览器网页不能顺手调本机的服务。
 - 请求体上限 4 MiB（`maxBodyBytes`），超过 413。
-- 错误正文统一 `{ error: { message, type } }`，`type` 是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`method_not_allowed`、`conflict_error`、`request_too_large`、`server_error`、`harness_error` 之一。
+- 错误正文统一 `{ error: { message, type } }`，`type` 是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`method_not_allowed`、`conflict_error`、`request_too_large`、`server_error`、`harness_error` 之一；会话的 `append` 冲突是 `conflict`，`/memory/*` 转发的协议错误是 `invalid_request`、`not_found`、`conflict`（见「记忆」）。
 
 服务端不替组件做隔离：挂一个 `ctx-exec` 执行环境就是把这台机器上的命令行交给持有 token 的人。要隔离，把执行环境的服务端放进容器。
 
@@ -187,4 +234,4 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 
 ## 测试
 
-客户端一侧跑协议包的契约测试，服务端挂核心包、`ctx-exec` 的实现：`describeSessionStoreContract`（服务端的存储有 `watch` 和没有 `watch` 两种）、`describeExecutorContract`（函数执行环境和子进程执行环境）、`describeHarnessContract`、`describeOrchestratorContract` 全部通过。另有一例端到端：会话存储、子进程执行环境、harness 各在一个 `startRemote` 里，harness 经客户端用另外两个，按剧本调用 `run_command` 跑 `echo hello`，日志里有工具结果。
+客户端一侧跑协议包的契约测试，服务端挂核心包、`ctx-exec` 的实现：`describeSessionStoreContract`（服务端的存储有 `watch` 和没有 `watch` 两种）、`describeExecutorContract`（函数执行环境和子进程执行环境）、`describeHarnessContract`、`describeOrchestratorContract`、`describeMemoryStoreContract`（服务端挂 `ctx-memory` 的内存存储）全部通过。另有一例端到端：会话存储、子进程执行环境、harness 各在一个 `startRemote` 里，harness 经客户端用另外两个，按剧本调用 `run_command` 跑 `echo hello`，日志里有工具结果。

@@ -14,11 +14,13 @@ import {
 } from '@modelctx-ai/ctx';
 import { createScriptedModel } from '@modelctx-ai/ctx/testing';
 import { createProcessExecutor } from '@modelctx-ai/ctx-exec';
-import { CTX_EVENTS, eventEntry, userEntry, type Entry, type SessionStore } from '@modelctx-ai/ctx-protocol';
+import { createMemoryStore as createInMemoryMemoryStore } from '@modelctx-ai/ctx-memory';
+import { CTX_EVENTS, CtxError, eventEntry, userEntry, type Entry, type SessionStore } from '@modelctx-ai/ctx-protocol';
 import {
   type ModelScriptStep,
   describeExecutorContract,
   describeHarnessContract,
+  describeMemoryStoreContract,
   describeOrchestratorContract,
   describeSessionStoreContract,
 } from '@modelctx-ai/ctx-protocol/testing';
@@ -27,6 +29,7 @@ import { afterAll, describe, expect, test } from 'vite-plus/test';
 import {
   createRemoteExecutor,
   createRemoteHarness,
+  createRemoteMemoryStore,
   createRemoteOrchestrator,
   createRemoteSessionStore,
   isRemoteError,
@@ -180,6 +183,12 @@ describeOrchestratorContract(
       agent,
     };
   },
+  api,
+);
+
+describeMemoryStoreContract(
+  'remote（服务端：ctx-memory 的内存存储）',
+  async () => createRemoteMemoryStore(client(await serve({ memory: createInMemoryMemoryStore() }))),
   api,
 );
 
@@ -426,6 +435,80 @@ describe('远程执行环境', () => {
     );
     expect(output.type === 'error' && output.message).toMatch(/cancelled/);
     expect(await eventually(async () => aborted, Boolean)).toBe(true);
+  });
+});
+
+describe('远程记忆存储', () => {
+  const auth = { authorization: `Bearer ${accessToken}` };
+
+  test('没挂 memory：/memory/* 是 404，客户端抛 RemoteError 而不是 not_found', async () => {
+    const server = await serve({ store: createMemoryStore() });
+    const response = await fetch(`${server.baseUrl}/memory/notes`, { headers: auth });
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      error: { message: 'this server does not serve a memory store', type: 'not_found_error' },
+    });
+    const error: unknown = await createRemoteMemoryStore(client(server))
+      .core.get()
+      .catch((caught: unknown) => caught);
+    expect(isRemoteError(error) && [error.status, error.type]).toEqual([404, 'not_found_error']);
+  });
+
+  test('未知路径 404，方法不对 405，输入不对 400 invalid_request', async () => {
+    const server = await serve({ memory: createInMemoryMemoryStore() });
+    const call = (method: string, path: string, body?: unknown) =>
+      fetch(`${server.baseUrl}${path}`, {
+        method,
+        headers: { ...auth, 'content-type': 'application/json' },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      });
+    for (const path of ['/memory', '/memory/nope', '/memory/notes/nope', '/memory/facts/f1/nope', '/memory/core/x/y']) {
+      expect([path, (await call('GET', path)).status]).toEqual([path, 404]);
+    }
+    const wrongMethod: [string, string][] = [
+      ['DELETE', '/memory/notes'],
+      ['GET', '/memory/notes/settle'],
+      ['POST', '/memory/notes/head'],
+      ['GET', '/memory/facts/search'],
+      ['GET', '/memory/facts/f1/close'],
+      ['PUT', '/memory/procedures'],
+      ['GET', '/memory/procedures/p1/retire'],
+      ['POST', '/memory/core'],
+      ['POST', '/memory/core/history'],
+    ];
+    for (const [method, path] of wrongMethod) {
+      const response = await call(method, path, method === 'GET' ? undefined : {});
+      const { error } = (await response.json()) as { error: { type: string } };
+      expect([method, path, response.status, error.type]).toEqual([method, path, 405, 'method_not_allowed']);
+    }
+    const bad = await call('POST', '/memory/notes/settle', { ids: 'n1', at: 1 });
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: { type: string } }).error.type).toBe('invalid_request');
+    expect((await call('GET', '/memory/notes/head')).status).toBe(400);
+    expect((await call('GET', '/memory/facts?limit=abc')).status).toBe(400);
+    expect((await call('GET', '/memory/procedures?active=yes')).status).toBe(400);
+    const missing = await call('POST', '/memory/facts/missing/close', { at: 1 });
+    expect(missing.status).toBe(404);
+    expect(((await missing.json()) as { error: { type: string } }).error.type).toBe('not_found');
+  });
+
+  test('basePath：前缀下能用，根上的 /memory 是 404；id 里的 / 经转义过线', async () => {
+    const server = await serve({ memory: createInMemoryMemoryStore(), basePath: '/ctx' });
+    const store = createRemoteMemoryStore(client(server));
+    await store.core.set('画像', 1);
+    expect(await store.core.get()).toEqual({ text: '画像', at: 1 });
+    const fact = await store.facts.add({
+      subject: 'user',
+      text: '主人喜欢乌龙茶',
+      validFrom: 1,
+      confidence: 0.9,
+      salience: 0.5,
+      sources: [{ session: 'a/b', from: 1, upTo: 1 }],
+    });
+    expect((await store.facts.cite(fact.id, [{ session: 'a/b', from: 2, upTo: 3 }])).sources).toHaveLength(2);
+    expect((await fetch(`${server.origin}/memory/core`, { headers: auth })).status).toBe(404);
+    const error: unknown = await store.procedures.retire('x/y', 1).catch((caught: unknown) => caught);
+    expect(error instanceof CtxError && error.type).toBe('not_found');
   });
 });
 
