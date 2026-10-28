@@ -4,6 +4,7 @@
 
 ## 2026-10-27
 
+- **更新** [ctx-sqlite](../packages/sqlite/README.md)「多进程」一段：写明切 WAL 时 SQLite 不调 busy handler，本包自己重试（见 [CHANGELOG](../CHANGELOG.md)）。
 - **更新** 记忆的文档按其他七个组件的模式拆开，只搬动、不改写：[记忆](memory.md)（591 行 → 108 行）只留设计——四层记忆和 ctx 组件、五个决策、接进其余组件、预算、失败模式，「没有采用」改成指 ADR 0006 的同名一节；协议签名（`MemoryStore`、`DecisionModel`、`ExtractionModel`、门面 `Memory`、激活度公式）进[协议层](protocol.md)的记忆一节，取代原来「只列方法」的缩写版，契约测试一段补上各契约由谁跑；参考实现（`createMemory` 的选项、门控、召回、巩固，SQLite 和内存存储，模型实例化，组装）进[架构](architecture.md)新的「记忆」一节，放在编排器和网关之间。[架构](architecture.md)的「设计约束」改名「实现约束」，和[概念](concepts.md)的「设计约束」（设计原则）区分；[索引](index.md)三行、[AGENTS.md](../AGENTS.md) 的链接跟上。
 - **更新** [实践：yoyo](repos.md)只留跨仓库的事：删掉「yoyo 和 ctx 组件的对应」表、「yoyo 怎么用 ctx」「yoyo 的分层」两节（和 yoyo 仓库 `docs/tech/architecture.md` 的三节是同一份内容的两个副本，这里的已经落后），开头一句改成链接过去。顺带改正落后的事实：yoyo 依赖的是 7 个包（加 `ctx-memory`），`yoyo.db` 的契约加 `memory_` 前缀的表（结构版本 1），依赖图加 `ctx-memory`，去掉「yoyo 还没接记忆」。
 - **新增** [CHANGELOG.md](../CHANGELOG.md)：代码变更按版本倒序（未发布、0.3.0、0.2.0、0.1.0）。这里原来以「实现 / 发布 / 修复 / 删除」开头的条目原文搬了过去，这里只留文档的变更；[索引](index.md)的「其他」加一行，[AGENTS.md](../AGENTS.md) 的「记录」写明两处各记什么。

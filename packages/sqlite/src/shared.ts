@@ -24,18 +24,39 @@ export function openDatabase(
   const owned = !options.database;
   const database = options.database ?? new DatabaseSync(options.path!);
   try {
+    const timeout = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
     if (options.busyTimeoutMs !== undefined || owned) {
-      const timeout = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
       if (!Number.isInteger(timeout) || timeout < 0) throw new Error(`Invalid busyTimeoutMs ${timeout}.`);
       database.exec(`PRAGMA busy_timeout = ${timeout}`);
     }
-    if (owned) database.exec('PRAGMA journal_mode = WAL');
+    if (owned) enableWal(database, timeout);
     migrate(database);
   } catch (error) {
     if (owned) database.close();
     throw error;
   }
   return { database, owned };
+}
+
+/** SQLite 的结果码 `SQLITE_BUSY`。 */
+const SQLITE_BUSY = 5;
+
+/**
+ * 切到 WAL。库还在 rollback 模式、别的连接正持有写锁时（几个进程同时打开一个新库，另一个也正在切 WAL），
+ * 这条 PRAGMA 立刻报 `SQLITE_BUSY`，不等 `busy_timeout`：SQLite 为避免死锁在这条路上不调 busy handler。
+ * 所以自己等：每 10 毫秒再试一次，最多等 `timeout` 毫秒。库已经是 WAL 时这条 PRAGMA 只读，不碰锁。
+ */
+function enableWal(database: DatabaseSync, timeout: number): void {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    try {
+      database.exec('PRAGMA journal_mode = WAL');
+      return;
+    } catch (error) {
+      if ((error as { errcode?: number }).errcode !== SQLITE_BUSY || Date.now() >= deadline) throw error;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
 }
 
 export function hasTable(database: DatabaseSync, name: string): boolean {

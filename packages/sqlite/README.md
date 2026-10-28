@@ -77,7 +77,7 @@ watcher.close();
 
 ## 多进程
 
-自己开库时设 `journal_mode = WAL` 和 `busy_timeout`（缺省 5000 毫秒），几个进程可以同时写同一个库，等锁而不是报 `SQLITE_BUSY`。传进来的 `database` 归应用管：本包缺省不改它的 `journal_mode` 和 `busy_timeout`，要多进程写请应用自己设（或传 `busyTimeoutMs`）。写入每批第一条语句就是 INSERT，所以拿写锁时会等 `busy_timeout`；应用自己的事务如果先读后写，升级写锁时仍可能直接 `SQLITE_BUSY`，应该用 `BEGIN IMMEDIATE`。
+自己开库时设 `journal_mode = WAL` 和 `busy_timeout`（缺省 5000 毫秒），几个进程可以同时写同一个库，等锁而不是报 `SQLITE_BUSY`。切 WAL 这一步 SQLite 不调 busy handler（库还是 rollback 模式、别的连接正持有写锁时立刻 `SQLITE_BUSY`，几个进程同时打开一个新库就会碰上），本包自己重试，最多等 `busy_timeout` 那么久。传进来的 `database` 归应用管：本包缺省不改它的 `journal_mode` 和 `busy_timeout`，要多进程写请应用自己设（或传 `busyTimeoutMs`）。写入每批第一条语句就是 INSERT，所以拿写锁时会等 `busy_timeout`；应用自己的事务如果先读后写，升级写锁时仍可能直接 `SQLITE_BUSY`，应该用 `BEGIN IMMEDIATE`。
 
 ## 记忆存储
 
