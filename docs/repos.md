@@ -31,7 +31,7 @@ ctx 是框架，yoyo 是用它做出来的第一个程序：一个常驻的桌�
 | yoyo → dsh-pet | `POST /standalone-ai/settings`：把桌宠右键对话的模型地址指向 yoyo 里的 ctx-gateway，密钥填一次性的本机令牌                                                                                  |
 | yoyo → dsh-pet | 环境变量 `YOYO_PET_MENU`：yoyo 的补丁让桌面窗口按它藏掉自带菜单项、把 yoyo 的项提到第一层；没打补丁的桌宠不认                                                                               |
 | dsh-pet → yoyo | OpenAI Chat Completions：`POST /v1/chat/completions`，SSE 流式                                                                                                                              |
-| yoyo → LLM     | 导演经 ctx 和 AI SDK 调模型；网关原样转发到 OpenAI 兼容的上游                                                                                                                               |
+| yoyo → LLM     | 导演和右键对话都经 ctx 和 AI SDK 调模型；网关不转发                                                                                                                                         |
 
 ## 依赖和使用
 
@@ -101,12 +101,12 @@ flowchart LR
 
 右键对话这条路：
 
-1. yoyo 启动对话渠道：ctx-gateway 监听本机随机端口，上游是配置里的 `llm.baseUrl`，改写用 `withContext(context)`；生成一次性的本机令牌。
-2. yoyo 调 `POST /standalone-ai/settings`，把桌宠对话的地址设成网关、密钥设成本机令牌。真密钥只留在 yoyo 进程里。
-3. 用户在右键对话里说一句，桌宠带着它自己截断过的历史请求网关；网关保留桌宠的系统提示，把历史换成 ctx 的完整上下文，带上这一句，转发给上游，SSE 原样转回。
+1. yoyo 启动对话渠道：ctx-gateway 监听本机随机端口，生成一次性的本机令牌；网关的 `fetch` 换成 yoyo 自己，请求不转发出去。
+2. yoyo 调 `POST /standalone-ai/settings`，把桌宠对话的地址设成网关、密钥设成本机令牌、等待设成 60 秒。真密钥只留在 yoyo 进程里。
+3. 用户在右键对话里说一句，桌宠带着它自己的人设和截断过的历史请求网关。网关查过令牌，交给 yoyo：只取最后一句用户话，经编排器交给 harness 跑回复的 agent（ctx 的完整上下文、记忆、事实、工具、MCP），不写日志；回复按 Chat Completions 的 SSE 回给桌宠。
 4. 桌宠把问答写进自己的对话记忆。yoyo 每拍读一次 `GET /chat`，按幂等键 `pet:<ts>:<role>:<text>` 并进 ctx，重复的跳过。
 
-上游不是 OpenAI 兼容（`llm.provider` 不是 `openai-compatible`）时不开对话渠道，只记一行日志。
+哪种 `llm.provider` 都这样接：模型由 yoyo 自己调。
 
 ## 本地联调
 

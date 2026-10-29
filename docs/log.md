@@ -4,6 +4,7 @@
 
 ## 2026-10-29
 
+- **更新** [实践：yoyo](repos.md)的右键对话这条路：网关的 `fetch` 换成 yoyo 自己，请求不再转发到上游，由 yoyo 经编排器和 harness 跑回复的 agent；绑定时等待设成 60 秒；哪种 `llm.provider` 都接。契约里「yoyo → LLM」一行跟上。
 - **更新** [实践：yoyo](repos.md)跟上 yoyo 改用 npm 上的 dsh-pet：职责表写明不改 dsh-pet 的仓库（fork 只跟上游），yoyo 带一份右键菜单补丁；产物表写明 dsh-pet 发到 npm、yoyo 安装时打补丁；契约加 `YOYO_PET_MENU`；本地联调不再克隆 dsh-pet，桌宠用 yoyo 的 `pnpm pet` 开。
 
 ## 2026-10-27
