@@ -2,6 +2,10 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-10-29
+
+- **更新** [实践：yoyo](repos.md)跟上 yoyo 改用 npm 上的 dsh-pet：职责表写明不改 dsh-pet 的仓库（fork 只跟上游），yoyo 带一份右键菜单补丁；产物表写明 dsh-pet 发到 npm、yoyo 安装时打补丁；契约加 `YOYO_PET_MENU`；本地联调不再克隆 dsh-pet，桌宠用 yoyo 的 `pnpm pet` 开。
+
 ## 2026-10-27
 
 - **更新** [ctx-sqlite](../packages/sqlite/README.md)「多进程」一段：写明切 WAL 时 SQLite 不调 busy handler，本包自己重试（见 [CHANGELOG](../CHANGELOG.md)）。

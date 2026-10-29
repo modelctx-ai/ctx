@@ -6,11 +6,11 @@ ctx 是框架，yoyo 是用它做出来的第一个程序：一个常驻的桌�
 
 ## 职责
 
-| 仓库                                                                                | 是什么                                                    | 负责                                                                                                                                                                                                | 不碰                                                                       |
-| ----------------------------------------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| [modelctx-ai/ctx](https://github.com/modelctx-ai/ctx)（本仓库）                     | 面向 agent 原生程序的上下文与运行框架：协议和参考实现     | 会话日志和存储、上下文组装、工具目录、执行环境、harness、编排、MCP 接入、按配置建模型、远程传输、OpenAI 兼容网关；记忆的协议、操作（门控、召回、巩固、遗忘）、System One 模型的协议和按配置实例化   | 桌宠、人设、语音，任何具体应用的东西；记什么主题、什么值得记、什么时候整理 |
-| [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo)                             | 个人桌宠的“导演”：a personal ai, powered by ctx & dsh-pet | 人设、台词和语气、语音（Fish Audio 合成、whisper.cpp 听写）、闹钟、天气、表情包、联系人、粘贴板；决定说什么、什么时候说；记忆的主题表、哪些条目进门控、画像的预算、夜里什么时候整理、主人怎么看和删 | 画面和动画；上下文机制本身；记忆的存储和判断机制                           |
-| [ticoAg/dsh-pet](https://github.com/ticoAg/dsh-pet)（fork 自 PC2005-cloud/dsh-pet） | 桌宠本体：DSH 插件，也能以 Electron 独立模式运行          | 显示气泡、播放动作、右键菜单、自己的对话框和对话记忆                                                                                                                                                | 我们不改它，只用它的公开契约                                               |
+| 仓库                                                                                | 是什么                                                    | 负责                                                                                                                                                                                                | 不碰                                                                                  |
+| ----------------------------------------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| [modelctx-ai/ctx](https://github.com/modelctx-ai/ctx)（本仓库）                     | 面向 agent 原生程序的上下文与运行框架：协议和参考实现     | 会话日志和存储、上下文组装、工具目录、执行环境、harness、编排、MCP 接入、按配置建模型、远程传输、OpenAI 兼容网关；记忆的协议、操作（门控、召回、巩固、遗忘）、System One 模型的协议和按配置实例化   | 桌宠、人设、语音，任何具体应用的东西；记什么主题、什么值得记、什么时候整理            |
+| [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo)                             | 个人桌宠的“导演”：a personal ai, powered by ctx & dsh-pet | 人设、台词和语气、语音（Fish Audio 合成、whisper.cpp 听写）、闹钟、天气、表情包、联系人、粘贴板；决定说什么、什么时候说；记忆的主题表、哪些条目进门控、画像的预算、夜里什么时候整理、主人怎么看和删 | 画面和动画；上下文机制本身；记忆的存储和判断机制                                      |
+| [ticoAg/dsh-pet](https://github.com/ticoAg/dsh-pet)（fork 自 PC2005-cloud/dsh-pet） | 桌宠本体：DSH 插件，也能以 Electron 独立模式运行          | 显示气泡、播放动作、右键菜单、自己的对话框和对话记忆                                                                                                                                                | 不改它的仓库（fork 只用来跟上游）；yoyo 装 npm 上的版本，带一份自己维护的右键菜单补丁 |
 
 ## 产物
 
@@ -18,7 +18,7 @@ ctx 是框架，yoyo 是用它做出来的第一个程序：一个常驻的桌�
 | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ctx     | 9 个 npm 包：`@modelctx-ai/ctx`、`ctx-protocol`、`ctx-sqlite`、`ctx-models`、`ctx-memory`、`ctx-mcp`、`ctx-gateway`、`ctx-exec`、`ctx-remote` | npmjs 的 `@modelctx-ai` 作用域；和同组织的 `@modelctx-ai/via` 一样，由 GitHub Actions 经 OIDC trusted publishing 发布（见 [ADR 0002](adr/0002-packages.md)） | 0.3.0，未发布                                                                                                                                                                          |
 | yoyo    | 应用本身：`bin/yoyo.js` 命令行、`src/main.ts` 常驻进程；内部包 `@yoyo/dsh-pet`（dsh-pet HTTP 接口的类型化客户端）                             | 不发布，从仓库直接运行 `.ts`（Node ≥22.18，不构建）                                                                                                          | TypeScript pnpm workspace，重构见 [modelctx-ai/yoyo#1](https://github.com/modelctx-ai/yoyo/pull/1)，跟到 ctx 0.3 见 [modelctx-ai/yoyo#11](https://github.com/modelctx-ai/yoyo/pull/11) |
-| dsh-pet | DSH 插件包 `dsh-pet`、独立模式命令 `dsh-pet-standalone`                                                                                       | 上游维护                                                                                                                                                     | 只读                                                                                                                                                                                   |
+| dsh-pet | DSH 插件包 `dsh-pet`、独立模式命令 `dsh-pet-standalone`                                                                                       | 上游维护，发到 npm                                                                                                                                           | yoyo 依赖 npm 上的版本，安装时打上 yoyo 的补丁                                                                                                                                         |
 
 ## 契约
 
@@ -29,6 +29,7 @@ ctx 是框架，yoyo 是用它做出来的第一个程序：一个常驻的桌�
 | yoyo → dsh-pet | `openapi.yaml` 描述的 HTTP 接口，前缀 `/dsh-pet-7340`：`/state`（长轮询）、`/lock` 和 `/lock/release`、`/broadcast`、`/anim`、`/chat`（对话记忆）、`/menu/item` 和 `/menu/events` 等        |
 | yoyo → dsh-pet | 独立模式的运行状态文件 `~/.dsh/dsh-pet/standalone-runtime.json`：端口和本机令牌，写接口带请求头 `x-dsh-pet-token`                                                                           |
 | yoyo → dsh-pet | `POST /standalone-ai/settings`：把桌宠右键对话的模型地址指向 yoyo 里的 ctx-gateway，密钥填一次性的本机令牌                                                                                  |
+| yoyo → dsh-pet | 环境变量 `YOYO_PET_MENU`：yoyo 的补丁让桌面窗口按它藏掉自带菜单项、把 yoyo 的项提到第一层；没打补丁的桌宠不认                                                                               |
 | dsh-pet → yoyo | OpenAI Chat Completions：`POST /v1/chat/completions`，SSE 流式                                                                                                                              |
 | yoyo → LLM     | 导演经 ctx 和 AI SDK 调模型；网关原样转发到 OpenAI 兼容的上游                                                                                                                               |
 
@@ -53,7 +54,7 @@ flowchart LR
   core --> ai
   models --> ai
   memory --> ai
-  client -. "HTTP，按 openapi.yaml" .-> pet["ticoAg/dsh-pet"]
+  client -. "HTTP，按 openapi.yaml" .-> pet["dsh-pet（npm，带 yoyo 的补丁）"]
 ```
 
 箭头指向被依赖的一方；虚线是运行时的 HTTP 调用，没有代码依赖。实现包之间不互相依赖，都只依赖协议包（ctx-models、ctx-memory 另把 `ai` 当 peer）；`ctx-exec`、`ctx-remote` yoyo 不用，图里没画。
@@ -113,15 +114,14 @@ flowchart LR
 <workspace>/
 ├── ctx/        modelctx-ai/ctx
 ├── yoyo/       modelctx-ai/yoyo
-└── dsh-pet/    ticoAg/dsh-pet
 ```
 
 ```sh
 (cd ctx && pnpm install && pnpm build)
 (cd yoyo && pnpm install)        # overrides 链接 ../ctx/packages/*
 
-# 另开一个终端：dsh-pet 独立模式（先按它的 README 装好依赖）
-cd dsh-pet/dsh-pet && npm run build && npm run standalone
+# 另开一个终端：桌宠（npm 上的 dsh-pet，pnpm install 时已经装好、打上补丁）
+cd yoyo && pnpm pet
 
 # 回到第一个终端：先按 yoyo 的 README 准备 config.json
 cd yoyo && pnpm start
