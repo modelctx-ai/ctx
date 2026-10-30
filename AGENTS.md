@@ -1,6 +1,22 @@
 # AGENTS.md
 
-给在这个仓库里写代码的人和 coding agent 的工作约定。工具链、命令和依赖要求见 [README](README.md)「开发」「要求」；文档入口是 [docs/index.md](docs/index.md)。
+给在这个仓库里写代码的人和 coding agent 的工作约定。项目介绍见 [README](README.md)；文档入口是 [docs/index.md](docs/index.md)。
+
+## 工具链和命令
+
+开发要 Node ≥22.18（直接运行 `.ts`）和 pnpm 10（版本由 `packageManager` 固定）。工具链是 [Vite+](https://viteplus.dev/)（`vite-plus`，命令 `vp`），配置都在根目录和各包的 `vite.config.ts` 里。
+
+| 命令                                | 作用                                                                                        |
+| ----------------------------------- | ------------------------------------------------------------------------------------------- |
+| `pnpm install`                      | 安装依赖                                                                                    |
+| `pnpm typecheck`                    | `vp check --no-fmt --no-lint`：只做类型检查（tsgolint，TS 7），覆盖全部包的源码、测试和配置 |
+| `pnpm lint`                         | `vp lint`：Oxlint，带类型信息的规则，同时报类型错误；有警告也算失败                         |
+| `pnpm test`                         | `vp test`：Vitest 运行 `packages/*/src/**/*.test.ts`                                        |
+| `pnpm build`                        | 每个包 `vp pack`（tsdown）构建 `dist/`（ESM + `.d.ts`）                                     |
+| `pnpm format` / `pnpm format:check` | `vp fmt`：Oxfmt 改写 / 检查                                                                 |
+| `pnpm check`                        | `vp check`（格式、lint、类型）、test、build；CI 在 Node 22 和 24 上跑同样几步               |
+
+仓库里各包互相引用时按源码解析（`@modelctx-ai/source` 条件，见 [ADR 0002](docs/adr/0002-packages.md)），类型检查和测试不用先构建。使用方的 Node 版本和 peer dependency 写在各包 README 的「安装」里。
 
 ## 文档各管什么
 

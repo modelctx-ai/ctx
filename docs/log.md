@@ -2,6 +2,10 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-10-30
+
+- **更新** 根 [README](../README.md) 只做项目级展示：加「架构」一节，两张 Mermaid 图（八个组件和它们之间的协议调用、一轮的顺序）；三层表和包表合成一张、每个包一句话，运行环境和 peer dependency 留在各包 README 的「安装」；快速开始只留一个对话的例子，持久化、工具、harness、编排器、网关的例子删掉（各包 README 里都有）；同级目录链接压成一段，`overrides` 收进折叠块，细节指 [ADR 0002](adr/0002-packages.md#使用方式)；「开发」只留两条命令。命令表、工具链、开发用的 Node 和 pnpm 版本、源码条件挪进 [AGENTS.md](../AGENTS.md) 新的「工具链和命令」一节，开头的链接跟上。
+
 ## 2026-10-29
 
 - **更新** [实践：yoyo](repos.md)的右键对话这条路：网关的 `fetch` 换成 yoyo 自己，请求不再转发到上游，由 yoyo 经编排器和 harness 跑回复的 agent；绑定时等待设成 60 秒；哪种 `llm.provider` 都接。契约里「yoyo → LLM」一行跟上。
