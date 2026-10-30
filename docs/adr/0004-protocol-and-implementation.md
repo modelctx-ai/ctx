@@ -1,3 +1,11 @@
+---
+type: Decision Record
+title: 'ADR 0004：协议层与实现层分开，组件不绑定托管形态'
+description: '协议层和实现层分开，七个组件各一个协议，组件不绑定托管形态，`thread` 改 `session`'
+tags: [adr, protocol]
+status: stable
+---
+
 # ADR 0004：协议层与实现层分开，组件不绑定托管形态
 
 - 状态：已采纳

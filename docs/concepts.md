@@ -1,3 +1,11 @@
+---
+type: Overview
+title: '概念'
+description: 'ctx 的定位、七个组件和第八个组件记忆、术语表、和 Anthropic 公开实践的对应、设计约束'
+tags: [design, terminology]
+status: stable
+---
+
 # 概念
 
 ctx 是面向 agent 原生程序的上下文与运行框架。它把一个 agent 拆成七个组件，每个组件一个协议；组件之间只通过协议交互，任何一个都可以单独替换、单独托管。本仓库给每个协议一份参考实现，[yoyo](https://github.com/modelctx-ai/yoyo) 是把它们组合成业务的实践。

@@ -4,6 +4,7 @@
 
 ## 2026-10-30
 
+- **更新** 文档按 [Open Knowledge Format](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md) v0.2 组织：[概念](concepts.md)、[协议层](protocol.md)、[记忆](memory.md)、[架构](architecture.md)、[实践：yoyo](repos.md) 和六篇 ADR 加 frontmatter（`type`、`title`、`description`、`tags`、`status`），正文不动；[索引](index.md)从表格改成 OKF 的条目列表，描述和各篇的 `description` 一致，根上声明 `okf_version`；决策记录拆到新的 [adr/index.md](adr/index.md)，根索引只留一条。文件不搬家，外部链接（yoyo、各包 README）不受影响。[AGENTS.md](../AGENTS.md) 加「文档怎么组织」，ADR 和包的链接跟上。
 - **更新** 根 [README](../README.md) 只做项目级展示：加「架构」一节，两张 Mermaid 图（八个组件和它们之间的协议调用、一轮的顺序）；三层表和包表合成一张、每个包一句话，运行环境和 peer dependency 留在各包 README 的「安装」；快速开始只留一个对话的例子，持久化、工具、harness、编排器、网关的例子删掉（各包 README 里都有）；同级目录链接压成一段，`overrides` 收进折叠块，细节指 [ADR 0002](adr/0002-packages.md#使用方式)；「开发」只留两条命令。命令表、工具链、开发用的 Node 和 pnpm 版本、源码条件挪进 [AGENTS.md](../AGENTS.md) 新的「工具链和命令」一节，开头的链接跟上。
 
 ## 2026-10-29

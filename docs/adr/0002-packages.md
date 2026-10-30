@@ -1,3 +1,11 @@
+---
+type: Decision Record
+title: 'ADR 0002：包的拆分、命名、版本和发布'
+description: '包怎么拆、怎么命名，源码条件，版本，发布，使用方式'
+tags: [adr, packages, release]
+status: stable
+---
+
 # ADR 0002：包的拆分、命名、版本和发布
 
 - 状态：已采纳
