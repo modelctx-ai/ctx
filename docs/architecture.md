@@ -1,3 +1,11 @@
+---
+type: Architecture
+title: '架构：进程内参考实现'
+description: '`@modelctx-ai/ctx` 和各实现包怎么做：条目和存储、投影、调用和记录、压缩、来源、工具和 MCP、harness、编排器、记忆、网关、扩展点、实现约束'
+tags: [implementation]
+status: stable
+---
+
 # 架构：进程内参考实现
 
 ctx 分三层：协议（`@modelctx-ai/ctx-protocol`，只有接口）、实现（`@modelctx-ai/ctx` 和 `ctx-*`）、实践（yoyo）。组件和协议的说明见[概念](concepts.md)和[协议层](protocol.md)。本文写的是实现层里进程内的那一份：`@modelctx-ai/ctx` 的会话存储、上下文（投影、来源、压缩）、工具注册表、函数执行环境、harness、编排器和组合门面 `createContext()`，以及 sqlite、models、mcp、gateway 四个适配包。记忆的参考实现（`ctx-memory`，及 sqlite、models、remote 里的记忆部分）在[记忆](#记忆)一节；它的设计见[记忆](memory.md)。

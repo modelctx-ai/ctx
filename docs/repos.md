@@ -1,3 +1,11 @@
+---
+type: Integration
+title: '实践：yoyo 和三个仓库'
+description: 'ctx、yoyo、dsh-pet 各管什么，契约、依赖、运行时拓扑和本地联调'
+tags: [yoyo, dsh-pet, integration]
+status: stable
+---
+
 # 实践：yoyo 和三个仓库
 
 ctx 是框架，yoyo 是用它做出来的第一个程序：一个常驻的桌宠导演。yoyo 的存在是为了检验协议够不够用、参考实现好不好组合；ctx 里不出现任何桌宠的东西。

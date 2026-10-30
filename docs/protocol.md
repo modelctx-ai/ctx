@@ -1,3 +1,11 @@
+---
+type: Specification
+title: '协议层'
+description: '九个协议的职责、签名、JSON 形状、激活度公式、契约测试、托管矩阵和 HTTP 线上形态；`packages/protocol` 以它为准'
+tags: [protocol, specification]
+status: stable
+---
+
 # 协议层
 
 `@modelctx-ai/ctx-protocol` 定义九个协议（七个组件的六个，加记忆的 `MemoryStore`、`DecisionModel`、`ExtractionModel`）、随它们走的 JSON 形状、只依赖这些形状的纯函数，以及每个协议的契约测试。它不含实现。模型用 AI SDK 的 `LanguageModel`，不另定义；消息是 ctx 自己的 JSON 格式（见[消息格式和版本](#消息格式和版本)），协议包不依赖 AI SDK 的消息类型。

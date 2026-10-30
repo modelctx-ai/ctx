@@ -1,3 +1,11 @@
+---
+type: Decision Record
+title: 'ADR 0005：会话位置、并发写入、消息格式版本、AgentSpec 上下文配置'
+description: '位置只用 `seq`，写入前提条件 `expectSeq`，ctx 自己的带版本的 JSON 消息格式，`AgentSpec.context`，会话分页和 `kinds` 过滤'
+tags: [adr, session, protocol]
+status: stable
+---
+
 # ADR 0005：会话位置、并发写入、消息格式版本、AgentSpec 上下文配置
 
 - 状态：已采纳（2026-10-26 用户审阅后按「决定记录」修订）

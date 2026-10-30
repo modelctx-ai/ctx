@@ -1,3 +1,11 @@
+---
+type: Decision Record
+title: 'ADR 0003：只追加的上下文日志加投影'
+description: '只追加的日志加投影、摘要检查点、幂等导入、事实不进日志、延后记录'
+tags: [adr, context, session]
+status: stable
+---
+
 # ADR 0003：只追加的上下文日志加投影
 
 - 状态：已采纳

@@ -1,3 +1,11 @@
+---
+type: Decision Record
+title: 'ADR 0001：用 TypeScript 写 ctx 和 yoyo'
+description: '为什么 ctx 和 yoyo 用 TypeScript；工具链和编译选项'
+tags: [adr, toolchain]
+status: stable
+---
+
 # ADR 0001：用 TypeScript 写 ctx 和 yoyo
 
 - 状态：已采纳

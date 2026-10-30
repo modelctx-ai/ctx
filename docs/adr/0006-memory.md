@@ -1,3 +1,11 @@
+---
+type: Decision Record
+title: 'ADR 0006：记忆作为第八个组件，只读日志、夜里改写、System One 做判断'
+description: '记忆作为第八个组件：只读日志、夜里改写、事实不 UPDATE、证据必填、System One 模型做判断、遗忘是公式、只用已有扩展点接入'
+tags: [adr, memory]
+status: stable
+---
+
 # ADR 0006：记忆作为第八个组件，只读日志、夜里改写、System One 做判断
 
 - 状态：已采纳（2026-10-27 实施时按「决定记录」修订）
