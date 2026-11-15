@@ -47,6 +47,17 @@ export interface RemoteHandlerOptions {
   /** 挂在 `/memory` 下：`/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core`。 */
   readonly memory?: MemoryStore;
   /**
+   * `/runs` 和 `/orchestrator/runs` 只收这些模型名，别的回 400。不给就不限。
+   * 模型名由调用方写在 `agent.model` 里，服务端用自己的密钥去调，所以对外的服务该列出来。
+   */
+  readonly allowedModels?: readonly string[];
+  /**
+   * 调用方的 `agent.settings` 里收哪些键，别的回 400。缺省是 `DEFAULT_ALLOWED_SETTINGS`：采样参数、
+   * `maxRetries`、`timeoutMs`，不含 `headers` 和 `providerOptions`——这两项会原样进服务端发给模型服务商的请求
+   * （改请求头、开服务商侧的功能），要收就写进这个列表。
+   */
+  readonly allowedSettings?: readonly string[];
+  /**
    * 要求调用方带 `Authorization: Bearer <accessToken>`。不给就不查；空串（或全是空白）直接抛错，
    * 免得 `process.env.X ?? ''` 这类写法悄悄变成不鉴权。
    */
@@ -281,13 +292,47 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function runRequestOf(body: unknown): WireRunRequest {
+/** 远端的 `agent.settings` 缺省收的键。 */
+export const DEFAULT_ALLOWED_SETTINGS: readonly string[] = [
+  'temperature',
+  'maxOutputTokens',
+  'topP',
+  'topK',
+  'presencePenalty',
+  'frequencyPenalty',
+  'seed',
+  'stopSequences',
+  'maxRetries',
+  'timeoutMs',
+];
+
+interface AgentPolicy {
+  readonly models?: ReadonlySet<string> | undefined;
+  readonly settings: ReadonlySet<string>;
+}
+
+function runRequestOf(body: unknown, policy: AgentPolicy): WireRunRequest {
   if (!isObject(body)) fail(400, 'request body must be a RunRequest object');
   if (typeof body['session'] !== 'string' || !body['session']) fail(400, 'RunRequest.session must be a string');
   const agent = body['agent'];
   if (!isObject(agent)) fail(400, 'RunRequest.agent must be an object');
   if (typeof agent['model'] !== 'string' || !agent['model']) {
     fail(400, 'RunRequest.agent.model must be a model name string; model objects cannot cross the boundary');
+  }
+  if (policy.models && !policy.models.has(agent['model'])) {
+    fail(400, `model "${agent['model']}" is not allowed by this server`);
+  }
+  const settings = agent['settings'];
+  if (settings !== undefined) {
+    if (!isObject(settings)) fail(400, 'RunRequest.agent.settings must be an object');
+    const refused = Object.keys(settings).filter((key) => !policy.settings.has(key));
+    if (refused.length > 0) {
+      fail(
+        400,
+        `RunRequest.agent.settings.${refused.join(', ')} ${refused.length > 1 ? 'are' : 'is'} not accepted by this server ` +
+          '(the server operator can allow it with `allowedSettings`)',
+      );
+    }
   }
   if (body['runId'] !== undefined && typeof body['runId'] !== 'string') fail(400, 'RunRequest.runId must be a string');
   return body as unknown as WireRunRequest;
@@ -440,6 +485,10 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   const logger = options.logger ?? silentLogger;
   const hosts = options.allowedHosts ? lowered(options.allowedHosts) : undefined;
   const origins = lowered(options.allowedOrigins ?? []);
+  const agentPolicy: AgentPolicy = {
+    models: options.allowedModels ? new Set(options.allowedModels) : undefined,
+    settings: new Set(options.allowedSettings ?? DEFAULT_ALLOWED_SETTINGS),
+  };
 
   /** 正在跑的 harness 运行：`DELETE /runs/:id` 和断开都会中止它。 */
   const activeRuns = new Map<string, AbortController>();
@@ -610,7 +659,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
       return;
     }
     if (method !== 'POST') fail(405, 'use POST /runs');
-    const { aborted, ...wire } = runRequestOf(await readBody(req, limit));
+    const { aborted, ...wire } = runRequestOf(await readBody(req, limit), agentPolicy);
     const id = wire.runId ?? crypto.randomUUID();
     if (activeRuns.has(id)) fail(409, `run "${id}" is already running`);
     const controller = new AbortController();
@@ -705,7 +754,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     if (resource !== 'runs' || extra !== undefined) fail(404, `not found: ${url.pathname}`);
     if (runId === undefined) {
       if (method !== 'POST') fail(405, 'use POST /orchestrator/runs');
-      const { aborted, ...wire } = runRequestOf(await readBody(req, limit));
+      const { aborted, ...wire } = runRequestOf(await readBody(req, limit), agentPolicy);
       const handle = await queue.submit({ ...wire, ...(aborted ? { signal: AbortSignal.abort() } : {}) });
       remember(handle.runId, handle.session, handle.done);
       sendJson(res, 200, { runId: handle.runId, session: handle.session });

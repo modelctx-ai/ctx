@@ -34,7 +34,13 @@ import {
   createRemoteSessionStore,
   isRemoteError,
 } from './index.ts';
-import { createRemoteHandler, startRemote, type RemoteServer, type StartRemoteOptions } from './server.ts';
+import {
+  createRemoteHandler,
+  DEFAULT_ALLOWED_SETTINGS,
+  startRemote,
+  type RemoteServer,
+  type StartRemoteOptions,
+} from './server.ts';
 
 const api = { describe, test };
 const accessToken = 'test-token-0123456789';
@@ -241,6 +247,44 @@ describe('远程 harness', () => {
       'run.ended',
     ]);
     expect(eventKinds(await store.list('s')).at(-1)).toBe(CTX_EVENTS.runEnded);
+  });
+
+  test('agent.settings 缺省不收 headers、providerOptions，allowedSettings 放行；allowedModels 之外的模型 400', async () => {
+    const { harness } = localHarness([{ type: 'text', text: '好' }]);
+    const strict = createRemoteHarness(client(await serve({ harness, allowedModels: ['other'] })));
+    const refuse = async (run: Promise<unknown>): Promise<unknown> => run.catch((error: unknown) => error);
+    const post = (settings: Record<string, unknown>, remote = createRemoteHarness(client(server))) =>
+      remote.run({ session: 's', agent: { ...agent, settings }, input: '在吗' });
+    const server = await serve({ harness });
+
+    for (const settings of [
+      { headers: { authorization: 'Bearer x' } },
+      { providerOptions: { openai: {} } },
+      { nope: 1 },
+    ]) {
+      const error = await refuse(post(settings));
+      expect(isRemoteError(error) && error.status).toBe(400);
+      expect(String((error as Error).message)).toMatch(/not accepted by this server/);
+    }
+    expect((await post({ temperature: 0.2, maxRetries: 0, timeoutMs: 5000 })).stopReason).toBe('end_turn');
+
+    const wrongModel = await refuse(strict.run({ session: 's', agent, input: '在吗' }));
+    expect(isRemoteError(wrongModel) && wrongModel.status).toBe(400);
+    expect(String((wrongModel as Error).message)).toMatch(/is not allowed by this server/);
+
+    const open = localHarness([{ type: 'text', text: '好' }]);
+    const allowed = await serve({
+      harness: open.harness,
+      allowedModels: [agent.model],
+      allowedSettings: [...DEFAULT_ALLOWED_SETTINGS, 'headers'],
+    });
+    const result = await post({ headers: { 'x-trace': 'abc' } }, createRemoteHarness(client(allowed)));
+    expect(result.stopReason).toBe('end_turn');
+    const started = (await open.store.list('s')).find(
+      (entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.runStarted,
+    );
+    expect(JSON.stringify(started)).not.toContain('abc');
+    expect(JSON.stringify(started)).toContain('"x-trace":"[redacted]"');
   });
 
   test('stream：客户端中途不读了，服务端中止这一轮并写 ctx.run.ended（aborted）', async () => {

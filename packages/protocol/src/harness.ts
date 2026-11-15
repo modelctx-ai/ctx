@@ -54,7 +54,13 @@ export function modelName(model: ModelRef): string {
   return `${model.provider}/${model.modelId}`;
 }
 
-/** `AgentSpec` 的可序列化部分，`ctx.run.started` 的 `data.agent` 用它。 */
+/** 记进日志时，请求头的值换成这个：头里常有凭证，日志只追加、读得到会话的人都看得到。 */
+export const REDACTED_HEADER = '[redacted]';
+
+/**
+ * `AgentSpec` 的可序列化部分，`ctx.run.started` 的 `data.agent` 用它。
+ * `settings.headers` 只留名字，值换成 `REDACTED_HEADER`。
+ */
 export function agentSpecToJson(spec: AgentSpec): JsonObject {
   const out: Record<string, unknown> = { model: modelName(spec.model) };
   if (spec.name !== undefined) out['name'] = spec.name;
@@ -63,7 +69,12 @@ export function agentSpecToJson(spec: AgentSpec): JsonObject {
   if (spec.maxSteps !== undefined) out['maxSteps'] = spec.maxSteps;
   if (spec.window !== undefined) out['window'] = spec.window;
   if (spec.context !== undefined) out['context'] = spec.context;
-  if (spec.settings !== undefined) out['settings'] = spec.settings;
+  if (spec.settings !== undefined) {
+    const { headers, ...rest } = spec.settings;
+    out['settings'] = headers
+      ? { ...rest, headers: Object.fromEntries(Object.keys(headers).map((name) => [name, REDACTED_HEADER])) }
+      : rest;
+  }
   return out as JsonObject;
 }
 
