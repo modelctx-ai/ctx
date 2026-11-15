@@ -1,4 +1,5 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -35,6 +36,18 @@ function text(output: ToolOutput): string {
 function error(output: ToolOutput): string {
   if (output.type === 'error') return output.message;
   throw new Error(`expected error, got ${JSON.stringify(output)}`);
+}
+
+const posix = process.platform !== 'win32';
+
+/** 工作目录外面的一个临时目录，用完删掉。 */
+async function withOutside(body: (outside: string) => Promise<void>): Promise<void> {
+  const outside = await mkdtemp(join(tmpdir(), 'ctx-exec-outside-'));
+  try {
+    await body(outside);
+  } finally {
+    await rm(outside, { recursive: true, force: true });
+  }
 }
 
 // 回显工具：固定命令工具 echo，不经 shell 把输入原样交给 /bin/echo。
@@ -75,6 +88,34 @@ describe('run_command', () => {
     expect((await executor({ files: false }).tools()).map((tool) => tool.name)).toEqual(['run_command']);
   });
 
+  test('runCommand: false 时不报也不跑 run_command，别的工具照旧', async () => {
+    const exec = executor({
+      runCommand: false,
+      commands: { hello: { command: () => ['echo', 'hello'] } },
+    });
+    expect((await exec.tools()).map((tool) => tool.name)).toEqual(['read_file', 'write_file', 'list_dir', 'hello']);
+    const refused = error(
+      await exec.execute({ id: 'c', name: 'run_command', input: { command: 'touch run-command-off' } }, context),
+    );
+    expect(refused).toMatch(/run_command is turned off/);
+    expect(refused).toContain('Available tools: read_file, write_file, list_dir, hello.');
+    await expect(readFile(join(root, 'run-command-off'))).rejects.toThrow(/ENOENT/);
+    expect(text(await exec.execute({ id: 'c', name: 'hello', input: {} }, context))).toContain('hello');
+    expect(text(await exec.execute({ id: 'c', name: 'list_dir', input: {} }, context))).toBeTypeOf('string');
+    // 说明和截断提示里不再让模型去找 run_command。
+    expect(JSON.stringify(await exec.tools())).not.toContain('run_command');
+    await writeFile(join(root, 'no-shell.txt'), 'x'.repeat(20));
+    const cut = text(await exec.execute({ id: 'c', name: 'read_file', input: { path: 'no-shell.txt' } }, context));
+    expect(cut).toBe('x'.repeat(20));
+    expect(
+      text(await call('read_file', { path: 'no-shell.txt' }, { runCommand: false, maxOutputBytes: 5 })),
+    ).not.toContain('run_command');
+    // run_command 这个名字始终留给内置工具。
+    expect(() =>
+      createProcessExecutor({ runCommand: false, commands: { run_command: { command: () => 'ls' } } }),
+    ).toThrow(/taken/);
+  });
+
   test('在 cwd 里跑，返回退出码和 stdout', async () => {
     const output = text(await run('echo hello && pwd'));
     expect(output).toContain('<exit_code>0</exit_code>');
@@ -105,6 +146,23 @@ describe('run_command', () => {
     expect(error(output)).toMatch(/timed out after 200 ms/);
     expect(JSON.stringify(output.type === 'error' && output.data)).toContain('before');
     expect(JSON.stringify(output.type === 'error' && output.data)).not.toContain('after');
+  });
+
+  test.skipIf(!posix)('留下后台进程的命令在 shell 退出后就返回，不算超时，也不杀后台进程', async () => {
+    const started = Date.now();
+    // 后台的子 shell 继承了 stdout、stderr，管道要等它结束才关。
+    const output = await run('(sleep 2; echo done > background.txt) & echo started', { timeoutMs: 10_000 });
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(text(output)).toBe('<exit_code>0</exit_code>\n<stdout>\nstarted\n</stdout>');
+    await expect(readFile(join(root, 'background.txt'))).rejects.toThrow(/ENOENT/);
+    await expect
+      .poll(() => readFile(join(root, 'background.txt'), 'utf8').catch(() => ''), { timeout: 8_000 })
+      .toBe('done\n');
+  });
+
+  test.skipIf(!posix)('后台进程占着管道时，超时短于它也不误报', async () => {
+    const output = await run('sleep 2 & echo started; exit 4', { timeoutMs: 600 });
+    expect(text(output)).toBe('<exit_code>4</exit_code>\n<stdout>\nstarted\n</stdout>');
   });
 
   test('调用时的 timeoutMs 覆盖缺省值，但不超过上限', async () => {
@@ -143,6 +201,13 @@ describe('run_command', () => {
     expect(seen).toEqual(['touch should-not-exist']);
     await expect(readFile(join(root, 'should-not-exist'))).rejects.toThrow(/ENOENT/);
     expect(text(await run('echo ok', { allow: () => true }))).toContain('ok');
+  });
+
+  test('allow 只管命令，管不到文件工具', async () => {
+    const options: ProcessExecutorOptions = { allow: () => false };
+    expect(text(await call('write_file', { path: 'allow-only.txt', content: 'x' }, options))).toMatch(/Wrote 1 bytes/);
+    expect(text(await call('read_file', { path: 'allow-only.txt' }, options))).toBe('x');
+    expect(text(await call('list_dir', {}, options))).toContain('allow-only.txt');
   });
 
   test('起不来进程是错误，信息能照着做', async () => {
@@ -220,6 +285,217 @@ describe('文件工具', () => {
     } finally {
       await rm(outside, { recursive: true, force: true });
     }
+  });
+
+  test.skipIf(!posix)('悬空的符号链接不当成还不存在的文件：写不出去', async () => {
+    await withOutside(async (outside) => {
+      await symlink(join(outside, 'x.txt'), join(root, 'dangling'));
+      await symlink(join(outside, 'newdir'), join(root, 'dangling-dir'));
+      await symlink('loop-b', join(root, 'loop-a'));
+      await symlink('loop-a', join(root, 'loop-b'));
+      for (const [name, input] of [
+        ['write_file', { path: 'dangling', content: 'x' }],
+        ['write_file', { path: 'dangling', content: 'x', append: true }],
+        ['read_file', { path: 'dangling' }],
+        ['write_file', { path: 'dangling-dir/x.txt', content: 'x' }],
+        ['list_dir', { path: 'dangling-dir' }],
+        ['write_file', { path: 'loop-a', content: 'x' }],
+      ] as const) {
+        expect(error(await call(name, input)), `${name} ${JSON.stringify(input)}`).toMatch(
+          /symbolic link that cannot be resolved/,
+        );
+      }
+      await expect(readFile(join(outside, 'x.txt'))).rejects.toThrow(/ENOENT/);
+      await expect(lstat(join(outside, 'newdir'))).rejects.toThrow(/ENOENT/);
+      expect((await lstat(join(root, 'dangling'))).isSymbolicLink()).toBe(true);
+    });
+  });
+
+  test.skipIf(!posix)('指向外面文件的符号链接：读写都拒绝', async () => {
+    await withOutside(async (outside) => {
+      await writeFile(join(outside, 'secret.txt'), 'secret');
+      await symlink(join(outside, 'secret.txt'), join(root, 'out-file'));
+      for (const [name, input] of [
+        ['read_file', { path: 'out-file' }],
+        ['write_file', { path: 'out-file', content: 'x' }],
+        ['write_file', { path: 'out-file', content: 'x', append: true }],
+      ] as const) {
+        expect(error(await call(name, input)), `${name} ${JSON.stringify(input)}`).toMatch(
+          /outside the working directory/,
+        );
+      }
+      expect(await readFile(join(outside, 'secret.txt'), 'utf8')).toBe('secret');
+    });
+  });
+
+  test.skipIf(!posix)('指向里面的符号链接照常能用', async () => {
+    await mkdir(join(root, 'real-dir'), { recursive: true });
+    await writeFile(join(root, 'real-dir', 'target.txt'), 'one');
+    await symlink(join('real-dir', 'target.txt'), join(root, 'in-file'));
+    await symlink('real-dir', join(root, 'in-dir'));
+    expect(text(await call('read_file', { path: 'in-file' }))).toBe('one');
+    expect(text(await call('write_file', { path: 'in-file', content: 'two' }))).toBe('Wrote 3 bytes to in-file.');
+    expect(text(await call('write_file', { path: 'in-dir/target.txt', content: '!', append: true }))).toBe(
+      'Appended 1 bytes to in-dir/target.txt.',
+    );
+    expect(await readFile(join(root, 'real-dir', 'target.txt'), 'utf8')).toBe('two!');
+    // 写的是链接指向的文件，链接还是链接。
+    expect((await lstat(join(root, 'in-file'))).isSymbolicLink()).toBe(true);
+    expect(text(await call('write_file', { path: 'in-dir/sub/new.txt', content: 'n' }))).toMatch(/Wrote 1 bytes/);
+    expect(await readFile(join(root, 'real-dir', 'sub', 'new.txt'), 'utf8')).toBe('n');
+    expect(text(await call('list_dir', { path: 'in-dir' }))).toBe('sub/\ntarget.txt');
+    expect(text(await run('pwd', {}, { cwd: 'in-dir' }))).toMatch(/real-dir\n<\/stdout>/);
+  });
+
+  // 检查和打开之间路径被换掉：`allowFile` 正好在两者之间调用，用它把竞态做成确定的。
+  test.skipIf(!posix)('检查之后文件被换成指出去的符号链接：不跟过去', async () => {
+    await withOutside(async (outside) => {
+      await writeFile(join(outside, 'secret.txt'), 'secret');
+      const swap = async (): Promise<boolean> => {
+        await rm(join(root, 'swapped.txt'), { force: true });
+        await symlink(join(outside, 'secret.txt'), join(root, 'swapped.txt'));
+        return true;
+      };
+      for (const [name, input] of [
+        ['read_file', { path: 'swapped.txt' }],
+        ['write_file', { path: 'swapped.txt', content: 'x' }],
+        ['write_file', { path: 'swapped.txt', content: 'x', append: true }],
+      ] as const) {
+        await rm(join(root, 'swapped.txt'), { force: true });
+        await writeFile(join(root, 'swapped.txt'), 'inside');
+        expect(error(await call(name, input, { allowFile: swap })), `${name} ${JSON.stringify(input)}`).toMatch(
+          /changed while it was being opened/,
+        );
+      }
+      expect(await readFile(join(outside, 'secret.txt'), 'utf8')).toBe('secret');
+    });
+  });
+
+  test.skipIf(!posix)('检查之后父目录被换成指出去的符号链接：复核时拒绝', async () => {
+    await withOutside(async (outside) => {
+      await writeFile(join(outside, 'secret.txt'), 'secret');
+      const swap = async (): Promise<boolean> => {
+        await rename(join(root, 'swapped-dir'), join(root, 'swapped-dir-old'));
+        await symlink(outside, join(root, 'swapped-dir'));
+        return true;
+      };
+      for (const [name, input] of [
+        ['read_file', { path: 'swapped-dir/secret.txt' }],
+        ['write_file', { path: 'swapped-dir/secret.txt', content: 'x' }],
+        ['list_dir', { path: 'swapped-dir' }],
+      ] as const) {
+        await rm(join(root, 'swapped-dir'), { recursive: true, force: true });
+        await rm(join(root, 'swapped-dir-old'), { recursive: true, force: true });
+        await mkdir(join(root, 'swapped-dir'));
+        await writeFile(join(root, 'swapped-dir', 'secret.txt'), 'inside');
+        expect(error(await call(name, input, { allowFile: swap })), `${name} ${JSON.stringify(input)}`).toMatch(
+          /changed while it was being opened/,
+        );
+      }
+      expect(await readFile(join(outside, 'secret.txt'), 'utf8')).toBe('secret');
+      await rm(join(root, 'swapped-dir'), { force: true });
+    });
+  });
+
+  test.skipIf(!posix)(
+    'FIFO 不是普通文件：马上拒绝，不挂住',
+    async () => {
+      execFileSync('mkfifo', [join(root, 'pipe')]);
+      const started = Date.now();
+      expect(error(await call('read_file', { path: 'pipe' }))).toMatch(
+        /pipe is a FIFO \(named pipe\), not a regular file/,
+      );
+      expect(error(await call('write_file', { path: 'pipe', content: 'x' }))).toMatch(/pipe is not a regular file/);
+      expect(Date.now() - started).toBeLessThan(2_000);
+      await rm(join(root, 'pipe'));
+    },
+    5_000,
+  );
+
+  test.skipIf(!posix)('超过 2 GiB 的文件只读开头，照样截断', async () => {
+    const size = 3 * 1024 ** 3;
+    // 稀疏文件：只有长度，不占磁盘。
+    await writeFile(join(root, 'huge.bin'), 'head');
+    await truncate(join(root, 'huge.bin'), size);
+    try {
+      expect(text(await call('read_file', { path: 'huge.bin' }, { maxOutputBytes: 10 }))).toBe(
+        `head${'\0'.repeat(6)}\n[… truncated ${size - 10} more bytes; read the rest with run_command (sed -n, tail)]`,
+      );
+      const whole = text(await call('read_file', { path: 'huge.bin' }));
+      expect(whole.slice(0, 4)).toBe('head');
+      expect(whole).toContain(`[… truncated ${size - 64 * 1024} more bytes;`);
+    } finally {
+      await rm(join(root, 'huge.bin'));
+    }
+  });
+
+  test('正好到上限的文件不算截断，跨多块的也读全', async () => {
+    await writeFile(join(root, 'exact.txt'), 'y'.repeat(10));
+    expect(text(await call('read_file', { path: 'exact.txt' }, { maxOutputBytes: 10 }))).toBe('y'.repeat(10));
+    const long = 'z'.repeat(200_000);
+    await writeFile(join(root, 'long.txt'), long);
+    expect(text(await call('read_file', { path: 'long.txt' }, { maxOutputBytes: 1_000_000 }))).toBe(long);
+    expect(text(await call('read_file', { path: 'long.txt' }, { maxOutputBytes: 150_000 }))).toBe(
+      `${'z'.repeat(150_000)}\n[… truncated 50000 more bytes; read the rest with run_command (sed -n, tail)]`,
+    );
+    await writeFile(join(root, 'empty.txt'), '');
+    expect(text(await call('read_file', { path: 'empty.txt' }))).toBe('');
+  });
+
+  test('read_file 认 signal', async () => {
+    const controller = new AbortController();
+    const output = await executor({
+      // 路径检查过了、还没开始读的时候中止。
+      allowFile: () => {
+        controller.abort();
+        return true;
+      },
+    }).execute({ id: 'c', name: 'read_file', input: { path: 'big.txt' } }, { ...context, signal: controller.signal });
+    expect(error(output)).toMatch(/read_file was cancelled.*big\.txt/);
+  });
+
+  test('allowFile 拒绝时不读不写不列', async () => {
+    await mkdir(join(root, 'guarded'), { recursive: true });
+    await writeFile(join(root, 'guarded', 'keep.txt'), 'keep');
+    const seen: unknown[] = [];
+    const options: ProcessExecutorOptions = {
+      allowFile: (access) => {
+        seen.push(access);
+        return false;
+      },
+    };
+    expect(error(await call('read_file', { path: 'guarded/keep.txt' }, options))).toMatch(
+      /File access not allowed.*read_file guarded\/keep\.txt.*did not run/,
+    );
+    expect(error(await call('write_file', { path: 'guarded/keep.txt', content: 'x' }, options))).toMatch(
+      /not allowed.*write_file/,
+    );
+    expect(error(await call('write_file', { path: './guarded/sub/../new.txt', content: 'x' }, options))).toMatch(
+      /not allowed/,
+    );
+    expect(error(await call('list_dir', {}, options))).toMatch(/not allowed.*list_dir/);
+    expect(seen).toEqual([
+      { tool: 'read_file', path: join('guarded', 'keep.txt'), mode: 'read' },
+      { tool: 'write_file', path: join('guarded', 'keep.txt'), mode: 'write' },
+      { tool: 'write_file', path: join('guarded', 'new.txt'), mode: 'write' },
+      { tool: 'list_dir', path: '.', mode: 'read' },
+    ]);
+    expect(await readFile(join(root, 'guarded', 'keep.txt'), 'utf8')).toBe('keep');
+    await expect(readFile(join(root, 'guarded', 'new.txt'))).rejects.toThrow(/ENOENT/);
+    // 越界的路径先被拒绝，不问 allowFile；命令也不问它。
+    expect(error(await call('read_file', { path: '../x' }, options))).toMatch(/outside the working directory/);
+    expect(text(await run('echo ok', options))).toContain('ok');
+    expect(seen).toHaveLength(4);
+  });
+
+  test.skipIf(!posix)('allowFile 看到的是解析过符号链接的路径，可以是异步的', async () => {
+    await symlink('guarded', join(root, 'guarded-link'));
+    const options: ProcessExecutorOptions = {
+      allowFile: async ({ path, mode }) => mode === 'read' && !path.startsWith('guarded'),
+    };
+    expect(error(await call('read_file', { path: 'guarded-link/keep.txt' }, options))).toMatch(/not allowed/);
+    expect(text(await call('read_file', { path: 'big.txt' }, options))).toContain('x');
+    expect(error(await call('write_file', { path: 'big.txt', content: 'y' }, options))).toMatch(/not allowed/);
   });
 
   test('不存在的文件给出下一步', async () => {
