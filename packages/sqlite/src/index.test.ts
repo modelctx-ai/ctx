@@ -714,7 +714,7 @@ describe('删除和涂改', () => {
 describe('写入约束', () => {
   test('NOT NULL 违例报错，不再被当成重复静默跳过；整批回滚', async () => {
     const store = createSqliteStore({ path: ':memory:' });
-    await assert.rejects(store.append(null as unknown as string, [userEntry('x')]), /NOT NULL/);
+    await assert.rejects(store.append(null as unknown as string, [userEntry('x')]), /Invalid session name null/);
     await assert.rejects(
       store.append('t', [userEntry('先写的'), { ...userEntry('坏的'), type: null as unknown as 'message' }]),
       /NOT NULL/,

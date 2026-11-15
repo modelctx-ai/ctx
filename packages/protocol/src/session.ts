@@ -263,6 +263,21 @@ export function filterSessions(names: readonly string[], options: SessionsOption
   return limit > 0 ? out.slice(0, limit) : [];
 }
 
+// ---- 会话名 ----
+
+/**
+ * 会话名不能是空串、`.`、`..`：它们放不进 URL 的一段路径（空的一段没有了，`.` 和 `..` 被规范化折叠掉），
+ * 经远端存储读不到也删不掉。存储的每个方法和远端的客户端、服务端都先调它，抛 `invalid_request`。
+ * 别的名字（带 `/`、`%`、中文的）都行。
+ */
+export function checkSessionName(session: string): void {
+  if (typeof session === 'string' && session !== '' && session !== '.' && session !== '..') return;
+  throw new CtxError(
+    'invalid_request',
+    `Invalid session name ${JSON.stringify(session)}: it must be a non-empty string other than "." and "..".`,
+  );
+}
+
 // ---- 写入前提 ----
 
 /** 会话当前最后一条的 `seq`，空会话是 0。用 `list({ last: 1 })`，存储不必为它加方法。 */

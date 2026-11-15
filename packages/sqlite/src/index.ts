@@ -2,6 +2,7 @@ import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 
 import {
   checkExpectSeq,
+  checkSessionName,
   CTX_EVENTS,
   ENTRY_VERSION,
   erasedEntry,
@@ -300,6 +301,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
   const store: SqliteSessionStore = {
     database,
     async append(session, drafts, appendOptions) {
+      checkSessionName(session);
       // 先拿写锁再检查前提：两个进程读后写不会各自读到同一个末尾、再在升级写锁时撞上 SQLITE_BUSY，
       // 后到的那个等锁，拿到锁后读到新的末尾，得到 `conflict`。库上已有应用事务时退回 SAVEPOINT。
       return withWriteLock(database, `${prefix}write`, () => {
@@ -336,6 +338,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
       });
     },
     async list(session, listOptions: ListOptions = {}) {
+      checkSessionName(session);
       const where = ['session = ?'];
       const params: SQLInputValue[] = [session];
       if (listOptions.after !== undefined) {
@@ -374,9 +377,11 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
       return rows.map((row) => decode(row, unreadable));
     },
     async clear(session) {
+      checkSessionName(session);
       return Number(removeSession.run(session).changes);
     },
     async truncate(session, upTo) {
+      checkSessionName(session);
       if (!Number.isFinite(upTo)) return 0;
       return erase(session, () => {
         const found = database
@@ -390,6 +395,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
       });
     },
     async remove(session, ids) {
+      checkSessionName(session);
       const wanted = [...new Set(ids)];
       if (wanted.length === 0) return 0;
       return erase(session, () => {
@@ -408,6 +414,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
       });
     },
     async redact(session, ids) {
+      checkSessionName(session);
       const wanted = [...new Set(ids)];
       if (wanted.length === 0) return 0;
       return erase(session, () => {
@@ -464,6 +471,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
     },
     /** 轮询 `list(after)`：别的进程写进同一个库的条目也能看到。 */
     async *watch(session: string, watchOptions: WatchOptions = {}) {
+      checkSessionName(session);
       const { signal } = watchOptions;
       let after = watchOptions.after;
       for (;;) {

@@ -99,6 +99,15 @@ function padding(count: number): NewEntry[] {
   return Array.from({ length: count }, (_, n) => userEntry(`pad${n}`, { id: `pad-${n}` }));
 }
 
+/** `work` 要抛 `invalid_request`。 */
+async function rejected(work: () => Promise<unknown>, what: string): Promise<void> {
+  const error = await work().then(
+    () => undefined,
+    (thrown: unknown) => thrown,
+  );
+  assert.equal((error as { type?: string } | undefined)?.type, 'invalid_request', what);
+}
+
 const WATCH_TIMEOUT_MS = 2_000;
 
 /** 取迭代器的下一项，超时就失败，免得一个不出数据的 `watch` 把测试挂住。 */
@@ -120,6 +129,53 @@ export function describeSessionStoreContract(
   { describe, test }: ContractTestApi,
 ): void {
   describe(`SessionStore contract: ${name}`, () => {
+    test('存进去的是拷贝：改传进去的草稿、改读出来的条目，日志都不变', async () => {
+      const store = await factory({ now: () => 5 });
+      const draft = {
+        type: 'message' as const,
+        message: { role: 'user' as const, content: [{ type: 'text' as const, text: '原话' }] },
+        meta: { tags: ['a'] },
+      };
+      const [written] = await store.append('s', [draft]);
+      draft.message.content[0]!.text = '改了草稿';
+      draft.meta.tags.push('b');
+      (written as { meta?: JsonObject }).meta!['tags'] = ['改了返回值'];
+      const [first] = await store.list('s');
+      assert.ok(first?.type === 'message');
+      assert.deepEqual(first.message.content, [{ type: 'text', text: '原话' }]);
+      assert.deepEqual(first.meta, { tags: ['a'] });
+
+      (first.message.content as { text: string }[])[0]!.text = '改了读出来的';
+      (first as { meta?: JsonObject }).meta = { tags: ['改了读出来的'] };
+      const [again] = await store.list('s');
+      assert.ok(again?.type === 'message');
+      assert.deepEqual(again.message.content, [{ type: 'text', text: '原话' }]);
+      assert.deepEqual(again.meta, { tags: ['a'] });
+    });
+
+    test('会话名不能是空串、. 和 ..：每个方法都抛 invalid_request，别的名字照常', async () => {
+      const store = await factory({ now: () => 5 });
+      for (const session of ['', '.', '..']) {
+        const label = JSON.stringify(session);
+        await rejected(() => store.append(session, [userEntry('x')]), `append ${label}`);
+        await rejected(() => store.list(session), `list ${label}`);
+        await rejected(() => store.clear(session), `clear ${label}`);
+        await rejected(() => store.truncate(session, 1), `truncate ${label}`);
+        await rejected(() => store.remove(session, ['x']), `remove ${label}`);
+        await rejected(() => store.redact(session, ['x']), `redact ${label}`);
+        if (store.watch) {
+          const iterator = store.watch(session)[Symbol.asyncIterator]();
+          await rejected(() => iterator.next(), `watch ${label}`);
+        }
+      }
+      assert.deepEqual(await store.sessions(), []);
+      for (const session of ['...', '.a', 'a/b', 'a/../b', '100%', '中文 会话', ' ']) {
+        await store.append(session, [userEntry(session)]);
+        assert.deepEqual(texts(await store.list(session)), [session], JSON.stringify(session));
+        assert.equal(await store.clear(session), 1, JSON.stringify(session));
+      }
+    });
+
     test('导出再导入到另一个存储：seq 重新分配，摘要盖住的还是那几条', async () => {
       let clock = 1_000;
       const source = await factory({ now: () => clock++ });

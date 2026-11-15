@@ -1,5 +1,6 @@
 import {
   checkExpectSeq,
+  checkSessionName,
   ENTRY_VERSION,
   eraseEntries,
   erasedEntry,
@@ -7,6 +8,7 @@ import {
   filterSessions,
   type Entry,
   type Erasure,
+  type NewEntry,
   type SessionStore,
   type WatchOptions,
 } from '@modelctx-ai/ctx-protocol';
@@ -16,7 +18,23 @@ export interface MemoryStoreOptions {
   readonly id?: () => string;
 }
 
-/** 进程内存储。测试、短会话和不需要落盘的场景用。`watch` 靠内存里的订阅，写入后立刻唤醒。 */
+/**
+ * 草稿存成它的 JSON 形状：和落盘的存储一样，`undefined` 的字段不存，存进去的和调用方手里的不是同一个对象。
+ * 不能 JSON 化的（循环引用、`bigint`）在这里抛，不等换成落盘的存储才发现。
+ */
+function stored(draft: NewEntry): NewEntry {
+  return JSON.parse(JSON.stringify(draft)) as NewEntry;
+}
+
+/** 交出去的是拷贝：调用方改它，日志不变。 */
+function copies(entries: readonly Entry[]): Entry[] {
+  return entries.map((entry) => structuredClone(entry));
+}
+
+/**
+ * 进程内存储。测试、短会话和不需要落盘的场景用。`watch` 靠内存里的订阅，写入后立刻唤醒。
+ * 写入时拷一份、读出时再拷一份，所以只追加不靠调用方自觉：改传进来的草稿、改读出来的条目，日志都不变。
+ */
 export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStore {
   const now = options.now ?? Date.now;
   const id = options.id ?? (() => crypto.randomUUID());
@@ -86,11 +104,14 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
 
   return {
     async append(name, drafts, appendOptions) {
+      checkSessionName(name);
+      // 先全部转完再动日志：有一条转不了就整批不写。
+      const safe = drafts.map(stored);
       const target = session(name);
       // 前提先于去重；和下面的写入在同一个同步段里，中间不会插进别的写入。
       checkExpectSeq(target.entries.at(-1)?.seq ?? 0, appendOptions);
       const written: Entry[] = [];
-      for (const draft of drafts) {
+      for (const draft of safe) {
         if (draft.key !== undefined && target.keys.has(draft.key)) continue;
         const entryId = draft.id ?? id();
         if (ids.has(entryId)) continue;
@@ -102,12 +123,14 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
         written.push(entry);
       }
       if (written.length > 0) wake(name);
-      return written;
+      return copies(written);
     },
     async list(name, listOptions) {
-      return filterEntries(sessions.get(name)?.entries ?? [], listOptions);
+      checkSessionName(name);
+      return copies(filterEntries(sessions.get(name)?.entries ?? [], listOptions));
     },
     async clear(name) {
+      checkSessionName(name);
       const found = sessions.get(name);
       if (!found) return 0;
       for (const entry of found.entries) ids.delete(entry.id);
@@ -115,12 +138,15 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
       return found.entries.length;
     },
     async truncate(name, upTo) {
+      checkSessionName(name);
       return erase(name, { op: 'truncate', upTo });
     },
     async remove(name, entryIds) {
+      checkSessionName(name);
       return erase(name, { op: 'remove', ids: entryIds });
     },
     async redact(name, entryIds) {
+      checkSessionName(name);
       return erase(name, { op: 'redact', ids: entryIds });
     },
     async sessions(sessionsOptions) {
@@ -130,6 +156,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
       );
     },
     async *watch(name: string, watchOptions: WatchOptions = {}) {
+      checkSessionName(name);
       const { signal } = watchOptions;
       let after = watchOptions.after;
       for (;;) {
@@ -137,7 +164,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
         const fresh = filterEntries(sessions.get(name)?.entries ?? [], after ? { after } : undefined);
         for (const entry of fresh) {
           if (signal?.aborted) return;
-          yield entry;
+          yield structuredClone(entry);
           after = entry.seq;
         }
         if (fresh.length === 0) await waitFor(name, signal);
