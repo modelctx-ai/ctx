@@ -178,17 +178,17 @@ function run(agent: AgentSpec, model = answerModel()) {
   };
 }
 
-describe('窗口：请求带的上限和 builder 的配置', () => {
-  async function filled(window: NonNullable<ProjectionOptions['window']>) {
-    const store = createMemoryStore();
-    const builder = createContextBuilder({ store, projection: { window } });
-    await store.append(
-      's',
-      Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? userEntry(`问 ${i}`) : assistantEntry(`答 ${i}`))),
-    );
-    return builder;
-  }
+async function filled(window: NonNullable<ProjectionOptions['window']>) {
+  const store = createMemoryStore();
+  const builder = createContextBuilder({ store, projection: { window } });
+  await store.append(
+    's',
+    Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? userEntry(`问 ${i}`) : assistantEntry(`答 ${i}`))),
+  );
+  return builder;
+}
 
+describe('窗口：请求带的上限和 builder 的配置', () => {
   test('请求换上限，estimate 还是 builder 的；`{}` 是不裁剪', async () => {
     const builder = await filled({ maxTokens: 6000, estimate: () => 1000 });
     assert.equal((await builder.view('s')).messages.length, 6);

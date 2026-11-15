@@ -4,6 +4,10 @@ import { describe, test } from 'vite-plus/test';
 
 import { estimateFileTokens, estimateTextTokens, estimateTokens } from './tokens.ts';
 
+function base64(bytes: number): string {
+  return Buffer.alloc(bytes, 7).toString('base64');
+}
+
 describe('tokens', () => {
   test('中文一字约一个 token，英文约四个字符一个', () => {
     assert.equal(estimateTextTokens('今天下雨'), 4);
@@ -19,7 +23,6 @@ describe('tokens', () => {
   });
 
   test('附件按内容算：内联文字按字数，base64 按大小，图片分两档，不知道大小的按一张小图', () => {
-    const base64 = (bytes: number) => Buffer.alloc(bytes, 7).toString('base64');
     assert.equal(estimateFileTokens('text/plain', { type: 'text', text: 'a'.repeat(1_000_000) }), 250_000);
     assert.equal(estimateFileTokens('image/png', { type: 'data', data: base64(30_000) }), 256);
     assert.equal(estimateFileTokens('image/jpeg', { type: 'data', data: base64(2_000_000) }), 1600);

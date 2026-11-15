@@ -49,6 +49,10 @@ function summaryOf(id: string, covers: Entry, seq: number): SummaryEntry {
   };
 }
 
+function toolResult(id: string, name: string): Message {
+  return { role: 'tool', content: [{ type: 'tool-result', id, name, output: { type: 'text', text: '好' } }] };
+}
+
 describe('project', () => {
   test('连续碎碎念合成一条，对话原句不截断', async () => {
     const entries = await seed(
@@ -224,10 +228,6 @@ describe('project', () => {
         { type: 'tool-call', id: 'c3', name: 'search', input: {}, providerExecuted: true },
       ],
     };
-    const result = (id: string, name: string): Message => ({
-      role: 'tool',
-      content: [{ type: 'tool-result', id, name, output: { type: 'text', text: '好' } }],
-    });
     // 运行断在工具调用之后：c1、c2 都没有结果。
     const dangling = project(await seed(userEntry('天气？'), messageEntry(call), userEntry('还在吗')));
     assert.deepEqual(
@@ -257,7 +257,7 @@ describe('project', () => {
     // 只回了一个，另带一个对不上的：对上的留下，对不上的去掉，没回的补上。
     const mixed: Message = {
       role: 'tool',
-      content: [...(result('c2', 'clock').content as []), ...(result('zz', 'ghost').content as [])],
+      content: [...(toolResult('c2', 'clock').content as []), ...(toolResult('zz', 'ghost').content as [])],
     };
     const partial = project(await seed(userEntry('天气？'), messageEntry(call), messageEntry(mixed)));
     assert.deepEqual(
@@ -272,7 +272,7 @@ describe('project', () => {
     );
 
     // 整条都对不上：这条工具消息不要。
-    const stray = project(await seed(userEntry('在吗'), assistantEntry('在'), messageEntry(result('zz', 'ghost'))));
+    const stray = project(await seed(userEntry('在吗'), assistantEntry('在'), messageEntry(toolResult('zz', 'ghost'))));
     assert.deepEqual(
       stray.messages.map((message) => message.role),
       ['user', 'assistant'],

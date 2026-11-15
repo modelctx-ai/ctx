@@ -192,6 +192,21 @@ export function resolveModel(model: ModelRef, models: ((name: string) => Languag
 }
 
 /**
+ * 请求带了窗口就整个换掉 builder 配的上限（`{}` 是不裁剪），但 `estimate` 始终用 builder 的：
+ * 请求能过线、带不了函数，换上限不该顺手把应用接的分词器换回缺省估算。
+ * `reserve` 是历史之外已经占掉的 token，从 `maxTokens` 里扣。
+ */
+function windowOf(chosen: ProjectionOptions, request: WindowOptions | undefined, reserve = 0): ProjectionWindow {
+  const limits: WindowOptions = request ?? chosen.window ?? {};
+  const maxTokens = limits.maxTokens === undefined ? undefined : Math.max(0, limits.maxTokens - reserve);
+  return {
+    ...(limits.maxMessages !== undefined ? { maxMessages: limits.maxMessages } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...pickEstimate(chosen),
+  };
+}
+
+/**
  * 上下文的参考实现：投影规则（事件渲染、摘要渲染、消息改写、窗口）+ 来源 + 压缩。
  * 每次从会话存储重算，不改日志；压缩追加一条摘要和一条 `ctx.compacted`。
  */
@@ -226,21 +241,6 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     if (!summary) return store.list(session);
     const after = await store.list(session, { after: summary.covers });
     return after.some((entry) => entry.id === summary.id) ? after : [summary, ...after];
-  }
-
-  /**
-   * 请求带了窗口就整个换掉 builder 配的上限（`{}` 是不裁剪），但 `estimate` 始终用 builder 的：
-   * 请求能过线、带不了函数，换上限不该顺手把应用接的分词器换回缺省估算。
-   * `reserve` 是历史之外已经占掉的 token，从 `maxTokens` 里扣。
-   */
-  function windowOf(chosen: ProjectionOptions, request: WindowOptions | undefined, reserve = 0): ProjectionWindow {
-    const limits: WindowOptions = request ?? chosen.window ?? {};
-    const maxTokens = limits.maxTokens === undefined ? undefined : Math.max(0, limits.maxTokens - reserve);
-    return {
-      ...(limits.maxMessages !== undefined ? { maxMessages: limits.maxMessages } : {}),
-      ...(maxTokens !== undefined ? { maxTokens } : {}),
-      ...pickEstimate(chosen),
-    };
   }
 
   async function view(session: string, viewOptions: ViewOptions = {}): Promise<Projection> {
