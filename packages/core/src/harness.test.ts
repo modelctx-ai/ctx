@@ -33,6 +33,53 @@ function setup(extra: Partial<HarnessOptions> = {}) {
 }
 
 describe('harness', () => {
+  test('工具边界：不合 inputSchema 的输入不执行、问题回给模型；结果超过 maxToolOutputChars 截断', async () => {
+    const { harness, tools } = setup({ maxToolOutputChars: 400 });
+    // 只给了 JSON Schema 的工具：输入由 harness 查。
+    const calls: unknown[] = [];
+    tools.executor.register(
+      { name: 'lookup', inputSchema: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] } },
+      (input) => {
+        calls.push(input);
+        return { type: 'text', text: 'x'.repeat(1000) };
+      },
+    );
+    tools.add(tools.executor.definition('lookup')!);
+    const model = createScriptedModel(
+      [
+        { type: 'tool-call', id: 'c1', input: { id: 5 } },
+        { type: 'tool-call', id: 'c2', input: { id: 'a' } },
+        { type: 'text', text: '好。' },
+      ],
+      { tool: 'lookup' },
+    );
+    const result = await harness.run({ session: 's', agent: { model, maxSteps: 4 }, input: '查一下' });
+    assert.equal(result.stopReason, 'end_turn');
+    assert.match(
+      JSON.stringify(model.doGenerateCalls[1]!.prompt.at(-1)),
+      /Invalid input for tool \\"lookup\\": id must be string, got number/,
+    );
+    assert.deepEqual(calls, [{ id: 'a' }]);
+    assert.match(JSON.stringify(model.doGenerateCalls[2]!.prompt.at(-1)), /x{400}\\n\[… truncated 600 more characters/);
+  });
+
+  test('工具边界：addTool 加的工具按自己的 schema 校验，harness 不抢在前面', async () => {
+    const { harness, tools } = setup();
+    assert.equal(tools.validatesInput('weather'), true);
+    assert.equal(tools.validatesInput('nope'), false);
+    const model = createScriptedModel(
+      [
+        { type: 'tool-call', id: 'c1', input: { city: 5 } },
+        { type: 'text', text: '好。' },
+      ],
+      { tool: 'weather' },
+    );
+    await harness.run({ session: 's', agent: { model, maxSteps: 3 }, input: '天气？' });
+    const reply = JSON.stringify(model.doGenerateCalls[1]!.prompt.at(-1));
+    assert.match(reply, /Invalid input for tool \\"weather\\"/);
+    assert.doesNotMatch(reply, /city must be string, got number/);
+  });
+
   test('工具经注册表自带的函数执行环境执行：zod 校验和默认值照常生效', async () => {
     const { store, harness } = setup();
     const model = createScriptedModel(

@@ -48,7 +48,14 @@ import {
 
 import { isEmptyContent, resolveModel } from './builder.ts';
 import { fromModelMessages, toModelMessages } from './messages.ts';
-import { dispatchTo, executorMap, toToolSet, type Executors, type ToolDispatch } from './tools.ts';
+import {
+  dispatchTo,
+  executorMap,
+  toToolSet,
+  type Executors,
+  type LocalToolRegistry,
+  type ToolDispatch,
+} from './tools.ts';
 
 export type GenerateTextResult = Awaited<ReturnType<typeof generateText>>;
 export type StreamTextResult = ReturnType<typeof streamText>;
@@ -68,6 +75,16 @@ export interface HarnessOptions {
   readonly logger?: Logger;
   /** 用户输入写进日志、又没写 `source` 时记成谁写的。 */
   readonly source?: string;
+  /**
+   * 执行前按 `inputSchema` 查模型给的工具输入，不合就把问题回给模型、不执行。缺省查（`addTool` 加的工具除外，
+   * 它们按自己原来的 schema 校验）；`false` 关掉，`true` 连 `addTool` 的也查。
+   */
+  readonly validateToolInput?: boolean;
+  /**
+   * 一次工具结果（过了 `afterTool` 之后）最多多少字符，超过的截断并注明。缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`；
+   * 0 或 Infinity 不限。
+   */
+  readonly maxToolOutputChars?: number;
 }
 
 /** `createContext` 用的额外开关，不在协议里。 */
@@ -232,6 +249,11 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   const executors = executorMap(options.executors);
   if (hasExecutor(tools) && !executors.has(tools.executor.name)) executors.set(tools.executor.name, tools.executor);
   const base = dispatchTo([...executors.values()]);
+  /** `addTool` 加进注册表的工具自己校验输入。 */
+  const selfValidated = (name: string): boolean => {
+    const registry = tools as Partial<Pick<LocalToolRegistry, 'validatesInput'>> | undefined;
+    return typeof registry?.validatesInput === 'function' && registry.validatesInput(name);
+  };
   /** 已经告警过的执行环境名：同一个缺口每个 harness 只说一次。 */
   const warned = new Set<string>();
 
@@ -388,7 +410,13 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     return {
       model,
       prepared,
-      tools: toToolSet(definitions, undefined, { session, runId: state.runId, dispatch }),
+      tools: toToolSet(definitions, undefined, {
+        session,
+        runId: state.runId,
+        dispatch,
+        validateInput: options.validateToolInput ?? ((definition) => !selfValidated(definition.name)),
+        ...(options.maxToolOutputChars !== undefined ? { maxOutputChars: options.maxToolOutputChars } : {}),
+      }),
       toolCount: definitions.length,
       maxSteps: agent.maxSteps ?? (definitions.length > 0 ? 5 : 1),
     };

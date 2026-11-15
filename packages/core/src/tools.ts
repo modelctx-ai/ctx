@@ -1,6 +1,8 @@
 import {
+  checkJsonSchema,
   errorOutput,
   isValidToolName,
+  limitToolOutput,
   selectTools,
   toolOutputFromAiSdk,
   toolOutputToAiSdk,
@@ -45,7 +47,21 @@ export interface ToolSetOptions {
   readonly runId?: string;
   /** 换掉缺省的分发（找到绑定的执行环境 → `execute`）。 */
   readonly dispatch?: ToolDispatch;
+  /**
+   * 执行前按工具的 `inputSchema` 查模型给的输入（`checkJsonSchema`，只查认识的关键字），不合就不执行，
+   * 把问题作为错误结果回给模型。缺省查；`false` 关掉，函数按工具决定。注册表的 `toolSet` 和 harness 缺省不查
+   * `addTool` 加的工具：它们在函数执行环境里按自己原来的 schema（zod）校验，比这里准。
+   */
+  readonly validateInput?: boolean | ((definition: ToolDefinition) => boolean);
+  /** 结果超过这么多字符时截断并注明（`limitToolOutput`），缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`；0 或 Infinity 不限。 */
+  readonly maxOutputChars?: number;
 }
+
+/**
+ * 工具结果长度的兜底，20 万字符（大约 5 万到 20 万 token）。该截断、分页的是执行环境，它知道怎么截才有用；
+ * 这一层只保证哪个执行环境忘了也不会把一次结果原样塞满上下文。
+ */
+export const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 200_000;
 
 /** 缺省的分发：找到绑定的执行环境执行。找不到、或执行环境本身抛错，都变成给模型看的错误。 */
 export function dispatchTo(executors: Executors | undefined): ToolDispatch {
@@ -76,6 +92,9 @@ export function toToolSet(
   options: ToolSetOptions = {},
 ): ToolSet {
   const dispatch = options.dispatch ?? dispatchTo(executors);
+  const validates = (definition: ToolDefinition): boolean =>
+    typeof options.validateInput === 'function' ? options.validateInput(definition) : options.validateInput !== false;
+  const maxOutputChars = options.maxOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
   const out: ToolSet = {};
   for (const definition of definitions) {
     out[definition.name] = dynamicTool({
@@ -88,7 +107,15 @@ export function toToolSet(
           ...(options.runId !== undefined ? { runId: options.runId } : {}),
           ...(execution.abortSignal ? { signal: execution.abortSignal } : {}),
         };
-        return dispatch(call, definition, context);
+        if (validates(definition)) {
+          const issues = checkJsonSchema(definition.inputSchema, call.input);
+          if (issues.length > 0) {
+            return errorOutput(
+              `Invalid input for tool "${definition.name}": ${issues.join('; ')}. Fix the input and call the tool again.`,
+            );
+          }
+        }
+        return limitToolOutput(await dispatch(call, definition, context), maxOutputChars);
       },
       toModelOutput: ({ output }) => toolOutputToAiSdk(output as ToolOutput) as ToolResultPart['output'],
     });
@@ -114,6 +141,8 @@ export interface LocalToolRegistry extends ToolRegistry {
    * 执行函数放进注册表自带的函数执行环境。没有 `execute` 的工具（服务商工具、只声明的工具）不收。
    */
   addTool(name: string, tool: Tool, meta?: ToolMeta): LocalToolRegistry;
+  /** 这个工具是不是 `addTool` 加的：是的话它自己按原来的 schema 校验输入，harness 不再按 JSON Schema 查一遍。 */
+  validatesInput(name: string): boolean;
   addAll(tools: ToolSet, meta?: ToolMeta): LocalToolRegistry;
   /** 按筛选挑工具并包成 AI SDK 的 `ToolSet`，执行环境是注册表自带的加上 `executors`。 */
   toolSet(filter?: ToolFilter, options?: ToolSetOptions & { readonly executors?: Executors }): ToolSet;
@@ -221,6 +250,7 @@ export function createToolRegistry(options: ToolRegistryOptions = {}): LocalTool
       return registry;
     },
     addTool,
+    validatesInput: (name) => owned.has(name),
     addAll(set, meta) {
       for (const [name, tool] of Object.entries(set)) addTool(name, tool, meta);
       return registry;
@@ -245,7 +275,10 @@ export function createToolRegistry(options: ToolRegistryOptions = {}): LocalTool
     toolSet(filter, toolSetOptions = {}) {
       const { executors, ...rest } = toolSetOptions;
       const all = [executor, ...executorMap(executors).values()];
-      return toToolSet(selectTools([...tools.values()], filter), all, rest);
+      return toToolSet(selectTools([...tools.values()], filter), all, {
+        validateInput: (definition) => !owned.has(definition.name),
+        ...rest,
+      });
     },
   };
   return registry;

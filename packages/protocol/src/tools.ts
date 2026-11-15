@@ -360,3 +360,249 @@ export function toolOutputFromAiSdk(output: AiSdkToolOutput): ToolOutput {
     }
   }
 }
+
+// ---- 工具边界：输入校验和输出上限 ----
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function jsonTypeOf(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
+function matchesJsonType(type: string, value: unknown): boolean {
+  switch (type) {
+    case 'null':
+      return value === null;
+    case 'array':
+      return Array.isArray(value);
+    case 'object':
+      return isPlainObject(value);
+    case 'integer':
+      return typeof value === 'number' && Number.isInteger(value);
+    case 'number':
+      return typeof value === 'number';
+    case 'string':
+    case 'boolean':
+      return typeof value === type;
+    default:
+      // 不认识的类型名不拦。
+      return true;
+  }
+}
+
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    return a.length === b.length && a.every((item, index) => sameJson(item, b[index]));
+  }
+  if (isPlainObject(a) && isPlainObject(b)) {
+    const keys = Object.keys(a);
+    return (
+      keys.length === Object.keys(b).length && keys.every((key) => Object.hasOwn(b, key) && sameJson(a[key], b[key]))
+    );
+  }
+  return false;
+}
+
+function compile(pattern: unknown): RegExp | undefined {
+  if (typeof pattern !== 'string') return undefined;
+  try {
+    return new RegExp(pattern, 'u');
+  } catch {
+    return undefined;
+  }
+}
+
+interface SchemaCheck {
+  readonly issues: string[];
+  readonly limit: number;
+}
+
+function checkSchema(schema: unknown, value: unknown, path: string, check: SchemaCheck, depth: number): void {
+  const { issues } = check;
+  if (issues.length >= check.limit || depth > 64 || schema === true || schema === undefined) return;
+  const where = path || 'input';
+  if (schema === false) {
+    issues.push(`${where} is not allowed`);
+    return;
+  }
+  // 引用不解析：这一支不查。
+  if (!isPlainObject(schema) || '$ref' in schema || '$dynamicRef' in schema || '$recursiveRef' in schema) return;
+  if (value === null && schema['nullable'] === true) return;
+
+  const type = schema['type'];
+  const types = typeof type === 'string' ? [type] : Array.isArray(type) ? type : [];
+  if (types.length > 0 && !types.some((item) => typeof item !== 'string' || matchesJsonType(item, value))) {
+    issues.push(`${where} must be ${types.join(' or ')}, got ${jsonTypeOf(value)}`);
+    return;
+  }
+  const options = schema['enum'];
+  if (Array.isArray(options) && !options.some((item) => sameJson(item, value))) {
+    issues.push(`${where} must be one of ${JSON.stringify(options).slice(0, 200)}`);
+    return;
+  }
+  if ('const' in schema && !sameJson(schema['const'], value)) {
+    issues.push(`${where} must be ${JSON.stringify(schema['const']).slice(0, 200)}`);
+    return;
+  }
+  const bound = (key: string): number | undefined => (typeof schema[key] === 'number' ? schema[key] : undefined);
+
+  if (typeof value === 'string') {
+    const length = Array.from(value).length;
+    const min = bound('minLength');
+    const max = bound('maxLength');
+    if (min !== undefined && length < min) issues.push(`${where} must be at least ${min} characters`);
+    if (max !== undefined && length > max) issues.push(`${where} must be at most ${max} characters`);
+    const pattern = compile(schema['pattern']);
+    if (pattern && !pattern.test(value)) issues.push(`${where} must match the pattern ${String(schema['pattern'])}`);
+  } else if (typeof value === 'number') {
+    const min = bound('minimum');
+    const max = bound('maximum');
+    const above = bound('exclusiveMinimum');
+    const below = bound('exclusiveMaximum');
+    if (min !== undefined && value < min) issues.push(`${where} must be >= ${min}`);
+    if (max !== undefined && value > max) issues.push(`${where} must be <= ${max}`);
+    if (above !== undefined && value <= above) issues.push(`${where} must be > ${above}`);
+    if (below !== undefined && value >= below) issues.push(`${where} must be < ${below}`);
+  } else if (Array.isArray(value)) {
+    const min = bound('minItems');
+    const max = bound('maxItems');
+    if (min !== undefined && value.length < min) issues.push(`${where} must have at least ${min} items`);
+    if (max !== undefined && value.length > max) issues.push(`${where} must have at most ${max} items`);
+    // 2020-12 的 `prefixItems` + `items`，和 draft-07 的数组写法 `items` + `additionalItems`。
+    const items = schema['items'];
+    const prefix = Array.isArray(schema['prefixItems']) ? schema['prefixItems'] : Array.isArray(items) ? items : [];
+    const rest = Array.isArray(items) ? schema['additionalItems'] : items;
+    value.forEach((item, index) => {
+      checkSchema(index < prefix.length ? prefix[index] : rest, item, `${path}[${index}]`, check, depth + 1);
+    });
+  } else if (isPlainObject(value)) {
+    const properties = isPlainObject(schema['properties']) ? schema['properties'] : {};
+    const required = Array.isArray(schema['required']) ? schema['required'] : [];
+    for (const key of required) {
+      if (typeof key === 'string' && !Object.hasOwn(value, key))
+        issues.push(`${path ? `${path}.` : ''}${key} is required`);
+    }
+    const patterns = isPlainObject(schema['patternProperties']) ? Object.entries(schema['patternProperties']) : [];
+    const compiled = patterns.map(([pattern, sub]) => [compile(pattern), sub] as const);
+    // 有编不出来的 pattern 时说不清哪些键算「额外的」，就不查 additionalProperties。
+    const additional = compiled.every(([pattern]) => pattern) ? schema['additionalProperties'] : undefined;
+    for (const [key, item] of Object.entries(value)) {
+      const at = path ? `${path}.${key}` : key;
+      let known = false;
+      if (Object.hasOwn(properties, key)) {
+        known = true;
+        checkSchema(properties[key], item, at, check, depth + 1);
+      }
+      for (const [pattern, sub] of compiled) {
+        if (!pattern?.test(key)) continue;
+        known = true;
+        checkSchema(sub, item, at, check, depth + 1);
+      }
+      if (known || additional === undefined) continue;
+      if (additional === false) issues.push(`${at} is not a known property`);
+      else checkSchema(additional, item, at, check, depth + 1);
+    }
+  }
+
+  if (Array.isArray(schema['allOf']))
+    for (const sub of schema['allOf']) checkSchema(sub, value, path, check, depth + 1);
+  // `oneOf` 只查「一个都不满足」：认不全关键字时「满足了不止一个」可能是误判。
+  for (const key of ['anyOf', 'oneOf']) {
+    const branches = schema[key];
+    if (!Array.isArray(branches) || branches.length === 0) continue;
+    const failures: string[] = [];
+    const matched = branches.some((sub) => {
+      const attempt: SchemaCheck = { issues: [], limit: 1 };
+      checkSchema(sub, value, path, attempt, depth + 1);
+      if (attempt.issues[0]) failures.push(attempt.issues[0]);
+      return attempt.issues.length === 0;
+    });
+    if (!matched) issues.push(`${where} matches none of the allowed shapes (${failures.slice(0, 3).join('; ')})`);
+  }
+}
+
+/**
+ * 按 JSON Schema 查一个值，返回给模型看的问题（空数组是没查出问题），最多 `limit` 条。
+ *
+ * 只查认识的关键字：`type`、`enum`、`const`、`required`、`properties`、`patternProperties`、`additionalProperties`、
+ * `items`、`prefixItems`、长度和数值的上下限、`pattern`、`allOf`、`anyOf`、`oneOf`、OpenAPI 的 `nullable`。
+ * 其余（`$ref`、`not`、`if`/`then`、`format`、`multipleOf`、`uniqueItems`……）一概放行：报出来的一定是真问题，
+ * 没报不等于完全合规。要完整的校验，在执行环境里用专门的库。
+ */
+export function checkJsonSchema(schema: unknown, value: unknown, limit = 5): string[] {
+  const check: SchemaCheck = { issues: [], limit };
+  checkSchema(schema, value, '', check, 0);
+  return check.issues.slice(0, limit);
+}
+
+/** 留下前 `limit` 个字符（UTF-16 码元），不把一对代理项切成两半。 */
+function clipText(text: string, limit: number): string {
+  let end = Math.min(Math.max(Math.floor(limit), 0), text.length);
+  const last = text.charCodeAt(end - 1);
+  if (end < text.length && last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return text.slice(0, end);
+}
+
+function truncatedText(text: string, limit: number): string {
+  const kept = clipText(text, limit);
+  return `${kept}\n[… truncated ${text.length - kept.length} more characters; narrow the request (filters, paging, a smaller range) to see the rest]`;
+}
+
+/**
+ * 工具结果的长度兜底：超过 `maxChars` 个字符（UTF-16 码元）时截断并注明省略了多少，没超的原样返回（同一个对象）。
+ * 文字和错误信息直接截；`json` 序列化后超了就换成截断的文字；`content` 里各段合起来算，内联的文件数据
+ * （base64、文字）按字符数计，放不下的那个文件换成一句说明，超的那段文字截断、后面的文字不要了。
+ * `maxChars` 没给、是 0、负数或 Infinity 都是不限。
+ */
+export function limitToolOutput(output: ToolOutput, maxChars: number | undefined): ToolOutput {
+  if (maxChars === undefined || !Number.isFinite(maxChars) || maxChars <= 0) return output;
+  const limit = Math.floor(maxChars);
+  if (output.type === 'text') {
+    return output.text.length <= limit ? output : { type: 'text', text: truncatedText(output.text, limit) };
+  }
+  if (output.type === 'error') {
+    return output.message.length <= limit ? output : { ...output, message: truncatedText(output.message, limit) };
+  }
+  if (output.type === 'json') {
+    const json = JSON.stringify(output.value) ?? 'null';
+    return json.length <= limit ? output : { type: 'text', text: truncatedText(json, limit) };
+  }
+  const sizeOf = (part: ToolContentPart): number => {
+    if (part.type === 'text') return part.text.length;
+    if (part.data.type === 'data') return part.data.data.length;
+    return part.data.type === 'text' ? part.data.text.length : 0;
+  };
+  if (output.parts.reduce((sum, part) => sum + sizeOf(part), 0) <= limit) return output;
+  let left = limit;
+  let cut = false;
+  const parts: ToolContentPart[] = [];
+  for (const part of output.parts) {
+    const size = sizeOf(part);
+    if (part.type === 'file') {
+      if (size <= left) {
+        left -= size;
+        parts.push(part);
+      } else {
+        parts.push({
+          type: 'text',
+          text: `[${part.mediaType} file omitted: ${size} characters of data do not fit in the tool output limit]`,
+        });
+      }
+    } else if (!cut) {
+      if (size <= left) {
+        left -= size;
+        parts.push(part);
+      } else {
+        parts.push({ type: 'text', text: truncatedText(part.text, left) });
+        left = 0;
+        cut = true;
+      }
+    }
+  }
+  return { type: 'content', parts };
+}

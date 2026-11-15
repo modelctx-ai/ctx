@@ -11,6 +11,7 @@ export {
 } from './executor.ts';
 export {
   createToolRegistry,
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   dispatchTo,
   toToolSet,
   type Executors,
