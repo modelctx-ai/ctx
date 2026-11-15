@@ -1,0 +1,57 @@
+name: Release
+
+# 打 `v<版本>` 的 tag 触发：九个包同一个版本一起发到 npm（docs/adr/0002-packages.md）。
+# 正式版本（v0.4.0）发到 `latest`，预发布版本（v0.4.0-next.0）发到 `next`。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC trusted publishing 和 provenance 都要这个；仓库里不放 npm token。
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 要看 tag 的提交在不在 main 上
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      # trusted publishing 要 npm ≥ 11.5.1
+      - run: npm install -g npm@^11.5.1
+
+      # tag 和九个包的版本对得上，正式版本在 CHANGELOG 里有一节；输出 dist-tag
+      - id: release
+        run: node scripts/release.mjs check "$GITHUB_REF_NAME"
+
+      - name: 正式版本的 tag 要在 main 上
+        if: steps.release.outputs.dist-tag == 'latest'
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      # 打出来的包在干净目录里装得上、每个入口能 import、类型能解析
+      - run: node scripts/pack-smoke.mjs
+
+      # 一定用 pnpm 发：它先把 `workspace:^` 换成实际版本再交给 npm。已经发过的版本会跳过，中途失败可以重跑。
+      - run: pnpm -r publish --access public --no-git-checks --tag "$DIST_TAG"
+        env:
+          DIST_TAG: ${{ steps.release.outputs.dist-tag }}

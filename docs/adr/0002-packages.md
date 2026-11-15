@@ -8,8 +8,9 @@ status: stable
 
 # ADR 0002：包的拆分、命名、版本和发布
 
-- 状态：已采纳
+- 状态：已采纳（2026-11-15 按「决定记录」修订）
 - 日期：2026-10-23
+- 实施状态：拆包、命名、源码条件、版本约定已实施；发布工作流和发布前的检查 2026-11-15 加上，还没有发布过，见「实施状态」
 
 ## 拆分
 
@@ -89,9 +90,9 @@ status: stable
 
 Trusted publishing 只能给已经存在的包配置，所以第一次要先把包名占住。`@modelctx-ai/via` 就是这样：维护者手动发了一个 `0.0.0-stage`，在 npmjs.com 配好 trusted publisher，之后的正式版本都由 GitHub Actions 发布（npm 上记录的发布者是 GitHub Actions，带 provenance）。ctx 照做：
 
-1. 给 5 个包名各发一个占位版本 `0.0.0-stage`，用维护者账号或一次性 token；之后第一次正式发布会把 `latest` 移到正式版本。`publishConfig.provenance: true` 在本机发布会失败（provenance 只能在受支持的 CI 里生成），所以占位包用一个临时目录里只有 `name`、`version`、`license`、`repository` 的最小 `package.json` 发。
+1. 给每个包名（现在九个）各发一个占位版本 `0.0.0-stage`，用维护者账号或一次性 token；之后第一次正式发布会把 `latest` 移到正式版本。`publishConfig.provenance: true` 在本机发布会失败（provenance 只能在受支持的 CI 里生成），所以占位包用一个临时目录里只有 `name`、`version`、`license`、`repository` 的最小 `package.json` 发。
 2. 在 npmjs.com 每个包的设置里加 trusted publisher：GitHub Actions，`modelctx-ai/ctx`，发布工作流的文件名（例如 `release.yml`）。
-3. 发布工作流：`permissions: { contents: read, id-token: write }`；npm ≥ 11.5.1（Node 22 自带的是 npm 10，要先升级）；`pnpm install --frozen-lockfile`、`pnpm check`，再 `pnpm -r publish --access public --no-git-checks`。
+3. 发布工作流（`.github/workflows/release.yml`，打 `v<版本>` 的 tag 触发）：`permissions: { contents: read, id-token: write }`；npm ≥ 11.5.1（Node 22 自带的是 npm 10，要先升级）；核对 tag 和各包版本、`pnpm install --frozen-lockfile`、`pnpm check`、打包冒烟检查，再 `pnpm -r publish --access public --no-git-checks --tag <latest 或 next>`。
 4. 吊销第 1 步用过的 token。
 
 一定用 pnpm 发布：`pnpm publish` 先自己打包（把 `workspace:^` 换成实际版本），再交给 npm CLI 上传，OIDC 换 token 和 provenance 都由 npm 完成。直接在包目录里 `npm publish` 会把 `workspace:^` 原样发出去，使用方装不上。
@@ -107,3 +108,29 @@ Trusted publishing 只能给已经存在的包配置，所以第一次要先把�
 | npm          | 发布后                          | 删掉 `overrides`，`^0.1.0` 从 npm 解析                                                                                                     | npm 包里的 `dist/`                                    |
 
 使用方的 `package.json` 在链接和 npm 两种方式下写同样的版本范围，切换时只动 `overrides`。
+
+## 实施状态
+
+已经有的（2026-11-15）：
+
+- 九个包的 `publishConfig`（`access: public`、`provenance: true`）、`files: ["dist"]`、`workspace:^`。
+- `scripts/release.mjs`：`version <版本>` 把九个包改成同一个版本，正式版本顺带把 `CHANGELOG.md` 的「未发布」落成 `## <版本> - <日期>`；`check <tag>` 核对 tag 和各包版本、正式版本在 `CHANGELOG.md` 里有一节，给出 dist-tag。
+- `scripts/pack-smoke.mjs`（`pnpm smoke`）：每个包 `pnpm pack`，查包里的内容（有 `dist/`、`README.md`、`LICENSE`，没有 `src/` 和测试，没有残留的 `workspace:`，`exports` 指的文件都在），在干净目录里用 npm 一次装上九个 tarball，不打开源码条件用 `tsc`（`skipLibCheck: false`）把每个入口的类型解析一遍，再把每个入口 `import` 一遍、内存存储和 SQLite 存储各写读一次。
+- CI 的 `Pack smoke` 任务：上面的检查每个 PR 都跑；`import` 那一步另在 Node 22.0.0、22.13.0 上跑，按各包自己的 `engines.node` 决定跑哪些，`engines` 写低了这里会失败。
+- `.github/workflows/release.yml`：tag `v<版本>` 触发，`check`、`pnpm check`、冒烟检查都过了才 `pnpm -r publish`。正式版本的 tag 必须在 `main` 上，发到 `latest`；带 `-` 的预发布版本（`v0.4.0-next.0`）发到 `next`，给下游先试。
+
+还没做、只能由 npm 组织的维护者做的：「发布」里的第 1、2、4 步（占位版本、每个包配 trusted publisher 指向 `release.yml`、吊销 token）。发布工作流没有对真实的 npm 验证过；第一次建议先打一个预发布 tag 走一遍。
+
+发一版的步骤：
+
+1. `pnpm release:version 0.4.0`（预发布写 `0.4.0-next.0`），看一眼 `CHANGELOG.md`，提交 `chore: 发布 0.4.0`，合进 `main`。
+2. 在那个提交上打 tag `v0.4.0` 并推上去。
+3. 工作流发完以后，yoyo 这类下游把 `overrides` 里的 `link:` 去掉。
+
+`engines.node` 核对过（2026-11-15）：各包 `dist/` 用到的最新的运行时 API 是 `Promise.withResolvers`（Node 22.0）和不用开关的 `node:sqlite`（22.13），依赖 `ai@7`、`@ai-sdk/mcp` 自己要求 `>=22`。所以八个包保持 `>=22.0.0`，`ctx-sqlite` 保持 `>=22.13.0`；根目录的 `>=22.18.0` 是开发要求（直接运行 `.ts`、Vitest 5），不随包发布。
+
+## 决定记录
+
+- 2026-11-15：占位版本要给九个包名发；当初写「5 个」是 0.1 的包数。
+- 2026-11-15：暂不引入 changesets。`CHANGELOG.md` 继续手写（「未发布」一节），发版时由 `scripts/release.mjs version` 统一改版本号和落版本标题。九个包、版本一起升、一个人维护，changesets 的每 PR 一份变更说明换不来什么；包多到要分组、或者有了外部贡献者再议。
+- 2026-11-15：加预发布通道。带 `-` 的版本发到 npm 的 `next`，不动 `latest`，tag 不要求在 `main` 上。
