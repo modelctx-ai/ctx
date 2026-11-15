@@ -32,3 +32,32 @@ jobs:
       - run: pnpm exec vp check --deny-warnings
       - run: pnpm test
       - run: pnpm build
+
+  pack:
+    # 发布出去的包在使用方那边能不能用：干净目录里装上 `pnpm pack` 的产物，类型解析一遍，
+    # 再换到各包 `engines.node` 写的最低版本上把每个入口 import 一遍（sqlite 要 22.13，别的 22.0）。
+    name: Pack smoke (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.0.0', '22.13.0', 24.x]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: node scripts/pack-smoke.mjs --dir "$RUNNER_TEMP/pack-smoke"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - run: node scripts/pack-smoke.mjs --dir "$RUNNER_TEMP/pack-smoke" --run-only

@@ -6,15 +6,17 @@
 
 开发要 Node ≥22.18（直接运行 `.ts`）和 pnpm 10（版本由 `packageManager` 固定）。工具链是 [Vite+](https://viteplus.dev/)（`vite-plus`，命令 `vp`），配置都在根目录和各包的 `vite.config.ts` 里。
 
-| 命令                                | 作用                                                                                        |
-| ----------------------------------- | ------------------------------------------------------------------------------------------- |
-| `pnpm install`                      | 安装依赖                                                                                    |
-| `pnpm typecheck`                    | `vp check --no-fmt --no-lint`：只做类型检查（tsgolint，TS 7），覆盖全部包的源码、测试和配置 |
-| `pnpm lint`                         | `vp lint`：Oxlint，带类型信息的规则，同时报类型错误；有警告也算失败                         |
-| `pnpm test`                         | `vp test`：Vitest 运行 `packages/*/src/**/*.test.ts`                                        |
-| `pnpm build`                        | 每个包 `vp pack`（tsdown）构建 `dist/`（ESM + `.d.ts`）                                     |
-| `pnpm format` / `pnpm format:check` | `vp fmt`：Oxfmt 改写 / 检查                                                                 |
-| `pnpm check`                        | `vp check`（格式、lint、类型）、test、build；CI 在 Node 22 和 24 上跑同样几步               |
+| 命令                                | 作用                                                                                                                      |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm install`                      | 安装依赖                                                                                                                  |
+| `pnpm typecheck`                    | `vp check --no-fmt --no-lint`：只做类型检查（tsgolint，TS 7），覆盖全部包的源码、测试和配置                               |
+| `pnpm lint`                         | `vp lint`：Oxlint，带类型信息的规则，同时报类型错误；有警告也算失败                                                       |
+| `pnpm test`                         | `vp test`：Vitest 运行 `packages/*/src/**/*.test.ts`                                                                      |
+| `pnpm build`                        | 每个包 `vp pack`（tsdown）构建 `dist/`（ESM + `.d.ts`）                                                                   |
+| `pnpm format` / `pnpm format:check` | `vp fmt`：Oxfmt 改写 / 检查                                                                                               |
+| `pnpm check`                        | `vp check`（格式、lint、类型）、test、build；CI 在 Node 22 和 24 上跑同样几步                                             |
+| `pnpm smoke`                        | `scripts/pack-smoke.mjs`：`pnpm pack` 的产物在干净目录里装上、类型解析、每个入口 `import` 一遍；要先 `pnpm build`，要联网 |
+| `pnpm release:version <版本>`       | `scripts/release.mjs`：九个包改成同一个版本，正式版本把 CHANGELOG 的「未发布」落成这一版                                  |
 
 仓库里各包互相引用时按源码解析（`@modelctx-ai/source` 条件，见 [ADR 0002](docs/adr/0002-packages.md)），类型检查和测试不用先构建。使用方的 Node 版本和 peer dependency 写在各包 README 的「安装」里。
 
@@ -40,7 +42,7 @@
 
 - [CHANGELOG.md](CHANGELOG.md) 记代码变更：按版本倒序，没发布的放「未发布」，条目以「新增 / 实现 / 修复 / 删除 / 发布」开头，写公开 API 的名字、不兼容的地方和迁移方法。改了 `packages/` 里的行为就记一笔。
 - [docs/log.md](docs/log.md) 只记文档变更：按日期倒序，条目以「新增 / 更新 / 删除」开头，链接到改的文档，写改了什么、为什么。改了 `docs/` 或任何 README 就记一笔。一个 PR 既改代码又改文档，两处各记。
-- 版本和发布按 [ADR 0002](docs/adr/0002-packages.md)：1.0 之前不兼容改动升 minor，所有包同一个版本一起升，包间依赖是 `workspace:^`。不保留弃用别名；不兼容改动在提交标题的类型后加 `!`。
+- 版本和发布按 [ADR 0002](docs/adr/0002-packages.md)：1.0 之前不兼容改动升 minor，所有包同一个版本一起升，包间依赖是 `workspace:^`。发一版的步骤在它的「实施状态」里：`pnpm release:version`、提交、打 `v<版本>` 的 tag，剩下的由 `.github/workflows/release.yml` 做。改了包的 `exports`、`files`、`engines` 或加了新包，跑一次 `pnpm smoke`。不保留弃用别名；不兼容改动在提交标题的类型后加 `!`。
 
 ## 改代码时
 

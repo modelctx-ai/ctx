@@ -14,7 +14,9 @@
     "test": "vp test",
     "format": "vp fmt",
     "format:check": "vp fmt --check",
-    "check": "vp check --deny-warnings && vp test && pnpm build"
+    "check": "vp check --deny-warnings && vp test && pnpm build",
+    "smoke": "node scripts/pack-smoke.mjs",
+    "release:version": "node scripts/release.mjs version"
   },
   "devDependencies": {
     "@types/node": "^22.19.0",
