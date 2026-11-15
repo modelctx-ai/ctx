@@ -36,6 +36,9 @@ export interface SqliteStoreOptions {
   readonly pollIntervalMs?: number;
 }
 
+/** `watch` 一次读多少条。 */
+const WATCH_PAGE = 500;
+
 export interface SqliteSessionStore extends SessionStore {
   readonly database: DatabaseSync;
   watch(session: string, options?: WatchOptions): AsyncIterable<Entry>;
@@ -297,6 +300,13 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
       } else {
         sql += ' ORDER BY seq';
       }
+      if (listOptions.limit !== undefined) {
+        const limit = Number.isFinite(listOptions.limit) ? Math.floor(listOptions.limit) : 0;
+        if (limit <= 0) return [];
+        // 有 `last` 时外层已经是子查询的结果，再套一层取最早的几条。
+        sql = listOptions.last !== undefined ? `SELECT * FROM (${sql}) ORDER BY seq LIMIT ?` : `${sql} LIMIT ?`;
+        params.push(limit);
+      }
       const rows = database.prepare(sql).all(...params) as unknown as Row[];
       return rows.map(decode);
     },
@@ -339,13 +349,14 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
       let after = watchOptions.after;
       for (;;) {
         if (signal?.aborted) return;
-        const fresh = await store.list(session, after ? { after } : {});
+        // 一页一页读：从头订阅一个很长的会话时，不把整个会话一次读进内存、卡住事件循环。
+        const fresh = await store.list(session, { ...(after ? { after } : {}), limit: WATCH_PAGE });
         for (const entry of fresh) {
           if (signal?.aborted) return;
           yield entry;
           after = entry.seq;
         }
-        if (fresh.length === 0) await sleep(pollInterval, signal);
+        if (fresh.length < WATCH_PAGE) await sleep(pollInterval, signal);
       }
     },
     close() {

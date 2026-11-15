@@ -67,6 +67,11 @@ export interface ListOptions {
   readonly after?: number;
   /** 只要最后写入的 N 条（`seq` 最大的 N 条），仍按 `seq` 升序返回。小数向下取整，不是有限正数时返回空。 */
   readonly last?: number;
+  /**
+   * 最多返回这么多条，取过滤之后 `seq` 最小的（最早的）。和 `after` 配合向前翻页：下一页的 `after` 是这一页
+   * 最后一条的 `seq`，读到不满一页为止。小数向下取整，不是有限正数时返回空。和 `last` 同时给时先取 `last`。
+   */
+  readonly limit?: number;
   /** 只要这些类型。 */
   readonly types?: readonly EntryType[];
   /**
@@ -192,6 +197,10 @@ export function filterEntries(entries: readonly Entry[], options: ListOptions | 
   if (options?.last !== undefined) {
     const last = Number.isFinite(options.last) ? Math.floor(options.last) : 0;
     out = last > 0 ? out.slice(-last) : [];
+  }
+  if (options?.limit !== undefined) {
+    const limit = Number.isFinite(options.limit) ? Math.floor(options.limit) : 0;
+    out = limit > 0 ? out.slice(0, limit) : [];
   }
   return out;
 }

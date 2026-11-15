@@ -199,6 +199,35 @@ export function describeSessionStoreContract(
       assert.deepEqual(await store.list('s', { last: 0 }), []);
     });
 
+    test('limit 取最早的 N 条，和 after 配合向前翻页；过滤之后再取；和 last 同时给时先取 last', async () => {
+      const store = await factory({ now: Date.now });
+      await store.append('s', [
+        userEntry('1'),
+        eventEntry('pet.whisper', { text: '2' }),
+        userEntry('3'),
+        eventEntry('pet.whisper', { text: '4' }),
+        userEntry('5'),
+      ]);
+      await store.append('other', [userEntry('别的会话')]);
+      assert.deepEqual(texts(await store.list('s', { limit: 2 })), ['1', '2']);
+      const pages: string[][] = [];
+      for (let after = 0; ;) {
+        const page = await store.list('s', { after, limit: 2 });
+        pages.push(texts(page));
+        if (page.length < 2) break;
+        after = page.at(-1)!.seq;
+      }
+      assert.deepEqual(pages, [['1', '2'], ['3', '4'], ['5']]);
+      assert.deepEqual(texts(await store.list('s', { types: ['message'], limit: 2 })), ['1', '3']);
+      assert.deepEqual(texts(await store.list('s', { kinds: ['pet.whisper'], limit: 1 })), ['2']);
+      assert.deepEqual(texts(await store.list('s', { last: 3, limit: 2 })), ['3', '4']);
+      assert.deepEqual(texts(await store.list('s', { limit: 99 })), ['1', '2', '3', '4', '5']);
+      assert.deepEqual(texts(await store.list('s', { limit: 1.9 })), ['1']);
+      for (const n of [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        assert.deepEqual(await store.list('s', { limit: n }), [], `limit: ${n}`);
+      }
+    });
+
     test('last 向下取整，不是有限正数时返回空', async () => {
       const store = await factory({ now: Date.now });
       await store.append('s', [userEntry('a'), userEntry('b'), userEntry('c')]);

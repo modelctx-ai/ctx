@@ -344,6 +344,47 @@ function guardedServer(): Promise<RemoteServer> {
   return serve({ store: createMemoryStore(), maxBodyBytes: 1_024 });
 }
 
+describe('会话的条目分页', () => {
+  test('服务端一次最多回 maxListEntries 条并带 more；客户端的 list 自己接着读，结果不变', async () => {
+    const store = createMemoryStore();
+    await store.append(
+      's',
+      Array.from({ length: 10 }, (_, i) => userEntry(String(i + 1))),
+    );
+    const server = await serve({ store, maxListEntries: 3 });
+    const raw = await fetch(`${server.baseUrl}/sessions/s/entries`, {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    const body = (await raw.json()) as { entries: unknown[]; more?: boolean };
+    expect([body.entries.length, body.more]).toEqual([3, true]);
+
+    const remote = createRemoteSessionStore(client(server));
+    const texts = async (options?: Parameters<typeof remote.list>[1]) =>
+      (await remote.list('s', options)).map((entry) => (entry.type === 'message' ? entry.message.content : ''));
+    expect(await texts()).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']);
+    expect(await texts({ after: 4, limit: 5 })).toEqual(['5', '6', '7', '8', '9']);
+    expect(await texts({ limit: 2 })).toEqual(['1', '2']);
+    expect(await texts({ last: 2 })).toEqual(['9', '10']);
+  });
+
+  test('没有 watch 的存储：轮询一页一页读，长会话也读得完', async () => {
+    const inner = createMemoryStore();
+    await inner.append(
+      's',
+      Array.from({ length: 10 }, (_, i) => userEntry(String(i + 1))),
+    );
+    const { watch: _watch, ...store } = inner;
+    const remote = createRemoteSessionStore(client(await serve({ store, maxListEntries: 3, pollIntervalMs: 5 })));
+    const controller = new AbortController();
+    const seen: number[] = [];
+    for await (const entry of remote.watch('s', { signal: controller.signal })) {
+      seen.push(entry.seq);
+      if (seen.length === 10) controller.abort();
+    }
+    expect(seen).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+});
+
 describe('鉴权和安全缺省', () => {
   test('没带或带错 token 是 401', async () => {
     const { baseUrl } = await guardedServer();

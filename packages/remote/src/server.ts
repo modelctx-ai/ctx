@@ -73,6 +73,11 @@ export interface RemoteHandlerOptions {
   readonly maxBodyBytes?: number;
   /** 路径前缀，缺省挂在根上。 */
   readonly basePath?: string;
+  /**
+   * `GET …/entries` 一次最多回多少条，缺省 1000。会话更长时响应带 `more: true`，本包的客户端自己接着读，
+   * `list()` 的结果不变；服务端不必把整个会话一次读进内存、序列化成一个响应。
+   */
+  readonly maxListEntries?: number;
   /** 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔，缺省 250 毫秒。 */
   readonly pollIntervalMs?: number;
   /** 编排器的运行结果在结束后保留多久（给客户端的 `done` 取），缺省 10 分钟。 */
@@ -363,11 +368,13 @@ function sessionsOptionsOf(query: URLSearchParams): SessionsOptions {
 }
 
 function listOptionsOf(query: URLSearchParams): ListOptions {
-  const options: { after?: number; last?: number; types?: EntryType[]; kinds?: string[] } = {};
+  const options: { after?: number; last?: number; limit?: number; types?: EntryType[]; kinds?: string[] } = {};
   const after = afterParam(query);
   if (after !== undefined) options.after = after;
   const last = query.get('last');
   if (last !== null) options.last = Number(last);
+  const limit = query.get('limit');
+  if (limit !== null) options.limit = Number(limit);
   const types = query.get('types');
   if (types !== null) {
     const list = types.split(',').filter(Boolean);
@@ -481,6 +488,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   const basePath = normalizePath(options.basePath ?? '');
   const limit = options.maxBodyBytes ?? 4 * 1024 * 1024;
   const pollIntervalMs = options.pollIntervalMs ?? 250;
+  const maxListEntries = Math.max(1, Math.floor(options.maxListEntries ?? 1000));
   const retainMs = options.retainResultsMs ?? 10 * 60_000;
   const logger = options.logger ?? silentLogger;
   const hosts = options.allowedHosts ? lowered(options.allowedHosts) : undefined;
@@ -519,7 +527,13 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     }
     if (tail !== undefined) fail(404, `not found: ${url.pathname}`);
     if (method === 'GET') {
-      sendJson(res, 200, { entries: await sessionStore.list(session, listOptionsOf(url.searchParams)) });
+      // 一次最多回 `maxListEntries` 条：多读一条看后面还有没有，有就带 `more: true`，客户端接着用 `after` 读。
+      const asked = listOptionsOf(url.searchParams);
+      const wanted = asked.limit === undefined ? maxListEntries : Math.min(asked.limit, maxListEntries);
+      const capped = asked.limit === undefined || asked.limit > maxListEntries;
+      const entries = await sessionStore.list(session, { ...asked, limit: capped ? wanted + 1 : wanted });
+      const more = capped && entries.length > wanted;
+      sendJson(res, 200, { entries: more ? entries.slice(0, wanted) : entries, ...(more ? { more: true } : {}) });
       return;
     }
     if (method !== 'POST') fail(405, 'use GET or POST /sessions/:session/entries');
@@ -562,11 +576,15 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
       } else {
         let position = after;
         while (!signal.aborted) {
-          const entries: Entry[] = await sessionStore.list(session, position !== undefined ? { after: position } : {});
+          const entries: Entry[] = await sessionStore.list(session, {
+            ...(position !== undefined ? { after: position } : {}),
+            limit: maxListEntries,
+          });
           for (const entry of entries) await write(entry);
           const last = entries.at(-1);
           if (last) position = last.seq;
-          await sleep(pollIntervalMs, signal);
+          // 满一页说明后面多半还有，接着读；不满才等下一次轮询。
+          if (entries.length < maxListEntries) await sleep(pollIntervalMs, signal);
         }
       }
     } catch (error) {

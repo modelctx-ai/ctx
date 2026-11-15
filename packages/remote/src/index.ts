@@ -179,18 +179,29 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
       }
     },
     async list(session: string, listOptions: ListOptions = {}): Promise<Entry[]> {
-      const { after, last, types, kinds } = listOptions;
+      const { last, limit, types, kinds } = listOptions;
       // kinds 用逗号分隔，带逗号的 kind 过不了线；与其静默拆成两个，不如直接报错。
       if (kinds?.some((kind) => kind.includes(','))) throw new Error('An entry kind cannot contain a comma.');
-      const body = await connection.json<{ entries: Entry[] }>('GET', entriesPath(session), {
-        query: {
-          after: after !== undefined ? String(after) : undefined,
-          last: last !== undefined ? String(last) : undefined,
-          types: types ? types.join(',') : undefined,
-          kinds: kinds ? kinds.join(',') : undefined,
-        },
-      });
-      return body.entries;
+      const wanted = limit === undefined ? undefined : Number.isFinite(limit) ? Math.floor(limit) : 0;
+      if (wanted !== undefined && wanted <= 0) return [];
+      // 服务端一次只回一页（`more: true` 表示后面还有）：接着用 `after` 读，直到读完或够了 `limit`。
+      const out: Entry[] = [];
+      for (let after = listOptions.after; ;) {
+        const body = await connection.json<{ entries: Entry[]; more?: boolean }>('GET', entriesPath(session), {
+          query: {
+            after: after !== undefined ? String(after) : undefined,
+            last: last !== undefined ? String(last) : undefined,
+            limit: wanted !== undefined ? String(wanted - out.length) : undefined,
+            types: types ? types.join(',') : undefined,
+            kinds: kinds ? kinds.join(',') : undefined,
+          },
+        });
+        out.push(...body.entries);
+        const tail = body.entries.at(-1);
+        // `last` 是从末尾数的，翻页会改变它的意思：只读服务端给的这一页。
+        if (!body.more || tail === undefined || last !== undefined) return out;
+        after = tail.seq;
+      }
     },
     async clear(session: string): Promise<number> {
       return (await connection.json<{ deleted: number }>('DELETE', `/sessions/${segment(session)}`)).deleted;
