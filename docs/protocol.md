@@ -64,6 +64,7 @@ type NewEntry = NewMessageEntry | NewEventEntry | NewSummaryEntry;
 interface ListOptions {
   after?: number; // seq，不含
   last?: number; // seq 最大的 N 条，仍按 seq 升序；向下取整，不是有限正数时返回空
+  limit?: number; // 过滤之后 seq 最小的 N 条；和 after 配合向前翻页；和 last 同时给时先取 last
   types?: readonly EntryType[];
   kinds?: readonly string[]; // 只要事件，且 kind 在其中；与 types 取交集；空列表什么都不匹配
 }
@@ -96,6 +97,7 @@ interface SessionStore {
 - 去重不算失败：`id` 重复（全局）或 `key` 重复（同一会话，含同一批里的）的那一条静默跳过，同批其余照写；返回值就是真正写入的条目。重试一批时靠它不重复记。
 - `list` 和 `watch` 都按 `seq` 升序返回，也就是写入顺序。带旧 `at` 导入的条目排在写入的位置（所以 `after` 之后一定看得到新写入的），模型看到的逻辑顺序由投影按 `(at, seq)` 重排（`compareEntries`）。`seq` 只要求会话内单调，消费者不能跨会话比较。
 - `sessions` 只列有内容的会话，按名字升序（码点序，也就是 UTF-8 字节序）。翻页：`after` 给上一页最后一个名字，`prefix` 按字面匹配，`limit` 限条数。
+- `limit` 用来翻页：`list({ after, limit })` 读一页，下一页的 `after` 是这一页最后一条的 `seq`，读到不满一页为止。长会话不必一次读进内存；`ctx-sqlite` 的 `watch` 和 `ctx-remote` 的服务端都这样一页一页读。
 - `kinds` 只返回事件，消息和摘要没有 `kind`；和 `types` 取交集，`types` 里没有 `event` 就什么都不返回；`last` 在过滤之后取，所以 `{ kinds: [a, b], last: 1 }` 是这些事件里最后写的一条。
 - 生效的摘要是 `covers` 最大的那条；`covers` 相同时 `seq` 大的（后写的）生效。
 - 事件 `kind` 用 `{domain}.{action}`。框架保留 `ctx.` 前缀，常量是 `CTX_EVENTS`：
@@ -106,8 +108,11 @@ interface SessionStore {
 | `ctx.run.ended`   | harness       | `RunEndedData`：`{ runId, stopReason, usage? }`                          |
 | `ctx.compacted`   | 上下文        | `CompactedData`：`{ covers, summaryId }`                                 |
 | `ctx.error`       | harness、编排 | `CtxErrorData`：`{ runId?, message, type? }`                             |
+| `ctx.unreadable`  | （不写入）    | `UnreadableData`：`{ v?, type?, error: { type, message } }`，见下面      |
 
 这些事件缺省对模型不可见，和应用事件一样由投影规则决定要不要渲染。
+
+`ctx.unreadable` 不是写进去的条目，是读的时候给的占位：存储读到解不了的一行（格式版本比自己认识的高、带不认识的部件）时，缺省抛错——调用方看得到问题，不会拿着缺了一块的历史接着跑。实现可以另给宽松模式（`UnreadableMode` 的 `placeholder`，`ctx-sqlite` 和 `ctx-remote` 客户端的 `unreadable` 选项），这时那一行读成一条 `ctx.unreadable` 事件：`id`、`session`、`seq`、`at` 是那一行自己的，所以 `after`、`watch`、`expectSeq` 照常能用，会话其余部分照常能读；`data` 记着原来的 `v`、`type` 和错误。它是事件，缺省不进模型上下文；因为不是存进去的 `kind`，`list({ kinds })` 筛不出它。`readEntry(raw, mode?, fallback?)` 是这条规则的实现（`upgradeEntry` 加上占位），`unreadableEntry(raw, error)` 构造占位条目。
 
 纯函数：`upgradeEntry`（见下）；`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareEntries`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，`filterSessions(names, options)` 是 `SessionsOptions` 的语义，内存里的存储可以直接用。
 
@@ -128,7 +133,8 @@ interface SessionStore {
 `ToolFileData` 是 `{ type: 'data', data: base64 } | { type: 'url', url } | { type: 'reference', reference } | { type: 'text', text }`。`tool-result.output` 里的 `providerOptions` 和 `custom` 内容分段没有可序列化的内容，转换时丢掉。
 
 - 和 AI SDK 互转在 `@modelctx-ai/ctx`：`toModelMessages`、`fromModelMessages`（`createContext()` 仍收 AI SDK 的 `UserContent`，在边界上转）。遇到子集之外的部件（AI SDK 以后新加的）抛 `unsupported_part`，不静默丢；harness 把这一轮以 `error` 结束，写 `ctx.error`，不写半截的产出。核心包里有编译期的穷尽检查（`AI_SDK_PART_TYPES`）：AI SDK 在 `UserContent`、`AssistantContent`、`ToolContent` 里加了部件，核心包编译不过。
-- `ENTRY_VERSION = 1`，每个条目带 `v`。存储写新行时写 `v: 1`，读时对每一行调 `upgradeEntry(raw)` 升到当前形状，**不回写**旧行。没有 `v` 读作 0（0.2 及以前的写法：AI SDK 消息原样，二进制和 URL 用 `\u0000ctx` 标记，摘要的 `covers` 是 `{ at, seq }`）；0 → 1 把消息转成 `Message`，`covers` 取 `covers.seq`。读出来的 `Entry.v` 是这一行写入时的版本（旧行是 0），形状已是当前的；比自己认识的更高的 `v` 抛 `unsupported_version`，升级 ctx 再读。
+- `ENTRY_VERSION = 1`，每个条目带 `v`。存储写新行时写 `v: 1`，读时对每一行调 `upgradeEntry(raw)` 升到当前形状，**不回写**旧行。没有 `v` 读作 0（0.2 及以前的写法：AI SDK 消息原样，二进制和 URL 用 `\u0000ctx` 标记，摘要的 `covers` 是 `{ at, seq }`）；0 → 1 把消息转成 `Message`，`covers` 取 `covers.seq`。读出来的 `Entry.v` 是这一行写入时的版本（旧行是 0），形状已是当前的；比自己认识的更高的 `v` 抛 `unsupported_version`，升级 ctx 再读（宽松模式下读成 `ctx.unreadable`，见上面）。远端客户端按同一条规则检查服务端给的条目。
+- 滚动升级：新旧版本共用一个库（或一个远端）时，**读的一方先升**。新版本一旦写了新格式的行，旧进程对这个会话的 `list`、`view`、`watch` 都会抛 `unsupported_version`；要让旧进程在过渡期继续工作，给它开 `unreadable: 'placeholder'`，代价是新格式的条目它看不到。没有降级路径：`ctx-sqlite` 的结构迁移（改列名、换索引）不可逆，旧版本打不开升过级的库。
 - 0 版的摘要按 `at` 盖住旧条目，1 版按 `seq`，所以补写的旧记录可能被旧摘要盖住。`@modelctx-ai/ctx` 的 `findLossySummaries(store, { session? })` 只读，列出 `v` 为 0 且有条目被盖住的摘要 `{ session, summaryId, covers, hidden: seq[] }`；`recompactLossy(builder, finding, options)` 追加一条 `covers` 相同的新摘要（输入是旧摘要的文字加上被盖住的条目），靠「`covers` 相同时后写的生效」取代旧摘要。新摘要是 `v: 1`，所以 `findLossySummaries` 跑第二次找不到东西，可以放在启动阶段反复跑。
 
 ## 上下文 `ContextBuilder`
@@ -205,7 +211,10 @@ interface Projection {
 ```
 
 - 参考实现 = 投影规则（事件渲染、摘要渲染、消息改写、窗口）+ 来源 + 压缩，就是今天 `createContext` 里的 `prepare`、`view`、`compact`。
-- 投影、来源收集和 token 估算是纯函数，放在协议包：`project(entries, options)`、`latestSummary`、`defaultSummaryMessage`、`collectFacts(sources, { session, timeoutMs?, onError? })`、`renderFacts`、`defineSource`、`estimateTokens`、`estimateTextTokens`。语义见[架构](architecture.md#投影)。
+- 投影、来源收集和 token 估算是纯函数，放在协议包：`project(entries, options)`、`latestSummary`、`defaultSummaryMessage`、`collectFacts(sources, { session, timeoutMs?, onError? })`、`renderFacts`、`defineSource`、`estimateTokens`、`estimateTextTokens`、`estimateFileTokens`。语义见[架构](architecture.md#投影)。
+- 投影的输出是模型接口收得下的消息序列，不管日志里是什么样、窗口裁在哪：工具结果找不到对应的调用（调用被裁掉了、或者本来就没有）就去掉；工具调用没有结果（运行断在中间）就补一条错误结果（`No result was recorded for this tool call.`），服务商自己执行的调用（`providerExecuted`）除外；窗口裁剪之后，开头不留孤立的工具结果，没有摘要时也不以助手消息开头（接着裁到下一条用户消息）。
+- 窗口的两处配置：请求里的 `window`（`BuildRequest`、`ViewOptions`、`AgentSpec`）给了就**整个换掉** builder 配置的上限，`{}` 表示不裁剪；`estimate` 是函数、过不了线，始终用 builder 的。`build` 的 `maxTokens` 管的是整次调用：指令、事实、工具定义、`input`、`prompt` 的估算先从里面扣掉，剩下的才是历史的预算；`view` 没有这些，`maxTokens` 就是历史的预算。
+- token 估算不分词：中日韩文字一个字算 1，ASCII 4 个字符算 1，其余文字 2 个字符算 1；附件按 `estimateFileTokens(mediaType, data)`——内联文字按字数，base64 按解码后的大小（图片 64 KiB 以内 256、更大 1600；文本类按字节数除以 4；其余每 20 字节 1 个、至少 256），地址和服务商引用不知道大小，按 256。要准就在 `window.estimate` 里接分词器。
 - `ProjectionOptions` 里有函数，是进程内 builder 的配置，不经过协议方法；协议方法里只出现能序列化的 `WindowOptions`。
 - 提示缓存：事实追加在指令末尾会让 system 前缀每次都变，参考实现提供把事实放进最后一条临时用户消息的选项。
 
@@ -288,7 +297,9 @@ interface Executor {
 ```
 
 - 执行出错返回 `{ type: 'error' }` 而不是抛：模型要看到错误才能接着做。抛出表示执行环境本身坏了。错误信息要能照着做（「文件不存在：/a/b，当前目录有 …」），不是错误码。
-- 大输出由执行环境截断或分页，再交给模型。
+- 工具边界上的两件事各归谁：
+  - **输入**由 harness 在执行前按 `ToolDefinition.inputSchema` 校验，不合的不执行，把问题作为 `{ type: 'error' }` 回给模型重试。这样只给 JSON Schema 的执行环境（远端、MCP、子进程）不用各写各的，模型看到的错误也是同一种写法。纯函数 `checkJsonSchema(schema, value, limit?)` 返回问题的列表，只查认识的关键字（`type`、`enum`、`const`、`required`、`properties`、`patternProperties`、`additionalProperties`、`items`、`prefixItems`、长度和数值的上下限、`pattern`、`allOf`、`anyOf`、`oneOf`、`nullable`），其余一概放行：报出来的一定是真问题，没报不等于完全合规。执行环境对自己在意的约束仍然要自己查，直接调 `execute` 的调用方不经过这一层。执行环境手里有比 JSON Schema 更准的 schema、自己会校验的（参考实现里 `addTool` 的 zod 工具），harness 可以不重复查。
+  - **输出**由执行环境截断或分页，再交给模型：它知道怎么截才有用（命令输出留头尾、文件按行分页）。harness 另兜一层底：一次结果超过上限（参考实现缺省 20 万字符）时截断并注明省略了多少，免得哪个执行环境忘了就把上下文塞满。纯函数 `limitToolOutput(output, maxChars)`：文字和错误信息直接截，`json` 序列化后超了换成截断的文字，`content` 各段合起来算、放不下的内联文件换成一句说明。
 - 和 AI SDK 互转：`toolOutputToAiSdk(output)` 得到工具结果的 `output`（`text`、`json`、`error-text`、`error-json`、`content`），`toolOutputFromAiSdk` 转回来。协议 → AI SDK → 协议不丢信息：只有文字的错误是 `error-text`，带 `retryable` 或 `data` 的是 `error-json` 的 `{ message, retryable?, data? }`；`URL` 规范化会改写法时原串放进 `originalUrl`。反方向：二进制变 base64，已弃用的 `image-data`、`file-url` 等换成 `file`，`execution-denied` 变成错误，任意形状的 `error-json` 整个放进 `data`，`providerOptions` 和 `custom` 分段丢掉。
 - `errorOutput(message, { retryable?, data? })` 构造错误结果。
 - 实现：进程内函数（核心包）、MCP 服务器（`ctx-mcp`）、本机子进程（`ctx-exec`）、HTTP 远端（`ctx-remote`）。
@@ -397,7 +408,7 @@ interface Harness {
   4. 进程崩溃留下的未结束运行会让该会话一直 `session_busy`，直到有编排器 `recover` 它。**所以用 `record` 缺省（写日志）的应用，进程启动时要先 `recover()` 再接新的 `submit`。** 不写日志的运行没有这个要求。
   5. `RunRequest.owner` 写进 `ctx.run.started` 的 `owner`（编排器按自己的 `owner` 填）。
 - `text.delta` 不落日志，像 Managed Agents 的 event delta；其余事件各有对应的日志条目。
-- 纯函数：`modelName(model)` 把进程内模型记成 `<provider>/<modelId>`；`agentSpecToJson(spec)` 是写进 `ctx.run.started` 的可序列化部分。
+- 纯函数：`modelName(model)` 把进程内模型记成 `<provider>/<modelId>`；`agentSpecToJson(spec)` 是写进 `ctx.run.started` 的可序列化部分。`settings.headers` 只留名字，值换成 `REDACTED_HEADER`（`[redacted]`）：请求头里常有凭证，而日志只追加、读得到会话的人都看得到。
 - `Hooks` 是 harness 实现的构造参数，不在 `RunRequest` 里：它们是函数，不能跨边界。
 - 权限确认是 `beforeTool` 的一种实现：返回 `{ allow: false }` 时工具结果是一条错误，模型会看到原因，这一轮继续。
 - 参考实现基于 AI SDK 的 `generateText` / `streamText`：把选中的 `ToolDefinition` 包成 AI SDK 工具，`execute` 转给执行环境。
@@ -696,17 +707,17 @@ A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = (now − t_i) / 1 �
 
 `@modelctx-ai/ctx-protocol/testing`，用法见[包说明](../packages/protocol/README.md#实现一个协议)。
 
-| 契约测试                          | 工厂                                                                    | 覆盖                                                                                                                                                                                                                                                           |
-| --------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、`sessions` 的升序和翻页、`watch?` 的读已有、读新写入、中止 |
-| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                        |
-| `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                |
-| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                    |
-| `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                               |
-| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                               |
-| `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                               |
-| `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                   |
-| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                  |
+| 契约测试                          | 工厂                                                                    | 覆盖                                                                                                                                                                                                                                                                   |
+| --------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`limit`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、`sessions` 的升序和翻页、`watch?` 的读已有、读新写入、中止 |
+| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                                |
+| `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                        |
+| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                            |
+| `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                       |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                                       |
+| `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                       |
+| `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                           |
+| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                          |
 
 harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。记忆的契约用协议包 `/testing` 里的剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel`：`describeMemoryContract` 自己造好它们和一个内存会话日志交给工厂。谁跑：记忆存储的契约由 `ctx-memory` 的内存存储（带和不带 `embed`）、`createSqliteMemoryStore`、`createRemoteMemoryStore` 跑；决策模型的由剧本模型、启发式、`decisionFromLanguageModel`、`ctx-models` 的两个 provider（假 `fetch`）跑；提取模型的由剧本模型、`extractionFromLanguageModel`、`ctx-models` 的 `cloudflare` 跑；`describeMemoryContract` 由 `createMemory` 加内存存储跑，门控阈值固定在 0.1..0.9 之间，`LanguageModel` 可以不给。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里。
 
@@ -732,30 +743,37 @@ harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptSte
 
 ## 线上形态
 
-`ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON（每行一个值，出错时最后一行是 `{ error }`）；错误正文是 `{ error: ErrorInfo }`，客户端转成带 `status` 的 `Error`。鉴权用 `Authorization: Bearer <token>`，缺省只听本机，Host 只认监听地址，带 `Origin` 的请求缺省 403。消息本身就是 JSON，线上不做编码（0.3 起；0.2 的客户端和服务端不能混用）。路径按组件分组，可以整体挂在一个前缀下：
+`ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON（每行一个值，出错时最后一行是 `{ error }`；空行是心跳，读的一方跳过）；错误正文是 `{ error: ErrorInfo }`，客户端转成带 `status` 的 `Error`。鉴权用 `Authorization: Bearer <token>`，缺省只听本机，Host 只认监听地址，带 `Origin` 的请求缺省 403。消息本身就是 JSON，线上不做编码（0.3 起；0.2 的客户端和服务端不能混用）。路径按组件分组，可以整体挂在一个前缀下：
 
-| 组件     | 方法              | 路径                                                        | 请求体 → 响应                                                                              |
-| -------- | ----------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| 会话     | `append`          | `POST /sessions/:session/entries`                           | `{ entries, expectSeq? }` → `{ entries }`；前提不满足 409（`type: conflict`，`retryable`） |
-|          | `list`            | `GET /sessions/:session/entries?after=&last=&types=&kinds=` | → `{ entries }`；`types`、`kinds` 逗号分隔（`kind` 里不能有逗号）                          |
-|          | `watch`           | `GET /sessions/:session/entries/stream?after=`              | → NDJSON `Entry`；存储没有 `watch` 时服务端轮询 `list`                                     |
-|          | `clear`           | `DELETE /sessions/:session`                                 | → `{ deleted }`                                                                            |
-|          | `sessions`        | `GET /sessions?prefix=&after=&limit=`                       | → `{ sessions }`；名字升序                                                                 |
-| 执行环境 | （列出名字）      | `GET /executors`                                            | → `{ executors }`                                                                          |
-|          | `tools`           | `GET /executors/:name/tools`                                | → `{ tools }`                                                                              |
-|          | `execute`         | `POST /executors/:name/execute`                             | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止                        |
-| Harness  | `run`             | `POST /runs`                                                | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`                            |
-|          | `stream`          | `POST /runs?stream=1`                                       | 同上 → NDJSON `RunEvent`；断开即中止                                                       |
-|          | 取消（`signal`）  | `DELETE /runs/:runId`                                       | → `{ cancelled }`                                                                          |
-| 编排     | `submit`          | `POST /orchestrator/runs`                                   | 同 `POST /runs` → `{ runId, session }`                                                     |
-|          | `status` / `done` | `GET /orchestrator/runs/:runId?wait=<ms>`                   | → `{ runId, status, result?, error? }`；`wait` 是长轮询                                    |
-|          | `cancel`          | `DELETE /orchestrator/runs/:runId`                          | → `{ cancelled }`                                                                          |
-|          | `recover`         | `POST /orchestrator/recover`                                | → `{ recovered }`                                                                          |
-|          | `events`          | `GET /orchestrator/events`                                  | → NDJSON `OrchestratorEvent`                                                               |
-| 记忆     | `notes.*`         | `/memory/notes` 下                                          | 每个方法一条路径，逐条见 [`packages/remote`](../packages/remote/README.md)                 |
-|          | `facts.*`         | `/memory/facts` 下                                          | 同上                                                                                       |
-|          | `procedures.*`    | `/memory/procedures` 下                                     | 同上                                                                                       |
-|          | `core.*`          | `/memory/core` 下                                           | 同上                                                                                       |
+| 组件     | 方法              | 路径                                                               | 请求体 → 响应                                                                                                                               |
+| -------- | ----------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| 会话     | `append`          | `POST /sessions/:session/entries`                                  | `{ entries, expectSeq? }` → `{ entries }`；前提不满足 409（`type: conflict`，`retryable`）                                                  |
+|          | `list`            | `GET /sessions/:session/entries?after=&last=&limit=&types=&kinds=` | → `{ entries, more? }`；`types`、`kinds` 逗号分隔（`kind` 里不能有逗号）；一次最多一页，`more: true` 时用最后一条的 `seq` 当 `after` 接着读 |
+|          | `watch`           | `GET /sessions/:session/entries/stream?after=`                     | → NDJSON `Entry`；存储没有 `watch` 时服务端轮询 `list`                                                                                      |
+|          | `clear`           | `DELETE /sessions/:session`                                        | → `{ deleted }`                                                                                                                             |
+|          | `sessions`        | `GET /sessions?prefix=&after=&limit=`                              | → `{ sessions }`；名字升序                                                                                                                  |
+| 执行环境 | （列出名字）      | `GET /executors`                                                   | → `{ executors }`                                                                                                                           |
+|          | `tools`           | `GET /executors/:name/tools`                                       | → `{ tools }`                                                                                                                               |
+|          | `execute`         | `POST /executors/:name/execute`                                    | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止                                                                         |
+| Harness  | `run`             | `POST /runs`                                                       | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`                                                                             |
+|          | `stream`          | `POST /runs?stream=1`                                              | 同上 → NDJSON `RunEvent`；断开即中止                                                                                                        |
+|          | 取消（`signal`）  | `DELETE /runs/:runId`                                              | → `{ cancelled }`                                                                                                                           |
+| 编排     | `submit`          | `POST /orchestrator/runs`                                          | 同 `POST /runs` → `{ runId, session }`                                                                                                      |
+|          | `status` / `done` | `GET /orchestrator/runs/:runId?wait=<ms>&session=`                 | → `{ runId, status, session?, result?, error? }`；`wait` 是长轮询；给了 `session` 时结果可以从会话日志还原                                  |
+|          | `cancel`          | `DELETE /orchestrator/runs/:runId`                                 | → `{ cancelled }`                                                                                                                           |
+|          | `recover`         | `POST /orchestrator/recover`                                       | → `{ recovered }`                                                                                                                           |
+|          | `events`          | `GET /orchestrator/events`                                         | → NDJSON `OrchestratorEvent`                                                                                                                |
+| 记忆     | `notes.*`         | `/memory/notes` 下                                                 | 每个方法一条路径，逐条见 [`packages/remote`](../packages/remote/README.md)                                                                  |
+|          | `facts.*`         | `/memory/facts` 下                                                 | 同上                                                                                                                                        |
+|          | `procedures.*`    | `/memory/procedures` 下                                            | 同上                                                                                                                                        |
+|          | `core.*`          | `/memory/core` 下                                                  | 同上                                                                                                                                        |
+
+几条跨路径的规则：
+
+- 等很久才有结果的两个请求（`POST /runs`、`POST /executors/:name/execute`）会在结果出来之前先发 200 的响应头，隔一段时间写一个换行当心跳，最后才是 JSON 正文（JSON 允许前面有空白）。头发出去之后才出的错改不了状态码，正文是 `{ error, status }`，`status` 是本来该回的状态码。
+- 到了并发上限回 429（`type: rate_limit_error`，`retryable: true`）。
+- 500 的 `message` 只有一句通用的话和一个编号，原文在服务端的日志里；协议错误（`invalid_request`、`not_found`、`conflict`）照旧带着自己的 `type` 和文字。
+- 客户端可以放心重试的：所有 `GET`、带着 `id` 的 `append`（存储按 `id` 去重）、两个取消。提交运行、执行工具、记忆的写入不幂等，不重试。
 
 编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 

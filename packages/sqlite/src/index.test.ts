@@ -382,6 +382,40 @@ describe('schema 迁移', () => {
     await assert.rejects(store.list('t'), (error: Error) => error.name === 'unsupported_version');
   });
 
+  test('unreadable: placeholder：坏行读成 ctx.unreadable，会话其余部分和 watch 照常', async () => {
+    const database = new DatabaseSync(':memory:');
+    const writer = createSqliteStore({ database });
+    await writer.append('t', [userEntry('一'), userEntry('二'), userEntry('三'), userEntry('四')]);
+    database.exec(`UPDATE ctx_entries SET v = 2 WHERE seq = 2`);
+    database.exec(
+      `UPDATE ctx_entries SET v = 0, body = '{"message":{"role":"user","content":[{"type":"hologram"}]}}' WHERE seq = 3`,
+    );
+    await assert.rejects(writer.list('t'), (error: Error) => error.name === 'unsupported_version');
+
+    const store = createSqliteStore({ database, unreadable: 'placeholder' });
+    const entries = await store.list('t');
+    assert.deepEqual(
+      entries.map((entry) => [entry.seq, entry.type === 'event' ? entry.kind : entry.type]),
+      [
+        [1, 'message'],
+        [2, 'ctx.unreadable'],
+        [3, 'ctx.unreadable'],
+        [4, 'message'],
+      ],
+    );
+    const errors = entries.flatMap((entry) =>
+      entry.type === 'event' ? [(entry.data as { error: { type: string } }).error.type] : [],
+    );
+    assert.deepEqual(errors, ['unsupported_version', 'unsupported_part']);
+    const controller = new AbortController();
+    const seen: number[] = [];
+    for await (const entry of store.watch('t', { signal: controller.signal })) {
+      seen.push(entry.seq);
+      if (seen.length === 4) controller.abort();
+    }
+    assert.deepEqual(seen, [1, 2, 3, 4]);
+  });
+
   test('只补缺的：kind 列在、索引缺时只补索引；索引在、列缺时先补列', () => {
     const lacksIndex = new DatabaseSync(':memory:');
     lacksIndex.exec(PHASE1_DDL);

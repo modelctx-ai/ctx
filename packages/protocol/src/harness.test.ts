@@ -3,12 +3,24 @@ import assert from 'node:assert/strict';
 import { MockLanguageModelV4 } from 'ai/test';
 import { describe, test } from 'vite-plus/test';
 
-import { agentSpecToJson, modelName } from './harness.ts';
+import { agentSpecToJson, modelName, REDACTED_HEADER } from './harness.ts';
 
 describe('agent spec', () => {
   test('模型对象记成 provider/modelId，名字原样', () => {
     assert.equal(modelName('anthropic/claude-sonnet-5'), 'anthropic/claude-sonnet-5');
     assert.equal(modelName(new MockLanguageModelV4({ provider: 'mock', modelId: 'm1' })), 'mock/m1');
+  });
+
+  test('settings.headers 只留名字，值不进日志', () => {
+    const json = agentSpecToJson({
+      model: 'm',
+      settings: { temperature: 0, headers: { authorization: 'Bearer sk-secret', 'x-org': 'acme' } },
+    });
+    assert.deepEqual(json, {
+      model: 'm',
+      settings: { temperature: 0, headers: { authorization: REDACTED_HEADER, 'x-org': REDACTED_HEADER } },
+    });
+    assert.ok(!JSON.stringify(json).includes('sk-secret'));
   });
 
   test('可序列化部分只带给了的字段', () => {

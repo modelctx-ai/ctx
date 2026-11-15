@@ -15,7 +15,17 @@ import {
 import { createScriptedModel } from '@modelctx-ai/ctx/testing';
 import { createProcessExecutor } from '@modelctx-ai/ctx-exec';
 import { createMemoryStore as createInMemoryMemoryStore } from '@modelctx-ai/ctx-memory';
-import { CTX_EVENTS, CtxError, eventEntry, userEntry, type Entry, type SessionStore } from '@modelctx-ai/ctx-protocol';
+import {
+  CTX_EVENTS,
+  CtxError,
+  eventEntry,
+  userEntry,
+  type Entry,
+  type Harness,
+  type Orchestrator,
+  type RunResult,
+  type SessionStore,
+} from '@modelctx-ai/ctx-protocol';
 import {
   type ModelScriptStep,
   describeExecutorContract,
@@ -34,7 +44,13 @@ import {
   createRemoteSessionStore,
   isRemoteError,
 } from './index.ts';
-import { createRemoteHandler, startRemote, type RemoteServer, type StartRemoteOptions } from './server.ts';
+import {
+  createRemoteHandler,
+  DEFAULT_ALLOWED_SETTINGS,
+  startRemote,
+  type RemoteServer,
+  type StartRemoteOptions,
+} from './server.ts';
 
 const api = { describe, test };
 const accessToken = 'test-token-0123456789';
@@ -48,6 +64,32 @@ async function serve(options: StartRemoteOptions): Promise<RemoteServer> {
   const server = await startRemote({ accessToken, ...options });
   servers.push(server);
   return server;
+}
+
+function urlOf(input: string | URL | Request): string {
+  return input instanceof Request ? input.url : input.toString();
+}
+
+function pause(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function refuse(run: Promise<unknown>): Promise<unknown> {
+  return run.catch((error: unknown) => error);
+}
+
+/** 第一次 `POST` 照常发到服务端，但把响应丢掉，装成连接在回程断了。 */
+function losingFirstPost(): typeof fetch {
+  let lost = false;
+  return async (input, init) => {
+    const response = await fetch(input, init);
+    if (init?.method === 'POST' && !lost) {
+      lost = true;
+      await response.body?.cancel();
+      throw new TypeError('fetch failed');
+    }
+    return response;
+  };
 }
 
 function client(server: RemoteServer) {
@@ -243,6 +285,43 @@ describe('远程 harness', () => {
     expect(eventKinds(await store.list('s')).at(-1)).toBe(CTX_EVENTS.runEnded);
   });
 
+  test('agent.settings 缺省不收 headers、providerOptions，allowedSettings 放行；allowedModels 之外的模型 400', async () => {
+    const { harness } = localHarness([{ type: 'text', text: '好' }]);
+    const strict = createRemoteHarness(client(await serve({ harness, allowedModels: ['other'] })));
+    const post = (settings: Record<string, unknown>, remote = createRemoteHarness(client(server))) =>
+      remote.run({ session: 's', agent: { ...agent, settings }, input: '在吗' });
+    const server = await serve({ harness });
+
+    for (const settings of [
+      { headers: { authorization: 'Bearer x' } },
+      { providerOptions: { openai: {} } },
+      { nope: 1 },
+    ]) {
+      const error = await refuse(post(settings));
+      expect(isRemoteError(error) && error.status).toBe(400);
+      expect((error as Error).message).toMatch(/not accepted by this server/);
+    }
+    expect((await post({ temperature: 0.2, maxRetries: 0, timeoutMs: 5000 })).stopReason).toBe('end_turn');
+
+    const wrongModel = await refuse(strict.run({ session: 's', agent, input: '在吗' }));
+    expect(isRemoteError(wrongModel) && wrongModel.status).toBe(400);
+    expect((wrongModel as Error).message).toMatch(/is not allowed by this server/);
+
+    const open = localHarness([{ type: 'text', text: '好' }]);
+    const allowed = await serve({
+      harness: open.harness,
+      allowedModels: [agent.model],
+      allowedSettings: [...DEFAULT_ALLOWED_SETTINGS, 'headers'],
+    });
+    const result = await post({ headers: { 'x-trace': 'abc' } }, createRemoteHarness(client(allowed)));
+    expect(result.stopReason).toBe('end_turn');
+    const started = (await open.store.list('s')).find(
+      (entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.runStarted,
+    );
+    expect(JSON.stringify(started)).not.toContain('abc');
+    expect(JSON.stringify(started)).toContain('"x-trace":"[redacted]"');
+  });
+
   test('stream：客户端中途不读了，服务端中止这一轮并写 ctx.run.ended（aborted）', async () => {
     const { store, harness } = localHarness([
       { type: 'tool-call', id: 'call-1', input: { wait: true } },
@@ -299,6 +378,52 @@ describe('远程 harness', () => {
 function guardedServer(): Promise<RemoteServer> {
   return serve({ store: createMemoryStore(), maxBodyBytes: 1_024 });
 }
+
+describe('会话的条目分页', () => {
+  test('服务端一次最多回 maxListEntries 条并带 more；客户端的 list 自己接着读，结果不变', async () => {
+    const store = createMemoryStore();
+    await store.append(
+      's',
+      Array.from({ length: 10 }, (_, i) => userEntry(String(i + 1))),
+    );
+    const server = await serve({ store, maxListEntries: 3 });
+    const raw = await fetch(`${server.baseUrl}/sessions/s/entries`, {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    const body = (await raw.json()) as { entries: unknown[]; more?: boolean };
+    expect([body.entries.length, body.more]).toEqual([3, true]);
+
+    const remote = createRemoteSessionStore(client(server));
+    const texts = async (options?: Parameters<typeof remote.list>[1]) =>
+      (await remote.list('s', options)).map((entry) => (entry.type === 'message' ? entry.message.content : ''));
+    expect(await texts()).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9', '10']);
+    expect(await texts({ after: 4, limit: 5 })).toEqual(['5', '6', '7', '8', '9']);
+    expect(await texts({ limit: 2 })).toEqual(['1', '2']);
+    expect(await texts({ last: 2 })).toEqual(['9', '10']);
+  });
+
+  test('没有 watch 的存储：轮询一页一页读，长会话也读得完', async () => {
+    const inner = createMemoryStore();
+    await inner.append(
+      's',
+      Array.from({ length: 10 }, (_, i) => userEntry(String(i + 1))),
+    );
+    const store: SessionStore = {
+      append: (session, entries, options) => inner.append(session, entries, options),
+      list: (session, options) => inner.list(session, options),
+      clear: (session) => inner.clear(session),
+      sessions: (options) => inner.sessions(options),
+    };
+    const remote = createRemoteSessionStore(client(await serve({ store, maxListEntries: 3, pollIntervalMs: 5 })));
+    const controller = new AbortController();
+    const seen: number[] = [];
+    for await (const entry of remote.watch('s', { signal: controller.signal })) {
+      seen.push(entry.seq);
+      if (seen.length === 10) controller.abort();
+    }
+    expect(seen).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+});
 
 describe('鉴权和安全缺省', () => {
   test('没带或带错 token 是 401', async () => {
@@ -526,6 +651,298 @@ describe('远程记忆存储', () => {
 });
 
 // ---- 端到端：三个服务，各管一样 ----
+
+/** 装成更新的服务端：第二条的格式版本比客户端认识的高。 */
+function newer(entries: Entry[]): Entry[] {
+  return entries.map((entry) => (entry.seq === 2 ? { ...entry, v: 99 } : entry));
+}
+
+describe('比客户端新的条目', () => {
+  test('缺省抛 unsupported_version；unreadable: placeholder 时换成 ctx.unreadable', async () => {
+    const memory = createMemoryStore();
+    await memory.append('s', [userEntry('一'), userEntry('二')]);
+    const store: SessionStore = {
+      append: (session, entries, options) => memory.append(session, entries, options),
+      list: async (session, options) => newer(await memory.list(session, options)),
+      clear: (session) => memory.clear(session),
+      sessions: (options) => memory.sessions(options),
+    };
+    const server = await serve({ store, pollIntervalMs: 10 });
+    const strict = createRemoteSessionStore(client(server));
+    await expect(strict.list('s')).rejects.toMatchObject({ type: 'unsupported_version' });
+    expect(await strict.list('s', { limit: 1 })).toHaveLength(1);
+
+    const lenient = createRemoteSessionStore({ ...client(server), unreadable: 'placeholder' });
+    expect(eventKinds(await lenient.list('s'))).toEqual(['user', CTX_EVENTS.unreadable]);
+    const controller = new AbortController();
+    const seen: string[] = [];
+    for await (const entry of lenient.watch('s', { signal: controller.signal })) {
+      seen.push(...eventKinds([entry]));
+      if (seen.length === 2) controller.abort();
+    }
+    expect(seen).toEqual(['user', CTX_EVENTS.unreadable]);
+  });
+});
+
+describe('长请求、断线和上限', () => {
+  const auth = { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' };
+  const quick = { retry: { minDelayMs: 20, maxDelayMs: 100 } };
+  const result: RunResult = { runId: 'r', text: '好的', messages: [], recorded: [], stopReason: 'end_turn' };
+
+  test('等结果的时候发心跳：正文前面是换行，客户端照常拿到结果', async () => {
+    const harness: Harness = {
+      async run() {
+        await pause(120);
+        return result;
+      },
+    };
+    const local = createFunctionExecutor('fn').register({ name: 'slow', inputSchema: { type: 'object' } }, async () => {
+      await pause(120);
+      return { type: 'text', text: '跑完了' };
+    });
+    const server = await serve({ harness, executors: [local], heartbeatMs: 20 });
+    const raw = await fetch(`${server.baseUrl}/runs`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ session: 's', agent }),
+    });
+    const text = await raw.text();
+    expect(text.startsWith('\n')).toBe(true);
+    expect(JSON.parse(text)).toEqual(result);
+    expect(await createRemoteHarness(client(server)).run({ session: 's', agent })).toEqual(result);
+    const executor = createRemoteExecutor({ ...client(server), name: 'fn' });
+    expect(await executor.execute({ id: 'c', name: 'slow', input: {} }, { session: 's' })).toEqual({
+      type: 'text',
+      text: '跑完了',
+    });
+  });
+
+  test('心跳发出去以后才出的错：200 加 { error, status }，客户端转成 RemoteError；原文只进日志', async () => {
+    const logged: unknown[] = [];
+    const harness: Harness = {
+      async run() {
+        await pause(80);
+        throw new Error('open /var/lib/secret.db failed');
+      },
+    };
+    const server = await serve({
+      harness,
+      heartbeatMs: 20,
+      logger: { warn: (message, data) => void logged.push({ message, ...data }) },
+    });
+    const failure = await createRemoteHarness(client(server))
+      .run({ session: 's', agent })
+      .catch((error: unknown) => error);
+    expect(isRemoteError(failure) && failure.status).toBe(500);
+    expect((failure as Error).message).toMatch(/^internal error \(ref [0-9a-f]{8}\)/);
+    expect(JSON.stringify(logged)).toContain('secret.db');
+  });
+
+  test('内部错误不回原文；协议错误（CtxError）照旧带着 type', async () => {
+    const memory = createMemoryStore();
+    const store: SessionStore = {
+      ...memory,
+      list: () => Promise.reject(new Error('SQLITE_IOERR: /data/ctx.db')),
+      clear: () => Promise.reject(new CtxError('not_found', '没有这个会话')),
+    };
+    const remote = createRemoteSessionStore({ ...client(await serve({ store })), ...quick });
+    const failure = await remote.list('s').catch((error: unknown) => error);
+    expect(isRemoteError(failure) && failure.status).toBe(500);
+    expect((failure as Error).message).not.toContain('ctx.db');
+    expect(await remote.clear('s').catch((error: unknown) => error)).toMatchObject({ status: 404, type: 'not_found' });
+  });
+
+  test('空闲的流也有心跳行，客户端跳过', async () => {
+    const store = createMemoryStore();
+    const server = await serve({ store, heartbeatMs: 20 });
+    const controller = new AbortController();
+    const response = await fetch(`${server.baseUrl}/sessions/s/entries/stream`, {
+      headers: auth,
+      signal: controller.signal,
+    });
+    const { value } = await response.body!.getReader().read();
+    expect(new TextDecoder().decode(value)).toMatch(/^\n+$/);
+    controller.abort();
+
+    const seen: Entry[] = [];
+    const watching = new AbortController();
+    const done = (async () => {
+      for await (const entry of createRemoteSessionStore(client(server)).watch('s', { signal: watching.signal })) {
+        seen.push(entry);
+      }
+    })();
+    await pause(80);
+    await store.append('s', [userEntry('一')]);
+    await eventually(
+      async () => seen.length,
+      (count) => count === 1,
+    );
+    watching.abort();
+    await done;
+    expect(seen.map((entry) => entry.seq)).toEqual([1]);
+  });
+
+  test('watch：服务重启后按最后读到的 seq 重连，不重不漏', async () => {
+    const store = createMemoryStore();
+    const first = await startRemote({ accessToken, store });
+    const port = Number(new URL(first.origin).port);
+    const seen: number[] = [];
+    const controller = new AbortController();
+    const remote = createRemoteSessionStore({ baseUrl: first.baseUrl, accessToken, ...quick });
+    const done = (async () => {
+      for await (const entry of remote.watch('s', { signal: controller.signal })) seen.push(entry.seq);
+    })();
+    await store.append('s', [userEntry('一')]);
+    await eventually(
+      async () => seen.length,
+      (count) => count === 1,
+    );
+    await first.close();
+    await store.append('s', [userEntry('二')]);
+    await serve({ store, port });
+    await store.append('s', [userEntry('三')]);
+    await eventually(
+      async () => seen.length,
+      (count) => count === 3,
+    );
+    controller.abort();
+    await done;
+    expect(seen).toEqual([1, 2, 3]);
+  });
+
+  test('watch：一直连不上，试够次数就抛', async () => {
+    const server = await startRemote({ accessToken, store: createMemoryStore() });
+    await server.close();
+    const remote = createRemoteSessionStore({
+      baseUrl: server.baseUrl,
+      accessToken,
+      retry: { retries: 2, minDelayMs: 5 },
+    });
+    const read = (async () => {
+      for await (const _ of remote.watch('s')) break;
+    })();
+    await expect(read).rejects.toThrow(/fetch failed/);
+  });
+
+  test('append：响应丢了自己重试，不记两遍，返回值是写进去的那些', async () => {
+    const store = createMemoryStore();
+    const server = await serve({ store });
+    const remote = createRemoteSessionStore({ ...client(server), ...quick, fetch: losingFirstPost() });
+    const written = await remote.append('s', [userEntry('一'), eventEntry('app.note', { text: '二' })]);
+    expect(written.map((entry) => entry.seq)).toEqual([1, 2]);
+    expect(await store.list('s')).toHaveLength(2);
+  });
+
+  test('append：带 expectSeq 的那一批响应丢了，重试时的冲突认得出是自己写的', async () => {
+    const store = createMemoryStore();
+    const server = await serve({ store });
+    const remote = createRemoteSessionStore({ ...client(server), ...quick, fetch: losingFirstPost() });
+    const written = await remote.append('s', [userEntry('一')], { expectSeq: 0 });
+    expect(written.map((entry) => entry.seq)).toEqual([1]);
+    expect(await store.list('s')).toHaveLength(1);
+    // 真的冲突（末尾不是自己推后的）照旧抛。
+    await expect(remote.append('s', [userEntry('二')], { expectSeq: 0 })).rejects.toMatchObject({ type: 'conflict' });
+    expect(await store.list('s')).toHaveLength(1);
+  });
+
+  test('done：服务重启后不空转，结束了从会话日志还原结果', async () => {
+    // 第一个服务收下提交；查状态的请求都到第二个服务，它的编排器不认识这次提交（重启后的样子）。
+    const { store, harness } = localHarness([{ type: 'text', text: '好的' }], 200);
+    const orchestrator = createOrchestrator({ harness, store });
+    const first = await serve({ store, orchestrator });
+    let status: 'running' | 'completed' = 'running';
+    let polls = 0;
+    const restarted: Orchestrator = {
+      submit: () => Promise.reject(new Error('unused')),
+      status: async () => {
+        polls += 1;
+        return status;
+      },
+      cancel: async () => false,
+      close: async () => {},
+    };
+    const second = await serve({ store, orchestrator: restarted });
+    const remote = createRemoteOrchestrator({
+      baseUrl: first.baseUrl,
+      accessToken,
+      retry: { minDelayMs: 50, maxDelayMs: 400 },
+      fetch: (input, init) =>
+        fetch(init?.method === 'GET' ? urlOf(input).replace(first.baseUrl, second.baseUrl) : input, init),
+    });
+    const handle = await remote.submit({ session: 'restart', agent, input: '在吗', runId: 'run-restart' });
+    await eventually(
+      async () => runEnded(await store.list('restart')),
+      (ended) => ended.length === 1,
+    );
+    await pause(400);
+    expect(polls).toBeGreaterThan(0);
+    expect(polls).toBeLessThan(12);
+    status = 'completed';
+    const restored = await handle.done;
+    expect(restored).toMatchObject({ runId: 'run-restart', stopReason: 'end_turn', text: '好的' });
+    expect(eventKinds(restored.recorded)).toEqual(['ctx.run.started', 'user', 'assistant', 'ctx.run.ended']);
+    await orchestrator.close();
+  });
+
+  test('编排器不认识的运行：给了会话名就从日志找，日志里也没有才是 404', async () => {
+    const { store, harness } = localHarness([{ type: 'text', text: '好的' }]);
+    const ran = await harness.run({ session: 's', agent, input: '在吗', runId: 'run-1' });
+    const idle: Orchestrator = {
+      submit: () => Promise.reject(new Error('unused')),
+      status: async () => undefined,
+      cancel: async () => false,
+      close: async () => {},
+    };
+    const server = await serve({ store, orchestrator: idle });
+    const get = (path: string): Promise<Response> => fetch(`${server.baseUrl}${path}`, { headers: auth });
+    expect((await get('/orchestrator/runs/run-1')).status).toBe(404);
+    expect((await get('/orchestrator/runs/nope?session=s')).status).toBe(404);
+    const found = await get('/orchestrator/runs/run-1?session=s');
+    expect(found.status).toBe(200);
+    const body = (await found.json()) as { status: string; result: RunResult };
+    expect(body.status).toBe('completed');
+    expect(body.result).toMatchObject({ runId: 'run-1', text: '好的', stopReason: 'end_turn' });
+    expect(body.result.messages).toEqual(ran.messages);
+    expect(body.result.recorded.map((entry) => entry.seq)).toEqual(ran.recorded.map((entry) => entry.seq));
+  });
+
+  test('到了并发上限回 429（retryable），放掉以后又能用', async () => {
+    const { store, harness } = localHarness(
+      [
+        { type: 'text', text: '一' },
+        { type: 'text', text: '二' },
+      ],
+      200,
+    );
+    const server = await serve({ store, harness, maxRuns: 1, maxStreams: 1 });
+    const remote = createRemoteHarness(client(server));
+    const running = remote.run({ session: 'a', agent, input: '在吗' });
+    await pause(50);
+    const refused = await remote.run({ session: 'b', agent, input: '在吗' }).catch((error: unknown) => error);
+    expect(refused).toMatchObject({ status: 429, type: 'rate_limit_error', retryable: true });
+    expect((await running).stopReason).toBe('end_turn');
+    expect((await remote.run({ session: 'b', agent, input: '在吗' })).stopReason).toBe('end_turn');
+
+    const open = new AbortController();
+    const stream = await fetch(`${server.baseUrl}/sessions/a/entries/stream`, { headers: auth, signal: open.signal });
+    expect(stream.status).toBe(200);
+    const second = await fetch(`${server.baseUrl}/sessions/a/entries/stream`, { headers: auth });
+    expect(second.status).toBe(429);
+    open.abort();
+    await eventually(
+      async () => {
+        const controller = new AbortController();
+        const again = await fetch(`${server.baseUrl}/sessions/a/entries/stream`, {
+          headers: auth,
+          signal: controller.signal,
+        });
+        controller.abort();
+        return again.status;
+      },
+      (code) => code === 200,
+    );
+  });
+});
 
 describe('端到端', () => {
   test('本机 harness + 远程子进程执行环境 + 远程会话存储，跑一轮 run_command', async () => {

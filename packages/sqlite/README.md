@@ -40,14 +40,15 @@ watcher.close();
 
 ## 选项
 
-| 选项             | 说明                                                                                    |
-| ---------------- | --------------------------------------------------------------------------------------- |
-| `path`           | 数据库文件，或 `:memory:`；和 `database` 二选一                                         |
-| `database`       | 应用已经打开的 `DatabaseSync`；不改它的 `journal_mode`，`close()` 不关它                |
-| `busyTimeoutMs`  | 别的连接占着写锁时最多等多久。自己开库缺省 5000；传 `database` 时缺省不动，显式传了才设 |
-| `prefix`         | 表名前缀，缺省 `ctx_`，只能是标识符                                                     |
-| `now`、`id`      | 缺省 `at` 和 `id` 的生成函数                                                            |
-| `pollIntervalMs` | `watch` 轮询新条目的间隔，缺省 250 毫秒                                                 |
+| 选项             | 说明                                                                                                                                                     |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `path`           | 数据库文件，或 `:memory:`；和 `database` 二选一                                                                                                          |
+| `database`       | 应用已经打开的 `DatabaseSync`；不改它的 `journal_mode`，`close()` 不关它                                                                                 |
+| `busyTimeoutMs`  | 别的连接占着写锁时最多等多久。自己开库缺省 5000；传 `database` 时缺省不动，显式传了才设                                                                  |
+| `prefix`         | 表名前缀，缺省 `ctx_`，只能是标识符                                                                                                                      |
+| `now`、`id`      | 缺省 `at` 和 `id` 的生成函数                                                                                                                             |
+| `pollIntervalMs` | `watch` 轮询新条目的间隔，缺省 250 毫秒                                                                                                                  |
+| `unreadable`     | 读到解不了的一行（`v` 比这个版本认识的高、带不认识的部件）时怎么办。缺省 `throw`；`placeholder` 把那一行读成 `ctx.unreadable` 事件，会话其余部分照常能读 |
 
 ## 表
 
@@ -61,7 +62,7 @@ watcher.close();
 - 重复的 `id`、同会话重复的 `key` 由 `ON CONFLICT DO NOTHING` 跳过，同一批的其余照写；只跳过唯一约束冲突，NOT NULL 之类的违例照常报错；一批在一个 SAVEPOINT 里，要么全写要么不写。
 - `watch(session, { after, signal })` 轮询 `list(session, { after })`，先给出已有的再给出新写入的；`signal` 中止后迭代结束。
 - 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），`body` 就是 `JSON.stringify` 的结果，不做编码。有循环引用的条目写入时报错。
-- `v` 列记写入这一行时的格式版本（新行是 `1`，列加上之前的行是 `0`）。读每一行经协议包的 `upgradeEntry` 升到当前形状：0.2 及以前存的 AI SDK 消息（二进制和 URL 带 `\u0000ctx` 标记）转成 `Message`，旧摘要的 `covers: { at, seq }` 读成 `seq`；旧行不会被改写。比自己认识的更高的 `v` 读时抛 `unsupported_version`。
+- `v` 列记写入这一行时的格式版本（新行是 `1`，列加上之前的行是 `0`）。读每一行经协议包的 `upgradeEntry` 升到当前形状：0.2 及以前存的 AI SDK 消息（二进制和 URL 带 `\u0000ctx` 标记）转成 `Message`，旧摘要的 `covers: { at, seq }` 读成 `seq`；旧行不会被改写。比自己认识的更高的 `v` 读时抛 `unsupported_version`；开了 `unreadable: 'placeholder'` 时那一行读成一条 `ctx.unreadable` 事件（`id`、`seq`、`at` 不变，`data` 里是原来的 `v`、`type` 和错误），`list`、`watch` 不会断在它上面。
 - 通过协议包的契约测试 `describeSessionStoreContract`（含 `watch`）。
 
 ## 结构版本和迁移
@@ -72,6 +73,7 @@ watcher.close();
 - 版本比 3 低：在写锁里按序升级，同时打开同一个旧库的几个进程只有一个真的迁，其余拿到锁后重读版本。0.1 的库（列叫 `thread`，`schema` 是 `1`）会被改成 `session`，索引随列一起改，数据不动；0.2 的库（列已经是 `session`，`schema` 也是 `1`）和应用自己改过列名的库只升版本号；3 把索引 `(session, at, seq)` 换成 `(session, seq)`，旧摘要的 `covers: { at, seq }` 读成 `seq`。
 - 版本等于 3：不信版本号，查实际的列和索引（`PRAGMA table_xinfo`、`sqlite_master`），缺什么在写锁里补什么，结构完整时什么都不写。所以先前的提交建出来的 schema 3 库，在之后的版本上打开也会补齐；每一步都能重复执行。`v` 列（`INTEGER NOT NULL DEFAULT 0`）也在这一级补：缺就加，已有的行是 0。
 - 版本比 3 高：抛错，不打开。旧代码不认识新结构，写进去可能写坏；升级本包即可。
+- 几个进程共用一个库时的升级顺序：**读的一方先升**。结构迁移不可逆（改列名、换索引），没有降级路径——库一旦被新版本打开过，旧版本就打不开了，所以要所有进程都能换成新版本再升。条目格式（`v`）另算：新版本写了新格式的行之后，还没升级的进程读那个会话会抛 `unsupported_version`，过渡期可以给它开 `unreadable: 'placeholder'`。
 
 应用传进来的 `database` 上已经有事务时，迁移用 SAVEPOINT，随应用的事务一起提交或回滚。
 

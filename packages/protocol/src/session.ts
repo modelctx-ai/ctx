@@ -67,6 +67,11 @@ export interface ListOptions {
   readonly after?: number;
   /** 只要最后写入的 N 条（`seq` 最大的 N 条），仍按 `seq` 升序返回。小数向下取整，不是有限正数时返回空。 */
   readonly last?: number;
+  /**
+   * 最多返回这么多条，取过滤之后 `seq` 最小的（最早的）。和 `after` 配合向前翻页：下一页的 `after` 是这一页
+   * 最后一条的 `seq`，读到不满一页为止。小数向下取整，不是有限正数时返回空。和 `last` 同时给时先取 `last`。
+   */
+  readonly limit?: number;
   /** 只要这些类型。 */
   readonly types?: readonly EntryType[];
   /**
@@ -193,6 +198,10 @@ export function filterEntries(entries: readonly Entry[], options: ListOptions | 
     const last = Number.isFinite(options.last) ? Math.floor(options.last) : 0;
     out = last > 0 ? out.slice(-last) : [];
   }
+  if (options?.limit !== undefined) {
+    const limit = Number.isFinite(options.limit) ? Math.floor(options.limit) : 0;
+    out = limit > 0 ? out.slice(0, limit) : [];
+  }
   return out;
 }
 
@@ -257,6 +266,7 @@ export const CTX_EVENTS = {
   runEnded: 'ctx.run.ended',
   compacted: 'ctx.compacted',
   error: 'ctx.error',
+  unreadable: 'ctx.unreadable',
 } as const;
 
 export type CtxEventKind = (typeof CTX_EVENTS)[keyof typeof CTX_EVENTS];
@@ -287,6 +297,18 @@ export interface CtxErrorData {
   readonly runId?: string;
   readonly message: string;
   readonly type?: string;
+}
+
+/**
+ * `ctx.unreadable` 的 `data`。这种事件不是写进去的：存储在宽松模式下读到解不了的一行（格式版本比自己认识的高、
+ * 带不认识的部件、正文不是 JSON）时，用它占住那一行的位置（见 `readEntry`）。
+ */
+export interface UnreadableData {
+  /** 那一行存着的格式版本；读不出来时没有。 */
+  readonly v?: number;
+  /** 那一行本来的类型（`message`、`event`、`summary`）；读不出来时没有。 */
+  readonly type?: string;
+  readonly error: { readonly type: string; readonly message: string };
 }
 
 export function isFrameworkKind(kind: string): boolean {

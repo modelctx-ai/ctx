@@ -165,25 +165,28 @@ sequenceDiagram
 
 ## 存储
 
-| 方法                                           | 行为                                                                                                                                                                                                                                   |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `append(session, entries, { expectSeq? })`     | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）。给了 `expectSeq` 而会话末尾 `seq` 不等于它（空会话是 0）时整批不写，抛 `conflict`（`retryable`），检查先于去重 |
-| `list(session, { after, last, types, kinds })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；`kinds` 只要 `kind` 在其中的事件（消息和摘要不返回），与 `types` 取交集；都可以组合，`last` 在过滤之后取   |
-| `clear(session)`                               | 删掉整个会话，返回条数                                                                                                                                                                                                                 |
-| `sessions({ prefix, after, limit })`           | 有内容的会话，按名字升序（码点序）。`prefix` 按字面匹配，`after` 是上一页最后一个名字（不含），`limit` 限条数，小数向下取整，不是正数时返回空；都不给就是全部                                                                          |
-| `watch(session, { after, signal })`            | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                                                                                                                  |
+| 方法                                                  | 行为                                                                                                                                                                                                                                                                                                                      |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `append(session, entries, { expectSeq? })`            | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）。给了 `expectSeq` 而会话末尾 `seq` 不等于它（空会话是 0）时整批不写，抛 `conflict`（`retryable`），检查先于去重                                                                                    |
+| `list(session, { after, last, limit, types, kinds })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；`limit` 取过滤之后最早的 N 条，和 `after` 配合翻页（和 `last` 同时给时先取 `last`）；`kinds` 只要 `kind` 在其中的事件（消息和摘要不返回），与 `types` 取交集；都可以组合，`last` 在过滤之后取 |
+| `clear(session)`                                      | 删掉整个会话，返回条数                                                                                                                                                                                                                                                                                                    |
+| `sessions({ prefix, after, limit })`                  | 有内容的会话，按名字升序（码点序）。`prefix` 按字面匹配，`after` 是上一页最后一个名字（不含），`limit` 限条数，小数向下取整，不是正数时返回空；都不给就是全部                                                                                                                                                             |
+| `watch(session, { after, signal })`                   | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                                                                                                                                                                                                     |
 
-实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，缺省每 250ms，别的进程写进同一个库的也能读到）。条目只追加；除了 `clear`，没有删除和修改。
+实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，一次读一页，缺省每 250ms，别的进程写进同一个库的也能读到；`unreadable: 'placeholder'` 时解不了的行读成 `ctx.unreadable` 事件，见[协议层](protocol.md#会话-sessionstore)）。条目只追加；除了 `clear`，没有删除和修改。
 
 ## 投影
 
-`project(entries, options)` 按顺序做五步：
+`project(entries, options)` 按顺序做六步：
 
 1. 按 `(at, seq)` 排序（`compareEntries`）：补写的旧记录排回逻辑上的位置。
 2. 选摘要：`covers` 最大的那条生效，相同时后写（`seq` 大）的生效。`seq` ≤ `covers` 的条目不再出现，摘要之后补写的旧记录（`seq` > `covers`）仍然可见；摘要用 `options.summary` 渲染（缺省是一条用户消息 `Summary of the earlier conversation:\n…`），固定在第一条，不参与裁剪。
 3. 消息条目原样带上。`options.message(entry)` 可以改写，返回空就丢掉。
 4. 事件条目：没有规则的 `kind` 跳过，也不打断前后同类事件的合并。`fold: true` 的规则把连续的同类事件合成一组交给 `render(events)`；`render` 返回一条消息、多条消息，或者空（丢掉）。
-5. 窗口：开头孤立的工具结果（它的调用已经被摘要盖住或被裁掉）总是丢掉。设了 `maxMessages` 或 `maxTokens` 时，从最旧的消息开始整组丢弃直到不超；带工具调用的助手消息和紧跟的工具结果是一组。至少留下最后一组，宁可超预算也不交出空上下文。
+5. 配对：工具结果找不到对应的调用（按调用 `id`）就去掉；工具调用没有结果（运行断在中间）就在它后面补一条错误结果 `No result was recorded for this tool call.`，服务商自己执行的调用（`providerExecuted`）不补。
+6. 窗口：开头孤立的工具结果（它的调用已经被摘要盖住或被裁掉）总是丢掉。设了 `maxMessages` 或 `maxTokens` 时，从最旧的消息开始整组丢弃直到不超；带工具调用的助手消息和紧跟的工具结果是一组。裁过之后如果没有摘要、开头又不是用户消息，接着裁到下一条用户消息（后面没有用户消息了就不再裁）。至少留下最后一组，宁可超预算也不交出空上下文。
+
+这样不管日志里是什么样、窗口裁在哪，交给模型的都是服务商接口收得下的序列。
 
 例子：`whisper` 有 `fold` 规则，`clipboard` 没有规则。
 
@@ -212,14 +215,14 @@ sequenceDiagram
 
 结果 `Projection`：`messages`；`items`，每条带 `from`、`upTo`（它来自的条目里最小和最大的 `seq`）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`summary` 生效的摘要条目。
 
-缺省的 token 估算不依赖分词器：中日韩文字一个字约 1 token，其他字符约 4 个 1 token，每条消息另加 4，图片、文件每个按 256（工具结果里的也一样，不去数 base64）。只用于预算和裁剪，不用于计费。
+缺省的 token 估算不依赖分词器：中日韩文字一个字约 1 token，ASCII 约 4 个字符 1 token，其余文字（西里尔、阿拉伯、表情……）约 2 个字符 1 token，每条消息另加 4。附件按 `estimateFileTokens`：内联文字按字数，base64 按解码后的大小（图片 64 KiB 以内 256、更大 1600；文本类按字节数除以 4；其余每 20 字节 1 个、至少 256），只有地址或服务商引用、不知道大小的按 256；工具结果里的文件一样算。只用于预算和裁剪，不用于计费。
 
 ## 调用
 
 `createContextBuilder({ store, projection, projections, sources, sourceTimeoutMs, logger, factsPlacement, model })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
 
 1. 收集事实（`facts: false` 跳过；`FactsSpec.sources` 只用指定的来源）。投影名先认：不认识就以 `not_found` 失败，不回退，也不先去收事实。
-2. 读视图：只读最近一条摘要和它之后的条目，再投影。`window` 可以覆盖投影里的窗口设置。
+2. 读视图：只读最近一条摘要和它之后的条目，再投影。请求带了 `window` 就整个换掉投影里配的上限（`{}` 是不裁剪），`estimate` 始终用投影里配的。`build` 时 `maxTokens` 先扣掉历史之外已经占掉的部分——指令、事实、工具定义、`input`、`prompt` 的估算——剩下的才是历史的预算，所以它管的是整次调用；`view` 没有这些，不扣。
 3. 指令：`instructions` 是字符串时，事实追加在后面，用空行隔开；（`createContext` 里）是函数时把事实传进去，由函数决定怎么写。
 4. 投影里的 `system` 消息（摘要、事件规则或 `message` 钩子渲染成的，以及存成消息条目的）不放进 `messages`，文字按顺序接在指令最后，同样用空行隔开。
 5. 消息：视图 + `input`（这一轮用户说的话）+ `prompt`（最后一条临时用户消息；可以是函数，拿到事实）。
@@ -377,11 +380,13 @@ await hub.close();
 - 工具名只能是 `[a-zA-Z0-9_-]`，最长 64（各家接口的共同限制）。重名报错，`{ replace: true }` 覆盖。`addTool` 的 `source` 缺省 `local`，`removeSource(source)` 整批移除（函数执行环境里的函数一起拿掉）。
 - `registry.select(filter)` 按协议返回 `ToolDefinition[]`；要 AI SDK 的 `ToolSet` 用 `registry.toolSet(filter, { executors })`，或 `toToolSet(definitions, executors)`：每个工具的 `execute` 转给绑定的执行环境，结果经 `toolOutputToAiSdk` 交回模型。0.1 的 `add(name, tool, meta)`、`addAll` 还能用。
 - `createMcpHub(servers)` 收常见的 `mcpServers` 写法：有 `command` 走 stdio（`env` 只写额外的变量，`PATH`、`HOME` 等自动带上），有 `url` 走 Streamable HTTP，`type: 'sse'` 走 SSE。
-- `connect()` 并行连接，从不因为单个服务器抛错：失败记为 `failed` 和错误信息，`enabled: false` 记为 `disabled`；`status()` 按配置顺序。再调一次 `connect()` 会重试没连上的，已连上的不动。
+- `connect()` 并行连接，从不因为单个服务器抛错：失败记为 `failed` 和错误信息，`enabled: false` 记为 `disabled`；`status()` 按配置顺序。再调一次 `connect()` 会重试没连上的和后来断开的，已连上的不动。
 - 每台服务器连接加列工具最多等 `timeoutMs`：服务器配置里的优先，其次 hub 的，缺省 15 秒；`0` 或 `Infinity` 不限时。超时记为失败。连上以后任何一步失败都关掉连接，stdio 服务器的进程跟着结束。
 - 工具名缺省加服务器前缀 `<server>__<tool>`，非法字符换成 `_`，截到 64；`namespace: false` 保留原名。`include`、`exclude` 用服务器上的原名。改名后重名的按配置顺序留第一个，后面的原名记进那台服务器状态的 `skipped`。
 - hub 本身是一个执行环境，名字缺省 `mcp`（`createMcpHub(servers, { name })` 可改，一个应用开几个 hub 时各起一个）。`tools()` 报全部工具的 `ToolDefinition`，`executor` 指向 hub；`execute(call)` 调对应服务器的工具，MCP 结果转成 `ToolOutput`：全是文字时合成一段 `text`，图片、音频是 `file`，`isError` 是 `{ type: 'error' }`。`provision()` / `dispose()` 就是 `connect()` / `close()`。
 - `registerInto(registry)` 写进注册表，来源 `mcp:<server>`，执行环境是 hub；重复调用先删掉这个 hub 之前写的工具再写。注册表里已有别的来源的同名工具时不替换，跳过并告警；返回实际写入的条数。
+- 第三方的内容进上下文之前有上限：工具说明超过 `maxDescriptionChars`（缺省 2000）截断；一次结果的文字超过 `maxOutputChars`（缺省 10 万字符）截断并注明省略多少，图片、音频合计超过 `maxFileBytes`（缺省 5 MiB）时放不下的换成一句说明。一次调用最多等 `callTimeoutMs`（缺省 60 秒，服务器配置里的优先），到点返回错误并中止底层请求。
+- 服务器断开（stdio 进程退出、Streamable HTTP 会话过期、SSE 流断开）时，那台的状态变成 `failed`（`disconnected: …`），工具从 `tools()` 和写过的注册表里去掉，调它的工具返回说明断开的错误；`execute` 里不自动重连，下一次 `connect()` 重连。服务器发 `notifications/tools/list_changed` 时重新列工具，`refresh(name?)` 手动做同一件事；列不出来时保留原来的工具，原因记在状态的 `refreshError`。远程服务器的这两条靠 `@ai-sdk/mcp` 的内部结构，只对测试里的本地服务器验证过，没有对真实服务验证。
 - `close()` 断开全部连接、清空状态，并从写过的每个注册表里删掉这些工具。
 - MCP 工具和本地工具一样经 harness 的工具循环，调用和结果作为消息写进日志。
 
@@ -417,7 +422,7 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
 2. 记输入（`inputKey` 作幂等键；`source` 给了就记成它）。
 3. `agent.model` 是字符串时经 `models(name)` 造模型，没给 `models` 就以 `error` 结束。
 4. `tools.select(agent.tools)` 得到候选工具，`context.build(...)` 得到 `PreparedCall`，再交给 `beforeModel`（之后的每个工具步骤也会再调一次）。
-5. 调模型。每个工具调用：`beforeTool`（可以拒绝或改写输入；拒绝时模型看到 `not allowed: <原因>`，这一轮继续）→ 按定义的 `executor` 找执行环境 `execute` → `afterTool`（可以改写结果）。找不到执行环境、执行环境本身抛错也变成给模型看的错误。
+5. 调模型。每个工具调用：按定义的 `inputSchema` 查输入（`checkJsonSchema`；不合就不往下走，模型看到 `Invalid input for tool …` 和具体哪里不对，这一轮继续；`addTool` 加的工具不在这里查，函数执行环境按它原来的 zod 校验，注册表的 `validatesInput(name)` 告诉 harness 是哪些）→ `beforeTool`（可以拒绝或改写输入；拒绝时模型看到 `not allowed: <原因>`，这一轮继续）→ 按定义的 `executor` 找执行环境 `execute` → `afterTool`（可以改写结果）→ 结果超过 `maxToolOutputChars`（缺省 20 万字符）时截断并注明（`limitToolOutput`）。找不到执行环境、执行环境本身抛错也变成给模型看的错误。`validateToolInput: false` 关掉输入检查，`true` 连 `addTool` 的也查，`maxToolOutputChars: 0` 关掉截断。
 6. 记产出（`source: 'model'`）和 `ctx.run.ended`（`stopReason`、`usage`），同一批写。
 
 `stopReason`：模型自己停下是 `end_turn`；步数用完还想调工具是 `max_steps`；被 `maxOutputTokens` 截断是 `max_tokens`；`signal` 中止是 `aborted`；其他错误是 `error`，另记一条 `ctx.error`。出错和取消都照常返回 `RunResult` 并写 `ctx.run.ended`，只有写日志失败才 reject。`record: false` 一条都不写。

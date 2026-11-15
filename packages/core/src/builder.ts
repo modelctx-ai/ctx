@@ -3,6 +3,8 @@ import {
   CtxError,
   compactedEntry,
   defaultSummaryMessage,
+  estimateTextTokens,
+  estimateTokens,
   latestSummary,
   project,
   renderFacts,
@@ -22,11 +24,13 @@ import {
   type PreparedCall,
   type Projection,
   type ProjectionOptions,
+  type ProjectionWindow,
   type ToolOutput,
   type SessionStore,
   type SummaryEntry,
   type ToolDefinition,
   type ViewOptions,
+  type WindowOptions,
   silentLogger,
 } from '@modelctx-ai/ctx-protocol';
 import { generateText, type LanguageModel } from 'ai';
@@ -175,11 +179,31 @@ export function assemble(input: AssembleInput): PreparedCall {
   };
 }
 
+/** 只留投影配置里的 `estimate`：不裁剪，但 token 还按应用给的估。 */
+function pickEstimate(options: ProjectionOptions): ProjectionWindow {
+  return options.window?.estimate ? { estimate: options.window.estimate } : {};
+}
+
 /** 把模型的指代换成 AI SDK 的模型：对象原样，名字经 `models` 造。 */
 export function resolveModel(model: ModelRef, models: ((name: string) => LanguageModel) | undefined): LanguageModel {
   if (typeof model !== 'string') return model;
   if (!models) throw new Error(`Model "${model}" is a name; pass \`models\` to resolve model names.`);
   return models(model);
+}
+
+/**
+ * 请求带了窗口就整个换掉 builder 配的上限（`{}` 是不裁剪），但 `estimate` 始终用 builder 的：
+ * 请求能过线、带不了函数，换上限不该顺手把应用接的分词器换回缺省估算。
+ * `reserve` 是历史之外已经占掉的 token，从 `maxTokens` 里扣。
+ */
+function windowOf(chosen: ProjectionOptions, request: WindowOptions | undefined, reserve = 0): ProjectionWindow {
+  const limits: WindowOptions = request ?? chosen.window ?? {};
+  const maxTokens = limits.maxTokens === undefined ? undefined : Math.max(0, limits.maxTokens - reserve);
+  return {
+    ...(limits.maxMessages !== undefined ? { maxMessages: limits.maxMessages } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...pickEstimate(chosen),
+  };
 }
 
 /**
@@ -221,7 +245,12 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
 
   async function view(session: string, viewOptions: ViewOptions = {}): Promise<Projection> {
     const chosen = projectionNamed(viewOptions.projection);
-    return project(await load(session), { ...chosen, window: viewOptions.window ?? chosen.window });
+    return project(await load(session), { ...chosen, window: windowOf(chosen, viewOptions.window) });
+  }
+
+  /** 不裁剪的整段视图：压缩要看到全部，builder 配的窗口不能挡着。 */
+  async function whole(session: string): Promise<Projection> {
+    return project(await load(session), { ...projection, window: { ...pickEstimate(projection) } });
   }
 
   function facts(session: string, signal?: AbortSignal, factsOptions: { readonly sources?: readonly string[] } = {}) {
@@ -250,9 +279,20 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
       request.facts === false
         ? []
         : await facts(request.session, request.signal, spec.sources ? { sources: spec.sources } : {});
-    const projected = await view(request.session, {
-      ...(request.window ? { window: request.window } : {}),
-      ...(request.projection !== undefined ? { projection: request.projection } : {}),
+    // 窗口的 `maxTokens` 是整次调用的预算：指令、事实、工具定义、这一轮的输入和提示先占掉一部分，剩下的才给历史。
+    const chosen = projectionNamed(request.projection);
+    const estimate = chosen.window?.estimate ?? estimateTokens;
+    const sized = (content: MessageContent | undefined): number =>
+      isEmptyContent(content) ? 0 : estimate({ role: 'user', content: content! });
+    const reserve =
+      estimateTextTokens(request.instructions ?? '') +
+      (collected.length > 0 ? estimateTextTokens(renderFacts(collected, spec.heading)) : 0) +
+      (request.tools?.length ? estimateTextTokens(JSON.stringify(request.tools)) : 0) +
+      sized(request.input) +
+      sized(request.prompt);
+    const projected = project(await load(request.session), {
+      ...chosen,
+      window: windowOf(chosen, request.window, reserve),
     });
     return assemble({
       projection: projected,
@@ -272,7 +312,7 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     if (ref === undefined) {
       throw new Error('No language model: pass `model` to the context builder or to compact().');
     }
-    const full = await view(session, { window: {} });
+    const full = await whole(session);
     const pinned = full.items.filter((item) => item.pinned);
     const rest = full.items.filter((item) => !item.pinned);
     let cut = rest.length - (compactOptions.keep ?? 12);
@@ -283,8 +323,11 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     // 切点按日志顺序定：被保留的条目里最小的 seq 减 1。补写的旧记录按 `at` 排在前面，但 seq 在后面，
     // 不在这次摘要里，压缩后仍然可见；seq 在 covers 之内的条目一定都进摘要。
     const kept = rest.slice(cut);
+    // 用 reduce，不用 `Math.min(...数组)`：几十万条时展开成参数会栈溢出。
     let covers =
-      kept.length > 0 ? Math.min(...kept.map((item) => item.from)) - 1 : Math.max(...rest.map((item) => item.upTo));
+      kept.length > 0
+        ? kept.reduce((least, item) => Math.min(least, item.from), Infinity) - 1
+        : rest.reduce((most, item) => Math.max(most, item.upTo), 0);
     // fold 合并的事件组可能混进补写的旧记录：组的 seq 范围横跨切点（from ≤ covers < upTo）时，
     // 整组进摘要会让 seq > covers 的成员留在视图里重复，整组留下又会让 seq ≤ covers 的成员被盖住。
     // 只能把 covers 退到这一组的第一条之前，让整组都留在视图里。退一次可能让别的组横跨，所以退到不再有为止。
@@ -350,11 +393,10 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     const old = (await store.list(session, { types: ['summary'] })).find((entry) => entry.id === finding.summaryId);
     if (old?.type !== 'summary' || finding.hidden.length === 0) return null;
     const hidden = new Set(finding.hidden);
-    const entries = (await store.list(session, { after: Math.min(...finding.hidden) - 1 })).filter((entry) =>
-      hidden.has(entry.seq),
-    );
+    const first = finding.hidden.reduce((least, seq) => Math.min(least, seq), Infinity);
+    const entries = (await store.list(session, { after: first - 1 })).filter((entry) => hidden.has(entry.seq));
     // 输入是旧摘要的文字，加上被误盖住的条目（按投影规则渲染）。`covers` 不变，靠“相同时后写的生效”取代旧摘要。
-    const rendered = project(entries, { ...projection, window: {} });
+    const rendered = project(entries, { ...projection, window: { ...pickEstimate(projection) } });
     const summary = (projection.summary ?? defaultSummaryMessage)(old);
     return write(session, old.covers, [summary, ...rendered.messages], ref, compactOptions);
   }

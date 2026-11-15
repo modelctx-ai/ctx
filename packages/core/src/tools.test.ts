@@ -102,4 +102,38 @@ describe('tool registry', () => {
       value: '不会喊：{"x":1}',
     });
   });
+
+  test('toToolSet：输入不合 inputSchema 就不执行，问题回给模型；结果超过上限截断', async () => {
+    const calls: unknown[] = [];
+    const remote = createFunctionExecutor('remote').register(
+      {
+        name: 'read',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      },
+      (input) => {
+        calls.push(input);
+        return { type: 'text', text: 'x'.repeat(1000) };
+      },
+    );
+    const definition = remote.definition('read')!;
+    const execution = { toolCallId: 'c1', messages: [], context: {} };
+    const set = toToolSet([definition], [remote], { maxOutputChars: 100 });
+    assert.deepEqual(await set['read']!.execute!({ path: 5 }, execution), {
+      type: 'error',
+      message: 'Invalid input for tool "read": path must be string, got number. Fix the input and call the tool again.',
+    });
+    assert.deepEqual(await set['read']!.execute!(null, execution), {
+      type: 'error',
+      message: 'Invalid input for tool "read": input must be object, got null. Fix the input and call the tool again.',
+    });
+    assert.deepEqual(calls, []);
+    const output = (await set['read']!.execute!({ path: '/a' }, execution)) as { type: string; text: string };
+    assert.equal(output.text.startsWith(`${'x'.repeat(100)}\n[… truncated 900 more characters`), true);
+    assert.deepEqual(calls, [{ path: '/a' }]);
+
+    // 都可以关掉。
+    const loose = toToolSet([definition], [remote], { validateInput: false, maxOutputChars: 0 });
+    const raw = (await loose['read']!.execute!({ path: 5 }, execution)) as { type: string; text: string };
+    assert.equal(raw.text.length, 1000);
+  });
 });

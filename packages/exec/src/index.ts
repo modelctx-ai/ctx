@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readdir, readFile, realpath, stat, writeFile, appendFile } from 'node:fs/promises';
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { constants, type Stats } from 'node:fs';
+import { lstat, mkdir, open, readdir, readlink, realpath, stat, type FileHandle } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
   errorOutput,
@@ -25,6 +26,18 @@ export interface CommandTool {
   readonly tags?: readonly string[];
 }
 
+/** 文件工具的一次访问，交给 `allowFile` 判断。 */
+export interface FileAccess {
+  readonly tool: 'read_file' | 'write_file' | 'list_dir';
+  /**
+   * 相对工作目录的路径，已经解析过：没有 `..`，符号链接换成了它指向的真实位置，分隔符是平台的；工作目录本身是 `.`。
+   * 越界的路径到不了这里，先被拒绝了。
+   */
+  readonly path: string;
+  /** `read_file`、`list_dir` 是 `read`，`write_file` 是 `write`。 */
+  readonly mode: 'read' | 'write';
+}
+
 export interface ProcessExecutorOptions {
   /** 执行环境的名字，工具定义的 `executor` 填它。缺省 `process`。 */
   readonly name?: string;
@@ -43,10 +56,17 @@ export interface ProcessExecutorOptions {
   readonly maxTimeoutMs?: number;
   /** stdout、stderr、读文件各自最多给模型多少字节，缺省 64 KiB；超出的截掉并注明截掉了多少。 */
   readonly maxOutputBytes?: number;
-  /** 给了就在执行前问一次，返回 `false` 时不跑，模型收到一条错误。缺省都放行。 */
+  /**
+   * 给了就在跑命令前问一次，返回 `false` 时不跑，模型收到一条错误。缺省都放行。
+   * 只管 `run_command` 和固定命令工具，管不到文件工具（那边用 `allowFile`）。
+   */
   readonly allow?: (command: string) => Awaitable<boolean>;
+  /** 是否提供 `run_command`，缺省提供。`false` 时只剩文件工具和 `commands` 里的固定命令工具。 */
+  readonly runCommand?: boolean;
   /** 是否提供 `read_file`、`write_file`、`list_dir`，缺省提供。 */
   readonly files?: boolean;
+  /** 给了就在文件工具动手前问一次（路径已经确认在工作目录里），返回 `false` 时不读不写，模型收到一条错误。缺省都放行。 */
+  readonly allowFile?: (access: FileAccess) => Awaitable<boolean>;
   /** 额外的固定命令工具：名字 → 命令。 */
   readonly commands?: Readonly<Record<string, CommandTool>>;
 }
@@ -83,6 +103,16 @@ const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_LIST_ENTRIES = 1_000;
 /** 杀掉以后最多再等这么久让管道关上：逃出进程组的孙进程不该把调用挂住。 */
 const KILL_GRACE_MS = 2_000;
+/** 进程自己退出以后最多再等这么久让管道关上：它留下的后台进程还占着 stdout、stderr 时不等它们。 */
+const EXIT_GRACE_MS = 100;
+/** `read_file` 一次读多少字节；两次之间看一眼 `signal`。 */
+const READ_CHUNK_BYTES = 64 * 1024;
+
+// Windows 上没有这两个标志，按 0 处理。
+/** 最后一段是符号链接时打开失败，不跟过去。 */
+const O_NOFOLLOW = (constants.O_NOFOLLOW as number | undefined) ?? 0;
+/** 打开 FIFO 不等另一头；对普通文件没有影响。 */
+const O_NONBLOCK = (constants.O_NONBLOCK as number | undefined) ?? 0;
 
 const RUN_COMMAND = 'run_command';
 const READ_FILE = 'read_file';
@@ -180,6 +210,7 @@ function launch(command: Launch, options: SpawnOptions): Promise<Finished> {
   return new Promise((done) => {
     let settled = false;
     let reason: 'timeout' | 'aborted' | undefined;
+    let exited = false;
     let grace: ReturnType<typeof setTimeout> | undefined;
     const posix = process.platform !== 'win32';
     const child = spawn(command.file, [...command.args], {
@@ -200,7 +231,7 @@ function launch(command: Launch, options: SpawnOptions): Promise<Finished> {
       done({ outcome, stdout, stderr });
     };
     const kill = (why: 'timeout' | 'aborted'): void => {
-      if (reason || settled) return;
+      if (reason || settled || exited) return;
       reason = why;
       try {
         if (posix && child.pid !== undefined) process.kill(-child.pid, 'SIGKILL');
@@ -220,6 +251,22 @@ function launch(command: Launch, options: SpawnOptions): Promise<Finished> {
     child.stdout.on('data', (chunk: Buffer) => take(stdout, chunk, options.maxOutputBytes));
     child.stderr.on('data', (chunk: Buffer) => take(stderr, chunk, options.maxOutputBytes));
     child.on('error', (error) => finish({ type: 'failed', error }));
+    // 管道要等所有拿着它的进程都关了才 `close`：`sleep 20 & echo started` 的 shell 早退出了，后台的 sleep 还占着。
+    // 进程自己退出就不再算超时、不再杀进程组；给管道一个短宽限收尾，到点按正常退出返回已有的输出。
+    child.on('exit', (exitCode, signal) => {
+      if (reason || settled) return;
+      exited = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onAbort);
+      grace = setTimeout(() => {
+        // 再让出一轮事件循环，把已经到了的输出读完。
+        setImmediate(() => {
+          child.stdout.destroy();
+          child.stderr.destroy();
+          finish({ type: 'exited', code: exitCode, signal });
+        });
+      }, EXIT_GRACE_MS);
+    });
     child.on('close', (exitCode, signal) =>
       finish(reason ? { type: reason } : { type: 'exited', code: exitCode, signal }),
     );
@@ -253,29 +300,136 @@ function inside(root: string, target: string): boolean {
   return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-/** 解析到工作目录里；`..` 逃出或符号链接指出去都算越界，返回给模型看的错误。 */
-async function resolveInside(root: string, input: string): Promise<{ path: string } | { error: ToolOutput }> {
+interface Resolved {
+  /** 工作目录的真实路径。 */
+  readonly realRoot: string;
+  /** 照输入拼出来的路径，给人看。 */
+  readonly path: string;
+  /** 已存在的部分解析掉符号链接以后的路径，实际操作用它。 */
+  readonly real: string;
+}
+
+async function isSymlink(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function outsideError(input: string, realRoot: string): ToolOutput {
+  return errorOutput(
+    `Path "${input}" is outside the working directory ${realRoot}. Use a path relative to it, without "..".`,
+  );
+}
+
+/** 检查过以后路径又变了（符号链接被换掉）。 */
+function movedError(input: string, realRoot: string): ToolOutput {
+  return errorOutput(
+    `Path "${input}" changed while it was being opened and may now point outside the working directory ${realRoot}. ` +
+      `The operation was refused; check the path with list_dir and try again.`,
+  );
+}
+
+/**
+ * 解析到工作目录里；`..` 逃出、符号链接指出去、符号链接解析不了（悬空、成环）都拒绝，返回给模型看的错误。
+ * 指向工作目录里面的符号链接可以，`real` 是它指向的位置。
+ */
+async function resolveInside(root: string, input: string): Promise<Resolved | { error: ToolOutput }> {
   const realRoot = await realpath(root).catch(() => root);
   const target = resolve(realRoot, input);
-  const outside = (): { error: ToolOutput } => ({
-    error: errorOutput(
-      `Path "${input}" is outside the working directory ${realRoot}. Use a path relative to it, without "..".`,
-    ),
-  });
-  if (!inside(realRoot, target)) return outside();
-  // 符号链接：最深的已存在祖先解析出来也要在里面。
+  if (!inside(realRoot, target)) return { error: outsideError(input, realRoot) };
+  // 从路径本身往上找最深的、解析得出来的一段：它要在里面，剩下的（还不存在的）接在它后面。
   let probe = target;
   for (;;) {
+    let real: string;
     try {
-      if (!inside(realRoot, await realpath(probe))) return outside();
-      break;
+      real = await realpath(probe);
     } catch {
+      // 解析不了又确实是符号链接：目标不存在或者成环。当成「还不存在的文件」的话，之后写入会跟着链接写到外面。
+      if (await isSymlink(probe)) {
+        return {
+          error: errorOutput(
+            `Path "${input}" goes through a symbolic link that cannot be resolved (${shown(realRoot, probe)}: its target ` +
+              `does not exist, or it loops), so it may lead outside the working directory ${realRoot}. ` +
+              `Use a path without that link.`,
+          ),
+        };
+      }
       const parent = dirname(probe);
-      if (parent === probe) break;
+      if (parent === probe) return { realRoot, path: target, real: target };
       probe = parent;
+      continue;
     }
+    if (!inside(realRoot, real)) return { error: outsideError(input, realRoot) };
+    return { realRoot, path: target, real: join(real, relative(probe, target)) };
   }
-  return { path: target };
+}
+
+/** 描述符实际指向的路径；只有 Linux 的 `/proc` 能问，问不到返回 `undefined`。 */
+async function pathOfDescriptor(fd: number): Promise<string | undefined> {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const path = await readlink(`/proc/self/fd/${fd}`);
+    return isAbsolute(path) ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 打开解析过的路径，最后一段不跟符号链接（`O_NOFOLLOW`），不等 FIFO 的另一头（`O_NONBLOCK`）。
+ * 拿到描述符以后复核：父目录这时解析出来还在工作目录里；Linux 上再看描述符实际指向哪里。
+ * 复核不过就关掉、返回错误；过了的话读写都经这个描述符，路径之后再怎么变也不相干。
+ */
+async function openInside(
+  resolved: Resolved,
+  input: string,
+  flags: number,
+): Promise<{ handle: FileHandle; info: Stats } | { error: ToolOutput }> {
+  let handle: FileHandle;
+  try {
+    handle = await open(resolved.real, flags | O_NOFOLLOW | O_NONBLOCK);
+  } catch (error) {
+    // 最后一段在检查之后被换成了符号链接（Linux 报 ELOOP，BSD 报 EMLINK）。
+    if (errorCode(error) === 'ELOOP' || errorCode(error) === 'EMLINK') {
+      return { error: movedError(input, resolved.realRoot) };
+    }
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    const parent = await realpath(dirname(resolved.real));
+    const actual = await pathOfDescriptor(handle.fd);
+    if (!inside(resolved.realRoot, parent) || (actual !== undefined && !inside(resolved.realRoot, actual))) {
+      await handle.close();
+      return { error: movedError(input, resolved.realRoot) };
+    }
+    return { handle, info };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+function kindOf(info: Stats): string {
+  if (info.isFIFO()) return 'a FIFO (named pipe)';
+  if (info.isSocket()) return 'a socket';
+  if (info.isCharacterDevice() || info.isBlockDevice()) return 'a device';
+  return 'a special file';
+}
+
+/** `signal` 中止时不等 `work`，直接给 `aborted()`；`work` 自己收尾。 */
+async function orAborted<T>(work: Promise<T>, signal: AbortSignal | undefined, aborted: () => T): Promise<T> {
+  if (!signal) return work;
+  const stopped = Promise.withResolvers<T>();
+  const onAbort = (): void => stopped.resolve(aborted());
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await Promise.race([work, stopped.promise]);
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
 }
 
 function shown(root: string, path: string): string {
@@ -301,9 +455,9 @@ function numberField(input: JsonValue, key: string): number | undefined {
 }
 
 /**
- * 本机子进程执行环境：`run_command` 在工作目录里用 shell 跑一条命令，`read_file`、`write_file`、`list_dir`
- * 只碰工作目录里面的文件。非零退出码照常返回（模型要看到输出）；起不来进程、被 `allow` 拒绝、超时、取消、
- * 越界才是 `{ type: 'error' }`。这不是沙箱：命令以当前用户的权限运行。
+ * 本机子进程执行环境：`run_command` 在工作目录里用 shell 跑一条命令（`runCommand: false` 时不提供），`read_file`、
+ * `write_file`、`list_dir` 只碰工作目录里面的文件。非零退出码照常返回（模型要看到输出）；起不来进程、被 `allow`
+ * 或 `allowFile` 拒绝、超时、取消、越界才是 `{ type: 'error' }`。这不是沙箱：命令以当前用户的权限运行。
  */
 export function createProcessExecutor(options: ProcessExecutorOptions = {}): ProcessExecutor {
   const name = options.name ?? 'process';
@@ -313,6 +467,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxTimeoutMs = Math.max(options.maxTimeoutMs ?? DEFAULT_MAX_TIMEOUT_MS, timeoutMs);
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const shellTool = options.runCommand !== false;
   const files = options.files !== false;
   const commands = options.commands ?? {};
   let disposed = false;
@@ -326,8 +481,10 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
 
   const kib = `${Math.round(maxOutputBytes / 1024)} KiB`;
 
-  const definitions: ToolDefinition[] = [
-    {
+  const definitions: ToolDefinition[] = [];
+
+  if (shellTool) {
+    definitions.push({
       name: RUN_COMMAND,
       description:
         `Run one shell command (${shell.join(' ')} "<command>") on this machine and return its exit code, stdout and stderr. ` +
@@ -335,8 +492,9 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
         `(PATH, HOME, LANG and a few more; no secrets), no stdin and no TTY, so interactive programs will hang until the timeout. ` +
         `Each of stdout and stderr is cut at ${kib}; the cut is marked with how many bytes were dropped, so filter large output ` +
         `with head, tail or grep. Default timeout ${seconds(timeoutMs)} (max ${seconds(maxTimeoutMs)} via timeoutMs); on timeout the ` +
-        `command and its children are killed and you get an error with the partial output. A non-zero exit code is not an error: ` +
-        `read stderr. Errors (command rejected by policy, could not start, timeout, cancelled) come back as tool errors with the reason.`,
+        `command and its children are killed and you get an error with the partial output. A command that leaves background ` +
+        `jobs (cmd &) returns as soon as the shell exits and the jobs keep running: redirect their output to a file, it is not ` +
+        `captured after that. A non-zero exit code is not an error: read stderr. Errors (command rejected by policy, could not start, timeout, cancelled) come back as tool errors with the reason.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -356,8 +514,13 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       executor: name,
       source: 'process',
       tags: ['exec'],
-    },
-  ];
+    });
+  }
+
+  // 没有 `run_command` 时不让模型去找它。
+  const readRest = shellTool
+    ? 'read the rest with run_command (sed -n, tail)'
+    : 'this executor has no tool that reads the rest';
 
   if (files) {
     definitions.push(
@@ -365,7 +528,9 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
         name: READ_FILE,
         description:
           `Read a UTF-8 text file inside ${root} (path relative to it). Returns the content; files over ${kib} are cut and the ` +
-          `cut is marked, so read large files in parts with run_command (sed -n, head, tail). Paths outside the directory are refused.`,
+          `cut is marked` +
+          (shellTool ? `, so read large files in parts with run_command (sed -n, head, tail). ` : `. `) +
+          `Only regular files: directories, FIFOs and devices are refused, and so are paths outside the directory.`,
         inputSchema: {
           type: 'object',
           properties: { path: { type: 'string', description: 'File path relative to the working directory.' } },
@@ -399,7 +564,8 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
         name: LIST_DIR,
         description:
           `List a directory inside ${root} (path relative to it, default "."): one entry per line, directories end with "/". ` +
-          `At most ${MAX_LIST_ENTRIES} entries; use run_command with find for deep trees.`,
+          `At most ${MAX_LIST_ENTRIES} entries` +
+          (shellTool ? `; use run_command with find for deep trees.` : `.`),
         inputSchema: {
           type: 'object',
           properties: { path: { type: 'string', description: 'Directory relative to the working directory.' } },
@@ -468,7 +634,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     if (requested !== undefined) {
       const resolved = await resolveInside(root, requested);
       if ('error' in resolved) return resolved.error;
-      cwd = resolved.path;
+      cwd = resolved.real;
     }
     const requestedTimeout = numberField(input, 'timeoutMs');
     const limitMs = requestedTimeout && requestedTimeout > 0 ? Math.min(requestedTimeout, maxTimeoutMs) : timeoutMs;
@@ -493,21 +659,66 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     return runLaunch({ file, args, display: command.join(' ') }, root, limitMs, context);
   }
 
-  async function readText(input: JsonValue): Promise<ToolOutput> {
+  /** 过 `allowFile`；被拒绝时返回给模型看的错误。 */
+  async function fileDenied(
+    tool: FileAccess['tool'],
+    mode: FileAccess['mode'],
+    input: string,
+    resolved: Resolved,
+  ): Promise<ToolOutput | undefined> {
+    if (!options.allowFile) return undefined;
+    if (await options.allowFile({ tool, path: shown(resolved.realRoot, resolved.real), mode })) return undefined;
+    return errorOutput(
+      `File access not allowed by this executor's policy: ${tool} ${input}. It did not run; try a different path or ask the user.`,
+    );
+  }
+
+  /** 只读前 `maxOutputBytes` 字节（多读一个字节看有没有截断），不整读；每块之间认 `signal`。 */
+  async function readInside(
+    resolved: Resolved,
+    path: string,
+    signal: AbortSignal | undefined,
+    cancelled: () => ToolOutput,
+  ): Promise<ToolOutput> {
+    const opened = await openInside(resolved, path, constants.O_RDONLY);
+    if ('error' in opened) return opened.error;
+    const { handle, info } = opened;
+    try {
+      if (info.isDirectory()) return errorOutput(`${path} is a directory; use list_dir.`);
+      if (!info.isFile()) {
+        return errorOutput(`${path} is ${kindOf(info)}, not a regular file; read_file only reads regular files.`);
+      }
+      const kept = capture();
+      let position = 0;
+      while (position <= maxOutputBytes) {
+        if (signal?.aborted) return cancelled();
+        const chunk = Buffer.allocUnsafe(Math.min(READ_CHUNK_BYTES, maxOutputBytes + 1 - position));
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+        if (bytesRead === 0) break;
+        take(kept, chunk.subarray(0, bytesRead), maxOutputBytes);
+        position += bytesRead;
+      }
+      if (signal?.aborted) return cancelled();
+      const text = new TextDecoder().decode(Buffer.concat(kept.chunks));
+      // 没读到底：截掉多少按文件大小算。
+      const dropped = position > maxOutputBytes ? Math.max(info.size, position) - maxOutputBytes : 0;
+      return { type: 'text', text: dropped > 0 ? `${text}\n${truncatedNote(dropped, readRest)}` : text };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async function readText(input: JsonValue, context: ExecutionContext): Promise<ToolOutput> {
     const path = stringField(input, 'path');
     if (!path) return errorOutput('read_file needs a "path" string relative to the working directory.');
     const resolved = await resolveInside(root, path);
     if ('error' in resolved) return resolved.error;
+    const denied = await fileDenied(READ_FILE, 'read', path, resolved);
+    if (denied) return denied;
+    const cancelled = (): ToolOutput => errorOutput(`read_file was cancelled before it finished: ${path}.`);
+    if (context.signal?.aborted) return cancelled();
     try {
-      const bytes = await readFile(resolved.path);
-      const kept = bytes.subarray(0, maxOutputBytes);
-      const text = new TextDecoder().decode(kept);
-      const dropped = bytes.length - kept.length;
-      return {
-        type: 'text',
-        text:
-          dropped > 0 ? `${text}\n${truncatedNote(dropped, 'read the rest with run_command (sed -n, tail)')}` : text,
-      };
+      return await orAborted(readInside(resolved, path, context.signal, cancelled), context.signal, cancelled);
     } catch (error) {
       if (errorCode(error) === 'ENOENT') {
         return errorOutput(`File not found: ${path} (in ${root}). Use list_dir to see what is there.`);
@@ -525,17 +736,36 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     }
     const resolved = await resolveInside(root, path);
     if ('error' in resolved) return resolved.error;
+    const denied = await fileDenied(WRITE_FILE, 'write', path, resolved);
+    if (denied) return denied;
     const append = isObject(input) && input['append'] === true;
     try {
-      await mkdir(dirname(resolved.path), { recursive: true });
-      await (append ? appendFile : writeFile)(resolved.path, content, 'utf8');
+      await mkdir(dirname(resolved.real), { recursive: true });
+      // 不带 O_TRUNC：复核过了再清空，别在确认之前动文件。
+      const flags = constants.O_WRONLY | constants.O_CREAT | (append ? constants.O_APPEND : 0);
+      const opened = await openInside(resolved, path, flags);
+      if ('error' in opened) return opened.error;
+      const { handle, info } = opened;
+      try {
+        if (!info.isFile()) {
+          return errorOutput(`${path} is ${kindOf(info)}, not a regular file; write_file only writes regular files.`);
+        }
+        if (!append) await handle.truncate(0);
+        await handle.writeFile(content, 'utf8');
+      } finally {
+        await handle.close();
+      }
       const bytes = Buffer.byteLength(content, 'utf8');
       return {
         type: 'text',
-        text: `${append ? 'Appended' : 'Wrote'} ${bytes} bytes to ${shown(root, resolved.path)}.`,
+        text: `${append ? 'Appended' : 'Wrote'} ${bytes} bytes to ${shown(resolved.realRoot, resolved.path)}.`,
       };
     } catch (error) {
       if (errorCode(error) === 'EISDIR') return errorOutput(`${path} is a directory; give a file path.`);
+      // 没有读者的 FIFO：O_NONBLOCK 打开只写的一头报 ENXIO。
+      if (errorCode(error) === 'ENXIO') {
+        return errorOutput(`${path} is not a regular file; write_file only writes regular files.`);
+      }
       return errorOutput(`Could not write ${path}: ${messageOf(error)}`);
     }
   }
@@ -544,16 +774,26 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     const path = stringField(input, 'path') ?? '.';
     const resolved = await resolveInside(root, path);
     if ('error' in resolved) return resolved.error;
+    const denied = await fileDenied(LIST_DIR, 'read', path, resolved);
+    if (denied) return denied;
     try {
-      const info = await stat(resolved.path);
+      const info = await stat(resolved.real);
       if (!info.isDirectory()) return errorOutput(`${path} is a file, not a directory; use read_file.`);
-      const entries = (await readdir(resolved.path, { withFileTypes: true }))
+      const entries = (await readdir(resolved.real, { withFileTypes: true }))
         .map((entry) => (entry.isDirectory() ? `${entry.name}/` : entry.name))
         .toSorted();
+      // 目录没有「不跟符号链接地打开」可用，读完再复核一次：路径被换成指出去的链接时不把列到的东西交出去。
+      if (!inside(resolved.realRoot, await realpath(resolved.real))) return movedError(path, resolved.realRoot);
       const shownEntries = entries.slice(0, MAX_LIST_ENTRIES);
       const more = entries.length - shownEntries.length;
       const lines = shownEntries.length > 0 ? shownEntries : ['(empty directory)'];
-      if (more > 0) lines.push(`[… ${more} more entries; use run_command with find or ls and a pattern]`);
+      if (more > 0) {
+        lines.push(
+          shellTool
+            ? `[… ${more} more entries; use run_command with find or ls and a pattern]`
+            : `[… ${more} more entries; list a subdirectory instead]`,
+        );
+      }
       return { type: 'text', text: lines.join('\n') };
     } catch (error) {
       if (errorCode(error) === 'ENOENT') {
@@ -573,18 +813,24 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       if (disposed) return errorOutput(`Executor "${name}" has been disposed; tool "${call.name}" did not run.`);
       if (context.signal?.aborted) return errorOutput(`Aborted before tool "${call.name}" ran.`);
       try {
-        if (call.name === RUN_COMMAND) return await runCommand(call.input, context);
+        if (call.name === RUN_COMMAND && shellTool) return await runCommand(call.input, context);
         const fixed = commands[call.name];
         if (fixed && Object.hasOwn(commands, call.name)) return await runFixed(fixed, call.name, call.input, context);
         if (files) {
-          if (call.name === READ_FILE) return await readText(call.input);
+          if (call.name === READ_FILE) return await readText(call.input, context);
           if (call.name === WRITE_FILE) return await writeText(call.input);
           if (call.name === LIST_DIR) return await listDir(call.input);
         }
       } catch (error) {
         return errorOutput(`Tool "${call.name}" failed: ${messageOf(error)}`);
       }
-      const available = definitions.map((definition) => definition.name).join(', ');
+      const available = definitions.map((definition) => definition.name).join(', ') || '(none)';
+      if (call.name === RUN_COMMAND) {
+        return errorOutput(
+          `run_command is turned off on executor "${name}": it does not run arbitrary shell commands, so nothing ran. ` +
+            `Available tools: ${available}.`,
+        );
+      }
       return errorOutput(`Unknown tool "${call.name}". Available tools: ${available}.`);
     },
     async provision() {},

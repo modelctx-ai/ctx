@@ -102,7 +102,13 @@ describe('entries', () => {
 
 describe('framework events', () => {
   test('kind 是 ctx. 前缀的 {domain}.{action}', () => {
-    assert.deepEqual(Object.values(CTX_EVENTS), ['ctx.run.started', 'ctx.run.ended', 'ctx.compacted', 'ctx.error']);
+    assert.deepEqual(Object.values(CTX_EVENTS), [
+      'ctx.run.started',
+      'ctx.run.ended',
+      'ctx.compacted',
+      'ctx.error',
+      'ctx.unreadable',
+    ]);
     assert.ok(Object.values(CTX_EVENTS).every(isFrameworkKind));
     assert.equal(isFrameworkKind('pet.whisper'), false);
   });

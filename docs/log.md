@@ -4,6 +4,13 @@
 
 ## 2026-11-15
 
+- **更新** [协议层](protocol.md)：`ListOptions.limit` 和翻页的写法；读不了的条目（`ctx.unreadable`、`readEntry`、宽松模式）和滚动升级的顺序（读的一方先升，没有降级路径）——以前只写了「更高的版本抛错」，没说新旧版本共用一个库时怎么办；投影的输出保证（工具调用和结果成对、开头合法）；窗口的两处配置谁盖谁、`build` 的 `maxTokens` 管整次调用；token 估算的口径；工具边界上输入校验归 harness、输出截断归执行环境加 harness 兜底；`agentSpecToJson` 给请求头打码；线上形态加心跳、`more`、`{ error, status }`、429、500 不回原文、哪些请求可以重试。
+- **更新** [架构](architecture.md)：投影从五步改成六步（加配对），窗口裁剪和 token 估算跟上；「调用」写明请求的 `window` 和 `build` 的预算口径；harness 的工具步骤加输入检查和结果截断；MCP 一节加上限、调用时限、断开和重连、`list_changed`；存储表加 `limit`。
+- **更新** [ctx-remote](../packages/remote/README.md)：选项表补上 `allowedModels`、`allowedSettings`、`maxListEntries`、`heartbeatMs`、`maxRuns`、`maxExecutions`、`maxStreams`；新增「长请求和断线」一节，写明 Node `fetch` 的 300 秒缺省超时、心跳怎么绕开它、关掉心跳时怎么换 `fetch`，以及重试的范围；线上形态和安全缺省跟上。原来写的「客户端读到更高的版本时抛 `unsupported_version`」以前没有实现，现在实现了。
+- **更新** [ctx-sqlite](../packages/sqlite/README.md)：选项 `unreadable`；「结构版本和迁移」加几个进程共用一个库时的升级顺序。
+- **更新** [ctx-exec](../packages/exec/README.md)：`allowFile`、`runCommand`、`FileAccess`，文件工具挡住哪些绕过、挡不住什么。
+- **更新** [ctx-mcp](../packages/mcp/README.md)：上限、调用时限、断开和重连、`refresh`、自己写连接器时的两个钩子；写明远程传输的断开检测靠 SDK 内部实现、没有对真实服务验证。
+- **更新** [协议包](../packages/protocol/README.md)和[核心包](../packages/core/README.md)的导出表：`estimateFileTokens`、`REDACTED_HEADER`、`readEntry` 一组、`checkJsonSchema`、`limitToolOutput`、`DEFAULT_MAX_TOOL_OUTPUT_CHARS`；核心包的 harness 一节加窗口和工具边界两段。
 - **更新** [ctx-gateway](../packages/gateway/README.md)、[架构](architecture.md)的网关一节：请求处理表加 `routes`（缺省只转发聊天补全和模型列表），写明空的 `accessToken` 抛错、对外监听没有令牌拒绝启动（`allowUnauthenticated`）。对应的代码变更见 [CHANGELOG](../CHANGELOG.md)。
 - **更新** [ctx-remote](../packages/remote/README.md)：同样的鉴权规则；服务端示例补上 `allowedHosts`（原来照着示例写，客户端会得到 `403 host not allowed`）。
 - **更新** [ctx-models](../packages/models/README.md)：`apiKey` 一行写明 `anthropic` 换了 `baseUrl` 必须显式给密钥。
