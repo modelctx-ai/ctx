@@ -158,17 +158,76 @@ function blocks(items: readonly ProjectedMessage[]): ProjectedMessage[][] {
   return out;
 }
 
+/** 没有结果的工具调用补上的那条结果：模型看到的是「这次调用没有结果」，不是一段对不上的历史。 */
+const MISSING_RESULT = 'No result was recorded for this tool call.';
+
+/**
+ * 一组里的工具调用和结果按 `id` 配对：
+ * - 结果找不到同组里的调用（调用被裁掉、被摘要盖住，或者中间插进了别的消息）就去掉，整条消息空了就不要；
+ * - 调用找不到结果（运行中断、结果没写进日志）就补一条错误结果。服务商自己执行的调用（`providerExecuted`）不补。
+ * 不这样做的话，服务商会拒绝整段历史，而且每一轮都拒绝，直到这段被裁掉。
+ */
+function paired(group: readonly ProjectedMessage[], estimate: (message: Message) => number): ProjectedMessage[] {
+  const [first, ...results] = group;
+  if (!first) return [];
+  const calls = new Map<string, string>();
+  const answered = new Set<string>();
+  if (first.message.role === 'assistant' && typeof first.message.content !== 'string') {
+    for (const part of first.message.content) {
+      if (part.type === 'tool-call' && part.providerExecuted !== true) calls.set(part.id, part.name);
+      if (part.type === 'tool-result') answered.add(part.id);
+    }
+  }
+  const out: ProjectedMessage[] = [first];
+  for (const item of results) {
+    const { message } = item;
+    if (message.role !== 'tool' || typeof message.content === 'string') {
+      out.push(item);
+      continue;
+    }
+    const content = message.content.filter((part) => part.type !== 'tool-result' || calls.has(part.id));
+    for (const part of content) if (part.type === 'tool-result') answered.add(part.id);
+    if (content.length === message.content.length) out.push(item);
+    else if (content.length > 0) {
+      const trimmed = { ...message, content } as Message;
+      out.push({ ...item, message: trimmed, tokens: estimate(trimmed) });
+    }
+  }
+  const missing = [...calls].filter(([id]) => !answered.has(id));
+  if (missing.length > 0) {
+    const message: Message = {
+      role: 'tool',
+      content: missing.map(([id, name]) => ({
+        type: 'tool-result',
+        id,
+        name,
+        output: { type: 'error', message: MISSING_RESULT },
+      })),
+    };
+    out.push({ message, from: first.from, upTo: first.upTo, pinned: false, tokens: estimate(message) });
+  }
+  // 整组只剩孤立的工具结果、又都被去掉了：这一组不要。
+  return first.message.role === 'tool' ? out.filter((item) => item !== first) : out;
+}
+
 function windowed(
   pinned: readonly ProjectedMessage[],
   rest: readonly ProjectedMessage[],
-  window: WindowOptions | undefined,
+  window: ProjectionWindow | undefined,
+  estimate: (message: Message) => number,
 ): { kept: ProjectedMessage[]; dropped: number } {
   const maxMessages = window?.maxMessages;
   const maxTokens = window?.maxTokens;
-  const groups = blocks(rest);
-  // 开头不能是孤立的工具结果（它的调用已经被摘要盖住了）。
   let dropped = 0;
-  while (groups[0]?.[0]?.message.role === 'tool') dropped += groups.shift()!.length;
+  const groups: ProjectedMessage[][] = [];
+  for (const group of blocks(rest)) {
+    // 开头是工具结果的组：它的调用不在视图里（被摘要盖住了），整组不要。
+    if (group[0]?.message.role === 'tool') {
+      dropped += group.length;
+      continue;
+    }
+    groups.push(paired(group, estimate));
+  }
   if (maxMessages === undefined && maxTokens === undefined) return { kept: [...pinned, ...groups.flat()], dropped };
 
   const pinnedTokens = pinned.reduce((sum, item) => sum + item.tokens, 0);
@@ -176,12 +235,19 @@ function windowed(
   let tokens = pinnedTokens + groups.reduce((sum, group) => sum + group.reduce((s, item) => s + item.tokens, 0), 0);
   const over = (): boolean =>
     (maxMessages !== undefined && count > maxMessages) || (maxTokens !== undefined && tokens > maxTokens);
-  // 至少留下最后一组，宁可超预算也不交一份空上下文。
-  while (groups.length > 1 && over()) {
+  const drop = (): void => {
     const group = groups.shift()!;
     count -= group.length;
     tokens -= group.reduce((sum, item) => sum + item.tokens, 0);
     dropped += group.length;
+  };
+  const before = dropped;
+  // 至少留下最后一组，宁可超预算也不交一份空上下文。
+  while (groups.length > 1 && over()) drop();
+  // 裁过之后开头落在助手消息上、前面又没有摘要垫着：有的服务商要求第一条是用户消息，接着裁到下一条用户消息。
+  // 后面一条用户消息都没有时不动，同样是不交空上下文。
+  if (dropped > before && pinned.length === 0 && groups.some((group) => group[0]?.message.role === 'user')) {
+    while (groups[0]?.[0]?.message.role !== 'user') drop();
   }
   return { kept: [...pinned, ...groups.flat()], dropped };
 }
@@ -190,7 +256,8 @@ function windowed(
  * 把条目渲染成模型消息：
  * 1. 摘要之前的条目由摘要代替，摘要固定放在最前；
  * 2. 消息条目原样带上；事件按规则渲染，`fold` 的同类事件连在一起时合成一组；
- * 3. 有窗口时从最旧的消息开始裁，工具调用和结果成组进出。
+ * 3. 工具调用和结果按 `id` 配对：没有调用的结果去掉，没有结果的调用补一条错误结果；
+ * 4. 有窗口时从最旧的消息开始裁，工具调用和结果成组进出；裁过之后开头不留助手消息（前面有摘要时除外）。
  */
 export function project(entries: readonly Entry[], options: ProjectionOptions = {}): Projection {
   const estimate = options.window?.estimate ?? estimateTokens;
@@ -234,12 +301,17 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
         i += 1;
       }
     }
-    const from = Math.min(...group.map((member) => member.seq));
-    const upTo = Math.max(...group.map((member) => member.seq));
+    // 不用 `Math.min(...数组)`：一组可以有几十万条（心跳、传感器读数），展开成参数会栈溢出。
+    let from = entry.seq;
+    let upTo = entry.seq;
+    for (const member of group) {
+      if (member.seq < from) from = member.seq;
+      if (member.seq > upTo) upTo = member.seq;
+    }
     for (const message of asList(rule.render(group))) rest.push(make(message, from, upTo));
   }
 
-  const { kept, dropped } = windowed(pinned, rest, options.window);
+  const { kept, dropped } = windowed(pinned, rest, options.window, estimate);
   const result: Projection = {
     messages: kept.map((item) => item.message),
     items: kept,

@@ -185,6 +185,115 @@ describe('project', () => {
     );
   });
 
+  test('裁过之后开头不留助手消息：接着裁到下一条用户消息；一条用户消息都不剩时不动', async () => {
+    const call: Message = { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'w', input: {} }] };
+    const result: Message = {
+      role: 'tool',
+      content: [{ type: 'tool-result', id: 'c1', name: 'w', output: { type: 'text', text: '晴' } }],
+    };
+    const entries = await seed(
+      userEntry('1'),
+      assistantEntry('2'),
+      userEntry('3'),
+      messageEntry(call),
+      messageEntry(result),
+      assistantEntry('6'),
+      userEntry('7'),
+    );
+    const roles = (maxMessages: number) =>
+      project(entries, { window: { maxMessages } }).messages.map((message) => message.role);
+    assert.deepEqual(roles(6), ['user', 'assistant', 'tool', 'assistant', 'user']);
+    for (const maxMessages of [4, 3, 2, 1]) assert.deepEqual(roles(maxMessages), ['user'], String(maxMessages));
+    assert.equal(project(entries, { window: { maxMessages: 6 } }).dropped, 2);
+    assert.deepEqual(roles(7), ['user', 'assistant', 'user', 'assistant', 'tool', 'assistant', 'user'], '没裁就不动');
+    // 没裁的历史以助手消息开头是应用自己写的，不替它改。
+    const greeting = await seed(assistantEntry('早'), userEntry('早'));
+    assert.deepEqual(
+      project(greeting, { window: { maxMessages: 5 } }).messages.map((message) => message.role),
+      ['assistant', 'user'],
+    );
+  });
+
+  test('工具调用和结果按 id 配对：没有结果的调用补一条错误结果，没有调用的结果去掉', async () => {
+    const call: Message = {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: '查一下' },
+        { type: 'tool-call', id: 'c1', name: 'weather', input: {} },
+        { type: 'tool-call', id: 'c2', name: 'clock', input: {} },
+        { type: 'tool-call', id: 'c3', name: 'search', input: {}, providerExecuted: true },
+      ],
+    };
+    const result = (id: string, name: string): Message => ({
+      role: 'tool',
+      content: [{ type: 'tool-result', id, name, output: { type: 'text', text: '好' } }],
+    });
+    // 运行断在工具调用之后：c1、c2 都没有结果。
+    const dangling = project(await seed(userEntry('天气？'), messageEntry(call), userEntry('还在吗')));
+    assert.deepEqual(
+      dangling.messages.map((message) => message.role),
+      ['user', 'assistant', 'tool', 'user'],
+    );
+    assert.deepEqual(dangling.messages[2]?.content, [
+      {
+        type: 'tool-result',
+        id: 'c1',
+        name: 'weather',
+        output: { type: 'error', message: 'No result was recorded for this tool call.' },
+      },
+      {
+        type: 'tool-result',
+        id: 'c2',
+        name: 'clock',
+        output: { type: 'error', message: 'No result was recorded for this tool call.' },
+      },
+    ]);
+    assert.deepEqual([dangling.items[2]?.from, dangling.items[2]?.upTo], [2, 2], '补的结果算在调用那一条上');
+    assert.equal(
+      dangling.tokens,
+      dangling.items.reduce((sum, item) => sum + item.tokens, 0),
+    );
+
+    // 只回了一个，另带一个对不上的：对上的留下，对不上的去掉，没回的补上。
+    const mixed: Message = {
+      role: 'tool',
+      content: [...(result('c2', 'clock').content as []), ...(result('zz', 'ghost').content as [])],
+    };
+    const partial = project(await seed(userEntry('天气？'), messageEntry(call), messageEntry(mixed)));
+    assert.deepEqual(
+      partial.messages
+        .slice(2)
+        .map((message) =>
+          (message.content as unknown as { id: string; output: { type: string } }[]).map(
+            (part) => `${part.id}:${part.output.type}`,
+          ),
+        ),
+      [['c2:text'], ['c1:error']],
+    );
+
+    // 整条都对不上：这条工具消息不要。
+    const stray = project(await seed(userEntry('在吗'), assistantEntry('在'), messageEntry(result('zz', 'ghost'))));
+    assert.deepEqual(
+      stray.messages.map((message) => message.role),
+      ['user', 'assistant'],
+    );
+  });
+
+  test('一组折叠的事件有几十万条也不栈溢出', async () => {
+    const entries: Entry[] = Array.from({ length: 200_000 }, (_, i) => ({
+      ...eventEntry('pet.whisper', { text: '嗯' }),
+      id: `e${i}`,
+      session: 's',
+      seq: i + 1,
+      at: i + 1,
+      v: ENTRY_VERSION,
+    }));
+    const { items } = project(entries, {
+      events: { 'pet.whisper': { fold: true, render: () => ({ role: 'user', content: 'x' }) } },
+    });
+    assert.deepEqual([items[0]?.from, items[0]?.upTo], [1, 200_000]);
+  });
+
   test('message 钩子可以改写或丢掉消息', async () => {
     const entries = await seed(userEntry('留下'), assistantEntry('丢掉'));
     const { messages } = project(entries, {

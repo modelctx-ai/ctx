@@ -178,6 +178,50 @@ function run(agent: AgentSpec, model = answerModel()) {
   };
 }
 
+describe('窗口：请求带的上限和 builder 的配置', () => {
+  async function filled(window: NonNullable<ProjectionOptions['window']>) {
+    const store = createMemoryStore();
+    const builder = createContextBuilder({ store, projection: { window } });
+    await store.append(
+      's',
+      Array.from({ length: 40 }, (_, i) => (i % 2 === 0 ? userEntry(`问 ${i}`) : assistantEntry(`答 ${i}`))),
+    );
+    return builder;
+  }
+
+  test('请求换上限，estimate 还是 builder 的；`{}` 是不裁剪', async () => {
+    const builder = await filled({ maxTokens: 6000, estimate: () => 1000 });
+    assert.equal((await builder.view('s')).messages.length, 6);
+    const asked = await builder.view('s', { window: { maxTokens: 6000 } });
+    assert.equal(asked.messages.length, 6, '请求带同样的上限，结果一样');
+    assert.equal(asked.tokens, 6000);
+    assert.equal((await builder.view('s', { window: { maxTokens: 10_000 } })).messages.length, 10);
+    assert.equal((await builder.view('s', { window: { maxMessages: 30 } })).messages.length, 30, '上限整个换掉');
+    const whole = await builder.view('s', { window: {} });
+    assert.equal(whole.messages.length, 40);
+    assert.equal(whole.tokens, 40_000, '不裁剪时也按 builder 的估算');
+    const built = await builder.build({ session: 's', window: { maxTokens: 6000 }, facts: false });
+    assert.equal(built.projection?.messages.length, 6);
+  });
+
+  test('build 的 maxTokens 是整次调用的预算：指令、工具定义、输入先占，剩下的给历史', async () => {
+    const builder = await filled({ maxTokens: 10_000, estimate: () => 1000 });
+    const bare = await builder.build({ session: 's', facts: false });
+    assert.equal(bare.projection?.messages.length, 10);
+    const loaded = await builder.build({
+      session: 's',
+      facts: false,
+      instructions: 'x'.repeat(4000), // 约 1000 token
+      input: '在吗', // builder 的 estimate：1000
+      tools: [
+        { name: 'big', description: 'd'.repeat(4000), inputSchema: { type: 'object' }, executor: 'local' }, // 约 1000
+      ],
+    });
+    assert.equal(loaded.projection?.messages.length, 6, '占掉三千多，剩下的够六条');
+    assert.equal((await builder.view('s')).messages.length, 10, 'view 只看历史，不扣');
+  });
+});
+
 describe('AgentSpec.context 经 harness 到 builder', () => {
   test('两个 context 得到不同的事实、位置和投影；agentSpecToJson 把 context 记进 ctx.run.started', async () => {
     const a = run({ model: 'm', instructions: '你是助手', context: { facts: { sources: ['weather'] } } });
