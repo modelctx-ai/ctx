@@ -61,3 +61,57 @@ jobs:
           node-version: ${{ matrix.node }}
 
       - run: node scripts/pack-smoke.mjs --dir "$RUNNER_TEMP/pack-smoke" --run-only
+
+  downstream:
+    # yoyo 经 `link:../ctx/packages/*` 读这里的 `dist/`，它的 CI 检出 ctx `main` 的最新提交：
+    # 这里合进一个让它编不过的改动，它那边当场就红。所以在 PR 上先试一遍：用这次的构建产物跑 yoyo 的检查和测试。
+    # 不拦合并（`continue-on-error`）：有意的不兼容改动会让它红，红了说明合并前要有对应的 yoyo PR 在等（AGENTS.md）。
+    name: Downstream (yoyo)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      # 和本地一样两个仓库并排：yoyo 的 overrides 才找得到 ../ctx/packages/*
+      - uses: actions/checkout@v4
+        with:
+          path: ctx
+
+      - uses: actions/checkout@v4
+        with:
+          repository: modelctx-ai/yoyo
+          path: yoyo
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: ctx/package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: pnpm
+          cache-dependency-path: |
+            ctx/pnpm-lock.yaml
+            yoyo/pnpm-lock.yaml
+
+      - name: Build ctx
+        working-directory: ctx
+        run: pnpm install --frozen-lockfile && pnpm build
+
+      - working-directory: yoyo
+        run: pnpm install --frozen-lockfile
+      - name: yoyo 的格式、lint 和类型检查
+        working-directory: yoyo
+        run: pnpm exec vp check --deny-warnings
+      - name: yoyo 的测试
+        working-directory: yoyo
+        run: pnpm test
+
+      - name: 红了怎么办
+        if: failure()
+        run: |
+          {
+            echo '### yoyo 用这次的 ctx 过不了'
+            echo
+            echo '这个作业不拦合并。如果是有意的不兼容改动：合并前要有对应的 yoyo PR 在等，并在这个 PR 的正文里链接它。'
+            echo '如果不是有意的：看上面哪一步失败，先在本地的 `../yoyo` 里复现（ctx 里 `pnpm build`，yoyo 里 `pnpm exec vp check --deny-warnings && pnpm test`）。'
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo '::warning title=Downstream (yoyo)::yoyo 用这次的 ctx 过不了：合并前要有对应的 yoyo PR，或者这是一个没想到的不兼容改动。'
