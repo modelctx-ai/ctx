@@ -27,6 +27,33 @@ importers:
         specifier: 'catalog:'
         version: 1.4.0(@types/node@22.20.5)(@vitest/ui@5.0.5(vitest@5.0.5))(typescript@7.0.2)
 
+  examples:
+    dependencies:
+      '@modelctx-ai/ctx':
+        specifier: workspace:^
+        version: link:../packages/core
+      '@modelctx-ai/ctx-memory':
+        specifier: workspace:^
+        version: link:../packages/memory
+      '@modelctx-ai/ctx-models':
+        specifier: workspace:^
+        version: link:../packages/models
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../packages/protocol
+      '@modelctx-ai/ctx-remote':
+        specifier: workspace:^
+        version: link:../packages/remote
+      '@modelctx-ai/ctx-sqlite':
+        specifier: workspace:^
+        version: link:../packages/sqlite
+      ai:
+        specifier: ^7.0.150
+        version: 7.0.150(zod@4.6.7)
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+
   packages/core:
     dependencies:
       ai:

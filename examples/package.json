@@ -1,0 +1,16 @@
+{
+  "name": "ctx-examples",
+  "private": true,
+  "type": "module",
+  "description": "ctx 的最小例子：每个对应一种部署，都能直接跑。",
+  "dependencies": {
+    "@modelctx-ai/ctx": "workspace:^",
+    "@modelctx-ai/ctx-memory": "workspace:^",
+    "@modelctx-ai/ctx-models": "workspace:^",
+    "@modelctx-ai/ctx-protocol": "workspace:^",
+    "@modelctx-ai/ctx-remote": "workspace:^",
+    "@modelctx-ai/ctx-sqlite": "workspace:^",
+    "ai": "^7.0.150",
+    "zod": "^4.6.7"
+  }
+}
