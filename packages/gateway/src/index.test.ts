@@ -154,6 +154,49 @@ describe('gateway', () => {
     assert.equal(lower.status, 200, 'Bearer 不分大小写');
   });
 
+  test('缺省只转发聊天补全和模型列表，别的路径和方法 404、不到上游；routes 可以放开', async () => {
+    const auth = { authorization: 'Bearer local-token' };
+    const before = seen.length;
+    for (const [method, path] of [
+      ['DELETE', '/files/abc'],
+      ['POST', '/models'],
+      ['GET', '/chat/completions'],
+      ['GET', '/..%2f..%2fadmin/keys'],
+      ['POST', '/embeddings'],
+    ] as const) {
+      const response = await send(`${gateway.baseUrl}${path}`, { method, headers: auth });
+      assert.equal(response.status, 404, `${method} ${path}`);
+    }
+    assert.equal(seen.length, before, '挡下的请求不转发');
+    assert.equal((await send(`${gateway.baseUrl}/models/`, { headers: auth })).status, 200, '结尾的 / 不算别的路径');
+
+    const wide = await startGateway({ upstream: { baseUrl: upstreamUrl, apiKey: 'real-key' }, routes: '*' });
+    const some = await startGateway({ upstream: { baseUrl: upstreamUrl }, routes: ['post /embeddings'] });
+    try {
+      assert.equal((await send(`${wide.baseUrl}/files/abc`, { method: 'DELETE' })).status, 200);
+      assert.equal(seen.at(-1)?.method, 'DELETE');
+      assert.equal(seen.at(-1)?.path, '/v1/files/abc');
+      assert.equal((await send(`${some.baseUrl}/embeddings`, { method: 'POST', body: '{}' })).status, 200);
+      assert.equal((await send(`${some.baseUrl}/models`)).status, 404, '给了 routes 就只认这些');
+    } finally {
+      await wide.close();
+      await some.close();
+    }
+  });
+
+  test('空的 accessToken 直接报错；听在非本机地址上没有令牌就不启动', async () => {
+    const upstreamOptions = { upstream: { baseUrl: upstreamUrl } };
+    for (const accessToken of ['', '   ']) {
+      assert.throws(() => createGatewayHandler({ ...upstreamOptions, accessToken }), /`accessToken` is empty/);
+      await assert.rejects(startGateway({ ...upstreamOptions, accessToken }), /`accessToken` is empty/);
+    }
+    await assert.rejects(startGateway({ ...upstreamOptions, host: '0.0.0.0' }), /Refusing to listen on 0\.0\.0\.0/);
+    for (const extra of [{ accessToken: 't' }, { allowUnauthenticated: true }]) {
+      const open = await startGateway({ ...upstreamOptions, host: '0.0.0.0', ...extra });
+      await open.close();
+    }
+  });
+
   test('Host 不认识、带了没放行的 Origin 都回 403；本机的几种写法都认', async () => {
     const port = new URL(gateway.origin).port;
     const auth = { authorization: 'Bearer local-token' };

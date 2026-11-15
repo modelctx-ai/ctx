@@ -468,7 +468,7 @@ for await (const event of harness.stream({
 
 ## 编排器
 
-`createOrchestrator({ harness, store?, logger? })` 是进程内队列：每个会话一条队列，同一会话的运行串行，不同会话并行。
+`createOrchestrator({ harness, store?, owner?, retainEnded?, logger? })` 是进程内队列：每个会话一条队列，同一会话的运行串行，不同会话并行。
 
 ```ts
 import { createOrchestrator } from '@modelctx-ai/ctx';
@@ -493,8 +493,9 @@ await orchestrator.close(); // 不再收新运行，等运行中的结束
 - 状态：`completed` 跑完；`failed` 是 `stopReason: 'error'` 或 harness 抛错（`done` 跟着 reject）；`cancelled` 是被 `cancel` 或请求的 `signal` 取消。
 - `cancel(runId)`：排队中的直接取消，`done` 给出 `stopReason: 'aborted'` 的空结果，不调 harness；运行中的中止传给 harness 的 `signal`。跑完的或不认识的返回 `false`。
 - `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外），补一条 `ctx.run.ended`（`stopReason: 'error'`，`source: 'orchestrator'`），不续跑。
+- 结束的运行只留状态给 `status` 查，最多 `retainEnded` 个（缺省 1000），再多就从最早结束的开始忘，忘掉之后 `status` 返回 `undefined`；请求和结果在运行结束时就放手，常驻进程的内存不随运行数增长。留着状态的 `runId` 不能再 `submit`。
 - `owner`：写进每个运行的 `ctx.run.started`；`recover()` 只收 `owner` 相同的断点（都没配置也算相同），两个进程共用一个库时各配一个名字。写 `ctx.run.ended` 时带 `expectSeq`，读和写之间会话有新条目就跳过那个运行。
-- 用缺省 `record`（写日志）的应用，进程崩溃留下的未结束运行会让该会话一直 `session_busy`，所以启动时要先 `recover()` 再 `submit`；`record: false` 的运行不留生命周期事件，没有这个要求。harness 里同一会话最多一个未结束的运行（跨进程也成立；同一个 harness 实例内部先按会话排队，一个接一个，`session_busy` 只出现在跨进程或别的 harness 实例上，`record: false` 不排），每次写入带 `expectSeq`，被 `recover` 结束的运行在下一次写入时发现自己被围栏，以 `aborted` 停下、不再写 `ctx.run.ended`。
+- 用缺省 `record`（写日志）的应用，进程崩溃留下的未结束运行会让该会话一直 `session_busy`，所以启动时要先 `recover()` 再 `submit`；`record: false` 的运行不留生命周期事件，没有这个要求。harness 里同一会话最多一个未结束的运行（跨进程也成立；同一个 harness 实例内部先按会话排队，一个接一个，`session_busy` 只出现在跨进程或别的 harness 实例上，`record: false` 不排），每次写入带 `expectSeq`，被 `recover` 结束的运行在下一次写入时发现自己被围栏，以 `aborted` 停下、不再写 `ctx.run.ended`；运行中途会话被 `clear` 也一样（冲突后发现自己的 `ctx.run.started` 不在了），删掉的会话不会被这一轮的收尾写回来。
 
 ## 记忆
 
@@ -740,15 +741,17 @@ sequenceDiagram
 | 带 `Origin` 头，又不在 `allowedOrigins` 里（缺省一个都不放）                                | 403                                                                           |
 | 路径不在 `basePath`（缺省 `/v1`；`''` 或 `/` 挂在根上）下                                   | 404                                                                           |
 | 设了 `accessToken`，`Authorization: Bearer` 没带或不对（`Bearer` 不分大小写，常量时间比较） | 401                                                                           |
+| 方法和路径不在 `routes` 里（缺省 `POST /chat/completions`、`GET /models`；`'*'` 是全部）    | 404，不转发                                                                   |
 | 请求体超过 `maxBodyBytes`（缺省 4 MiB）                                                     | 413                                                                           |
 | `POST <basePath>/chat/completions`，设了 `rewrite`                                          | 请求体不是 JSON，或不是带 `messages` 数组的对象：400；否则 `rewrite` 以后转发 |
-| 其他                                                                                        | 原样转发：方法、路径、查询串、请求体                                          |
+| `routes` 里的其他请求                                                                       | 原样转发：方法、路径、查询串、请求体                                          |
 | 上游连不上                                                                                  | 502                                                                           |
 
 - `startGateway` 缺省只认监听地址的 `Host`（`host:port`，不分大小写），挡 DNS rebinding；监听本机时 `localhost`、`127.0.0.1`、`[::1]` 加端口都认。`createGatewayHandler` 不知道端口，没给 `allowedHosts` 就不查 `Host`，`Origin` 照查。浏览器网页发来的请求带 `Origin`，缺省一律拒绝。
 - 只转发调用方的 `content-type`、`accept`，加上 `upstream.headers`；有 `upstream.apiKey` 时设 `Authorization: Bearer <apiKey>`。调用方的令牌不会到上游，上游的密钥不会到调用方。
 - 响应的状态码和头原样转回（去掉逐跳头和 `content-encoding`、`content-length`），正文边收边转，SSE 不缓冲。调用方中途断开时取消上游请求，不算出错。
 - 错误正文是 OpenAI 的形状：`{ "error": { "message", "type" } }`，`type` 是 `authentication_error`（401）、`permission_error`（403）或 `gateway_error`。
+- `accessToken` 是空串时抛错；`startGateway` 听在非本机地址上又没有 `accessToken` 时拒绝启动，除非写 `allowUnauthenticated: true`。`ctx-remote` 的 `startRemote` 是同样的规则。
 - 缺省只听 `127.0.0.1`、随机端口。`createGatewayHandler(options)` 返回 `(req, res) => Promise<void>`，可以挂到已有的 HTTP 服务上。
 
 `replaceHistory(history, { keepSystem })` 生成改写函数：保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `toChatMessages(await history())`（去掉其中的 `system`），再接上调用方从最后一句用户话起的尾巴：这句话，以及它之后的工具调用、工具结果和预填的助手话。完整历史的最后一条和这句用户话内容完全相同（图片也比）时，这句不重复带。`withContext(context)` 就是 `replaceHistory(async () => (await context.view()).messages)`；`withContext(builder, session)` 直接用一个 `ContextBuilder` 和会话名。

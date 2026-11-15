@@ -1,6 +1,6 @@
 # @modelctx-ai/ctx-gateway
 
-本机的 OpenAI 兼容网关。转发 `POST /v1/chat/completions` 时把调用方带来的历史换成 ctx 管理的上下文，其余请求原样转发，流式响应边收边转。给只会说 OpenAI 协议、自己截断历史的客户端用，例如 dsh-pet 的右键对话。
+本机的 OpenAI 兼容网关。转发 `POST /v1/chat/completions` 时把调用方带来的历史换成 ctx 管理的上下文，别的请求缺省只放 `GET /v1/models`（`routes` 可以放开），流式响应边收边转。给只会说 OpenAI 协议、自己截断历史的客户端用，例如 dsh-pet 的右键对话。
 
 ## 安装
 
@@ -65,12 +65,15 @@ createServer((req, res) => void handle(req, res)).listen(8080, '127.0.0.1');
 | 带 `Origin` 头，又不在 `allowedOrigins` 里（缺省一个都不放）                  | 403                                                                           |
 | 路径不在 `basePath`（缺省 `/v1`）下                                           | 404                                                                           |
 | 设了 `accessToken`，`Authorization: Bearer` 没带或不对（`Bearer` 不分大小写） | 401                                                                           |
+| 方法和路径不在 `routes` 里（缺省 `POST /chat/completions`、`GET /models`）    | 404，不转发                                                                   |
 | 请求体超过 `maxBodyBytes`（缺省 4 MiB）                                       | 413                                                                           |
 | `POST <basePath>/chat/completions`，设了 `rewrite`                            | 请求体不是 JSON，或不是带 `messages` 数组的对象：400；否则 `rewrite` 以后转发 |
-| 其他                                                                          | 原样转发：方法、路径、查询串、请求体                                          |
+| `routes` 里的其他请求                                                         | 原样转发：方法、路径、查询串、请求体                                          |
 | 上游连不上                                                                    | 502                                                                           |
 
 - `startGateway` 缺省只认监听地址的 `Host`（`host:port`，不分大小写），挡 DNS rebinding；监听本机时 `localhost`、`127.0.0.1`、`[::1]` 加端口都认。`createGatewayHandler` 没给 `allowedHosts` 就不查 `Host`，`Origin` 照查。
+- `routes` 写成 `'<方法> <basePath 之后的路径>'`，缺省是导出的 `DEFAULT_ROUTES`；`'*'` 全部转发。调用方的令牌换来的是上游密钥的权限，所以缺省只给聊天补全和模型列表，文件、微调、删除这些要显式放开。
+- `accessToken` 给了空串（或全是空白）直接抛错，不当成「不要鉴权」。`startGateway` 的 `host` 不是本机地址（`localhost`、`127.*`、`::1`）又没有 `accessToken` 时拒绝启动，除非写 `allowUnauthenticated: true`（前面另有一层在鉴权）。
 - 转发时只带调用方的 `content-type`、`accept`，加上 `upstream.headers`；有 `upstream.apiKey` 时设 `Authorization: Bearer <apiKey>`。
 - 响应状态码和头原样转回（去掉逐跳头和 `content-encoding`、`content-length`），正文边收边转；调用方中途断开时取消上游请求，不算出错。
 - 错误正文是 OpenAI 的形状 `{ "error": { "message", "type" } }`，`type` 是 `authentication_error`（401）、`permission_error`（403）或 `gateway_error`。
@@ -87,19 +90,22 @@ createServer((req, res) => void handle(req, res)).listen(8080, '127.0.0.1');
 | `withContext(context, options?)`、`withContext(builder, session, options?)`                                                                                   | 用会话的当前视图作为历史：`createContext()` 的 `view()`，或任何 `ContextBuilder` 的 `view(session)` |
 | `toChatMessages(messages)`                                                                                                                                    | ctx 的 `Message` 转成 Chat Completions 消息：工具调用和结果、图片                                   |
 | `chatText(content)`                                                                                                                                           | Chat Completions 消息里的纯文字                                                                     |
+| `DEFAULT_ROUTES`                                                                                                                                              | 缺省转发的请求：`POST /chat/completions`、`GET /models`                                             |
 | `GatewayOptions`、`UpstreamOptions`、`Gateway`、`Rewrite`、`ReplaceHistoryOptions`、`ChatCompletionRequest`、`ChatMessage`、`ChatContentPart`、`ChatToolCall` | 类型                                                                                                |
 
 `GatewayOptions`：
 
-| 选项             | 说明                                                                                             |
-| ---------------- | ------------------------------------------------------------------------------------------------ |
-| `upstream`       | `{ baseUrl, apiKey?, headers? }`，`baseUrl` 写到 `/v1` 为止                                      |
-| `rewrite`        | 只作用于 `POST <basePath>/chat/completions`                                                      |
-| `accessToken`    | 要求调用方带 `Authorization: Bearer <accessToken>`                                               |
-| `host`、`port`   | 缺省 `127.0.0.1`、`0`（随机端口）                                                                |
-| `basePath`       | 对外的路径前缀，缺省 `/v1`；`''` 或 `/` 挂在根上                                                 |
-| `allowedHosts`   | 只接受这些 `Host`（`host:port`）。`startGateway` 缺省用监听地址，`createGatewayHandler` 缺省不查 |
-| `allowedOrigins` | 带 `Origin` 头的请求只放行这些来源，缺省一个都不放                                               |
-| `maxBodyBytes`   | 请求体上限，缺省 4 MiB                                                                           |
-| `fetch`          | 换掉转发用的 `fetch`                                                                             |
-| `onError`        | 转发出错时的回调                                                                                 |
+| 选项                   | 说明                                                                                                   |
+| ---------------------- | ------------------------------------------------------------------------------------------------------ |
+| `upstream`             | `{ baseUrl, apiKey?, headers? }`，`baseUrl` 写到 `/v1` 为止                                            |
+| `rewrite`              | 只作用于 `POST <basePath>/chat/completions`                                                            |
+| `routes`               | 转发哪些请求，`'<方法> <路径>'` 的列表或 `'*'`，缺省 `DEFAULT_ROUTES`；别的 404                        |
+| `accessToken`          | 要求调用方带 `Authorization: Bearer <accessToken>`；空串抛错                                           |
+| `host`、`port`         | 缺省 `127.0.0.1`、`0`（随机端口）。`host` 不是本机地址时必须给 `accessToken` 或 `allowUnauthenticated` |
+| `allowUnauthenticated` | 听在非本机地址上又不要鉴权时写 `true`，只有 `startGateway` 看它                                        |
+| `basePath`             | 对外的路径前缀，缺省 `/v1`；`''` 或 `/` 挂在根上                                                       |
+| `allowedHosts`         | 只接受这些 `Host`（`host:port`）。`startGateway` 缺省用监听地址，`createGatewayHandler` 缺省不查       |
+| `allowedOrigins`       | 带 `Origin` 头的请求只放行这些来源，缺省一个都不放                                                     |
+| `maxBodyBytes`         | 请求体上限，缺省 4 MiB                                                                                 |
+| `fetch`                | 换掉转发用的 `fetch`                                                                                   |
+| `onError`              | 转发出错时的回调                                                                                       |

@@ -25,6 +25,11 @@ export interface OrchestratorOptions {
    * 的断掉的运行（都没配置也算相同）：两个进程共用一个库时各配一个名字，互不收对方的运行。
    */
   readonly owner?: string;
+  /**
+   * 结束的运行只留状态，给 `status` 查，最多留这么多个（缺省 1000），再多就从最早结束的开始忘，
+   * 忘掉之后 `status` 返回 `undefined`。请求、结果这些大对象在运行结束时就放手，常驻进程的内存不随运行数增长。
+   */
+  readonly retainEnded?: number;
   readonly logger?: Logger;
 }
 
@@ -47,6 +52,8 @@ function messageOf(error: unknown): string {
 
 /** `recover` 一次向存储要多少个会话名。 */
 const RECOVER_PAGE = 100;
+/** 结束的运行留多少个状态。 */
+const RETAIN_ENDED = 1000;
 
 /**
  * 进程内编排器：每个会话一条队列，同一会话的运行串行，不同会话并行；一个 harness。
@@ -56,7 +63,11 @@ const RECOVER_PAGE = 100;
 export function createOrchestrator(options: OrchestratorOptions): LocalOrchestrator {
   const { harness, store } = options;
   const logger = options.logger ?? silentLogger;
+  const retainEnded = Math.max(0, Math.floor(options.retainEnded ?? RETAIN_ENDED));
+  /** 排着队和正在跑的运行。 */
   const runs = new Map<string, Run>();
+  /** 结束的运行只剩状态，按结束的先后排，超过 `retainEnded` 就丢最早的。 */
+  const finished = new Map<string, RunStatus>();
   /** 每个会话队尾的那一轮跑完的时刻。 */
   const tails = new Map<string, Promise<void>>();
   const listeners = new Set<(event: OrchestratorEvent) => void>();
@@ -65,8 +76,20 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
 
   function emit(run: Run, status: RunStatus): void {
     run.status = status;
+    if (status !== 'queued' && status !== 'running') retire(run);
     const event: OrchestratorEvent = { type: `run.${status}`, runId: run.runId, session: run.session };
     for (const listener of listeners) listener(event);
+  }
+
+  /** 运行结束：从活动表里摘掉，只留状态。调用方手里的 `done` 不受影响。 */
+  function retire(run: Run): void {
+    runs.delete(run.runId);
+    if (retainEnded === 0) return;
+    finished.set(run.runId, run.status);
+    for (const oldest of finished.keys()) {
+      if (finished.size <= retainEnded) break;
+      finished.delete(oldest);
+    }
   }
 
   function skipped(run: Run): RunResult {
@@ -97,7 +120,7 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
     async submit(request) {
       if (closed) throw new Error('Orchestrator is closed.');
       const runId = request.runId ?? crypto.randomUUID();
-      if (runs.has(runId)) throw new Error(`Run "${runId}" was already submitted.`);
+      if (runs.has(runId) || finished.has(runId)) throw new Error(`Run "${runId}" was already submitted.`);
       const controller = new AbortController();
       const run: Run = {
         runId,
@@ -130,7 +153,7 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
       return { runId, session: run.session, done: run.done.promise } satisfies RunHandle;
     },
     async status(runId) {
-      return runs.get(runId)?.status;
+      return runs.get(runId)?.status ?? finished.get(runId);
     },
     async cancel(runId) {
       const run = runs.get(runId);
@@ -204,8 +227,7 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
           // 别的实例的运行不归这个编排器收。
           if ((typeof data?.owner === 'string' ? data.owner : undefined) !== options.owner) continue;
           // 这个编排器自己正在跑的不算断掉。
-          const known = runs.get(runId);
-          if (known && (known.status === 'queued' || known.status === 'running')) continue;
+          if (runs.has(runId)) continue;
           // 写 ended 时带这个末尾：读和写之间会话有新条目，说明那个运行在动。只有找到断点的会话才多读这一次。
           const head = await headSeq(store, session);
           try {

@@ -13,7 +13,7 @@ import {
 import { generateText, type LanguageModel } from 'ai';
 
 import { scoreAnswer } from './heuristic.ts';
-import { clamp01, stripMemoryTags } from './text.ts';
+import { clamp01, stripMemoryTags, stripTags } from './text.ts';
 
 /** `decisionFromLanguageModel`、`extractionFromLanguageModel` 的选项。 */
 export interface LanguageModelAdapterOptions {
@@ -66,7 +66,8 @@ export function parseJsonObject(text: string): Record<string, unknown> | undefin
 }
 
 function stateText(state: JsonValue): string {
-  return stripMemoryTags(typeof state === 'string' ? state : JSON.stringify(state, null, 2));
+  // 两种包裹都去：`<state>` 是这里自己加的，`<memory>` 是这段文字日后被召回时加的。
+  return stripTags(stripMemoryTags(typeof state === 'string' ? state : JSON.stringify(state, null, 2)), 'state');
 }
 
 function toNumber(value: unknown): number | undefined {

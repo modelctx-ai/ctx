@@ -97,9 +97,22 @@ export function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
 }
 
-/** 把 `<memory>` 包裹用的标签从文字里去掉，免得记忆里的文字提前闭合包裹。 */
+/**
+ * 把包裹用的标签从文字里去掉，免得里面的文字提前闭合包裹。
+ * 去掉一遍之后剩下的字可能又拼出一个标签（`</mem</memory>ory>`），所以去到不再变为止。
+ */
+export function stripTags(text: string, tag: string): string {
+  const pattern = new RegExp(`<\\/?\\s*${tag}\\s*>`, 'giu');
+  for (let current = text; ;) {
+    const next = current.replaceAll(pattern, '');
+    if (next === current) return next;
+    current = next;
+  }
+}
+
+/** 去掉 `<memory>` 包裹用的标签。 */
 export function stripMemoryTags(text: string): string {
-  return text.replaceAll(/<\/?\s*memory\s*>/giu, '');
+  return stripTags(text, 'memory');
 }
 
 export const DAY_MS = 86_400_000;

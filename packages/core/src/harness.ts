@@ -108,6 +108,8 @@ interface RunState {
   readonly recorded: Entry[];
   /** 本轮最后一次写入之后会话的末尾 `seq`，下一次写入拿它当 `expectSeq`；还没写过时是 `undefined`。 */
   head: number | undefined;
+  /** 本轮 `ctx.run.started` 的 `seq`；还没写时是 `undefined`。 */
+  started?: number;
   /** 写日志失败过：这时 run 要 reject，不能当成模型出错。 */
   logFailed: boolean;
 }
@@ -195,7 +197,10 @@ function begin(request: RunRequest): RunState {
   };
 }
 
-/** 前提冲突时别人已经给这一轮写了 `ctx.run.ended`（被 `recover` 当作断掉的运行收走了）：这一轮停下，不再写。 */
+/**
+ * 前提冲突时别人已经给这一轮写了 `ctx.run.ended`（被 `recover` 当作断掉的运行收走了），
+ * 或者这一轮的 `ctx.run.started` 不在了（会话被 `clear` 了）：这一轮停下，不再写。
+ */
 class Fenced extends Error {
   constructor() {
     super('This run was ended by another process (fenced).');
@@ -275,8 +280,8 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   }
 
   /**
-   * 本轮的写入：带 `expectSeq`（上一次写入返回的末尾）。冲突时先看有没有人给自己的 `runId` 写了 `ended`：
-   * 有就是被围栏了，抛 `Fenced`；没有只是别人写了应用事件，用新的末尾重试。
+   * 本轮的写入：带 `expectSeq`（上一次写入返回的末尾）。冲突时先看有没有人给自己的 `runId` 写了 `ended`、
+   * 自己的 `started` 还在不在：有 `ended` 或者 `started` 没了就是被围栏了，抛 `Fenced`；都不是只是别人写了应用事件，用新的末尾重试。
    */
   async function write(state: RunState, entries: readonly NewEntry[]): Promise<void> {
     if (!state.record || entries.length === 0) return;
@@ -286,18 +291,20 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
           return await append(state, entries, state.head);
         } catch (error) {
           if (!isConflict(error) || state.head === undefined || conflicts >= MAX_CONFLICTS) throw error;
-          // 先读末尾再读 ended：中间若又有人写，下一次写入会再冲突，再查一遍。
+          // 先读末尾再读生命周期事件：中间若又有人写，下一次写入会再冲突，再查一遍。
           const head = await headSeq(store, state.request.session);
-          const ended = await store.list(state.request.session, { after: state.head, kinds: [CTX_EVENTS.runEnded] });
-          if (
-            ended.some(
-              (entry) =>
-                (entry.type === 'event' ? (entry.data as { runId?: unknown } | undefined)?.runId : undefined) ===
-                state.runId,
-            )
-          ) {
-            throw new Fenced();
-          }
+          const lifecycle = await store.list(state.request.session, {
+            after: state.started !== undefined ? state.started - 1 : state.head,
+            kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded],
+          });
+          const mine = lifecycle.filter(
+            (entry) =>
+              (entry.type === 'event' ? (entry.data as { runId?: unknown } | undefined)?.runId : undefined) ===
+              state.runId,
+          );
+          if (mine.some((entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.runEnded)) throw new Fenced();
+          // 自己的 started 不在了：会话在这一轮中途被清掉。接着写会把删掉的会话写回来。
+          if (state.started !== undefined && !mine.some((entry) => entry.seq === state.started)) throw new Fenced();
           state.head = head;
         }
       }
@@ -329,6 +336,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         if (last?.type === 'event' && last.kind === CTX_EVENTS.runStarted) return false;
         try {
           await append(state, [started], head);
+          state.started = state.recorded.at(-1)?.seq;
           return true;
         } catch (error) {
           if (!isConflict(error) || conflicts >= MAX_CONFLICTS) throw error;

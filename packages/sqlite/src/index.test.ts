@@ -48,6 +48,27 @@ describe('sqlite store', () => {
     assert.equal(database.prepare('SELECT count(*) AS n FROM app').get()?.['n'], 0, 'close 不关别人的库');
   });
 
+  test('提交失败（别的连接正读着）要回滚：连接不卡在事务里，之后的写入真的落盘', async () => {
+    const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
+    // 传进来的库不切 WAL、不设 busy_timeout：提交要独占锁，别的连接有读事务时立刻失败。
+    const database = new DatabaseSync(path);
+    const store = createSqliteStore({ database });
+    await store.append('t', [userEntry('一')]);
+    const reader = new DatabaseSync(path);
+    reader.exec('BEGIN');
+    reader.prepare('SELECT count(*) FROM ctx_entries').get();
+    await assert.rejects(store.append('t', [userEntry('二')]), /locked|busy/i);
+    assert.equal(database.isTransaction, false, '提交失败后事务已经回滚');
+    reader.exec('COMMIT');
+    await store.append('t', [userEntry('三')]);
+    assert.equal(database.isTransaction, false);
+    const other = new DatabaseSync(path);
+    assert.equal(other.prepare('SELECT count(*) AS n FROM ctx_entries').get()?.['n'], 2, '别的连接读得到');
+    other.close();
+    reader.close();
+    database.close();
+  });
+
   test('循环结构写不进去，整批回滚', async () => {
     const store = createSqliteStore({ path: ':memory:' });
     const loop: Record<string, unknown> = {};

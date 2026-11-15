@@ -46,7 +46,10 @@ export interface RemoteHandlerOptions {
   readonly orchestrator?: Orchestrator;
   /** 挂在 `/memory` 下：`/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core`。 */
   readonly memory?: MemoryStore;
-  /** 要求调用方带 `Authorization: Bearer <accessToken>`。 */
+  /**
+   * 要求调用方带 `Authorization: Bearer <accessToken>`。不给就不查；空串（或全是空白）直接抛错，
+   * 免得 `process.env.X ?? ''` 这类写法悄悄变成不鉴权。
+   */
   readonly accessToken?: string;
   /**
    * 只接受这些 Host 头（`host:port`，不分大小写），别的回 403，挡 DNS rebinding。`startRemote` 缺省用监听地址，
@@ -69,8 +72,10 @@ export interface RemoteHandlerOptions {
 export type RemoteHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
 
 export interface StartRemoteOptions extends RemoteHandlerOptions {
-  /** 缺省 `127.0.0.1`。 */
+  /** 缺省 `127.0.0.1`。不是本机地址时必须给 `accessToken`，或者写明 `allowUnauthenticated: true`。 */
   readonly host?: string;
+  /** 听在非本机地址上又不要鉴权（前面另有一层在管）时写 `true`；不写就拒绝启动。 */
+  readonly allowUnauthenticated?: boolean;
   /** 缺省 0：随机端口。 */
   readonly port?: number;
 }
@@ -208,9 +213,20 @@ function lowered(values: readonly string[]): Set<string> {
 
 const LOOPBACK = ['localhost', '127.0.0.1', '::1'];
 
+function isLoopback(host: string): boolean {
+  return LOOPBACK.includes(host) || host.startsWith('127.');
+}
+
+/** 给了 `accessToken` 却是空的：当成配置写错，不当成「不要鉴权」。 */
+function checkAccessToken(token: string | undefined): void {
+  if (token !== undefined && !token.trim()) {
+    throw new Error('`accessToken` is empty. Leave it out to run without authentication, or pass a real token.');
+  }
+}
+
 /** 监听地址本身；监听本机（或所有地址）时，本机的几种写法都认。 */
 function defaultHosts(host: string, port: number): string[] {
-  const local = LOOPBACK.includes(host) || host.startsWith('127.') || host === '0.0.0.0' || host === '::';
+  const local = isLoopback(host) || host === '0.0.0.0' || host === '::';
   const names = local ? [host, ...LOOPBACK] : [host];
   return names.flatMap((name) => {
     const bare = name.includes(':') ? `[${name}]` : name;
@@ -415,6 +431,7 @@ interface SubmittedRun {
  */
 export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandler {
   const { store, harness, orchestrator, memory } = options;
+  checkAccessToken(options.accessToken);
   const executors = executorTable(options.executors);
   const basePath = normalizePath(options.basePath ?? '');
   const limit = options.maxBodyBytes ?? 4 * 1024 * 1024;
@@ -976,9 +993,19 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   };
 }
 
-/** 起一个只听本机的服务。Host 头缺省只认监听地址（见 `allowedHosts`）。 */
-export function startRemote(options: StartRemoteOptions): Promise<RemoteServer> {
+/**
+ * 起一个服务，缺省只听本机。Host 头缺省只认监听地址（见 `allowedHosts`）。
+ * 听在非本机地址上而没有 `accessToken` 时拒绝启动，除非写明 `allowUnauthenticated: true`。
+ */
+export async function startRemote(options: StartRemoteOptions): Promise<RemoteServer> {
   const host = options.host ?? '127.0.0.1';
+  checkAccessToken(options.accessToken);
+  if (!isLoopback(host) && !options.accessToken && options.allowUnauthenticated !== true) {
+    throw new Error(
+      `Refusing to listen on ${host} without \`accessToken\`: anyone who can reach it could read sessions and run tools. ` +
+        'Pass `accessToken`, or `allowUnauthenticated: true` if something in front of it authenticates.',
+    );
+  }
   const basePath = normalizePath(options.basePath ?? '');
   // 端口要等监听上才知道，处理函数到那时再建。
   let handler: RemoteHandler | undefined;
