@@ -81,7 +81,7 @@ await hub.close();
 - 连上以后任何一步失败（列工具出错、超时）都关掉连接，stdio 服务器的进程跟着结束；超时以后才连上的也马上关掉。
 - 连上以后服务器自己断了（stdio 进程退出；Streamable HTTP 的会话过期，服务器对带旧会话号的请求回 404；SSE 的事件流断了）：连接摘掉，状态变成 `{ state: 'failed', error: 'disconnected: …' }`，它的工具从 `tools()`、`toolSet()` 和写过的注册表里去掉，`logger.warn` 记一条。这之后调它的工具返回说明服务器断开了的错误，断开那一刻还在跑的调用也是。hub 不自己重连：再调 `connect()`（或 `provision()`）才重连，连上以后工具回到注册表里。远程服务器只是不可达（网络断了、服务器没起来）时没有「连接关闭」这回事，调用各自报错或超时，状态不变。
 - 服务器发 `notifications/tools/list_changed` 时 hub 重新列它的工具，`tools()`、状态和写过的注册表跟着变；`refresh(name?)` 手动做同一件事，返回全部状态，只管连着的服务器（没连上的、不认识的名字不动）。同一台服务器的刷新一次接一次：正在列的时候又来了通知或 `refresh()`，列完再列一次，等的人拿到的都是最后一次的结果。列不出来（出错，或超过 `timeoutMs`）时不断开，保留原来的工具，原因记在状态的 `refreshError` 里，下次刷新成功就没有了。
-- 远程服务器（HTTP、SSE）的 `list_changed`、会话过期和事件流断开没有对真实服务验证，只对测试里起的本地服务器验证过。`@ai-sdk/mcp` 的客户端不处理服务器发来的通知，不报连接关闭，也不导出远程传输的类：`connectorFor` 从客户端上取它内部的传输来接通知，SSE 的断开按它报的错误信息来认。它改了内部结构或错误信息时，远程服务器就收不到 `list_changed`、认不出 SSE 断开（stdio 和 HTTP 的会话过期不受影响），这时用 `refresh()`。
+- 远程服务器的连接、列工具、调用在 2026-11-15 对一台公开的 Streamable HTTP 服务器验证过（`@ai-sdk/mcp` 2.0.83，见 [`live/`](https://github.com/modelctx-ai/ctx/blob/main/live/README.md)，每晚重跑）。`list_changed`、会话过期和事件流断开没有对真实服务验证，只对测试里起的本地服务器验证过；SSE 传输也没有对真实服务验证。`@ai-sdk/mcp` 的客户端不处理服务器发来的通知，不报连接关闭，也不导出远程传输的类：`connectorFor` 从客户端上取它内部的传输来接通知，SSE 的断开按它报的错误信息来认。它改了内部结构或错误信息时，远程服务器就收不到 `list_changed`、认不出 SSE 断开（stdio 和 HTTP 的会话过期不受影响），这时用 `refresh()`。
 - 工具名缺省是 `<server>__<tool>`，非法字符换成 `_`，截到 64；`namespace: false` 保留原名，也可以传 `(server, tool) => string`。改名后重名的按配置顺序留第一个，后面的原名记在那台服务器状态的 `skipped` 里。
 - `include`、`exclude` 按服务器上的原名过滤。
 - hub 是一个执行环境，名字缺省 `mcp`（选项 `name` 可改；一个应用开几个 hub 时各起一个名字）。选了「一个 hub 一个执行环境」而不是每台服务器一个 `mcp:<server>`：工具名已经带服务器前缀，`execute` 按名字找到服务器，应用只要把 hub 交给 harness 一次。`source` 仍是 `mcp:<server>`，按服务器筛选、移除用它。

@@ -6,18 +6,19 @@
 
 开发要 Node ≥22.18（直接运行 `.ts`）和 pnpm 10（版本由 `packageManager` 固定）。工具链是 [Vite+](https://viteplus.dev/)（`vite-plus`，命令 `vp`），配置都在根目录和各包的 `vite.config.ts` 里。
 
-| 命令                                | 作用                                                                                                                      |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `pnpm install`                      | 安装依赖                                                                                                                  |
-| `pnpm typecheck`                    | `vp check --no-fmt --no-lint`：只做类型检查（tsgolint，TS 7），覆盖全部包的源码、测试和配置                               |
-| `pnpm lint`                         | `vp lint`：Oxlint，带类型信息的规则，同时报类型错误；有警告也算失败                                                       |
-| `pnpm test`                         | `vp test`：Vitest 运行 `packages/*/src/**/*.test.ts`                                                                      |
-| `pnpm build`                        | 每个包 `vp pack`（tsdown）构建 `dist/`（ESM + `.d.ts`）                                                                   |
-| `pnpm format` / `pnpm format:check` | `vp fmt`：Oxfmt 改写 / 检查                                                                                               |
-| `pnpm check`                        | `vp check`（格式、lint、类型）、test、build；CI 在 Node 22 和 24 上跑同样几步                                             |
-| `pnpm examples`                     | `examples/` 里的例子用剧本模型各跑一遍（读 `dist/`，要先 `pnpm build`）；`pnpm test` 也跑它们的测试                       |
-| `pnpm smoke`                        | `scripts/pack-smoke.mjs`：`pnpm pack` 的产物在干净目录里装上、类型解析、每个入口 `import` 一遍；要先 `pnpm build`，要联网 |
-| `pnpm release:version <版本>`       | `scripts/release.mjs`：九个包改成同一个版本，正式版本把 CHANGELOG 的「未发布」落成这一版                                  |
+| 命令                                | 作用                                                                                                                                                                                                         |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pnpm install`                      | 安装依赖                                                                                                                                                                                                     |
+| `pnpm typecheck`                    | `vp check --no-fmt --no-lint`：只做类型检查（tsgolint，TS 7），覆盖全部包的源码、测试和配置                                                                                                                  |
+| `pnpm lint`                         | `vp lint`：Oxlint，带类型信息的规则，同时报类型错误；有警告也算失败                                                                                                                                          |
+| `pnpm test`                         | `vp test`：Vitest 运行 `packages/*/src/**/*.test.ts`                                                                                                                                                         |
+| `pnpm build`                        | 每个包 `vp pack`（tsdown）构建 `dist/`（ESM + `.d.ts`）                                                                                                                                                      |
+| `pnpm format` / `pnpm format:check` | `vp fmt`：Oxfmt 改写 / 检查                                                                                                                                                                                  |
+| `pnpm check`                        | `vp check`（格式、lint、类型）、test、build；CI 在 Node 22 和 24 上跑同样几步                                                                                                                                |
+| `pnpm examples`                     | `examples/` 里的例子用剧本模型各跑一遍（读 `dist/`，要先 `pnpm build`）；`pnpm test` 也跑它们的测试                                                                                                          |
+| `pnpm live`                         | `live/smoke.ts`：对配了密钥的真实服务跑冒烟场景，没配的跳过；`--record` 把真实响应录成 `live/fixtures/` 里的夹具。要先 `pnpm build`，要联网。不进 PR 的 CI，`live.yml` 每晚跑；录下的夹具由 `pnpm test` 重放 |
+| `pnpm smoke`                        | `scripts/pack-smoke.mjs`：`pnpm pack` 的产物在干净目录里装上、类型解析、每个入口 `import` 一遍；要先 `pnpm build`，要联网                                                                                    |
+| `pnpm release:version <版本>`       | `scripts/release.mjs`：九个包改成同一个版本，正式版本把 CHANGELOG 的「未发布」落成这一版                                                                                                                     |
 
 仓库里各包互相引用时按源码解析（`@modelctx-ai/source` 条件，见 [ADR 0002](docs/adr/0002-packages.md)），类型检查和测试不用先构建。使用方的 Node 版本和 peer dependency 写在各包 README 的「安装」里。
 
@@ -51,7 +52,7 @@
 - 依赖方向和放置规则（核心包只依赖 `ai`，实现包只依赖协议包，Node 专属模块只进适配包）见[架构](docs/architecture.md#实现约束)，新代码不打破。
 - yoyo 经 `link:../ctx/packages/*` 读这里的 `dist/`，它的 CI 检出 ctx `main` 的最新提交。改公开 API 之前先在 `../yoyo` 里 grep 用法：会让 yoyo 编不过的改动，合并前要有对应的 yoyo PR 在等。CI 的 `Downstream (yoyo)` 作业用 PR 的构建产物跑 yoyo 的检查和测试，不拦合并；它红了就是这种情况，在 PR 正文里链接那个 yoyo PR。
 - [`examples/`](examples/README.md) 里每种部署一个能直接跑的例子，类型检查和测试跟各包一起跑。改了公开 API 让例子编不过或测试红了，同一个 PR 里改例子；加了新的部署方式或值得示范的组件，加一个例子。
-- 对真实服务（模型提供商、MCP 服务器）的映射没有在线验证时，在文档里写明「没有对真实服务验证」，不要删掉这句。
+- 对真实服务（模型提供商、MCP 服务器）的映射没有在线验证时，在文档里写明「没有对真实服务验证」，不要删掉这句。验证过的（[`live/`](live/README.md) 的冒烟场景对真实服务通过，夹具已提交）把这句换成验证的日期和依赖的版本。改了服务商的映射（`ctx-models`、`ctx-mcp`、`ctx-gateway` 的请求和响应），给 `live/scenarios.ts` 加或改场景。
 
 ## 格式和提交
 
