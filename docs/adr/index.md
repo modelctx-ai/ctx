@@ -6,3 +6,4 @@
 - [ADR 0004：协议层与实现层分开，组件不绑定托管形态](0004-protocol-and-implementation.md) - 协议层和实现层分开，七个组件各一个协议，组件不绑定托管形态，`thread` 改 `session`
 - [ADR 0005：会话位置、并发写入、消息格式版本、AgentSpec 上下文配置](0005-session-position-writes-format.md) - 位置只用 `seq`，写入前提条件 `expectSeq`，ctx 自己的带版本的 JSON 消息格式，`AgentSpec.context`，会话分页和 `kinds` 过滤
 - [ADR 0006：记忆作为第八个组件，只读日志、夜里改写、System One 做判断](0006-memory.md) - 记忆作为第八个组件：只读日志、夜里改写、事实不 UPDATE、证据必填、System One 模型做判断、遗忘是公式、只用已有扩展点接入
+- [ADR 0007：会话的擦除和保留期](0007-deletion-and-retention.md) - 只追加的例外：`truncate`、`remove`、`redact` 和擦除记录 `ctx.erased`，运行中的 harness 怎么看见，SQLite 的 `secure_delete` 和 `vacuum`，保留期是应用调的函数

@@ -2,9 +2,13 @@ import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 
 import {
   checkExpectSeq,
+  CTX_EVENTS,
   ENTRY_VERSION,
+  erasedEntry,
   readEntry,
+  redactedEntry,
   type Entry,
+  type ErasedData,
   type JsonObject,
   type JsonValue,
   type ListOptions,
@@ -40,14 +44,31 @@ export interface SqliteStoreOptions {
    * `placeholder` 把那一行读成 `ctx.unreadable` 事件，会话其余部分照常能读。
    */
   readonly unreadable?: UnreadableMode;
+  /**
+   * 在这条连接上打开 `PRAGMA secure_delete`，缺省 `true`：被删掉、被改掉的内容当场用零覆写，不留在库文件的空闲空间里。
+   * 开关是连接上的，不存进库文件，所以每次打开都设；传 `database` 时也设，应用在这条连接上对自己的表的删除同样会覆写。
+   * 写入时也要开着：没开的时候页分裂会在页里留下行内容的旧副本，之后再开着删也擦不到，只有 `vacuum()` 清得掉。
+   * 传 `false` 不动连接的设置：删除就只是把空间标成可用，内容留到被新数据盖住或 `vacuum()` 为止。
+   */
+  readonly secureDelete?: boolean;
 }
 
 /** `watch` 一次读多少条。 */
 const WATCH_PAGE = 500;
 
+/** `remove`、`redact` 一条语句里最多带多少个 `id`（SQLite 对绑定参数的个数有上限）。 */
+const ID_CHUNK = 500;
+
 export interface SqliteSessionStore extends SessionStore {
   readonly database: DatabaseSync;
   watch(session: string, options?: WatchOptions): AsyncIterable<Entry>;
+  /**
+   * `VACUUM` 重写整个库文件，再 `PRAGMA wal_checkpoint(TRUNCATE)` 把 `-wal` 截到空。两个用处：把删除腾出来的空间
+   * 还给文件系统（删除本身不会让文件变小，腾出来的页留给以后的写入）；清掉没开 `secure_delete` 时留在文件里的旧内容
+   * （升级之前写的、别的连接写的、`secureDelete: false` 时删的）。库是应用传进来的时候，整个库（含应用自己的表）一起重写。
+   * 不能在事务里调；要独占库，别的连接正读写时会等 `busy_timeout`，等不到就抛。
+   */
+  vacuum(): void;
   close(): void;
 }
 
@@ -94,6 +115,12 @@ function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
     const timer = setTimeout(done, ms);
     signal?.addEventListener('abort', done, { once: true });
   });
+}
+
+function chunks<T>(items: readonly T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 function bodyOf(entry: NewEntry): Body {
@@ -226,6 +253,8 @@ function migrate(database: DatabaseSync, prefix: string): void {
  * 基于 `node:sqlite` 的存储。所有条目在一张表里，按会话和写入序号 `seq` 建索引，事件另按 `kind` 建索引。
  * 每次写入在 `BEGIN IMMEDIATE` 里做（先拿写锁，再检查 `expectSeq`，再写）；库上已有应用的事务时改用 SAVEPOINT，
  * 所以和应用共用一个库、处在应用自己的事务里也能用。
+ * 连接上缺省开着 `secure_delete`：删除（`clear`、`truncate`、`remove`）和涂改（`redact`）当场覆写被删的内容；
+ * 文件不会因此变小，要空间就调 `vacuum()`。
  */
 export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionStore {
   const prefix = options.prefix ?? 'ctx_';
@@ -241,6 +270,32 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
   const removeSession = database.prepare(`DELETE FROM ${table} WHERE session = ?`);
   const pollInterval = options.pollIntervalMs ?? 250;
   const unreadable = options.unreadable ?? 'throw';
+  // 连接级的开关，不存进库文件，所以每次打开都设。写入时也要开着（见 `SqliteStoreOptions.secureDelete`）。
+  if (options.secureDelete !== false) database.exec('PRAGMA secure_delete = ON');
+
+  /** 删除和涂改在写锁里做；`work` 返回擦除记录的 `data`，真的动了条目才在同一个事务里追加 `ctx.erased`。 */
+  function erase(session: string, work: () => ErasedData | undefined): number {
+    return withWriteLock(database, `${prefix}write`, () => {
+      const erased = work();
+      if (!erased) return 0;
+      const record = erasedEntry(erased);
+      const written = insert.run(
+        id(),
+        session,
+        now(),
+        record.type,
+        null,
+        record.source ?? null,
+        JSON.stringify(bodyOf(record)),
+        null,
+        ENTRY_VERSION,
+      );
+      // 记录没写进去（`id` 生成器给了一个已有的 `id`）就整个回滚：没有记录，运行中的 harness 和 `watch` 看不见这次擦除。
+      if (written.changes === 0)
+        throw new Error('Could not record the erasure: the generated entry id already exists.');
+      return erased.count;
+    });
+  }
 
   const store: SqliteSessionStore = {
     database,
@@ -321,6 +376,62 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
     async clear(session) {
       return Number(removeSession.run(session).changes);
     },
+    async truncate(session, upTo) {
+      if (!Number.isFinite(upTo)) return 0;
+      return erase(session, () => {
+        const found = database
+          .prepare(`SELECT count(*) AS count, max(seq) AS last FROM ${table} WHERE session = ? AND seq <= ?`)
+          .get(session, Math.floor(upTo));
+        const count = Number(found?.['count'] ?? 0);
+        if (count === 0) return undefined;
+        const last = Number(found?.['last']);
+        database.prepare(`DELETE FROM ${table} WHERE session = ? AND seq <= ?`).run(session, last);
+        return { op: 'truncate', upTo: last, count };
+      });
+    },
+    async remove(session, ids) {
+      const wanted = [...new Set(ids)];
+      if (wanted.length === 0) return 0;
+      return erase(session, () => {
+        const seqs: number[] = [];
+        // 只按列删，不解析正文：读不了的行也删得掉。
+        for (const chunk of chunks(wanted, ID_CHUNK)) {
+          const rows = database
+            .prepare(
+              `DELETE FROM ${table} WHERE session = ? AND id IN (${chunk.map(() => '?').join(', ')}) RETURNING seq`,
+            )
+            .all(session, ...chunk);
+          for (const row of rows) seqs.push(Number(row['seq']));
+        }
+        if (seqs.length === 0) return undefined;
+        return { op: 'remove', seqs: seqs.toSorted((a, b) => a - b), count: seqs.length };
+      });
+    },
+    async redact(session, ids) {
+      const wanted = [...new Set(ids)];
+      if (wanted.length === 0) return 0;
+      return erase(session, () => {
+        const seqs: number[] = [];
+        const rewrite = database.prepare(`UPDATE ${table} SET type = ?, body = ?, meta = NULL, v = ? WHERE seq = ?`);
+        for (const chunk of chunks(wanted, ID_CHUNK)) {
+          // 只读列和消息的角色，不整行解码：读不了的行也能涂改。已经是占位的跳过。
+          const rows = database
+            .prepare(
+              `SELECT seq, id, session, at, type, key, source, json_extract(body, '$.message.role') AS role FROM ${table}
+               WHERE session = ? AND id IN (${chunk.map(() => '?').join(', ')}) AND NOT (type = 'event' AND kind IS ?)`,
+            )
+            .all(session, ...chunk, CTX_EVENTS.redacted);
+          for (const row of rows) {
+            const seq = Number(row['seq']);
+            const placeholder = redactedEntry({ ...row, seq, at: Number(row['at']), message: { role: row['role'] } });
+            rewrite.run(placeholder.type, JSON.stringify(bodyOf(placeholder)), ENTRY_VERSION, seq);
+            seqs.push(seq);
+          }
+        }
+        if (seqs.length === 0) return undefined;
+        return { op: 'redact', seqs: seqs.toSorted((a, b) => a - b), count: seqs.length };
+      });
+    },
     async sessions(sessionsOptions: SessionsOptions = {}) {
       const where: string[] = [];
       const params: SQLInputValue[] = [];
@@ -366,6 +477,11 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
         }
         if (fresh.length < WATCH_PAGE) await sleep(pollInterval, signal);
       }
+    },
+    vacuum() {
+      if (database.isTransaction) throw new Error('vacuum() cannot run inside a transaction.');
+      database.exec('VACUUM');
+      database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
     },
     close() {
       if (owned) database.close();

@@ -5,6 +5,7 @@ import {
   ctxErrorEntry,
   headSeq,
   isConflict,
+  isErased,
   errorOutput,
   messageEntry,
   runEndedEntry,
@@ -13,6 +14,7 @@ import {
   userEntry,
   type ContextBuilder,
   type Entry,
+  type ErasedData,
   type ErrorInfo,
   type Executor,
   type Harness,
@@ -216,7 +218,8 @@ function begin(request: RunRequest): RunState {
 
 /**
  * 前提冲突时别人已经给这一轮写了 `ctx.run.ended`（被 `recover` 当作断掉的运行收走了），
- * 或者这一轮的 `ctx.run.started` 不在了（会话被 `clear` 了）：这一轮停下，不再写。
+ * 这一轮的 `ctx.run.started` 不在了（会话被 `clear` 了），或者有 `ctx.erased` 动了这一轮自己写的条目
+ * （`truncate`、`remove`、`redact`）：这一轮停下，不再写。
  */
 class Fenced extends Error {
   constructor() {
@@ -303,7 +306,8 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
 
   /**
    * 本轮的写入：带 `expectSeq`（上一次写入返回的末尾）。冲突时先看有没有人给自己的 `runId` 写了 `ended`、
-   * 自己的 `started` 还在不在：有 `ended` 或者 `started` 没了就是被围栏了，抛 `Fenced`；都不是只是别人写了应用事件，用新的末尾重试。
+   * 自己的 `started` 还在不在、有没有擦除记录动了自己写的条目：有 `ended`、`started` 没了、或者自己的条目被删被涂改，
+   * 就是被围栏了，抛 `Fenced`；都不是只是别人写了应用事件（或者删了更早的历史），用新的末尾重试。
    */
   async function write(state: RunState, entries: readonly NewEntry[]): Promise<void> {
     if (!state.record || entries.length === 0) return;
@@ -317,7 +321,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
           const head = await headSeq(store, state.request.session);
           const lifecycle = await store.list(state.request.session, {
             after: state.started !== undefined ? state.started - 1 : state.head,
-            kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded],
+            kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded, CTX_EVENTS.erased],
           });
           const mine = lifecycle.filter(
             (entry) =>
@@ -327,6 +331,15 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
           if (mine.some((entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.runEnded)) throw new Fenced();
           // 自己的 started 不在了：会话在这一轮中途被清掉。接着写会把删掉的会话写回来。
           if (state.started !== undefined && !mine.some((entry) => entry.seq === state.started)) throw new Fenced();
+          // 这一轮自己写的条目被删或被涂改了：接着写会把针对已删内容的产出记回去。删的是更早的历史就不管。
+          const erasures = lifecycle.flatMap((entry) =>
+            entry.type === 'event' && entry.kind === CTX_EVENTS.erased && typeof entry.data === 'object' && entry.data
+              ? [entry.data as unknown as ErasedData]
+              : [],
+          );
+          if (erasures.some((erased) => state.recorded.some((entry) => isErased(erased, entry.seq)))) {
+            throw new Fenced();
+          }
           state.head = head;
         }
       }

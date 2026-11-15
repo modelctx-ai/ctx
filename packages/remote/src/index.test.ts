@@ -165,6 +165,9 @@ describeSessionStoreContract(
       append: (session, entries, options) => memory.append(session, entries, options),
       list: (session, options) => memory.list(session, options),
       clear: (session) => memory.clear(session),
+      truncate: (session, upTo) => memory.truncate(session, upTo),
+      remove: (session, ids) => memory.remove(session, ids),
+      redact: (session, ids) => memory.redact(session, ids),
       sessions: (options) => memory.sessions(options),
     };
     return createRemoteSessionStore(client(await serve({ store, pollIntervalMs: 20 })));
@@ -412,6 +415,9 @@ describe('会话的条目分页', () => {
       append: (session, entries, options) => inner.append(session, entries, options),
       list: (session, options) => inner.list(session, options),
       clear: (session) => inner.clear(session),
+      truncate: (session, upTo) => inner.truncate(session, upTo),
+      remove: (session, ids) => inner.remove(session, ids),
+      redact: (session, ids) => inner.redact(session, ids),
       sessions: (options) => inner.sessions(options),
     };
     const remote = createRemoteSessionStore(client(await serve({ store, maxListEntries: 3, pollIntervalMs: 5 })));
@@ -422,6 +428,66 @@ describe('会话的条目分页', () => {
       if (seen.length === 10) controller.abort();
     }
     expect(seen).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+});
+
+describe('会话的擦除', () => {
+  test('truncate、remove、redact 各一条 POST 路径；条数和服务端存储一致，擦除记录客户端读得到', async () => {
+    const memory = createMemoryStore();
+    const server = await serve({ store: memory });
+    const remote = createRemoteSessionStore(client(server));
+    const written = await remote.append('a/b', [userEntry('一'), userEntry('二'), userEntry('三'), userEntry('四')]);
+    const calls: string[] = [];
+    const spying = createRemoteSessionStore({
+      ...client(server),
+      fetch: (input, init) => {
+        const body = typeof init?.body === 'string' ? init.body : '';
+        calls.push(`${init?.method} ${new URL(urlOf(input)).pathname} ${body}`);
+        return fetch(input, init);
+      },
+    });
+    expect(await spying.truncate('a/b', written[0]!.seq)).toBe(1);
+    expect(await spying.remove('a/b', [written[1]!.id, 'missing'])).toBe(1);
+    expect(await spying.redact('a/b', [written[2]!.id])).toBe(1);
+    expect(calls).toEqual([
+      `POST /sessions/a%2Fb/entries/truncate {"upTo":${written[0]!.seq}}`,
+      `POST /sessions/a%2Fb/entries/remove {"ids":["${written[1]!.id}","missing"]}`,
+      `POST /sessions/a%2Fb/entries/redact {"ids":["${written[2]!.id}"]}`,
+    ]);
+    expect(await spying.truncate('a/b', Number.NaN)).toBe(0);
+    expect(calls).toHaveLength(3);
+    const kinds = (await remote.list('a/b')).map((entry) => (entry.type === 'event' ? entry.kind : entry.type));
+    expect(kinds).toEqual([CTX_EVENTS.redacted, 'message', CTX_EVENTS.erased, CTX_EVENTS.erased, CTX_EVENTS.erased]);
+    expect(await remote.list('a/b')).toEqual(await memory.list('a/b'));
+  });
+
+  test('请求体不对是 400，方法不对是 405；存储抛的协议错误照旧带着 type', async () => {
+    const memory = createMemoryStore();
+    const store: SessionStore = {
+      ...memory,
+      remove: () => Promise.reject(new CtxError('invalid_request', '这个存储不让删')),
+    };
+    const { baseUrl } = await serve({ store });
+    const post = (tail: string, body: unknown, method = 'POST') =>
+      fetch(`${baseUrl}/sessions/s/entries/${tail}`, {
+        method,
+        headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' },
+        ...(method === 'POST' ? { body: JSON.stringify(body) } : {}),
+      });
+    for (const body of [{}, { upTo: '3' }, { upTo: null }, []]) {
+      expect((await post('truncate', body)).status).toBe(400);
+    }
+    for (const tail of ['remove', 'redact']) {
+      for (const body of [{}, { ids: 'x' }, { ids: [1] }]) expect((await post(tail, body)).status).toBe(400);
+      expect((await post(tail, undefined, 'GET')).status).toBe(405);
+    }
+    expect((await post('truncate', undefined, 'DELETE')).status).toBe(405);
+    expect((await post('redact', { ids: [] })).status).toBe(200);
+    const refused = await post('remove', { ids: ['x'] });
+    expect([refused.status, await refused.json()]).toEqual([
+      400,
+      { error: { message: '这个存储不让删', type: 'invalid_request' } },
+    ]);
   });
 });
 
@@ -665,6 +731,9 @@ describe('比客户端新的条目', () => {
       append: (session, entries, options) => memory.append(session, entries, options),
       list: async (session, options) => newer(await memory.list(session, options)),
       clear: (session) => memory.clear(session),
+      truncate: (session, upTo) => memory.truncate(session, upTo),
+      remove: (session, ids) => memory.remove(session, ids),
+      redact: (session, ids) => memory.redact(session, ids),
       sessions: (options) => memory.sessions(options),
     };
     const server = await serve({ store, pollIntervalMs: 10 });

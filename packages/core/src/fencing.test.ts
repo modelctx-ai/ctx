@@ -218,6 +218,88 @@ describe('围栏：运行中途会话被 clear', () => {
   });
 });
 
+/** 跑一轮，卡在模型调用上；`meddle` 趁这时动日志，再放行。 */
+async function runWhile(meddle: (store: SessionStore, log: readonly Entry[]) => Promise<unknown>) {
+  const { store, harness } = setup();
+  await store.append('s', [userEntry('更早的一句'), eventEntry('app.note', { text: '更早的事件' })]);
+  const { model, entered, release } = gatedModel();
+  const running = harness.run({ session: 's', agent: { model }, input: '在吗', runId: 'r1' });
+  await entered;
+  await meddle(store, await store.list('s'));
+  release();
+  return { result: await running, log: await store.list('s') };
+}
+
+describe('围栏：运行中途有条目被擦除', () => {
+  test('truncate 只删到这一轮之前：冲突一次，重读后照常完成', async () => {
+    const { result, log } = await runWhile((store, before) => store.truncate('s', before[1]!.seq));
+    assert.equal(result.stopReason, 'end_turn');
+    assert.deepEqual(roles(log), [CTX_EVENTS.runStarted, 'user', CTX_EVENTS.erased, 'assistant', CTX_EVENTS.runEnded]);
+  });
+
+  test('remove、redact 更早的条目：同样照常完成', async () => {
+    const removed = await runWhile((store, before) => store.remove('s', [before[0]!.id]));
+    assert.equal(removed.result.stopReason, 'end_turn');
+    const redacted = await runWhile((store, before) => store.redact('s', [before[1]!.id]));
+    assert.equal(redacted.result.stopReason, 'end_turn');
+    assert.deepEqual(roles(redacted.log), [
+      'user',
+      CTX_EVENTS.redacted,
+      CTX_EVENTS.runStarted,
+      'user',
+      CTX_EVENTS.erased,
+      'assistant',
+      CTX_EVENTS.runEnded,
+    ]);
+  });
+
+  test('truncate 删到了这一轮的 started：以 aborted 停下，不写回复和 ended', async () => {
+    const { result, log } = await runWhile((store, before) => store.truncate('s', before[2]!.seq));
+    assert.equal(result.stopReason, 'aborted');
+    assert.deepEqual(roles(log), ['user', CTX_EVENTS.erased], '这一轮的输入还在，但针对它的回答不会写回来');
+  });
+
+  test('remove 掉这一轮的输入：以 aborted 停下，针对已删内容的回答不写回来', async () => {
+    const { result, log } = await runWhile((store, before) => store.remove('s', [before[3]!.id]));
+    assert.equal(result.stopReason, 'aborted');
+    assert.equal(result.error, undefined);
+    assert.deepEqual(roles(log), ['user', 'app.note', CTX_EVENTS.runStarted, CTX_EVENTS.erased]);
+  });
+
+  test('redact 这一轮的输入：同样停下', async () => {
+    const { result, log } = await runWhile((store, before) => store.redact('s', [before[3]!.id]));
+    assert.equal(result.stopReason, 'aborted');
+    assert.deepEqual(roles(log), ['user', 'app.note', CTX_EVENTS.runStarted, CTX_EVENTS.redacted, CTX_EVENTS.erased]);
+  });
+
+  test('remove 掉别人在这一轮期间写的应用事件：不是这一轮自己的条目，照常完成', async () => {
+    const { result, log } = await runWhile(async (store) => {
+      const [note] = await store.append('s', [eventEntry('app.typing')]);
+      await store.remove('s', [note!.id]);
+    });
+    assert.equal(result.stopReason, 'end_turn');
+    assert.equal(roles(log).at(-1), CTX_EVENTS.runEnded);
+  });
+
+  test('stream 一样：自己的条目被删就停下', async () => {
+    const { store, harness } = setup();
+    const { model, entered, release } = gatedModel();
+    let stopReason: string | undefined;
+    const reading = (async () => {
+      for await (const event of harness.stream({ session: 's', agent: { model }, input: '在吗', runId: 'r1' })) {
+        if (event.type === 'run.ended') stopReason = event.result.stopReason;
+      }
+    })();
+    await entered;
+    const [, input] = await store.list('s');
+    await store.remove('s', [input!.id]);
+    release();
+    await reading;
+    assert.equal(stopReason, 'aborted');
+    assert.deepEqual(roles(await store.list('s')), [CTX_EVENTS.runStarted, CTX_EVENTS.erased]);
+  });
+});
+
 describe('owner', () => {
   test('写进 ctx.run.started；请求自己带的 owner 优先', async () => {
     const { store, harness } = setup();

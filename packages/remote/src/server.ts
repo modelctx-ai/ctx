@@ -701,6 +701,25 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
       await watchEntries(sessionStore, session, afterParam(url.searchParams), res);
       return;
     }
+    if (tail === 'truncate' || tail === 'remove' || tail === 'redact') {
+      if (method !== 'POST') fail(405, `use POST /sessions/:session/entries/${tail}`);
+      const body = await readBody(req, limit);
+      if (tail === 'truncate') {
+        const upTo = isObject(body) ? body['upTo'] : undefined;
+        if (typeof upTo !== 'number' || !Number.isFinite(upTo)) {
+          fail(400, 'request body must be { "upTo": number } (a seq)');
+        }
+        sendJson(res, 200, { deleted: await sessionStore.truncate(session, upTo) });
+        return;
+      }
+      const ids = isObject(body) ? body['ids'] : undefined;
+      if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string')) {
+        fail(400, 'request body must be { "ids": string[] }');
+      }
+      if (tail === 'remove') sendJson(res, 200, { removed: await sessionStore.remove(session, ids) });
+      else sendJson(res, 200, { redacted: await sessionStore.redact(session, ids) });
+      return;
+    }
     if (tail !== undefined) fail(404, `not found: ${url.pathname}`);
     if (method === 'GET') {
       // 一次最多回 `maxListEntries` 条：多读一条看后面还有没有，有就带 `more: true`，客户端接着用 `after` 读。

@@ -13,21 +13,27 @@ import assert from 'node:assert/strict';
 import type { AgentSpec, Harness, RunEvent, RunRequest } from './harness.ts';
 import type { Message } from './message.ts';
 import type { Orchestrator, OrchestratorEvent } from './orchestrator.ts';
+import { eraseEntries, isErased, type Erasure } from './erase.ts';
 import {
   CTX_EVENTS,
   assistantEntry,
+  erasedEntry,
   eventEntry,
   filterEntries,
   filterSessions,
   headSeq,
   isConflict,
   messageEntry,
+  summaryEntry,
   userEntry,
   type Entry,
+  type ErasedData,
   type NewEntry,
   type SessionStore,
 } from './session.ts';
 import { ENTRY_VERSION } from './version.ts';
+import { copySession, exportSession, importSession } from './transfer.ts';
+import { project } from './context.ts';
 import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type ToolRegistry } from './tools.ts';
 import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 import {
@@ -77,6 +83,22 @@ function batch(tag: string): NewEntry[] {
   return [1, 2, 3, 4].map((n) => userEntry(`${tag}${n}`));
 }
 
+/** 会话里的擦除记录（`ctx.erased`）的 `data`，按写入顺序。 */
+async function erasures(store: SessionStore, session: string): Promise<ErasedData[]> {
+  const records = await store.list(session, { kinds: [CTX_EVENTS.erased] });
+  return records.flatMap((entry) => (entry.type === 'event' ? [entry.data as unknown as ErasedData] : []));
+}
+
+/** 去掉擦除记录之后的条目：只看应用自己写的。 */
+function withoutErased(entries: readonly Entry[]): Entry[] {
+  return entries.filter((entry) => entry.type !== 'event' || entry.kind !== CTX_EVENTS.erased);
+}
+
+/** 占位置用的条目，自己带 `id`：不和别的存储生成的 `id` 撞。 */
+function padding(count: number): NewEntry[] {
+  return Array.from({ length: count }, (_, n) => userEntry(`pad${n}`, { id: `pad-${n}` }));
+}
+
 const WATCH_TIMEOUT_MS = 2_000;
 
 /** 取迭代器的下一项，超时就失败，免得一个不出数据的 `watch` 把测试挂住。 */
@@ -98,6 +120,152 @@ export function describeSessionStoreContract(
   { describe, test }: ContractTestApi,
 ): void {
   describe(`SessionStore contract: ${name}`, () => {
+    test('导出再导入到另一个存储：seq 重新分配，摘要盖住的还是那几条', async () => {
+      let clock = 1_000;
+      const source = await factory({ now: () => clock++ });
+      const target = await factory({ now: () => clock++ });
+      // 两边的 seq 对不上：源存储先被别的会话占掉一段，目标存储占掉更长的一段。
+      await source.append('pad', batch('p'));
+      await target.append('pad', padding(12));
+      const written = await source.append('s', [...batch('旧'), userEntry('问'), assistantEntry('答')]);
+      const covers = written[3]!.seq;
+      const [summary] = await source.append('s', [summaryEntry('前四句的摘要', covers, { source: 'compactor' })]);
+      await source.append('s', [
+        eventEntry('ctx.compacted', { data: { covers, summaryId: summary!.id } }),
+        userEntry('再问', { key: 'k1', meta: { lang: 'zh' } }),
+      ]);
+
+      const chunks: string[] = [];
+      for await (const chunk of exportSession(source, 's', { pageSize: 3 })) chunks.push(chunk);
+      const result = await importSession(target, chunks, { batchSize: 2 });
+      assert.equal(result.session, 's');
+      assert.equal(result.read, 9);
+      assert.equal(result.written, 9);
+      assert.equal(result.skipped, 0);
+
+      const before = await source.list('s');
+      const after = await target.list('s');
+      assert.deepEqual(texts(after), texts(before));
+      assert.deepEqual(
+        after.map((entry) => [entry.id, entry.at, entry.key, entry.source, entry.meta]),
+        before.map((entry) => [entry.id, entry.at, entry.key, entry.source, entry.meta]),
+        'id、at、key、source、meta 原样带过去',
+      );
+      const moved = after.find((entry) => entry.type === 'summary');
+      assert.ok(moved?.type === 'summary');
+      assert.equal(moved.covers, after[3]!.seq, 'covers 换成目标存储里同一条的 seq');
+      assert.equal(result.remap(covers), after[3]!.seq);
+      assert.equal(result.remap(before[0]!.seq - 1), 0, '第一条之前是会话开头');
+      const compacted = after.find((entry) => entry.type === 'event' && entry.kind === 'ctx.compacted');
+      assert.deepEqual(compacted?.type === 'event' && compacted.data, {
+        covers: after[3]!.seq,
+        summaryId: summary!.id,
+      });
+      assert.deepEqual(project(after).messages, project(before).messages, '投影出来的消息一样');
+      assert.equal(project(after).messages.length, 4, '摘要、问、答、再问');
+    });
+
+    test('导入可以重来：同一份文件导两次只有一份，截断的文件报错之后拿完整的接上', async () => {
+      let clock = 1_000;
+      const source = await factory({ now: () => clock++ });
+      const target = await factory({ now: () => clock++ });
+      const written = await source.append('s', batch('m'));
+      await source.append('s', [summaryEntry('摘要', written[1]!.seq), userEntry('后来')]);
+      let file = '';
+      for await (const chunk of exportSession(source, 's')) file += chunk;
+
+      const lines = file.trimEnd().split('\n');
+      const cut = `${lines.slice(0, 4).join('\n')}\n`;
+      const error = await importSession(target, cut).then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      );
+      assert.equal((error as { type?: string } | undefined)?.type, 'invalid_request', '没有结束行的文件是截断的');
+      assert.deepEqual(texts(await target.list('s')), ['m1', 'm2', 'm3'], '读到的部分已经写进去');
+
+      const resumed = await importSession(target, file);
+      assert.equal(resumed.written, 3);
+      assert.equal(resumed.skipped, 3);
+      const again = await importSession(target, file);
+      assert.equal(again.written, 0);
+      assert.equal(again.skipped, 6);
+      const after = await target.list('s');
+      assert.deepEqual(texts(after), ['m1', 'm2', 'm3', 'm4', '摘要', '后来']);
+      const summary = after[4]!;
+      assert.equal(summary.type === 'summary' && summary.covers, after[1]!.seq, '接上之后 covers 仍然指对');
+      assert.equal(again.remap(written[1]!.seq), after[1]!.seq, '跳过的条目也找得回位置');
+    });
+
+    test('copySession：同一个存储里复制成另一个会话，id 重新生成，引用跟着换', async () => {
+      let clock = 1_000;
+      const store = await factory({ now: () => clock++ });
+      const written = await store.append('a', batch('m'));
+      const [summary] = await store.append('a', [summaryEntry('摘要', written[2]!.seq)]);
+      await store.append('a', [
+        eventEntry('ctx.compacted', { data: { covers: written[2]!.seq, summaryId: summary!.id } }),
+      ]);
+
+      const kept = await copySession(store, 'a', store, 'b', { ids: 'keep' }).then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      );
+      assert.equal((kept as { type?: string } | undefined)?.type, 'conflict', '保留 id 写不进同一个存储');
+      assert.deepEqual(await store.list('b'), []);
+
+      const result = await copySession(store, 'a', store, 'b');
+      assert.equal(result.written, 6);
+      const original = await store.list('a');
+      const copy = await store.list('b');
+      assert.deepEqual(texts(copy), texts(original));
+      const originalIds = new Set(original.map((entry) => entry.id));
+      assert.ok(
+        copy.every((entry) => !originalIds.has(entry.id)),
+        '每一条都是新的 id',
+      );
+      const copied = copy[4]!;
+      assert.equal(copied.type === 'summary' && copied.covers, copy[2]!.seq);
+      const compacted = copy[5]!;
+      assert.deepEqual(compacted.type === 'event' && compacted.data, { covers: copy[2]!.seq, summaryId: copied.id });
+      assert.deepEqual(texts(await store.list('a')), texts(original), '源会话不动');
+
+      const mapped = await copySession(store, 'a', store, 'c', { ids: (id) => `c:${id}` });
+      const again = await copySession(store, 'a', store, 'c', { ids: (id) => `c:${id}` });
+      assert.equal(mapped.written, 6);
+      assert.equal(again.written, 0, 'id 有固定的映射时重复复制不写第二份');
+      const third = await store.list('c');
+      assert.deepEqual(third[5]!.type === 'event' && third[5]!.data, {
+        covers: third[2]!.seq,
+        summaryId: `c:${summary!.id}`,
+      });
+    });
+
+    test('导出和导入带上擦除：涂改的占位留在原位，擦除记录只留还指得到的位置', async () => {
+      let clock = 1_000;
+      const source = await factory({ now: () => clock++ });
+      const target = await factory({ now: () => clock++ });
+      await target.append('pad', padding(4));
+      const written = await source.append('s', batch('m'));
+      await source.redact('s', [written[1]!.id]);
+      await source.remove('s', [written[2]!.id]);
+      await source.append('s', [userEntry('后来')]);
+
+      const result = await copySession(source, 's', target, 's');
+      const after = await target.list('s');
+      assert.deepEqual(
+        after.map((entry) => (entry.type === 'event' ? entry.kind : entry.type)),
+        ['message', 'ctx.redacted', 'message', 'ctx.erased', 'ctx.erased', 'message'],
+      );
+      assert.equal(result.written, 6);
+      const records = after.filter((entry) => entry.type === 'event' && entry.kind === 'ctx.erased');
+      assert.deepEqual(
+        records.map((entry) => entry.type === 'event' && entry.data),
+        [
+          { op: 'redact', seqs: [after[1]!.seq], count: 1 },
+          { op: 'remove', seqs: [], count: 1 },
+        ],
+      );
+    });
+
     test('list 按 seq 返回：补写的旧记录排在写入的位置，不按 at 插回去', async () => {
       let clock = 1_000;
       const store = await factory({ now: () => clock++ });
@@ -559,6 +727,213 @@ export function describeSessionStoreContract(
       assert.equal(await store.clear('b'), 2);
       assert.deepEqual(await store.sessions(), ['a']);
       assert.equal(await store.clear('missing'), 0);
+    });
+
+    test('truncate：删掉 seq ≤ upTo 的，返回条数，之后的条目原样；追加一条 ctx.erased，末尾往前走', async () => {
+      let clock = 100;
+      const store = await factory({ now: () => (clock += 1) });
+      const written = await store.append('s', batch('a'));
+      await store.append('other', [userEntry('别的会话')]);
+      const head = await headSeq(store, 's');
+      assert.equal(await store.truncate('s', written[1]!.seq), 2);
+      const left = await store.list('s');
+      assert.deepEqual(withoutErased(left), written.slice(2), '剩下的条目 id、seq、at 都不变');
+      assert.deepEqual(await erasures(store, 's'), [{ op: 'truncate', upTo: written[1]!.seq, count: 2 }]);
+      const record = left.at(-1)!;
+      assert.equal(record.type === 'event' && record.kind, CTX_EVENTS.erased, '擦除记录在末尾');
+      assert.equal(record.source, 'store');
+      assert.ok(record.seq > head, `末尾 ${record.seq} 应大于删之前的 ${head}`);
+      assert.deepEqual(JSON.parse(JSON.stringify(record)), record, '擦除记录是纯 JSON');
+      assert.deepEqual(texts(await store.list('other')), ['别的会话'], '只动这个会话');
+      assert.deepEqual(await store.list('s', { types: ['message'] }), written.slice(2));
+    });
+
+    test('truncate：什么都没删时返回 0，不追加记录，末尾不变；upTo 向下取整，不是有限数时不删', async () => {
+      const store = await factory({ now: Date.now });
+      const written = await store.append('s', batch('a'));
+      const head = await headSeq(store, 's');
+      assert.equal(await store.truncate('s', 0), 0);
+      assert.equal(await store.truncate('s', written[0]!.seq - 0.5), 0);
+      assert.equal(await store.truncate('s', Number.NaN), 0);
+      assert.equal(await store.truncate('s', Number.POSITIVE_INFINITY), 0);
+      assert.equal(await store.truncate('missing', 100), 0);
+      assert.equal(await headSeq(store, 's'), head);
+      assert.deepEqual(await store.list('s'), written);
+      assert.deepEqual(await store.sessions(), ['s'], '不存在的会话不会因此出现');
+      assert.equal(await store.truncate('s', written[0]!.seq + 0.5), 1, '小数向下取整');
+      assert.deepEqual(texts(withoutErased(await store.list('s'))), ['a2', 'a3', 'a4']);
+    });
+
+    test('truncate 删到末尾之后：只剩擦除记录，seq 不回退、不复用，upTo 记的是真删掉的最大 seq', async () => {
+      const store = await factory({ now: Date.now });
+      const written = await store.append('s', batch('a'));
+      const head = written.at(-1)!.seq;
+      assert.equal(await store.truncate('s', head + 1_000), 4);
+      const [record, ...rest] = await store.list('s');
+      assert.deepEqual(rest, []);
+      assert.ok(record!.seq > head);
+      assert.deepEqual(await erasures(store, 's'), [{ op: 'truncate', upTo: head, count: 4 }]);
+      assert.deepEqual(await store.sessions(), ['s'], '留着擦除记录，会话还在');
+      const [next] = await store.append('s', [userEntry('b')]);
+      assert.ok(next!.seq > record!.seq);
+      assert.equal(await store.truncate('s', record!.seq), 1, '旧的擦除记录也是条目，删得掉');
+      assert.deepEqual(await erasures(store, 's'), [{ op: 'truncate', upTo: record!.seq, count: 1 }]);
+    });
+
+    test('truncate 到摘要的 covers：被盖住的条目删掉，摘要和之后的条目留着', async () => {
+      const store = await factory({ now: Date.now });
+      const old = await store.append('s', batch('a'));
+      const [summary] = await store.append('s', [summaryEntry('摘要', old[3]!.seq)]);
+      const [later] = await store.append('s', [userEntry('之后')]);
+      assert.equal(await store.truncate('s', old[3]!.seq), 4);
+      assert.deepEqual(withoutErased(await store.list('s')), [summary, later]);
+    });
+
+    test('remove：按 id 真删，返回条数；认不得的、别的会话的 id 跳过，重复的只算一次；记录里的 seqs 升序', async () => {
+      const store = await factory({ now: Date.now });
+      const written = await store.append('s', batch('a'));
+      const [other] = await store.append('other', [userEntry('别的会话')]);
+      const head = await headSeq(store, 's');
+      const [a1, a2, a3, a4] = written;
+      assert.equal(await store.remove('s', [a3!.id, a1!.id, a3!.id, other!.id, 'missing']), 2);
+      const left = await store.list('s');
+      assert.deepEqual(withoutErased(left), [a2, a4]);
+      assert.deepEqual(await erasures(store, 's'), [{ op: 'remove', seqs: [a1!.seq, a3!.seq], count: 2 }]);
+      assert.ok(left.at(-1)!.seq > head, '末尾往前走');
+      assert.deepEqual(await store.list('other'), [other], '别的会话的条目删不到');
+      assert.equal(await store.remove('s', [a1!.id, 'missing']), 0, '已经删掉的不再算');
+      assert.equal(await store.remove('s', []), 0);
+      assert.equal((await erasures(store, 's')).length, 1, '什么都没删不追加记录');
+    });
+
+    test('remove 之后 id 和 key 可以再用；删掉最后一条，末尾也不回退', async () => {
+      const store = await factory({ now: Date.now });
+      const [first, last] = await store.append('s', [userEntry('一', { id: 'x1', key: 'k1' }), userEntry('二')]);
+      assert.equal(await store.remove('s', [last!.id, first!.id]), 2);
+      assert.ok((await headSeq(store, 's')) > last!.seq);
+      const again = await store.append('s', [userEntry('重写', { id: 'x1', key: 'k1' })]);
+      assert.equal(again.length, 1);
+      assert.ok(again[0]!.seq > last!.seq, 'seq 不复用');
+    });
+
+    test('redact：id、seq、at、key、source 留着，内容换成 ctx.redacted；位置不变，再涂一遍是空操作', async () => {
+      const store = await factory({ now: Date.now });
+      const written = await store.append('s', [
+        userEntry('银行卡号 6222', { key: 'k1', source: 'user', at: 111, meta: { secret: '6222' } }),
+        assistantEntry('记下了 6222'),
+        eventEntry('pet.whisper', { text: '6222', data: { card: '6222' } }),
+        userEntry('别的'),
+      ]);
+      const [user, assistant, event, keep] = written;
+      const head = await headSeq(store, 's');
+      assert.equal(await store.redact('s', [event!.id, user!.id, assistant!.id, 'missing']), 3);
+      const left = await store.list('s');
+      assert.deepEqual(
+        withoutErased(left).map((entry) => entry.seq),
+        written.map((entry) => entry.seq),
+        '位置不变',
+      );
+      assert.ok(!JSON.stringify(left).includes('6222'), '内容、数据、meta 都不在了');
+      assert.deepEqual(left[0], {
+        type: 'event',
+        kind: CTX_EVENTS.redacted,
+        id: user!.id,
+        session: 's',
+        seq: user!.seq,
+        at: 111,
+        v: ENTRY_VERSION,
+        key: 'k1',
+        source: 'user',
+        data: { type: 'message', role: 'user' },
+      });
+      assert.deepEqual(
+        left.slice(1, 3).map((entry) => entry.type === 'event' && entry.data),
+        [{ type: 'message', role: 'assistant' }, { type: 'event' }],
+      );
+      assert.deepEqual(left[3], keep);
+      assert.deepEqual(await erasures(store, 's'), [
+        { op: 'redact', seqs: [user!.seq, assistant!.seq, event!.seq], count: 3 },
+      ]);
+      assert.ok(left.at(-1)!.seq > head, '末尾往前走');
+      assert.deepEqual(await store.list('s', { types: ['message'] }), [keep], '占位是事件，不是消息');
+      assert.equal((await store.list('s', { kinds: [CTX_EVENTS.redacted] })).length, 3, '占位按 kind 筛得出');
+      assert.equal(await store.redact('s', [user!.id, assistant!.id]), 0, '已经涂改过的跳过');
+      assert.equal((await erasures(store, 's')).length, 1);
+      assert.deepEqual(
+        await store.append('s', [userEntry('银行卡号 6222', { key: 'k1' })]),
+        [],
+        'key 还在，重试写不回来',
+      );
+    });
+
+    test('redact 一条摘要：它不再是摘要；别的会话的 id 涂不到', async () => {
+      const store = await factory({ now: Date.now });
+      const [first] = await store.append('s', [userEntry('一')]);
+      const [summary] = await store.append('s', [summaryEntry('摘要里有 6222', first!.seq)]);
+      assert.equal(await store.redact('other', [summary!.id]), 0);
+      assert.equal(await store.redact('s', [summary!.id]), 1);
+      assert.deepEqual(await store.list('s', { types: ['summary'] }), []);
+      const [placeholder] = await store.list('s', { kinds: [CTX_EVENTS.redacted] });
+      assert.equal(placeholder?.seq, summary!.seq);
+      assert.deepEqual(placeholder?.type === 'event' && placeholder.data, { type: 'summary' });
+    });
+
+    test('擦除之后拿着旧末尾的 expectSeq 冲突一次，重读看得到记录；什么都没动时不冲突；isErased 认得出动了哪些 seq', async () => {
+      const store = await factory({ now: Date.now });
+      const written = await store.append('s', batch('a'));
+      const [a1, a2, a3, a4] = written;
+      const steps: [() => Promise<number>, number[]][] = [
+        [() => store.truncate('s', a1!.seq), [a1!.seq]],
+        [() => store.remove('s', [a2!.id]), [a2!.seq]],
+        [() => store.redact('s', [a3!.id]), [a3!.seq]],
+      ];
+      for (const [erase, touched] of steps) {
+        const head = await headSeq(store, 's');
+        assert.equal(await erase(), 1);
+        await assert.rejects(store.append('s', [userEntry('旧前提')], { expectSeq: head }), isConflict);
+        const [record] = await store.list('s', { after: head, kinds: [CTX_EVENTS.erased] });
+        assert.ok(record?.type === 'event', '重读就看得到擦除记录');
+        const data = record.data as unknown as ErasedData;
+        assert.deepEqual(
+          written.map((entry) => entry.seq).filter((seq) => isErased(data, seq)),
+          touched,
+        );
+      }
+      const head = await headSeq(store, 's');
+      assert.equal(await store.remove('s', ['missing']), 0);
+      const [next] = await store.append('s', [userEntry('新前提')], { expectSeq: head });
+      assert.ok(next!.seq > a4!.seq);
+    });
+
+    test('擦除是原子的：和并发的 append 不交错，记录在那一批之前或之后', async () => {
+      const store = await factory({ now: Date.now });
+      const [first] = await store.append('s', [userEntry('起点')]);
+      const [removed, appended] = await Promise.all([store.remove('s', [first!.id]), store.append('s', batch('b'))]);
+      assert.equal(removed, 1);
+      assert.equal(appended.length, 4);
+      const left = await store.list('s');
+      assert.deepEqual(texts(withoutErased(left)), ['b1', 'b2', 'b3', 'b4']);
+      const at = left.findIndex((entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.erased);
+      assert.ok(at === 0 || at === 4, `擦除记录不在这一批中间（在 ${at}）`);
+    });
+
+    test('watch（有时）：擦除记录也到达已经在看的 watch', async () => {
+      const store = await factory({ now: Date.now });
+      if (!store.watch) return;
+      const [first, second] = await store.append('s', [userEntry('一'), userEntry('二')]);
+      const controller = new AbortController();
+      const iterator = store.watch('s', { after: second!.seq, signal: controller.signal })[Symbol.asyncIterator]();
+      try {
+        const pending = nextWithin(iterator, '擦除记录');
+        await store.redact('s', [first!.id]);
+        const result = await pending;
+        assert.ok(!result.done && result.value.type === 'event');
+        assert.equal(result.value.kind, CTX_EVENTS.erased);
+        assert.deepEqual(result.value.data, { op: 'redact', seqs: [first!.seq], count: 1 });
+      } finally {
+        controller.abort();
+        await iterator.return?.();
+      }
     });
 
     test('watch（有时）：先给出 after 之后已有的，再给出新写入的，只看这个会话', async () => {
@@ -2159,6 +2534,20 @@ function contractSessionStore(now: () => number): SessionStore {
   const logs = new Map<string, Entry[]>();
   let seq = 0;
   let id = 0;
+  const erase = (session: string, erasure: Erasure): number => {
+    const { entries, erased } = eraseEntries(logs.get(session) ?? [], erasure);
+    if (!erased) return 0;
+    const record = {
+      ...erasedEntry(erased),
+      id: `e${(id += 1)}`,
+      session,
+      seq: (seq += 1),
+      at: now(),
+      v: ENTRY_VERSION,
+    };
+    logs.set(session, [...entries, record]);
+    return erased.count;
+  };
   return {
     async append(session, drafts) {
       const written = drafts.map((draft) => ({
@@ -2180,6 +2569,9 @@ function contractSessionStore(now: () => number): SessionStore {
       logs.delete(session);
       return count;
     },
+    truncate: async (session, upTo) => erase(session, { op: 'truncate', upTo }),
+    remove: async (session, entryIds) => erase(session, { op: 'remove', ids: entryIds }),
+    redact: async (session, entryIds) => erase(session, { op: 'redact', ids: entryIds }),
     async sessions(options) {
       return filterSessions([...logs.keys()], options);
     },

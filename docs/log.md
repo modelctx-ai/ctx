@@ -4,6 +4,14 @@
 
 ## 2026-11-15
 
+- **更新** [协议层](protocol.md)：会话一节加「导出、导入、复制」小节——JSON Lines 的格式（头、条目、结束行）、`exportSession`、`importSession`、`copySession` 的签名，导入时哪些 `seq` 引用跟着换、`id` 的三种处理、不是原子的、哪些情况抛什么；契约测试表跟上。以前没有写会话怎么搬到别的存储，「`list` 再 `append`」会让 `covers` 指错位置。[概念](concepts.md)术语表加「导出、导入」。[协议包](../packages/protocol/README.md)导出表加这三个函数和格式的常量、类型。
+- **新增** 例子 [`move-session.ts`](../examples/move-session.ts)：一个压缩过的会话从内存存储导成文件、导进 SQLite、再复制到远端存储，三边的上下文一样；[例子说明](../examples/README.md)的表加一行。
+- **新增** [ADR 0007](adr/0007-deletion-and-retention.md)（已采纳，会话这一半已实现）：只追加的例外。`truncate`、`remove`、`redact` 三个方法和擦除记录 `ctx.erased`（为什么要留记录：末尾一定前进、`expectSeq` 一定冲突、`watch` 收得到），运行中的 harness 在自己写的条目被擦除时停下，摘要不跟着改，SQLite 用连接级的 `secure_delete` 加 `vacuum()`（附实测：只在删除时打开擦不干净），保留期是应用调的函数；破坏面、代价、没有采用的方案。[ADR 索引](adr/index.md)加一行；[ADR 0003](adr/0003-context-model.md) 头部加修订行指过来，正文不动。
+- **更新** [协议层](protocol.md)：`SessionStore` 的签名加三个方法；新的「擦除」小节写每个方法做什么，和 `seq`、`expectSeq`、`watch`、摘要的 `covers`、投影、生命周期事件的关系，以及 `clear` 为什么不在其中；框架事件表加 `ctx.erased`、`ctx.redacted`；harness 的写入规则加第三种围栏（自己写的条目被擦除）；契约测试表和线上形态（三条 `POST` 路径、重试的说法）跟上。
+- **更新** [概念](concepts.md)：术语表加擦除和擦除记录、涂改、保留期，围栏一条和事件 `kind` 一条跟上；设计约束 1「只追加」写明例外只在应用明确删除时发生。
+- **更新** [架构](architecture.md)：存储表加三个方法；新的「删除和保留期」小节写内存存储、`ctx-sqlite`、`ctx-remote` 各怎么做，`pruneSession` 的选项和两条保守的规则，以及擦除和记忆的证据的关系；harness 的围栏、自定义存储的用例表、实现约束里「只追加」一行跟上。
+- **更新** [ctx-sqlite](../packages/sqlite/README.md)：选项 `secureDelete`；新的「删除和文件大小」一节回答四个问题（删掉的内容还在不在、`-wal` 呢、文件什么时候变小、什么时候要 `vacuum()`）和 `secure_delete` 的三个注意（连接级、写入时也要开着、只管库文件里的字节）；导出表加 `vacuum()`。
+- **更新** [协议包](../packages/protocol/README.md)、[核心包](../packages/core/README.md)、[ctx-remote](../packages/remote/README.md)：协议表和导出表加擦除的方法、纯函数和事件，核心包加 `pruneSession`，远端的线上形态加三条路径、写明不自动重试。[实践：yoyo](repos.md) 的 `yoyo.db` 契约加一句：yoyo 传进来的连接上会打开 `secure_delete`。
 - **新增** [`examples/`](../examples/README.md)：四个能直接跑的最小例子（单进程、拆开部署、两个进程共用一个库、记忆接进上下文），缺省用剧本模型，CI 里跑。[README](../README.md) 的「安装」后面指过去；[AGENTS.md](../AGENTS.md) 的命令表加 `pnpm examples`，「改代码时」写明例子要跟着公开 API 改。
 - **更新** [AGENTS.md](../AGENTS.md)：改公开 API 的约定里写上 CI 的 `Downstream (yoyo)` 作业（用 PR 的构建产物跑 yoyo 的检查和测试，不拦合并）和它红了该怎么办。
 - **更新** [ctx-gateway](../packages/gateway/README.md) 和[架构](architecture.md)的网关一节：`replaceHistory` 怎么判断「同一句话」、没配对的工具调用怎么处理、没有用户话时的预填；请求处理表里 400、500、502 的条件和正文。[ADR 0004](adr/0004-protocol-and-implementation.md) 加「决定记录」：协议的数目几处说法对上（七个组件、协议包里六个加记忆的三个共九个）。

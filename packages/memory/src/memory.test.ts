@@ -80,6 +80,16 @@ function sessionLog(clock: () => number = () => NOW): SessionStore & { appends: 
       logs.delete(session);
       return count;
     },
+    // 这些用例不删条目：三个擦除方法只为满足 `SessionStore`，什么都不动。
+    async truncate() {
+      return 0;
+    },
+    async remove() {
+      return 0;
+    },
+    async redact() {
+      return 0;
+    },
     async sessions() {
       return [...logs.keys()].toSorted();
     },
