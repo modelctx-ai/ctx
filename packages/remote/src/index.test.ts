@@ -652,6 +652,38 @@ describe('远程记忆存储', () => {
 
 // ---- 端到端：三个服务，各管一样 ----
 
+/** 装成更新的服务端：第二条的格式版本比客户端认识的高。 */
+function newer(entries: Entry[]): Entry[] {
+  return entries.map((entry) => (entry.seq === 2 ? { ...entry, v: 99 } : entry));
+}
+
+describe('比客户端新的条目', () => {
+  test('缺省抛 unsupported_version；unreadable: placeholder 时换成 ctx.unreadable', async () => {
+    const memory = createMemoryStore();
+    await memory.append('s', [userEntry('一'), userEntry('二')]);
+    const store: SessionStore = {
+      append: (session, entries, options) => memory.append(session, entries, options),
+      list: async (session, options) => newer(await memory.list(session, options)),
+      clear: (session) => memory.clear(session),
+      sessions: (options) => memory.sessions(options),
+    };
+    const server = await serve({ store, pollIntervalMs: 10 });
+    const strict = createRemoteSessionStore(client(server));
+    await expect(strict.list('s')).rejects.toMatchObject({ type: 'unsupported_version' });
+    expect(await strict.list('s', { limit: 1 })).toHaveLength(1);
+
+    const lenient = createRemoteSessionStore({ ...client(server), unreadable: 'placeholder' });
+    expect(eventKinds(await lenient.list('s'))).toEqual(['user', CTX_EVENTS.unreadable]);
+    const controller = new AbortController();
+    const seen: string[] = [];
+    for await (const entry of lenient.watch('s', { signal: controller.signal })) {
+      seen.push(...eventKinds([entry]));
+      if (seen.length === 2) controller.abort();
+    }
+    expect(seen).toEqual(['user', CTX_EVENTS.unreadable]);
+  });
+});
+
 describe('长请求、断线和上限', () => {
   const auth = { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json' };
   const quick = { retry: { minDelayMs: 20, maxDelayMs: 100 } };

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 
 import { describe, test } from 'vite-plus/test';
 
-import { ENTRY_VERSION, upgradeEntry } from './version.ts';
+import { CTX_EVENTS, type UnreadableData } from './session.ts';
+import { ENTRY_VERSION, readEntry, upgradeEntry } from './version.ts';
 
 /**
  * v0 的黄金样例：0.2 及以前存进 `body` 的样子（AI SDK 的 `ModelMessage` 原样，二进制和 URL 用 `\u0000ctx` 标记，
@@ -238,5 +239,45 @@ describe('upgradeEntry 其他版本', () => {
         (error: Error) => error.name === 'unsupported_version',
       );
     }
+  });
+});
+
+function broken(): unknown {
+  return JSON.parse('{oops');
+}
+
+describe('readEntry', () => {
+  const bad = { id: 'e2', session: 's', seq: 2, at: 20, v: ENTRY_VERSION + 1, type: 'message', message: {} };
+
+  test('缺省和 upgradeEntry 一样抛', () => {
+    assert.throws(
+      () => readEntry(bad),
+      (error: Error) => error.name === 'unsupported_version',
+    );
+    assert.deepEqual(readEntry({ ...bad, v: ENTRY_VERSION, type: 'event', kind: 'app.x' }).seq, 2);
+  });
+
+  test('placeholder：解不了的行读成 ctx.unreadable 事件，位置不变', () => {
+    const entry = readEntry(bad, 'placeholder');
+    assert.equal(entry.type === 'event' && entry.kind, CTX_EVENTS.unreadable);
+    assert.deepEqual(
+      { id: entry.id, session: entry.session, seq: entry.seq, at: entry.at, v: entry.v },
+      { id: 'e2', session: 's', seq: 2, at: 20, v: ENTRY_VERSION },
+    );
+    const data = (entry.type === 'event' ? entry.data : undefined) as unknown as UnreadableData;
+    assert.equal(data.v, ENTRY_VERSION + 1);
+    assert.equal(data.type, 'message');
+    assert.equal(data.error.type, 'unsupported_version');
+    // 读得了的行不受影响。
+    assert.equal(readEntry({ ...bad, v: ENTRY_VERSION, type: 'event', kind: 'app.x' }, 'placeholder').type, 'event');
+  });
+
+  test('现做的行：函数里抛的错（例如正文不是 JSON）用 fallback 的字段占位', () => {
+    const head = { id: 'e3', session: 's', seq: 3, at: 30, v: 1, type: 'event' };
+    assert.throws(() => readEntry(broken, 'throw', head), SyntaxError);
+    const entry = readEntry(broken, 'placeholder', head);
+    assert.equal(entry.seq, 3);
+    const data = (entry.type === 'event' ? entry.data : undefined) as unknown as UnreadableData;
+    assert.equal(data.error.type, 'unreadable');
   });
 });

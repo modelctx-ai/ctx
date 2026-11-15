@@ -4,7 +4,9 @@
  */
 import {
   CtxError,
+  ENTRY_VERSION,
   errorOutput,
+  unreadableEntry,
   type AppendOptions,
   type CoreVersion,
   type Entry,
@@ -32,6 +34,7 @@ import {
   type ToolCall,
   type ToolDefinition,
   type ToolOutput,
+  type UnreadableMode,
   type WatchOptions,
 } from '@modelctx-ai/ctx-protocol';
 
@@ -240,6 +243,14 @@ function entriesPath(session: string): string {
   return `/sessions/${segment(session)}/entries`;
 }
 
+export interface RemoteSessionStoreOptions extends RemoteClientOptions {
+  /**
+   * 读到格式版本比这个客户端认识的高的条目（服务端先升级了）时怎么办。缺省 `throw`：抛 `unsupported_version`；
+   * `placeholder`：那一条换成 `ctx.unreadable` 事件，其余照常。
+   */
+  readonly unreadable?: UnreadableMode;
+}
+
 /** `append` 重试后回头找自己写的条目时，至少看会话末尾这么多条。 */
 const APPEND_LOOKBACK = 200;
 
@@ -247,10 +258,23 @@ const APPEND_LOOKBACK = 200;
  * 远端的会话存储。`watch` 读 `GET …/entries/stream` 的 NDJSON，连接断了按最后读到的 `seq` 重连；
  * `signal` 中止后迭代正常结束。`append` 发出前给没有 `id` 的条目补上，连不上时重试不会记两遍。
  */
-export function createRemoteSessionStore(options: RemoteClientOptions): SessionStore & {
+export function createRemoteSessionStore(options: RemoteSessionStoreOptions): SessionStore & {
   watch(session: string, options?: WatchOptions): AsyncIterable<Entry>;
 } {
   const connection = connect(options);
+  const mode = options.unreadable ?? 'throw';
+  /** 服务端比这个客户端新时，条目的 `v` 会比这里认识的高：形状可能已经变了，不能当成当前版本用。 */
+  const checked = (entry: Entry): Entry => {
+    const v: unknown = entry.v;
+    if (typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= ENTRY_VERSION) return entry;
+    const error = new CtxError(
+      'unsupported_version',
+      `Entry format version ${JSON.stringify(v)} is newer than the version ${ENTRY_VERSION} this client supports. ` +
+        'Upgrade @modelctx-ai/ctx-remote.',
+    );
+    if (mode === 'throw') throw error;
+    return unreadableEntry(entry, error);
+  };
 
   async function list(session: string, listOptions: ListOptions = {}): Promise<Entry[]> {
     const { last, limit, types, kinds } = listOptions;
@@ -270,7 +294,7 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
           kinds: kinds ? kinds.join(',') : undefined,
         },
       });
-      out.push(...body.entries);
+      out.push(...body.entries.map(checked));
       const tail = body.entries.at(-1);
       // `last` 是从末尾数的，翻页会改变它的意思：只读服务端给的这一页。
       if (!body.more || tail === undefined || last !== undefined) return out;
@@ -298,11 +322,11 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
             body,
             retry: false,
           });
-          if (failures === 0 || response.entries.length === batch.length) return response.entries;
+          if (failures === 0 || response.entries.length === batch.length) return response.entries.map(checked);
           // 重试的这一次里被去重跳过的，可能是上一次写进去的：把它们也算进返回值。
           const got = new Set(response.entries.map((entry) => entry.id));
           const earlier = (await written()).filter((entry) => !got.has(entry.id));
-          return [...earlier, ...response.entries].toSorted((a, b) => a.seq - b.seq);
+          return [...earlier, ...response.entries.map(checked)].toSorted((a, b) => a.seq - b.seq);
         } catch (error) {
           // 409 + conflict：前提不满足，转成协议的 `conflict`，调用方不必认识 HTTP。
           if (isRemoteError(error) && error.status === 409 && error.type === 'conflict') {
@@ -347,8 +371,9 @@ export function createRemoteSessionStore(options: RemoteClientOptions): SessionS
           connectedAt = Date.now();
           for await (const entry of lines<Entry>(response)) {
             failures = 0;
+            const read = checked(entry);
             after = entry.seq;
-            yield entry;
+            yield read;
           }
           // 服务端自己结束了这条流。
           return;

@@ -266,6 +266,7 @@ export const CTX_EVENTS = {
   runEnded: 'ctx.run.ended',
   compacted: 'ctx.compacted',
   error: 'ctx.error',
+  unreadable: 'ctx.unreadable',
 } as const;
 
 export type CtxEventKind = (typeof CTX_EVENTS)[keyof typeof CTX_EVENTS];
@@ -296,6 +297,18 @@ export interface CtxErrorData {
   readonly runId?: string;
   readonly message: string;
   readonly type?: string;
+}
+
+/**
+ * `ctx.unreadable` 的 `data`。这种事件不是写进去的：存储在宽松模式下读到解不了的一行（格式版本比自己认识的高、
+ * 带不认识的部件、正文不是 JSON）时，用它占住那一行的位置（见 `readEntry`）。
+ */
+export interface UnreadableData {
+  /** 那一行存着的格式版本；读不出来时没有。 */
+  readonly v?: number;
+  /** 那一行本来的类型（`message`、`event`、`summary`）；读不出来时没有。 */
+  readonly type?: string;
+  readonly error: { readonly type: string; readonly message: string };
 }
 
 export function isFrameworkKind(kind: string): boolean {

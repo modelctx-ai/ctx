@@ -3,7 +3,7 @@ import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import {
   checkExpectSeq,
   ENTRY_VERSION,
-  upgradeEntry,
+  readEntry,
   type Entry,
   type JsonObject,
   type JsonValue,
@@ -12,6 +12,7 @@ import {
   type NewEntry,
   type SessionStore,
   type SessionsOptions,
+  type UnreadableMode,
   type WatchOptions,
 } from '@modelctx-ai/ctx-protocol';
 
@@ -34,6 +35,11 @@ export interface SqliteStoreOptions {
   readonly id?: () => string;
   /** `watch` 轮询新条目的间隔（毫秒），缺省 250。 */
   readonly pollIntervalMs?: number;
+  /**
+   * 读到解不了的一行（`v` 比这个版本认识的高、带不认识的部件、正文不是 JSON）时怎么办。缺省 `throw`；
+   * `placeholder` 把那一行读成 `ctx.unreadable` 事件，会话其余部分照常能读。
+   */
+  readonly unreadable?: UnreadableMode;
 }
 
 /** `watch` 一次读多少条。 */
@@ -97,23 +103,24 @@ function bodyOf(entry: NewEntry): Body {
 }
 
 /**
- * 一行转成条目：行里的字段和 `body` 平铺成一个对象交给 `upgradeEntry`，它按 `v` 升到当前格式
+ * 一行转成条目：行里的字段和 `body` 平铺成一个对象交给 `readEntry`（里面是 `upgradeEntry`），它按 `v` 升到当前格式
  * （0 版的消息是 AI SDK 的 `ModelMessage`，二进制和 URL 带 `\u0000ctx` 标记，摘要的 `covers` 是 `{ at, seq }`）。
  * 存量行不改写，每次读都现升。
  */
-function decode(row: Row): Entry {
-  return upgradeEntry({
-    id: row.id,
-    session: row.session,
-    seq: Number(row.seq),
-    at: Number(row.at),
-    v: Number(row.v),
-    ...(row.key !== null ? { key: row.key } : {}),
-    ...(row.source !== null ? { source: row.source } : {}),
-    ...(row.meta !== null ? { meta: JSON.parse(row.meta) as JsonObject } : {}),
-    type: row.type,
-    ...(JSON.parse(row.body) as Body),
-  });
+function decode(row: Row, mode: UnreadableMode): Entry {
+  const head = { id: row.id, session: row.session, seq: Number(row.seq), at: Number(row.at), v: Number(row.v) };
+  return readEntry(
+    () => ({
+      ...head,
+      ...(row.key !== null ? { key: row.key } : {}),
+      ...(row.source !== null ? { source: row.source } : {}),
+      ...(row.meta !== null ? { meta: JSON.parse(row.meta) as JsonObject } : {}),
+      type: row.type,
+      ...(JSON.parse(row.body) as Body),
+    }),
+    mode,
+    { ...head, type: row.type },
+  );
 }
 
 /**
@@ -233,6 +240,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
   );
   const removeSession = database.prepare(`DELETE FROM ${table} WHERE session = ?`);
   const pollInterval = options.pollIntervalMs ?? 250;
+  const unreadable = options.unreadable ?? 'throw';
 
   const store: SqliteSessionStore = {
     database,
@@ -308,7 +316,7 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
         params.push(limit);
       }
       const rows = database.prepare(sql).all(...params) as unknown as Row[];
-      return rows.map(decode);
+      return rows.map((row) => decode(row, unreadable));
     },
     async clear(session) {
       return Number(removeSession.run(session).changes);
