@@ -176,7 +176,7 @@ sequenceDiagram
 | `sessions({ prefix, after, limit })`                  | 有内容的会话，按名字升序（码点序）。`prefix` 按字面匹配，`after` 是上一页最后一个名字（不含），`limit` 限条数，小数向下取整，不是正数时返回空；都不给就是全部                                                                                                                                                             |
 | `watch(session, { after, signal })`                   | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                                                                                                                                                                                                     |
 
-实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，一次读一页，缺省每 250ms，别的进程写进同一个库的也能读到；`unreadable: 'placeholder'` 时解不了的行读成 `ctx.unreadable` 事件，见[协议层](protocol.md#会话-sessionstore)）。条目只追加；框架自己不删不改，删除和涂改只在应用调下面这几个方法时发生。
+实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒；写入和读出各拷一份，和落盘的存储一样不把存着的对象交出去）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，一次读一页，缺省每 250ms，别的进程写进同一个库的也能读到；`unreadable: 'placeholder'` 时解不了的行读成 `ctx.unreadable` 事件，见[协议层](protocol.md#会话-sessionstore)）。条目只追加；框架自己不删不改，删除和涂改只在应用调下面这几个方法时发生。
 
 ### 删除和保留期
 

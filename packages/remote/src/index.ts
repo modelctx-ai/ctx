@@ -4,6 +4,7 @@
  */
 import {
   checkMemoryScope,
+  checkSessionName,
   CtxError,
   DEFAULT_MEMORY_SCOPE,
   ENTRY_VERSION,
@@ -242,6 +243,8 @@ function messageOf(error: unknown): string {
 // ---- 会话 ----
 
 function entriesPath(session: string): string {
+  // `.`、`..`、空串放不进一段路径，发出去之前就拒绝。
+  checkSessionName(session);
   return `/sessions/${segment(session)}/entries`;
 }
 
@@ -312,6 +315,7 @@ export function createRemoteSessionStore(options: RemoteSessionStoreOptions): Se
 
   return {
     async append(session: string, entries: readonly NewEntry[], appendOptions?: AppendOptions): Promise<Entry[]> {
+      checkSessionName(session);
       // 发出前给每条补上 `id`：响应丢了再发一遍时，存储按 `id` 去重，不会记两遍。
       const batch = entries.map((entry) => (entry.id === undefined ? { ...entry, id: crypto.randomUUID() } : entry));
       const ids = new Set(batch.map((entry) => entry.id));
@@ -350,6 +354,7 @@ export function createRemoteSessionStore(options: RemoteSessionStoreOptions): Se
     },
     list,
     async clear(session: string): Promise<number> {
+      checkSessionName(session);
       return (await connection.json<{ deleted: number }>('DELETE', `/sessions/${segment(session)}`)).deleted;
     },
     async truncate(session: string, upTo: number): Promise<number> {
@@ -378,6 +383,7 @@ export function createRemoteSessionStore(options: RemoteSessionStoreOptions): Se
       return body.sessions;
     },
     async *watch(session: string, watchOptions: WatchOptions = {}): AsyncGenerator<Entry> {
+      checkSessionName(session);
       const { signal } = watchOptions;
       // 记住读到哪了：连接断了就带着最后的 `seq` 重连，不重不漏。
       let after = watchOptions.after;

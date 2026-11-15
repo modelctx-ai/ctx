@@ -7,6 +7,7 @@ import { describe, test } from 'vite-plus/test';
 import { eraseEntries, type Erasure } from './erase.ts';
 import {
   checkExpectSeq,
+  checkSessionName,
   erasedEntry,
   filterEntries,
   filterSessions,
@@ -32,6 +33,7 @@ function fakeStore(now: () => number): SessionStore {
   let nextId = 0;
 
   function erase(session: string, erasure: Erasure): number {
+    checkSessionName(session);
     const { entries, touched, erased } = eraseEntries(sessions.get(session) ?? [], erasure);
     if (!erased) return 0;
     if (erasure.op !== 'redact') for (const entry of touched) ids.delete(entry.id);
@@ -45,6 +47,7 @@ function fakeStore(now: () => number): SessionStore {
 
   const store: SessionStore = {
     async append(session, drafts, options) {
+      checkSessionName(session);
       const list = sessions.get(session) ?? [];
       checkExpectSeq(list.at(-1)?.seq ?? 0, options);
       const keys = new Set(list.flatMap((entry) => (entry.key === undefined ? [] : [entry.key])));
@@ -54,7 +57,7 @@ function fakeStore(now: () => number): SessionStore {
         const id = draft.id ?? `e${(nextId += 1)}`;
         if (ids.has(id)) continue;
         seq += 1;
-        const entry = { ...draft, id, session, seq, at: draft.at ?? now(), v: ENTRY_VERSION } as Entry;
+        const entry = { ...structuredClone(draft), id, session, seq, at: draft.at ?? now(), v: ENTRY_VERSION } as Entry;
         ids.add(id);
         if (entry.key !== undefined) keys.add(entry.key);
         written.push(entry);
@@ -63,12 +66,14 @@ function fakeStore(now: () => number): SessionStore {
         sessions.set(session, [...list, ...written]);
         for (const wake of waiters) wake();
       }
-      return written;
+      return structuredClone(written);
     },
     async list(session, options) {
-      return filterEntries(sessions.get(session) ?? [], options);
+      checkSessionName(session);
+      return structuredClone(filterEntries(sessions.get(session) ?? [], options));
     },
     async clear(session) {
+      checkSessionName(session);
       const list = sessions.get(session) ?? [];
       for (const entry of list) ids.delete(entry.id);
       sessions.delete(session);
@@ -81,13 +86,14 @@ function fakeStore(now: () => number): SessionStore {
       return filterSessions([...sessions.keys()], options);
     },
     async *watch(session, options = {}) {
+      checkSessionName(session);
       let after = options.after;
       const signal = options.signal;
       for (;;) {
         if (signal?.aborted) return;
         const fresh = filterEntries(sessions.get(session) ?? [], after ? { after } : {});
         for (const entry of fresh) {
-          yield entry;
+          yield structuredClone(entry);
           after = entry.seq;
         }
         if (fresh.length > 0) continue;
