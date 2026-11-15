@@ -15,6 +15,7 @@
 | `pnpm build`                        | 每个包 `vp pack`（tsdown）构建 `dist/`（ESM + `.d.ts`）                                                                   |
 | `pnpm format` / `pnpm format:check` | `vp fmt`：Oxfmt 改写 / 检查                                                                                               |
 | `pnpm check`                        | `vp check`（格式、lint、类型）、test、build；CI 在 Node 22 和 24 上跑同样几步                                             |
+| `pnpm examples`                     | `examples/` 里的例子用剧本模型各跑一遍（读 `dist/`，要先 `pnpm build`）；`pnpm test` 也跑它们的测试                       |
 | `pnpm smoke`                        | `scripts/pack-smoke.mjs`：`pnpm pack` 的产物在干净目录里装上、类型解析、每个入口 `import` 一遍；要先 `pnpm build`，要联网 |
 | `pnpm release:version <版本>`       | `scripts/release.mjs`：九个包改成同一个版本，正式版本把 CHANGELOG 的「未发布」落成这一版                                  |
 
@@ -49,6 +50,7 @@
 - 实现一个协议就跑它的 `describeXContract`，新加的协议要在 `packages/protocol/src/testing` 里给契约测试，内存实现和 sqlite、remote 都要过。
 - 依赖方向和放置规则（核心包只依赖 `ai`，实现包只依赖协议包，Node 专属模块只进适配包）见[架构](docs/architecture.md#实现约束)，新代码不打破。
 - yoyo 经 `link:../ctx/packages/*` 读这里的 `dist/`，它的 CI 检出 ctx `main` 的最新提交。改公开 API 之前先在 `../yoyo` 里 grep 用法：会让 yoyo 编不过的改动，合并前要有对应的 yoyo PR 在等。CI 的 `Downstream (yoyo)` 作业用 PR 的构建产物跑 yoyo 的检查和测试，不拦合并；它红了就是这种情况，在 PR 正文里链接那个 yoyo PR。
+- [`examples/`](examples/README.md) 里每种部署一个能直接跑的例子，类型检查和测试跟各包一起跑。改了公开 API 让例子编不过或测试红了，同一个 PR 里改例子；加了新的部署方式或值得示范的组件，加一个例子。
 - 对真实服务（模型提供商、MCP 服务器）的映射没有在线验证时，在文档里写明「没有对真实服务验证」，不要删掉这句。
 
 ## 格式和提交

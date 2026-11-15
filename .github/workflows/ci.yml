@@ -32,6 +32,8 @@ jobs:
       - run: pnpm exec vp check --deny-warnings
       - run: pnpm test
       - run: pnpm build
+      # 例子按使用方的方式（读 dist/）各跑一遍，模型是剧本的
+      - run: pnpm examples
 
   pack:
     # 发布出去的包在使用方那边能不能用：干净目录里装上 `pnpm pack` 的产物，类型解析一遍，

@@ -1,0 +1,40 @@
+# 例子
+
+每个例子对应一种部署，都是一个能直接跑的文件。不设环境变量时模型按剧本回答（协议包的剧本模型），不用联网、不用密钥；CI 里跑的就是这一种（`examples.test.ts`，以及构建之后的 `pnpm examples`）。
+
+| 文件                                     | 部署                                          | 看什么                                                                                        |
+| ---------------------------------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| [`single-process.ts`](single-process.ts) | 单进程：SQLite 加一个模型，带工具             | `createSqliteStore`、`createToolRegistry().addTool`、`createHarness`、`createOrchestrator`    |
+| [`remote-split.ts`](remote-split.ts)     | 拆开：存储一个进程，执行环境一个进程，经 HTTP | `startRemote`、`createRemoteSessionStore`、`createRemoteExecutor`；harness 一侧只认协议       |
+| [`two-processes.ts`](two-processes.ts)   | 记录开着，两个进程共用一个库                  | 一个会话最多一个未结束的运行（`session_busy`）、`owner`、`recover` 收走自己断掉的运行         |
+| [`memory.ts`](memory.ts)                 | 记忆接进上下文                                | `createMemory` 的 `gate`、`consolidate`、`source()`、`recall` 工具，按用户的作用域（`scope`） |
+
+## 怎么跑
+
+Node ≥22.18（直接运行 `.ts`）。在仓库根目录：
+
+```sh
+pnpm install
+pnpm build
+node examples/single-process.ts
+```
+
+用真的模型：任何 OpenAI 兼容的地址都行。
+
+```sh
+CTX_EXAMPLE_BASE_URL=https://api.deepseek.com/v1 CTX_EXAMPLE_API_KEY=… CTX_EXAMPLE_MODEL=deepseek-chat node examples/single-process.ts
+```
+
+真的模型怎么回答、调不调工具由它自己定，输出和剧本的不一样是正常的。没有对真实服务验证：CI 只跑剧本模型。
+
+`remote-split.ts` 可以真的拆成三个进程：
+
+```sh
+node examples/remote-split.ts store     # 打印地址和 CTX_TOKEN
+CTX_TOKEN=… node examples/remote-split.ts sandbox
+CTX_STORE_URL=… CTX_SANDBOX_URL=… CTX_TOKEN=… node examples/remote-split.ts agent
+```
+
+## 改例子
+
+例子是仓库的一个工作区包（`ctx-examples`，不发布），类型检查和测试跟各包一起跑（`pnpm check`）。改了公开 API，例子编不过或者测试红了，就在同一个 PR 里改例子。每个例子导出 `main(log?)`，返回值给测试断言用；文件末尾的 `if (isMain(import.meta.url))` 让它也能被 `node` 直接跑。

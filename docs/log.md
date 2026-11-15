@@ -4,6 +4,7 @@
 
 ## 2026-11-15
 
+- **新增** [`examples/`](../examples/README.md)：四个能直接跑的最小例子（单进程、拆开部署、两个进程共用一个库、记忆接进上下文），缺省用剧本模型，CI 里跑。[README](../README.md) 的「安装」后面指过去；[AGENTS.md](../AGENTS.md) 的命令表加 `pnpm examples`，「改代码时」写明例子要跟着公开 API 改。
 - **更新** [AGENTS.md](../AGENTS.md)：改公开 API 的约定里写上 CI 的 `Downstream (yoyo)` 作业（用 PR 的构建产物跑 yoyo 的检查和测试，不拦合并）和它红了该怎么办。
 - **更新** [ctx-gateway](../packages/gateway/README.md) 和[架构](architecture.md)的网关一节：`replaceHistory` 怎么判断「同一句话」、没配对的工具调用怎么处理、没有用户话时的预填；请求处理表里 400、500、502 的条件和正文。[ADR 0004](adr/0004-protocol-and-implementation.md) 加「决定记录」：协议的数目几处说法对上（七个组件、协议包里六个加记忆的三个共九个）。
 - **更新** [协议层](protocol.md)的记忆存储一节：作用域（`scope(name)`、隔离的范围、名字的规则、不是鉴权）；线上形态的 `?scope=`。[记忆](memory.md)的失败模式表加两行（多用户串、事件里的指令）。[ADR 0006](adr/0006-memory.md) 的「决定记录」补两条：为什么是视图而不是每个方法多一个参数、为什么不复用 `subject`；提取和证据用门控的筛选。
