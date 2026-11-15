@@ -133,3 +133,7 @@ TypeScript 里用接口和工厂函数表达，不用类继承：协议是 `inte
 - 自定义消息格式代替 AI SDK 的 `ModelMessage`：当时的理由是 `ModelMessage` 已经是 JSON，实际不是（二进制和 URL 要另外编码，两处各写了一份），所以这一条已被 [ADR 0005](0005-session-position-writes-format.md) 决定 3 推翻：协议包定义自己的 JSON `Message`，AI SDK 的互转放在 `@modelctx-ai/ctx`。
 - 用类继承表达协议：TypeScript 里接口加工厂函数更轻，也和现有代码一致。
 - 直接用 Managed Agents：它只跑 Claude、只在 Anthropic 托管，上下文策略在它的 harness 里。它可以作为我们协议的一种实现接进来（一个远端 `Harness` 加 `Executor`），不是替代。
+
+## 决定记录
+
+- 2026-11-15：数目对一下。组件是七个，各有一个协议；其中模型用 AI SDK 的 `LanguageModel`，所以协议包自己定义的是六个，正文包表里的「六个协议」指的是这个。[ADR 0006](0006-memory.md) 之后协议包又加了记忆的三个（`MemoryStore`、`DecisionModel`、`ExtractionModel`），现在是九个，[协议层](../protocol.md)和各处索引写的「九个协议」是这个数。

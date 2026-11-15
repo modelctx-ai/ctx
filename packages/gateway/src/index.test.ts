@@ -318,6 +318,46 @@ describe('gateway', () => {
     assert.equal((await fetch(`${gateway.origin}/other`)).status, 404);
   });
 
+  test('messages 逐条校验：不是对象、role 不认识都是 400，不进改写', async () => {
+    for (const messages of [[null], ['hi'], [{ content: 'hi' }], [{ role: 'robot', content: 'hi' }]]) {
+      const response = await fetch(`${gateway.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer local-token' },
+        body: JSON.stringify({ messages }),
+      });
+      assert.equal(response.status, 400, JSON.stringify(messages));
+      assert.match(JSON.stringify(await response.json()), /messages\[0\]/);
+    }
+  });
+
+  test('改写出错回 500，原因只进 onError；上游连不上的原因也不回给调用方', async () => {
+    const errors: unknown[] = [];
+    const broken = await startGateway({
+      upstream: { baseUrl: 'http://127.0.0.1:9/v1' },
+      rewrite: () => {
+        throw new Error('no such table: ctx_entries at /srv/secret/app.db');
+      },
+      onError: (error) => errors.push(error),
+    });
+    try {
+      const response = await fetch(`${broken.baseUrl}/chat/completions`, {
+        method: 'POST',
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      assert.equal(response.status, 500);
+      assert.doesNotMatch(await response.text(), /secret|ctx_entries/);
+      assert.equal(errors.length, 1, '只报一次');
+      assert.match(String(errors[0]), /no such table/);
+
+      const dead = await fetch(`${broken.baseUrl}/models`);
+      assert.equal(dead.status, 502);
+      assert.doesNotMatch(await dead.text(), /127\.0\.0\.1|ECONNREFUSED/);
+      assert.equal(errors.length, 2);
+    } finally {
+      await broken.close();
+    }
+  });
+
   test('坏 JSON 回 400，上游连不上回 502', async () => {
     const bad = await fetch(`${gateway.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -409,6 +449,72 @@ describe('rewrite', () => {
       messages: [picture('https://example.com/a.png'), { role: 'assistant', content: '预填' }],
     });
     assert.deepEqual(same.messages, [picture('https://example.com/a.png'), { role: 'assistant', content: '预填' }]);
+  });
+
+  test('字符串和分段写法是同一句话：不重复带', async () => {
+    const rewrite = replaceHistory(() => [
+      { role: 'assistant', content: '在' },
+      { role: 'user', content: '现在几点' },
+    ]);
+    const parts = await rewrite({ messages: [{ role: 'user', content: [{ type: 'text', text: '现在几点' }] }] });
+    assert.deepEqual(parts.messages.map(contentText), ['在', '现在几点']);
+    const split = await rewrite({
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: '现在' },
+            { type: 'text', text: '' },
+            { type: 'text', text: '几点' },
+          ],
+        },
+      ],
+    });
+    assert.equal(split.messages.length, 2);
+    const different = await rewrite({ messages: [{ role: 'user', content: [{ type: 'text', text: '现在几点？' }] }] });
+    assert.equal(different.messages.length, 3, '不是同一句就都带上');
+  });
+
+  test('全文里没配对的工具调用和工具结果先去掉，再接尾巴', async () => {
+    const rewrite = replaceHistory(() => [
+      { role: 'user', content: '查天气' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: '我查一下' },
+          { type: 'tool-call', id: 'done', name: 'weather', input: { city: '台北' } },
+        ],
+      },
+      {
+        role: 'tool',
+        content: [{ type: 'tool-result', id: 'done', name: 'weather', output: { type: 'text', text: '晴' } }],
+      },
+      {
+        role: 'tool',
+        content: [{ type: 'tool-result', id: 'stray', name: 'weather', output: { type: 'text', text: '?' } }],
+      },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'pending', name: 'weather', input: { city: '高雄' } }] },
+    ]);
+    const out = await rewrite({ messages: [{ role: 'user', content: '算了，不用查了' }] });
+    assert.deepEqual(
+      out.messages.map(
+        (message) => `${message.role}${message.tool_calls ? '(tool_calls)' : ''}:${contentText(message)}`,
+      ),
+      ['user:查天气', 'assistant(tool_calls):我查一下', 'tool:晴', 'user:算了，不用查了'],
+    );
+  });
+
+  test('调用方没有用户话时，留下它最后一条预填的助手话', async () => {
+    const rewrite = replaceHistory(() => [{ role: 'user', content: '写一首诗' }]);
+    const out = await rewrite({
+      messages: [
+        { role: 'system', content: '你是诗人' },
+        { role: 'assistant', content: '春' },
+      ],
+    });
+    assert.deepEqual(out.messages.map(contentText), ['你是诗人', '写一首诗', '春']);
+    const none = await rewrite({ messages: [{ role: 'system', content: '你是诗人' }] });
+    assert.deepEqual(none.messages.map(contentText), ['你是诗人', '写一首诗']);
   });
 
   test('withContext 用上下文的视图作为历史；也可以给 builder 和会话名', async () => {

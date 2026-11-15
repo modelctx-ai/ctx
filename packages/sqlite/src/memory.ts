@@ -2,8 +2,10 @@ import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 
 import {
   checkEvidence,
+  checkMemoryScope,
   checkSourceRef,
   CtxError,
+  DEFAULT_MEMORY_SCOPE,
   sameSourceRef,
   type CoreVersion,
   type FactHit,
@@ -36,17 +38,29 @@ export interface SqliteMemoryStore extends MemoryStore {
 
 /**
  * 记忆的结构版本，存在 `${prefix}meta` 的 `memory_schema` 里（键和会话存储的 `schema` 不同，同一个前缀也不冲突）。
- * 1：`notes`、`facts`、`procedures`、`core` 四张表和它们的索引。同一级的结构可能是之前的提交建的，所以版本号等于 1 时
- * 也要查实际的表和索引（见 `memoryRepairs`）。
+ * 1：`notes`、`facts`、`procedures`、`core` 四张表和它们的索引。
+ * 2：四张表各加一列 `scope`（作用域，已有的行都在缺省的作用域 `''` 里），索引换成以 `scope` 开头的。
+ * 同一级的结构可能是之前的提交建的，所以版本号对得上时也要查实际的表、列和索引（见 `memoryRepairs`）。
  */
-const MEMORY_SCHEMA_VERSION = 1;
+const MEMORY_SCHEMA_VERSION = 2;
 const MEMORY_SCHEMA_KEY = 'memory_schema';
 
 /** 仍然成立且没归档（`isOpenFact`）。`list({ open: true })`、`search` 和部分索引 `facts_open` 用同一段文字。 */
 const OPEN_FACT = 'valid_to IS NULL AND archived_at IS NULL';
 
+/** 老库的表补上 `scope` 列：已有的行都算缺省的作用域。 */
+const SCOPE_COLUMN = `scope TEXT NOT NULL DEFAULT ''`;
+
+interface MemoryTable {
+  readonly table: string;
+  readonly create: string;
+  readonly indexes: Record<string, string>;
+  /** 版本 1 建的、现在不用的索引：迁移时删掉。 */
+  readonly obsolete: readonly string[];
+}
+
 /** 每张表的建表语句和索引。只加不改：结构要变就升版本。 */
-function memoryTables(prefix: string): { table: string; create: string; indexes: Record<string, string> }[] {
+function memoryTables(prefix: string): MemoryTable[] {
   const notes = `${prefix}notes`;
   const facts = `${prefix}facts`;
   const procedures = `${prefix}procedures`;
@@ -58,6 +72,7 @@ function memoryTables(prefix: string): { table: string; create: string; indexes:
       create: `CREATE TABLE ${notes} (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         id TEXT NOT NULL UNIQUE,
+        ${SCOPE_COLUMN},
         session TEXT NOT NULL,
         from_seq INTEGER NOT NULL,
         up_to INTEGER NOT NULL,
@@ -69,10 +84,12 @@ function memoryTables(prefix: string): { table: string; create: string; indexes:
       )`,
       indexes: {
         // `head`：max(up_to) 只读索引的一端。
-        [`${notes}_head`]: `CREATE INDEX ${notes}_head ON ${notes} (session, up_to)`,
-        // `list({ pending: true })`：待处理的按写入顺序。
-        [`${notes}_pending`]: `CREATE INDEX ${notes}_pending ON ${notes} (seq) WHERE settled_at IS NULL`,
+        [`${notes}_scope_head`]: `CREATE INDEX ${notes}_scope_head ON ${notes} (scope, session, up_to)`,
+        // `list`：一个作用域里按写入顺序；`pending: true` 走部分索引。
+        [`${notes}_scope`]: `CREATE INDEX ${notes}_scope ON ${notes} (scope, seq)`,
+        [`${notes}_scope_pending`]: `CREATE INDEX ${notes}_scope_pending ON ${notes} (scope, seq) WHERE settled_at IS NULL`,
       },
+      obsolete: [`${notes}_head`, `${notes}_pending`],
     },
     {
       table: facts,
@@ -80,6 +97,7 @@ function memoryTables(prefix: string): { table: string; create: string; indexes:
       // `sources`、`recalls` 是 JSON 数组。
       create: `CREATE TABLE ${facts} (
         id TEXT PRIMARY KEY NOT NULL,
+        ${SCOPE_COLUMN},
         subject TEXT NOT NULL,
         predicate TEXT,
         text TEXT NOT NULL,
@@ -94,19 +112,22 @@ function memoryTables(prefix: string): { table: string; create: string; indexes:
         archived_at INTEGER
       )`,
       indexes: {
-        [`${facts}_subject`]: `CREATE INDEX ${facts}_subject ON ${facts} (subject, id)`,
-        [`${facts}_topic`]: `CREATE INDEX ${facts}_topic ON ${facts} (topic, id)`,
+        [`${facts}_scope`]: `CREATE INDEX ${facts}_scope ON ${facts} (scope, id)`,
+        [`${facts}_scope_subject`]: `CREATE INDEX ${facts}_scope_subject ON ${facts} (scope, subject, id)`,
+        [`${facts}_scope_topic`]: `CREATE INDEX ${facts}_scope_topic ON ${facts} (scope, topic, id)`,
         // `open: true` 的条件必须和这里一字不差，规划器才认部分索引。
-        [`${facts}_open`]: `CREATE INDEX ${facts}_open ON ${facts} (id) WHERE ${OPEN_FACT}`,
+        [`${facts}_scope_open`]: `CREATE INDEX ${facts}_scope_open ON ${facts} (scope, id) WHERE ${OPEN_FACT}`,
         // `forget` 清掉指向被删事实的 `superseded_by`。
         [`${facts}_superseded`]: `CREATE INDEX ${facts}_superseded ON ${facts} (superseded_by) WHERE superseded_by IS NOT NULL`,
       },
+      obsolete: [`${facts}_subject`, `${facts}_topic`, `${facts}_open`],
     },
     {
       table: procedures,
       create: `CREATE TABLE ${procedures} (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
         id TEXT NOT NULL UNIQUE,
+        ${SCOPE_COLUMN},
         topic TEXT,
         when_text TEXT NOT NULL,
         do_text TEXT NOT NULL,
@@ -116,29 +137,41 @@ function memoryTables(prefix: string): { table: string; create: string; indexes:
         retired_at INTEGER
       )`,
       indexes: {
-        [`${procedures}_topic`]: `CREATE INDEX ${procedures}_topic ON ${procedures} (topic, seq)`,
+        [`${procedures}_scope`]: `CREATE INDEX ${procedures}_scope ON ${procedures} (scope, seq)`,
+        [`${procedures}_scope_topic`]: `CREATE INDEX ${procedures}_scope_topic ON ${procedures} (scope, topic, seq)`,
       },
+      obsolete: [`${procedures}_topic`],
     },
     {
       table: core,
-      // 每次 `set` 一行，`seq` 是写入顺序，最后一行就是当前版本。
+      // 每次 `set` 一行，`seq` 是写入顺序，一个作用域里最后一行就是它当前的版本。
       create: `CREATE TABLE ${core} (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        ${SCOPE_COLUMN},
         text TEXT NOT NULL,
         at INTEGER NOT NULL
       )`,
-      indexes: {},
+      indexes: {
+        [`${core}_scope`]: `CREATE INDEX ${core}_scope ON ${core} (scope, seq)`,
+      },
+      obsolete: [],
     },
   ];
 }
 
-/** 当前结构缺的表和索引，每一项是一条语句；空表示完整。只补缺的，重复执行没有副作用。 */
+/**
+ * 当前结构缺的表、列和索引，以及多出来的旧索引，每一项是一条语句；空表示完整。只补缺的，重复执行没有副作用。
+ * 版本 1 的表没有 `scope` 列：补上（已有的行落在缺省的作用域里），再把索引换成以 `scope` 开头的。
+ */
 function memoryRepairs(database: DatabaseSync, prefix: string): string[] {
   const sql: string[] = [];
-  for (const { table, create, indexes } of memoryTables(prefix)) {
-    if (!hasTable(database, table)) sql.push(create);
-    const existing = inspect(database, table).indexes;
+  for (const { table, create, indexes, obsolete } of memoryTables(prefix)) {
+    const exists = hasTable(database, table);
+    if (!exists) sql.push(create);
+    const { columns, indexes: existing } = inspect(database, table);
+    if (exists && !columns.has('scope')) sql.push(`ALTER TABLE ${table} ADD COLUMN ${SCOPE_COLUMN}`);
     for (const [name, statement] of Object.entries(indexes)) if (!existing.has(name)) sql.push(statement);
+    for (const name of obsolete) if (existing.has(name)) sql.push(`DROP INDEX ${name}`);
   }
   return sql;
 }
@@ -325,270 +358,305 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
   const core = `${prefix}core`;
   const write = <T>(work: () => T): T => withWriteLock(database, `${prefix}memory_write`, work);
 
+  // 每条语句都带 `scope`：按 `id` 找的也带，别的作用域的 `id` 和不存在的一样。
   const insertNote = database.prepare(
-    `INSERT INTO ${notes} (id, session, from_seq, up_to, at, salience, kind, topic, settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ${notes} (id, scope, session, from_seq, up_to, at, salience, kind, topic, settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
-  const selectNote = database.prepare(`SELECT * FROM ${notes} WHERE id = ?`);
-  const settleNote = database.prepare(`UPDATE ${notes} SET settled_at = ? WHERE id = ? AND settled_at IS NULL`);
+  const selectNote = database.prepare(`SELECT * FROM ${notes} WHERE id = ? AND scope = ?`);
+  const settleNote = database.prepare(
+    `UPDATE ${notes} SET settled_at = ? WHERE id = ? AND scope = ? AND settled_at IS NULL`,
+  );
   const insertFact = database.prepare(
-    `INSERT INTO ${facts} (id, subject, predicate, text, topic, valid_from, confidence, salience, sources) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ${facts} (id, scope, subject, predicate, text, topic, valid_from, confidence, salience, sources) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
-  const selectFact = database.prepare(`SELECT * FROM ${facts} WHERE id = ?`);
+  const selectFact = database.prepare(`SELECT * FROM ${facts} WHERE id = ? AND scope = ?`);
   const insertProcedure = database.prepare(
-    `INSERT INTO ${procedures} (id, topic, when_text, do_text, evidence, confirmations, at) VALUES (?, ?, ?, ?, ?, 1, ?)`,
+    `INSERT INTO ${procedures} (id, scope, topic, when_text, do_text, evidence, confirmations, at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
   );
-  const selectProcedure = database.prepare(`SELECT * FROM ${procedures} WHERE id = ?`);
+  const selectProcedure = database.prepare(`SELECT * FROM ${procedures} WHERE id = ? AND scope = ?`);
 
-  const factOf = (factId: string): MemoryFact => {
-    const row = selectFact.get(factId) as FactRow | undefined;
-    if (!row) throw notFound(factId);
-    return decodeFact(row);
+  const views = new Map<string, MemoryStore>();
+  const scopeOf = (scope: string): MemoryStore => {
+    checkMemoryScope(scope);
+    let view = views.get(scope);
+    if (!view) {
+      view = createView(scope);
+      views.set(scope, view);
+    }
+    return view;
   };
-  const procedureOf = (procedureId: string): Procedure => {
-    const row = selectProcedure.get(procedureId) as ProcedureRow | undefined;
-    if (!row) throw notFound(procedureId);
-    return decodeProcedure(row);
-  };
+
+  /** 一个作用域的视图：和别的作用域共用连接、写锁和语句，只是每次都带上自己的名字。 */
+  function createView(scope: string): MemoryStore {
+    const factOf = (factId: string): MemoryFact => {
+      const row = selectFact.get(factId, scope) as FactRow | undefined;
+      if (!row) throw notFound(factId);
+      return decodeFact(row);
+    };
+    const procedureOf = (procedureId: string): Procedure => {
+      const row = selectProcedure.get(procedureId, scope) as ProcedureRow | undefined;
+      if (!row) throw notFound(procedureId);
+      return decodeProcedure(row);
+    };
+
+    return {
+      scope: scopeOf,
+      notes: {
+        async add(drafts) {
+          for (const draft of drafts) checkSourceRef(draft);
+          return write(() =>
+            drafts.map((draft) => {
+              const noteId = id();
+              insertNote.run(
+                noteId,
+                scope,
+                draft.session,
+                draft.from,
+                draft.upTo,
+                draft.at,
+                draft.salience,
+                draft.kind ?? null,
+                draft.topic ?? null,
+                draft.settledAt ?? null,
+              );
+              return decodeNote(selectNote.get(noteId, scope) as unknown as NoteRow);
+            }),
+          );
+        },
+        async list(query) {
+          const where: string[] = ['scope = ?'];
+          const params: SQLInputValue[] = [scope];
+          if (query?.session !== undefined) {
+            where.push('session = ?');
+            params.push(query.session);
+          }
+          if (query?.pending !== undefined) where.push(query.pending ? 'settled_at IS NULL' : 'settled_at IS NOT NULL');
+          const limit = countOf(query?.limit);
+          if (limit === 0) return [];
+          let sql = `SELECT * FROM ${notes} WHERE ${where.join(' AND ')} ORDER BY seq`;
+          if (Number.isFinite(limit)) {
+            sql += ' LIMIT ?';
+            params.push(limit);
+          }
+          return (database.prepare(sql).all(...params) as unknown as NoteRow[]).map(decodeNote);
+        },
+        async settle(ids, at) {
+          return write(() => {
+            let count = 0;
+            for (const noteId of ids) count += Number(settleNote.run(at, noteId, scope).changes);
+            return count;
+          });
+        },
+        async head(session) {
+          const row = database
+            .prepare(`SELECT coalesce(max(up_to), 0) AS head FROM ${notes} WHERE scope = ? AND session = ?`)
+            .get(scope, session) as { head: number };
+          return row.head;
+        },
+      },
+      facts: {
+        async add(draft) {
+          checkEvidence(draft.sources);
+          return write(() => {
+            const factId = id();
+            insertFact.run(
+              factId,
+              scope,
+              draft.subject,
+              draft.predicate ?? null,
+              draft.text,
+              draft.topic ?? null,
+              draft.validFrom,
+              draft.confidence,
+              draft.salience,
+              encodeRefs(draft.sources),
+            );
+            return factOf(factId);
+          });
+        },
+        async close(factId, at, closeOptions) {
+          write(() => {
+            const found = factOf(factId);
+            const supersededBy = closeOptions?.supersededBy;
+            if (supersededBy !== undefined) factOf(supersededBy);
+            if (found.validTo !== undefined) return;
+            database
+              .prepare(`UPDATE ${facts} SET valid_to = ?, superseded_by = ? WHERE id = ? AND scope = ?`)
+              .run(at, supersededBy ?? null, factId, scope);
+          });
+        },
+        async cite(factId, sources) {
+          checkEvidence(sources);
+          return write(() => {
+            const found = factOf(factId);
+            const merged = appendRefs(found.sources, sources);
+            if (!merged) return found;
+            database
+              .prepare(`UPDATE ${facts} SET sources = ? WHERE id = ? AND scope = ?`)
+              .run(encodeRefs(merged), factId, scope);
+            return { ...found, sources: merged };
+          });
+        },
+        async touch(ids, at) {
+          const touch = database.prepare(
+            `UPDATE ${facts} SET recalls = json_insert(recalls, '$[#]', ?) WHERE id = ? AND scope = ?`,
+          );
+          write(() => {
+            for (const factId of ids) touch.run(at, factId, scope);
+          });
+        },
+        async archive(ids, at) {
+          const archive = database.prepare(
+            `UPDATE ${facts} SET archived_at = ? WHERE id = ? AND scope = ? AND archived_at IS NULL`,
+          );
+          return write(() => {
+            let count = 0;
+            for (const factId of new Set(ids)) count += Number(archive.run(at, factId, scope).changes);
+            return count;
+          });
+        },
+        async forget(ids) {
+          const remove = database.prepare(`DELETE FROM ${facts} WHERE id = ? AND scope = ?`);
+          const unlink = database.prepare(`UPDATE ${facts} SET superseded_by = NULL WHERE superseded_by = ?`);
+          return write(() => {
+            let count = 0;
+            for (const factId of new Set(ids)) {
+              const removed = Number(remove.run(factId, scope).changes);
+              if (removed > 0) unlink.run(factId);
+              count += removed;
+            }
+            return count;
+          });
+        },
+        async list(query) {
+          const where: string[] = ['scope = ?'];
+          const params: SQLInputValue[] = [scope];
+          if (query?.subject !== undefined) {
+            where.push('subject = ?');
+            params.push(query.subject);
+          }
+          if (query?.topic !== undefined) {
+            where.push('topic = ?');
+            params.push(query.topic);
+          }
+          if (query?.open === true) where.push(OPEN_FACT);
+          if (query?.after !== undefined) {
+            where.push('id > ?');
+            params.push(query.after);
+          }
+          const limit = countOf(query?.limit);
+          if (limit === 0) return [];
+          let sql = `SELECT * FROM ${facts} WHERE ${where.join(' AND ')} ORDER BY id`;
+          if (Number.isFinite(limit)) {
+            sql += ' LIMIT ?';
+            params.push(limit);
+          }
+          return (database.prepare(sql).all(...params) as unknown as FactRow[]).map(decodeFact);
+        },
+        async search(query) {
+          if (typeof query?.text !== 'string') throw new CtxError('invalid_request', 'Search text must be a string.');
+          const k = countOf(query.k ?? 10);
+          if (k === 0) return [];
+          const text = foldAscii(query.text);
+          const terms = text.split(/\s+/).filter((term) => term.length > 0);
+          // 整个查询或任何一个词是子串就是候选；分数在 JS 里算（见 `scoreOf`），所以候选全取出来再排。
+          const needles = [...new Set([text, ...terms])];
+          const where = ['scope = ?', `(${needles.map(() => 'instr(lower(text), ?) > 0').join(' OR ')})`];
+          const params: SQLInputValue[] = [scope, ...needles];
+          if (query.topic !== undefined) {
+            where.push('topic = ?');
+            params.push(query.topic);
+          }
+          if (query.open !== false) where.push(OPEN_FACT);
+          const rows = database
+            .prepare(`SELECT * FROM ${facts} WHERE ${where.join(' AND ')} ORDER BY id`)
+            .all(...params) as unknown as FactRow[];
+          const hits: FactHit[] = rows.map((row) => ({ fact: decodeFact(row), score: scoreOf(row.text, text, terms) }));
+          // 分数相同时保持 `id` 序，结果稳定。
+          return hits.toSorted((a, b) => b.score - a.score).slice(0, k);
+        },
+      },
+      procedures: {
+        async add(draft) {
+          checkEvidence(draft.evidence);
+          return write(() => {
+            const procedureId = id();
+            insertProcedure.run(
+              procedureId,
+              scope,
+              draft.topic ?? null,
+              draft.when,
+              draft.do,
+              encodeRefs(draft.evidence),
+              draft.at,
+            );
+            return procedureOf(procedureId);
+          });
+        },
+        async confirm(procedureId, evidence) {
+          checkEvidence(evidence);
+          return write(() => {
+            const found = procedureOf(procedureId);
+            const merged = appendRefs(found.evidence, evidence);
+            if (!merged) return found;
+            database
+              .prepare(
+                `UPDATE ${procedures} SET evidence = ?, confirmations = confirmations + 1 WHERE id = ? AND scope = ?`,
+              )
+              .run(encodeRefs(merged), procedureId, scope);
+            return procedureOf(procedureId);
+          });
+        },
+        async retire(procedureId, at) {
+          write(() => {
+            procedureOf(procedureId);
+            database
+              .prepare(`UPDATE ${procedures} SET retired_at = ? WHERE id = ? AND scope = ? AND retired_at IS NULL`)
+              .run(at, procedureId, scope);
+          });
+        },
+        async list(query) {
+          const where: string[] = ['scope = ?'];
+          const params: SQLInputValue[] = [scope];
+          if (query?.topic !== undefined) {
+            where.push('topic = ?');
+            params.push(query.topic);
+          }
+          if (query?.active === true) where.push('retired_at IS NULL');
+          const sql = `SELECT * FROM ${procedures} WHERE ${where.join(' AND ')} ORDER BY seq`;
+          return (database.prepare(sql).all(...params) as unknown as ProcedureRow[]).map(decodeProcedure);
+        },
+      },
+      core: {
+        async get() {
+          const row = database
+            .prepare(`SELECT text, at FROM ${core} WHERE scope = ? ORDER BY seq DESC LIMIT 1`)
+            .get(scope) as CoreVersion | undefined;
+          return row ? { text: row.text, at: row.at } : null;
+        },
+        async set(text, at) {
+          write(() => {
+            database.prepare(`INSERT INTO ${core} (scope, text, at) VALUES (?, ?, ?)`).run(scope, text, at);
+          });
+        },
+        async history(historyOptions) {
+          const last = countOf(historyOptions?.last);
+          if (last === 0) return [];
+          const sql = Number.isFinite(last)
+            ? `SELECT text, at FROM (SELECT seq, text, at FROM ${core} WHERE scope = ? ORDER BY seq DESC LIMIT ?) ORDER BY seq`
+            : `SELECT text, at FROM ${core} WHERE scope = ? ORDER BY seq`;
+          const rows = database
+            .prepare(sql)
+            .all(...(Number.isFinite(last) ? [scope, last] : [scope])) as unknown as CoreVersion[];
+          return rows.map((row) => ({ text: row.text, at: row.at }));
+        },
+      },
+    };
+  }
 
   return {
+    ...scopeOf(DEFAULT_MEMORY_SCOPE),
     database,
-    notes: {
-      async add(drafts) {
-        for (const draft of drafts) checkSourceRef(draft);
-        return write(() =>
-          drafts.map((draft) => {
-            const noteId = id();
-            insertNote.run(
-              noteId,
-              draft.session,
-              draft.from,
-              draft.upTo,
-              draft.at,
-              draft.salience,
-              draft.kind ?? null,
-              draft.topic ?? null,
-              draft.settledAt ?? null,
-            );
-            return decodeNote(selectNote.get(noteId) as unknown as NoteRow);
-          }),
-        );
-      },
-      async list(query) {
-        const where: string[] = [];
-        const params: SQLInputValue[] = [];
-        if (query?.session !== undefined) {
-          where.push('session = ?');
-          params.push(query.session);
-        }
-        if (query?.pending !== undefined) where.push(query.pending ? 'settled_at IS NULL' : 'settled_at IS NOT NULL');
-        const limit = countOf(query?.limit);
-        if (limit === 0) return [];
-        let sql = `SELECT * FROM ${notes}${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY seq`;
-        if (Number.isFinite(limit)) {
-          sql += ' LIMIT ?';
-          params.push(limit);
-        }
-        return (database.prepare(sql).all(...params) as unknown as NoteRow[]).map(decodeNote);
-      },
-      async settle(ids, at) {
-        return write(() => {
-          let count = 0;
-          for (const noteId of ids) count += Number(settleNote.run(at, noteId).changes);
-          return count;
-        });
-      },
-      async head(session) {
-        const row = database
-          .prepare(`SELECT coalesce(max(up_to), 0) AS head FROM ${notes} WHERE session = ?`)
-          .get(session) as { head: number };
-        return row.head;
-      },
-    },
-    facts: {
-      async add(draft) {
-        checkEvidence(draft.sources);
-        return write(() => {
-          const factId = id();
-          insertFact.run(
-            factId,
-            draft.subject,
-            draft.predicate ?? null,
-            draft.text,
-            draft.topic ?? null,
-            draft.validFrom,
-            draft.confidence,
-            draft.salience,
-            encodeRefs(draft.sources),
-          );
-          return factOf(factId);
-        });
-      },
-      async close(factId, at, closeOptions) {
-        write(() => {
-          const found = factOf(factId);
-          const supersededBy = closeOptions?.supersededBy;
-          if (supersededBy !== undefined) factOf(supersededBy);
-          if (found.validTo !== undefined) return;
-          database
-            .prepare(`UPDATE ${facts} SET valid_to = ?, superseded_by = ? WHERE id = ?`)
-            .run(at, supersededBy ?? null, factId);
-        });
-      },
-      async cite(factId, sources) {
-        checkEvidence(sources);
-        return write(() => {
-          const found = factOf(factId);
-          const merged = appendRefs(found.sources, sources);
-          if (!merged) return found;
-          database.prepare(`UPDATE ${facts} SET sources = ? WHERE id = ?`).run(encodeRefs(merged), factId);
-          return { ...found, sources: merged };
-        });
-      },
-      async touch(ids, at) {
-        const touch = database.prepare(`UPDATE ${facts} SET recalls = json_insert(recalls, '$[#]', ?) WHERE id = ?`);
-        write(() => {
-          for (const factId of ids) touch.run(at, factId);
-        });
-      },
-      async archive(ids, at) {
-        const archive = database.prepare(`UPDATE ${facts} SET archived_at = ? WHERE id = ? AND archived_at IS NULL`);
-        return write(() => {
-          let count = 0;
-          for (const factId of new Set(ids)) count += Number(archive.run(at, factId).changes);
-          return count;
-        });
-      },
-      async forget(ids) {
-        const remove = database.prepare(`DELETE FROM ${facts} WHERE id = ?`);
-        const unlink = database.prepare(`UPDATE ${facts} SET superseded_by = NULL WHERE superseded_by = ?`);
-        return write(() => {
-          let count = 0;
-          for (const factId of new Set(ids)) {
-            const removed = Number(remove.run(factId).changes);
-            if (removed > 0) unlink.run(factId);
-            count += removed;
-          }
-          return count;
-        });
-      },
-      async list(query) {
-        const where: string[] = [];
-        const params: SQLInputValue[] = [];
-        if (query?.subject !== undefined) {
-          where.push('subject = ?');
-          params.push(query.subject);
-        }
-        if (query?.topic !== undefined) {
-          where.push('topic = ?');
-          params.push(query.topic);
-        }
-        if (query?.open === true) where.push(OPEN_FACT);
-        if (query?.after !== undefined) {
-          where.push('id > ?');
-          params.push(query.after);
-        }
-        const limit = countOf(query?.limit);
-        if (limit === 0) return [];
-        let sql = `SELECT * FROM ${facts}${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY id`;
-        if (Number.isFinite(limit)) {
-          sql += ' LIMIT ?';
-          params.push(limit);
-        }
-        return (database.prepare(sql).all(...params) as unknown as FactRow[]).map(decodeFact);
-      },
-      async search(query) {
-        if (typeof query?.text !== 'string') throw new CtxError('invalid_request', 'Search text must be a string.');
-        const k = countOf(query.k ?? 10);
-        if (k === 0) return [];
-        const text = foldAscii(query.text);
-        const terms = text.split(/\s+/).filter((term) => term.length > 0);
-        // 整个查询或任何一个词是子串就是候选；分数在 JS 里算（见 `scoreOf`），所以候选全取出来再排。
-        const needles = [...new Set([text, ...terms])];
-        const where = [`(${needles.map(() => 'instr(lower(text), ?) > 0').join(' OR ')})`];
-        const params: SQLInputValue[] = [...needles];
-        if (query.topic !== undefined) {
-          where.push('topic = ?');
-          params.push(query.topic);
-        }
-        if (query.open !== false) where.push(OPEN_FACT);
-        const rows = database
-          .prepare(`SELECT * FROM ${facts} WHERE ${where.join(' AND ')} ORDER BY id`)
-          .all(...params) as unknown as FactRow[];
-        const hits: FactHit[] = rows.map((row) => ({ fact: decodeFact(row), score: scoreOf(row.text, text, terms) }));
-        // 分数相同时保持 `id` 序，结果稳定。
-        return hits.toSorted((a, b) => b.score - a.score).slice(0, k);
-      },
-    },
-    procedures: {
-      async add(draft) {
-        checkEvidence(draft.evidence);
-        return write(() => {
-          const procedureId = id();
-          insertProcedure.run(
-            procedureId,
-            draft.topic ?? null,
-            draft.when,
-            draft.do,
-            encodeRefs(draft.evidence),
-            draft.at,
-          );
-          return procedureOf(procedureId);
-        });
-      },
-      async confirm(procedureId, evidence) {
-        checkEvidence(evidence);
-        return write(() => {
-          const found = procedureOf(procedureId);
-          const merged = appendRefs(found.evidence, evidence);
-          if (!merged) return found;
-          database
-            .prepare(`UPDATE ${procedures} SET evidence = ?, confirmations = confirmations + 1 WHERE id = ?`)
-            .run(encodeRefs(merged), procedureId);
-          return procedureOf(procedureId);
-        });
-      },
-      async retire(procedureId, at) {
-        write(() => {
-          procedureOf(procedureId);
-          database
-            .prepare(`UPDATE ${procedures} SET retired_at = ? WHERE id = ? AND retired_at IS NULL`)
-            .run(at, procedureId);
-        });
-      },
-      async list(query) {
-        const where: string[] = [];
-        const params: SQLInputValue[] = [];
-        if (query?.topic !== undefined) {
-          where.push('topic = ?');
-          params.push(query.topic);
-        }
-        if (query?.active === true) where.push('retired_at IS NULL');
-        const sql = `SELECT * FROM ${procedures}${where.length > 0 ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY seq`;
-        return (database.prepare(sql).all(...params) as unknown as ProcedureRow[]).map(decodeProcedure);
-      },
-    },
-    core: {
-      async get() {
-        const row = database.prepare(`SELECT text, at FROM ${core} ORDER BY seq DESC LIMIT 1`).get() as
-          | CoreVersion
-          | undefined;
-        return row ? { text: row.text, at: row.at } : null;
-      },
-      async set(text, at) {
-        write(() => {
-          database.prepare(`INSERT INTO ${core} (text, at) VALUES (?, ?)`).run(text, at);
-        });
-      },
-      async history(historyOptions) {
-        const last = countOf(historyOptions?.last);
-        if (last === 0) return [];
-        const sql = Number.isFinite(last)
-          ? `SELECT text, at FROM (SELECT seq, text, at FROM ${core} ORDER BY seq DESC LIMIT ?) ORDER BY seq`
-          : `SELECT text, at FROM ${core} ORDER BY seq`;
-        const rows = database.prepare(sql).all(...(Number.isFinite(last) ? [last] : [])) as unknown as CoreVersion[];
-        return rows.map((row) => ({ text: row.text, at: row.at }));
-      },
-    },
     close() {
       if (owned) database.close();
     },

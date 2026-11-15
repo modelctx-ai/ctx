@@ -48,6 +48,7 @@ Node ≥22。
 | `checkJsonSchema`、`limitToolOutput`                                                     | 工具边界：按 JSON Schema 查工具输入（只查认识的关键字，返回给模型看的问题）；结果超过上限时截断并注明                 |
 | `modelName`、`agentSpecToJson`、`REDACTED_HEADER`                                        | 模型名的字符串写法；`AgentSpec` 的可序列化部分（`settings.headers` 的值换成 `REDACTED_HEADER`）                       |
 | `activation`、`rankFacts`、`renderCore`、`ACTIVATION_DEFAULTS`                           | 记忆的 ACT-R 激活度、召回排序（`0.6 × 相似度 + 0.4 × 激活度`）、`core` 的缺省写法（按 token 预算截断）                |
+| `DEFAULT_MEMORY_SCOPE`、`MAX_MEMORY_SCOPE_LENGTH`、`checkMemoryScope`                    | 记忆的作用域：缺省的名字（空串）、名字的长度上限、存储实现 `scope(name)` 时用的校验（抛 `invalid_request`）           |
 | `sourceRef`、`checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`           | 证据区间：从条目算、存储写入前校验（抛 `invalid_request`）、去重、判断条目在不在区间里                                |
 | `isOpenFact`、`filterFacts`                                                              | `FactQuery` 的语义（`open`、按 `id` 码点序翻页）                                                                      |
 

@@ -59,17 +59,17 @@ createServer((req, res) => void handle(req, res)).listen(8080, '127.0.0.1');
 
 按顺序检查：
 
-| 请求                                                                          | 处理                                                                          |
-| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| `Host` 不在 `allowedHosts` 里                                                 | 403                                                                           |
-| 带 `Origin` 头，又不在 `allowedOrigins` 里（缺省一个都不放）                  | 403                                                                           |
-| 路径不在 `basePath`（缺省 `/v1`）下                                           | 404                                                                           |
-| 设了 `accessToken`，`Authorization: Bearer` 没带或不对（`Bearer` 不分大小写） | 401                                                                           |
-| 方法和路径不在 `routes` 里（缺省 `POST /chat/completions`、`GET /models`）    | 404，不转发                                                                   |
-| 请求体超过 `maxBodyBytes`（缺省 4 MiB）                                       | 413                                                                           |
-| `POST <basePath>/chat/completions`，设了 `rewrite`                            | 请求体不是 JSON，或不是带 `messages` 数组的对象：400；否则 `rewrite` 以后转发 |
-| `routes` 里的其他请求                                                         | 原样转发：方法、路径、查询串、请求体                                          |
-| 上游连不上                                                                    | 502                                                                           |
+| 请求                                                                          | 处理                                                                                                                                                            |
+| ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Host` 不在 `allowedHosts` 里                                                 | 403                                                                                                                                                             |
+| 带 `Origin` 头，又不在 `allowedOrigins` 里（缺省一个都不放）                  | 403                                                                                                                                                             |
+| 路径不在 `basePath`（缺省 `/v1`）下                                           | 404                                                                                                                                                             |
+| 设了 `accessToken`，`Authorization: Bearer` 没带或不对（`Bearer` 不分大小写） | 401                                                                                                                                                             |
+| 方法和路径不在 `routes` 里（缺省 `POST /chat/completions`、`GET /models`）    | 404，不转发                                                                                                                                                     |
+| 请求体超过 `maxBodyBytes`（缺省 4 MiB）                                       | 413                                                                                                                                                             |
+| `POST <basePath>/chat/completions`，设了 `rewrite`                            | 请求体不是 JSON、不是带 `messages` 数组的对象、`messages` 里有不是对象或 `role` 不认识的：400；`rewrite` 抛错：500，原因只进 `onError`；否则 `rewrite` 以后转发 |
+| `routes` 里的其他请求                                                         | 原样转发：方法、路径、查询串、请求体                                                                                                                            |
+| 上游连不上                                                                    | 502，正文是 `upstream request failed`，原因（地址、端口）只进 `onError`                                                                                         |
 
 - `startGateway` 缺省只认监听地址的 `Host`（`host:port`，不分大小写），挡 DNS rebinding；监听本机时 `localhost`、`127.0.0.1`、`[::1]` 加端口都认。`createGatewayHandler` 没给 `allowedHosts` 就不查 `Host`，`Origin` 照查。
 - `routes` 写成 `'<方法> <basePath 之后的路径>'`，缺省是导出的 `DEFAULT_ROUTES`；`'*'` 全部转发。调用方的令牌换来的是上游密钥的权限，所以缺省只给聊天补全和模型列表，文件、微调、删除这些要显式放开。
@@ -77,7 +77,7 @@ createServer((req, res) => void handle(req, res)).listen(8080, '127.0.0.1');
 - 转发时只带调用方的 `content-type`、`accept`，加上 `upstream.headers`；有 `upstream.apiKey` 时设 `Authorization: Bearer <apiKey>`。
 - 响应状态码和头原样转回（去掉逐跳头和 `content-encoding`、`content-length`），正文边收边转；调用方中途断开时取消上游请求，不算出错。
 - 错误正文是 OpenAI 的形状 `{ "error": { "message", "type" } }`，`type` 是 `authentication_error`（401）、`permission_error`（403）或 `gateway_error`。
-- `replaceHistory` 保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `history()` 给的全文，再接上调用方从最后一句用户话起的尾巴：这句话和它之后的工具调用、工具结果、预填的助手话。全文最后一条和这句用户话内容完全相同（图片也比）时，这句不重复带。
+- `replaceHistory` 保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `history()` 给的全文，再接上调用方从最后一句用户话起的尾巴：这句话和它之后的工具调用、工具结果、预填的助手话；调用方没有用户话时只留它最后一条预填的助手话。全文最后一条和这句用户话内容相同时这句不重复带——字符串和分段写法（`[{ type: 'text', text }]`）算一样，相邻的文字段并起来比，图片比地址。全文里没配对的工具调用和工具结果先去掉再接尾巴：历史以没做完的工具调用结尾时，上游多半回 400（没有对真实服务验证）。
 - 网关不写日志：调用方的问答要由应用另外并进上下文。
 
 ## 导出

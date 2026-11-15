@@ -161,13 +161,37 @@ export interface CoreHistoryOptions {
   readonly last?: number;
 }
 
+/** 缺省的作用域：不调 `scope` 时存储读写的那一个。 */
+export const DEFAULT_MEMORY_SCOPE = '';
+
+/** 作用域名最长多少个字符（UTF-16 码元）。 */
+export const MAX_MEMORY_SCOPE_LENGTH = 256;
+
+/** 作用域名合法：字符串，不超过 `MAX_MEMORY_SCOPE_LENGTH`。空串是缺省的作用域。不合法抛 `invalid_request`。 */
+export function checkMemoryScope(scope: unknown): asserts scope is string {
+  if (typeof scope !== 'string') throw new CtxError('invalid_request', 'A memory scope must be a string.');
+  if (scope.length > MAX_MEMORY_SCOPE_LENGTH) {
+    throw new CtxError('invalid_request', `A memory scope is at most ${MAX_MEMORY_SCOPE_LENGTH} characters.`);
+  }
+}
+
 /**
  * 记忆的存储：笔记、事实、程序、画像四个集合。全部只收发 JSON，可以放到进程边界另一侧；身份是字符串，由存储生成。
  * 时刻都由调用方给（毫秒），存储不看钟。错误用 `CtxError`：参数不合法是 `invalid_request`（例如没有证据、
  * `from > upTo`），认不得的 `id` 是 `not_found`；批量方法（`settle`、`touch`、`archive`、`forget`）跳过认不得的 `id`，不报错。
  * 记忆只读会话日志，存储从不写它。
+ *
+ * 一份存储按作用域分开（`scope`）：一个用户、租户或项目一个作用域，名字由应用定。四个集合都在作用域里面，
+ * 一个作用域读不到、搜不到、改不了、删不掉另一个作用域的东西；别的作用域的 `id` 和不存在的 `id` 一样对待
+ * （`not_found`，批量方法跳过）。作用域是隔离，不是鉴权：谁能用哪个作用域由应用决定。
  */
 export interface MemoryStore {
+  /**
+   * 同一份数据上名叫 `scope` 的作用域的视图。名字是绝对的，不嵌套：`store.scope('a').scope('b')` 就是 `store.scope('b')`，
+   * `scope(DEFAULT_MEMORY_SCOPE)` 回到缺省的那个。从没写过的作用域是空的，不用先建。名字不合法（`checkMemoryScope`）
+   * 抛 `invalid_request`。
+   */
+  scope(scope: string): MemoryStore;
   readonly notes: {
     /** 按输入顺序返回写入的笔记（带 `id`）。区间不合法时整批不写，抛 `invalid_request`。 */
     add(notes: readonly NewNote[]): Promise<Note[]>;

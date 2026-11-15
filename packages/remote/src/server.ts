@@ -8,6 +8,7 @@ import type { AddressInfo } from 'node:net';
 
 import {
   CTX_EVENTS,
+  DEFAULT_MEMORY_SCOPE,
   isConflict,
   silentLogger,
   type Entry,
@@ -331,6 +332,16 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 // ---- 输入校验 ----
+
+/** 请求要的那个作用域的记忆存储；名字不合法是 400。 */
+function scopedMemory(memory: MemoryStore | undefined, scope: string): MemoryStore {
+  const store = need(memory, 'a memory store');
+  try {
+    return store.scope(scope);
+  } catch (error) {
+    throw ctxFailure(error) ?? error;
+  }
+}
 
 function need<T>(component: T | undefined, what: string): T {
   if (component === undefined) fail(404, `this server does not serve ${what}`);
@@ -1006,9 +1017,10 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   // ---- 记忆 ----
 
   async function memoryRoutes(method: string, rest: string[], url: URL, req: IncomingMessage, res: ServerResponse) {
-    const memoryStore = need(memory, 'a memory store');
     const [collection, ...tail] = rest;
     const query = url.searchParams;
+    // 作用域从查询参数来（不带就是缺省的那个）；名字不合法由存储报 `invalid_request`。
+    const memoryStore = scopedMemory(memory, query.get('scope') ?? DEFAULT_MEMORY_SCOPE);
     const body = async (shape: string): Promise<Record<string, unknown>> =>
       bodyObject(await readBody(req, limit), shape);
     const only = (expected: string, route: string): void => {

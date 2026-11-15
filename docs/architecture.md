@@ -759,7 +759,7 @@ sequenceDiagram
 - `accessToken` 是空串时抛错；`startGateway` 听在非本机地址上又没有 `accessToken` 时拒绝启动，除非写 `allowUnauthenticated: true`。`ctx-remote` 的 `startRemote` 是同样的规则。
 - 缺省只听 `127.0.0.1`、随机端口。`createGatewayHandler(options)` 返回 `(req, res) => Promise<void>`，可以挂到已有的 HTTP 服务上。
 
-`replaceHistory(history, { keepSystem })` 生成改写函数：保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `toChatMessages(await history())`（去掉其中的 `system`），再接上调用方从最后一句用户话起的尾巴：这句话，以及它之后的工具调用、工具结果和预填的助手话。完整历史的最后一条和这句用户话内容完全相同（图片也比）时，这句不重复带。`withContext(context)` 就是 `replaceHistory(async () => (await context.view()).messages)`；`withContext(builder, session)` 直接用一个 `ContextBuilder` 和会话名。
+`replaceHistory(history, { keepSystem })` 生成改写函数：保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `toChatMessages(await history())`（去掉其中的 `system`），再接上调用方从最后一句用户话起的尾巴：这句话，以及它之后的工具调用、工具结果和预填的助手话（调用方没有用户话时只留最后一条预填的助手话）。完整历史的最后一条和这句用户话内容相同时这句不重复带：比的是归一后的内容，字符串和分段写法算一样，图片比地址。完整历史里没配对的工具调用和工具结果先去掉。请求的 `messages` 逐条校验，不合的回 400；改写函数抛错回 500、连不上上游回 502，两种的原因都只进 `onError`，不回给调用方。`withContext(context)` 就是 `replaceHistory(async () => (await context.view()).messages)`；`withContext(builder, session)` 直接用一个 `ContextBuilder` 和会话名。
 
 网关只读上下文，不写日志。调用方自己保存的问答要另外并进上下文，例如 yoyo 每拍把 dsh-pet 的对话记忆按幂等键导入（见 [ADR 0003](adr/0003-context-model.md)）。
 

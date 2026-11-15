@@ -1,6 +1,8 @@
 import {
   checkEvidence,
+  checkMemoryScope,
   checkSourceRef,
+  DEFAULT_MEMORY_SCOPE,
   CtxError,
   filterFacts,
   isOpenFact,
@@ -47,14 +49,34 @@ function appendRefs(existing: readonly SourceRef[], refs: readonly SourceRef[]):
  * 所以 `facts.list` 的 `id` 序就是写入顺序。`search` 是全文（子串命中记 1，否则按词重叠打分），给了 `embed` 再加余弦。
  */
 export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore {
+  return scopeOf({ next: 0, scopes: new Map() }, options, DEFAULT_MEMORY_SCOPE);
+}
+
+/** 各作用域共用的东西：`id` 的序号（所以 `id` 在整份存储里不重复）和已经建出来的作用域。 */
+interface Shared {
+  next: number;
+  readonly scopes: Map<string, MemoryStore>;
+}
+
+function scopeOf(shared: Shared, options: MemoryStoreOptions, scope: string): MemoryStore {
+  checkMemoryScope(scope);
+  let store = shared.scopes.get(scope);
+  if (!store) {
+    store = createScope(shared, options);
+    shared.scopes.set(scope, store);
+  }
+  return store;
+}
+
+/** 一个作用域：四个集合各自一份，别的作用域碰不到。 */
+function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
   const notes: Note[] = [];
   const facts = new Map<string, MemoryFact>();
   const procedures: Procedure[] = [];
   const versions: CoreVersion[] = [];
   const vectors = new Map<string, Promise<readonly number[]>>();
   const minCosine = options.minCosine ?? 0.3;
-  let next = 0;
-  const newId = (prefix: string): string => `${prefix}${String((next += 1)).padStart(8, '0')}`;
+  const newId = (prefix: string): string => `${prefix}${String((shared.next += 1)).padStart(8, '0')}`;
   const factOf = (id: string): MemoryFact => {
     const found = facts.get(id);
     if (!found) throw notFound(id);
@@ -77,6 +99,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore
   };
 
   return {
+    scope: (scope) => scopeOf(shared, options, scope),
     notes: {
       async add(drafts) {
         for (const draft of drafts) checkSourceRef(draft);

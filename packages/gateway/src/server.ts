@@ -61,9 +61,12 @@ export const DEFAULT_ROUTES: readonly string[] = ['POST /chat/completions', 'GET
 
 class HttpError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /** 原因已经交给过 `onError`，不再报第二次。 */
+  readonly reported: boolean;
+  constructor(status: number, message: string, reported = false) {
     super(message);
     this.status = status;
+    this.reported = reported;
   }
 }
 
@@ -117,13 +120,25 @@ function lowered(values: readonly string[]): Set<string> {
   return new Set(values.map((value) => value.trim().toLowerCase().replace(/\/+$/, '')));
 }
 
-function isChatRequest(value: unknown): value is ChatCompletionRequest {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    !Array.isArray(value) &&
-    Array.isArray((value as { messages?: unknown }).messages)
-  );
+const CHAT_ROLES = new Set(['system', 'developer', 'user', 'assistant', 'tool']);
+
+/** 请求体哪里不对；没问题是 undefined。逐条看 `messages`：改写要读每一条的 `role`。 */
+function chatRequestProblem(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return 'request body must be a JSON object with messages';
+  }
+  const { messages } = value as { messages?: unknown };
+  if (!Array.isArray(messages)) return 'request body must be a JSON object with messages';
+  for (const [index, message] of messages.entries()) {
+    if (typeof message !== 'object' || message === null || Array.isArray(message)) {
+      return `messages[${index}] must be an object`;
+    }
+    const { role } = message as { role?: unknown };
+    if (typeof role !== 'string' || !CHAT_ROLES.has(role)) {
+      return `messages[${index}].role must be one of ${[...CHAT_ROLES].join(', ')}`;
+    }
+  }
+  return undefined;
 }
 
 const LOOPBACK = ['localhost', '127.0.0.1', '::1'];
@@ -212,8 +227,16 @@ export function createGatewayHandler(
         } catch {
           throw new HttpError(400, 'request body is not valid JSON');
         }
-        if (!isChatRequest(parsed)) throw new HttpError(400, 'request body must be a JSON object with messages');
-        body = JSON.stringify(await options.rewrite(parsed));
+        const problem = chatRequestProblem(parsed);
+        if (problem !== undefined) throw new HttpError(400, problem);
+        try {
+          body = JSON.stringify(await options.rewrite(parsed as ChatCompletionRequest));
+        } catch (error) {
+          // 改写是应用给的函数（读会话、拼历史）：它出错不是上游的错，原文只进 `onError`，不回给调用方。
+          if (controller.signal.aborted || error instanceof HttpError) throw error;
+          options.onError?.(error);
+          throw new HttpError(500, 'the gateway could not prepare this request', true);
+        }
       }
 
       const headers = new Headers({ ...options.upstream.headers });
@@ -251,9 +274,14 @@ export function createGatewayHandler(
       stream.pipe(res);
     } catch (error) {
       if (controller.signal.aborted) return;
+      if (error instanceof HttpError) {
+        if (!error.reported) options.onError?.(error);
+        sendError(res, error.status, error.message);
+        return;
+      }
       options.onError?.(error);
-      if (error instanceof HttpError) sendError(res, error.status, error.message);
-      else sendError(res, 502, error instanceof Error ? error.message : 'upstream request failed');
+      // 连不上上游：原因（主机名、端口、内部地址）只进 `onError`。
+      sendError(res, 502, 'upstream request failed');
     }
   };
 }
