@@ -6,7 +6,7 @@ export default defineConfig({
   ssr: { resolve: { conditions: ['@modelctx-ai/source', ...defaultServerConditions] } },
 
   test: {
-    include: ['packages/*/src/**/*.test.ts', 'examples/**/*.test.ts'],
+    include: ['packages/*/src/**/*.test.ts', 'examples/**/*.test.ts', 'live/**/*.test.ts'],
   },
 
   lint: {

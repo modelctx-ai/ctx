@@ -1,0 +1,67 @@
+name: Live smoke
+
+# 对真实服务的冒烟测试（live/README.md）：每晚跑一次，也可以手动触发。不进 PR 的 CI。
+# 密钥放仓库 secrets；哪一组没配就跳过那一组，不算失败。
+on:
+  schedule:
+    # 每天 19:17 UTC
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+    inputs:
+      record:
+        description: 通过的场景把真实响应录成夹具（作为产物上传，下载后提交到 live/fixtures/）
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    name: Live smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      - name: Smoke
+        run: node live/smoke.ts ${{ inputs.record && '--record' || '' }}
+        env:
+          CTX_LIVE_OPENAI_BASE_URL: ${{ vars.CTX_LIVE_OPENAI_BASE_URL }}
+          CTX_LIVE_OPENAI_MODEL: ${{ vars.CTX_LIVE_OPENAI_MODEL }}
+          CTX_LIVE_OPENAI_API_KEY: ${{ secrets.CTX_LIVE_OPENAI_API_KEY }}
+          CTX_LIVE_ANTHROPIC_API_KEY: ${{ secrets.CTX_LIVE_ANTHROPIC_API_KEY }}
+          CTX_LIVE_ANTHROPIC_MODEL: ${{ vars.CTX_LIVE_ANTHROPIC_MODEL }}
+          CTX_LIVE_ANTHROPIC_BASE_URL: ${{ vars.CTX_LIVE_ANTHROPIC_BASE_URL }}
+          CTX_LIVE_CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CTX_LIVE_CLOUDFLARE_ACCOUNT_ID }}
+          CTX_LIVE_CLOUDFLARE_API_TOKEN: ${{ secrets.CTX_LIVE_CLOUDFLARE_API_TOKEN }}
+          CTX_LIVE_CLOUDFLARE_DECISION_MODEL: ${{ vars.CTX_LIVE_CLOUDFLARE_DECISION_MODEL }}
+          CTX_LIVE_CLOUDFLARE_EXTRACTION_MODEL: ${{ vars.CTX_LIVE_CLOUDFLARE_EXTRACTION_MODEL }}
+          CTX_LIVE_TYPESAFE_API_KEY: ${{ secrets.CTX_LIVE_TYPESAFE_API_KEY }}
+          CTX_LIVE_TYPESAFE_MODEL: ${{ vars.CTX_LIVE_TYPESAFE_MODEL }}
+          # 不用密钥的公开 MCP 服务器；仓库变量可以换成别的。
+          CTX_LIVE_MCP_URL: ${{ vars.CTX_LIVE_MCP_URL || 'https://mcp.deepwiki.com/mcp' }}
+          CTX_LIVE_MCP_TOOL: ${{ vars.CTX_LIVE_MCP_TOOL || 'read_wiki_structure' }}
+          CTX_LIVE_MCP_INPUT: ${{ vars.CTX_LIVE_MCP_INPUT || '{"repoName":"modelcontextprotocol/servers"}' }}
+
+      - name: Upload fixtures
+        if: ${{ inputs.record }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-fixtures
+          path: live/fixtures/*.json
+          if-no-files-found: ignore

@@ -54,6 +54,30 @@ importers:
         specifier: ^4.6.7
         version: 4.6.7
 
+  live:
+    dependencies:
+      '@modelctx-ai/ctx':
+        specifier: workspace:^
+        version: link:../packages/core
+      '@modelctx-ai/ctx-gateway':
+        specifier: workspace:^
+        version: link:../packages/gateway
+      '@modelctx-ai/ctx-mcp':
+        specifier: workspace:^
+        version: link:../packages/mcp
+      '@modelctx-ai/ctx-models':
+        specifier: workspace:^
+        version: link:../packages/models
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../packages/protocol
+      ai:
+        specifier: ^7.0.150
+        version: 7.0.150(zod@4.6.7)
+      zod:
+        specifier: ^4.6.7
+        version: 4.6.7
+
   packages/core:
     dependencies:
       ai:

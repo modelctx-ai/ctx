@@ -4,6 +4,7 @@
 
 ## 2026-11-15
 
+- **新增** [`live/`](../live/README.md) 的说明：对真实服务的冒烟场景（模型的带工具流式运行、网关改写、决策、提取、MCP）、要哪些环境变量、怎么录夹具和重放、现在验证到哪了（只有 MCP 的连接、列工具、调用对一台公开服务器验证过，别的还没有密钥）。[AGENTS.md](../AGENTS.md) 的命令表加 `pnpm live`，「没有对真实服务验证」那条约定写明验证过之后换成日期和版本。[ctx-mcp](../packages/mcp/README.md) 的限制一条写上验证过的部分和日期，没验证的照旧留着。
 - **更新** [协议层](protocol.md)的会话一节：加两条规则——会话名不能是空串、`.`、`..`（为什么、谁来拒绝、`checkSessionName`），存进去和读出来的都是拷贝；契约测试表跟上。[协议包](../packages/protocol/README.md)导出表加 `checkSessionName`；[核心包](../packages/core/README.md)和[架构](architecture.md)写明内存存储写入、读出各拷一份；[ctx-remote](../packages/remote/README.md)写明这三种会话名客户端直接拒绝。
 - **更新** [协议层](protocol.md)：会话一节加「导出、导入、复制」小节——JSON Lines 的格式（头、条目、结束行）、`exportSession`、`importSession`、`copySession` 的签名，导入时哪些 `seq` 引用跟着换、`id` 的三种处理、不是原子的、哪些情况抛什么；契约测试表跟上。以前没有写会话怎么搬到别的存储，「`list` 再 `append`」会让 `covers` 指错位置。[概念](concepts.md)术语表加「导出、导入」。[协议包](../packages/protocol/README.md)导出表加这三个函数和格式的常量、类型。
 - **新增** 例子 [`move-session.ts`](../examples/move-session.ts)：一个压缩过的会话从内存存储导成文件、导进 SQLite、再复制到远端存储，三边的上下文一样；[例子说明](../examples/README.md)的表加一行。
