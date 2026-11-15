@@ -4,6 +4,7 @@
 
 ## 2026-11-15
 
+- **更新** [ctx-gateway](../packages/gateway/README.md) 和[架构](architecture.md)的网关一节：`replaceHistory` 怎么判断「同一句话」、没配对的工具调用怎么处理、没有用户话时的预填；请求处理表里 400、500、502 的条件和正文。[ADR 0004](adr/0004-protocol-and-implementation.md) 加「决定记录」：协议的数目几处说法对上（七个组件、协议包里六个加记忆的三个共九个）。
 - **更新** [协议层](protocol.md)的记忆存储一节：作用域（`scope(name)`、隔离的范围、名字的规则、不是鉴权）；线上形态的 `?scope=`。[记忆](memory.md)的失败模式表加两行（多用户串、事件里的指令）。[ADR 0006](adr/0006-memory.md) 的「决定记录」补两条：为什么是视图而不是每个方法多一个参数、为什么不复用 `subject`；提取和证据用门控的筛选。
 - **更新** [ctx-memory](../packages/memory/README.md)：选项 `scope`、`ownsSession`，新节「几个用户共用一份存储」。[ctx-remote](../packages/remote/README.md)：记忆的作用域和 `RemoteMemoryStoreOptions`。[协议包](../packages/protocol/README.md)导出表加作用域的三个名字。[ctx-sqlite](../packages/sqlite/README.md)：记忆的表加 `scope` 列、索引和结构版本 2 的升级。
 - **更新** [ADR 0002](adr/0002-packages.md)：加「实施状态」（发布工作流、`scripts/release.mjs`、打包冒烟检查、发一版的步骤、`engines` 核对的结论、还要维护者在 npm 上做的三步）和「决定记录」（占位版本是九个包、暂不引入 changesets、预发布发到 `next`）；「发布」里的包数和工作流步骤改对。[AGENTS.md](../AGENTS.md) 的命令表加 `pnpm smoke`、`pnpm release:version`。

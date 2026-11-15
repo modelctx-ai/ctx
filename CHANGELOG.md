@@ -4,6 +4,8 @@
 
 ## 未发布
 
+- **修复** `ctx-gateway` 的 `replaceHistory`：同一句用户话用字符串和分段写法（`[{ type: 'text', text }]`）各发一次不再出现两遍；历史里没配对的工具调用、工具结果先去掉再接调用方的尾巴；调用方没有用户话时保留它最后一条预填的助手话（以前整段丢掉）。
+- **修复** `ctx-gateway` 的错误处理：`messages` 逐条校验，`[null]`、没有 `role`、不认识的 `role` 回 400（以前是 502 加内部异常的文字）；`rewrite` 抛错回 500、上游连不上回 502，正文都不带原因，原因只进 `onError`。**行为变化**：靠 502 正文里的错误文字排查的，改看 `onError`。
 - **新增** 记忆按作用域隔离（不兼容：自己实现 `MemoryStore` 的要加一个方法）。`MemoryStore.scope(name)` 是同一份数据上另一个作用域的视图，笔记、事实、程序、画像都在作用域里面：互相读不到、搜不到、改不了、删不掉，别的作用域的 `id` 和不存在的一样（`not_found`，批量方法跳过）。不调 `scope` 就是缺省的作用域（`DEFAULT_MEMORY_SCOPE`，空串），已有的数据都在里面，单用户的用法不用改。协议包另导出 `MAX_MEMORY_SCOPE_LENGTH`、`checkMemoryScope`；契约测试 `describeMemoryStoreContract` 加隔离用例。`createMemoryStore`、`createSqliteMemoryStore`、`createRemoteMemoryStore`（新选项 `scope`，线上是 `?scope=`）都实现了。以前几个用户共用一份存储时事实出现在别人的召回里、画像互相覆盖、新事实能关掉别人的旧事实。`ctx-sqlite` 的记忆结构版本升到 2（四张表加 `scope` 列，索引换成以它开头的），老库打开时自动升级，升级后旧版本打不开。
 - **新增** `createMemory` 的 `scope`（用存储的哪个作用域）和 `ownsSession`（这份记忆管哪些会话：不归它管的，`gate` 抛 `invalid_request`，来源不注入，`recall` 工具返回错误，证据不读原文）。
 - **修复** 记忆的提取和证据只读门控看过的条目（`gate.entries`，缺省只有消息）。以前 `consolidate` 按区间读原文不带筛选，区间里的事件和摘要也进了提取；`recall` 工具带回的证据原文同样。**行为变化**：靠事件内容提取事实的应用要在 `gate.entries` 里放行事件。
