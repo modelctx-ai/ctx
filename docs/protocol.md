@@ -168,6 +168,67 @@ function eraseEntries(
 
 擦除管的是存储里的条目。摘要里的文字、记忆里从这些条目提取的事实、备份，都不在这个保证里；各实现在介质上擦到什么程度见它们的说明（`ctx-sqlite` 见[包说明](../packages/sqlite/README.md#删除和文件大小)）。
 
+### 导出、导入、复制
+
+```ts
+interface SessionExportHeader {
+  format: 'ctx.session';
+  version: number; // SESSION_EXPORT_VERSION，当前是 1
+  session: string; // 导出时的会话名
+  exportedAt: number;
+}
+interface SessionExportEnd {
+  end: true;
+  entries: number; // 中间的条目行数
+}
+
+function exportSession(
+  store: Pick<SessionStore, 'list'>,
+  session: string,
+  options?: { pageSize?: number; unreadable?: 'throw' | 'skip'; now?: () => number; signal?: AbortSignal },
+): AsyncGenerator<string>;
+
+type ImportIds = 'keep' | 'new' | ((id: string) => string);
+function importSession(
+  store: Pick<SessionStore, 'append' | 'list'>,
+  source: string | Iterable<string> | AsyncIterable<string>,
+  options?: { session?: string; ids?: ImportIds; batchSize?: number; signal?: AbortSignal },
+): Promise<{
+  session: string;
+  header: SessionExportHeader;
+  read: number;
+  written: number;
+  skipped: number;
+  remap(seq: number): number;
+}>;
+
+function copySession(
+  source: Pick<SessionStore, 'list'>,
+  from: string,
+  target: Pick<SessionStore, 'append' | 'list'>,
+  to: string,
+  options?,
+): Promise<ImportSessionResult>;
+```
+
+`seq` 是各个存储自己分配的，所以把会话搬到别的存储（换实现、备份恢复、分叉、改名）不能 `list` 再 `append`：摘要的 `covers` 还是源存储的 `seq`，到了目标存储要么盖住不该盖的，要么什么都盖不住。这三个函数只用 `list` 和 `append`，对任何实现都能用，搬的时候把引用 `seq` 的字段换掉。
+
+**格式**是 JSON Lines（一行一个 JSON 对象，`\n` 结尾）：第一行 `SessionExportHeader`，中间每行一条条目（`list` 返回的形状，按 `seq` 升序，`v` 是导出时的 `ENTRY_VERSION`），最后一行 `SessionExportEnd`。没有结束行的文件是截断的。
+
+**导出**分页读（`pageSize`，缺省 500），不是快照：导出期间别人写进来的条目读到哪算哪。读到 `ctx.unreadable` 占位（存储在宽松模式下解不了的行）缺省抛 `unreadable`，不把缺了一块的历史当成完整的导出去；`unreadable: 'skip'` 跳过那一行。
+
+**导入**的规则：
+
+- `source` 是整份文本，或者按任意位置切开的文本块（文件流、`exportSession` 的返回值）。
+- 目标会话缺省是头里记的名字，`session` 改名。`at`、`key`、`source`、`meta` 原样保留，`session`、`seq`、`v` 由目标存储填。
+- **`seq` 的引用跟着换**：摘要的 `covers`、`ctx.compacted` 的 `covers` 换成 `remap(旧值)`——源会话里 `seq` 小于等于它的条目中最后一条在目标会话里的 `seq`，一条都没有（盖住的条目已经被 `truncate` 掉）是 0。所以源会话里被摘要盖住的条目，导过去还是那些被盖住。`ctx.erased` 的 `upTo` 同样换；`seqs` 只留文件里还在的位置（涂改的占位），被删掉的条目没有位置可指。返回值里的 `remap` 给会话之外引用 `seq` 的东西用（记忆的 `SourceRef`、应用自己存的位置）。
+- **`id`**：`keep`（缺省）保留。`id` 全局唯一，所以同一份文件导两次只有一份，中途失败之后拿完整的文件再导一次就接上；也因此不能在同一个存储里复制——条目的 `id` 已经在别的会话里时抛 `conflict`，不静默丢掉。`new` 让目标存储重新生成，重复导入会写出第二份。给函数就按它换（同样的输入要给同样的输出），重复导入还是只有一份。`ctx.compacted` 的 `summaryId` 跟着摘要的新 `id` 走。
+- **不是原子的**：按批 `append`（`batchSize`，缺省 200），中途失败时已经写的留在目标会话里。截断的文件读到头抛 `invalid_request`，读到的部分已经写进去。
+- 行的 `v` 比自己的 `ENTRY_VERSION` 低就升级（同 `upgradeEntry`），高就抛 `unsupported_version`；头的 `version` 比 `SESSION_EXPORT_VERSION` 高同样抛。不是导出文件、行的顺序不对、条数和结束行对不上，抛 `invalid_request`。
+- 不检查目标会话是不是空的：往有内容的会话里导，导进来的摘要会把原有的条目一起盖住。
+
+`copySession` 是导出接导入。两个存储是同一个对象时 `ids` 缺省 `new`，否则 `keep`；同一个库的两个客户端看不出来是同一个，自己给 `ids`。
+
 ### 消息格式和版本
 
 协议包定义 ctx 自己的 `Message`（`system`、`user`、`assistant`、`tool` 四种角色），是 AI SDK `ModelMessage` 的子集，但全是 JSON：
@@ -769,17 +830,17 @@ A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = (now − t_i) / 1 �
 
 `@modelctx-ai/ctx-protocol/testing`，用法见[包说明](../packages/protocol/README.md#实现一个协议)。
 
-| 契约测试                          | 工厂                                                                    | 覆盖                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| --------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`limit`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、擦除（`truncate`、`remove`、`redact` 的条数和剩下的条目、`ctx.erased` 记录、什么都没动时不留记录、末尾前进和旧 `expectSeq` 冲突、`id`/`key` 让不让出来、和并发 `append` 不交错）、`sessions` 的升序和翻页、`watch?` 的读已有、读新写入、读擦除记录、中止 |
-| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                                                                                                                                                                                                                              |
-| `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                                                                                                                                                                                                                      |
-| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                                                                                                                                                                                                                          |
-| `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                                                                                                                                                                                                                     |
-| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                                                                                                                                                                                                                                     |
-| `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                         |
-| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                        |
+| 契约测试                          | 工厂                                                                    | 覆盖                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`limit`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、擦除（`truncate`、`remove`、`redact` 的条数和剩下的条目、`ctx.erased` 记录、什么都没动时不留记录、末尾前进和旧 `expectSeq` 冲突、`id`/`key` 让不让出来、和并发 `append` 不交错）、`sessions` 的升序和翻页、导出再导入（另一个存储里 `covers` 指对位置、投影一致、重复导入只有一份、截断的文件接得上、同一个存储里复制、擦除记录的位置）、`watch?` 的读已有、读新写入、读擦除记录、中止 |
+| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                                                                                                                                                                                                                                                                                                                                                        |
+| `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                                                                                                                                                                                                                                                                                                                                                                   |
+| `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。记忆的契约用协议包 `/testing` 里的剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel`：`describeMemoryContract` 自己造好它们和一个内存会话日志交给工厂。谁跑：记忆存储的契约由 `ctx-memory` 的内存存储（带和不带 `embed`）、`createSqliteMemoryStore`、`createRemoteMemoryStore` 跑；决策模型的由剧本模型、启发式、`decisionFromLanguageModel`、`ctx-models` 的两个 provider（假 `fetch`）跑；提取模型的由剧本模型、`extractionFromLanguageModel`、`ctx-models` 的 `cloudflare` 跑；`describeMemoryContract` 由 `createMemory` 加内存存储跑，门控阈值固定在 0.1..0.9 之间，`LanguageModel` 可以不给。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里。
 

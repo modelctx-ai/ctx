@@ -1,13 +1,14 @@
 # 例子
 
-每个例子对应一种部署，都是一个能直接跑的文件。不设环境变量时模型按剧本回答（协议包的剧本模型），不用联网、不用密钥；CI 里跑的就是这一种（`examples.test.ts`，以及构建之后的 `pnpm examples`）。
+每个例子对应一种部署或一件值得示范的事，都是一个能直接跑的文件。不设环境变量时模型按剧本回答（协议包的剧本模型），不用联网、不用密钥；CI 里跑的就是这一种（`examples.test.ts`，以及构建之后的 `pnpm examples`）。
 
-| 文件                                     | 部署                                          | 看什么                                                                                        |
-| ---------------------------------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| [`single-process.ts`](single-process.ts) | 单进程：SQLite 加一个模型，带工具             | `createSqliteStore`、`createToolRegistry().addTool`、`createHarness`、`createOrchestrator`    |
-| [`remote-split.ts`](remote-split.ts)     | 拆开：存储一个进程，执行环境一个进程，经 HTTP | `startRemote`、`createRemoteSessionStore`、`createRemoteExecutor`；harness 一侧只认协议       |
-| [`two-processes.ts`](two-processes.ts)   | 记录开着，两个进程共用一个库                  | 一个会话最多一个未结束的运行（`session_busy`）、`owner`、`recover` 收走自己断掉的运行         |
-| [`memory.ts`](memory.ts)                 | 记忆接进上下文                                | `createMemory` 的 `gate`、`consolidate`、`source()`、`recall` 工具，按用户的作用域（`scope`） |
+| 文件                                     | 部署                                          | 看什么                                                                                                        |
+| ---------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| [`single-process.ts`](single-process.ts) | 单进程：SQLite 加一个模型，带工具             | `createSqliteStore`、`createToolRegistry().addTool`、`createHarness`、`createOrchestrator`                    |
+| [`remote-split.ts`](remote-split.ts)     | 拆开：存储一个进程，执行环境一个进程，经 HTTP | `startRemote`、`createRemoteSessionStore`、`createRemoteExecutor`；harness 一侧只认协议                       |
+| [`two-processes.ts`](two-processes.ts)   | 记录开着，两个进程共用一个库                  | 一个会话最多一个未结束的运行（`session_busy`）、`owner`、`recover` 收走自己断掉的运行                         |
+| [`memory.ts`](memory.ts)                 | 记忆接进上下文                                | `createMemory` 的 `gate`、`consolidate`、`source()`、`recall` 工具，按用户的作用域（`scope`）                 |
+| [`move-session.ts`](move-session.ts)     | 搬会话：内存 → 文件 → SQLite → 远端           | `exportSession`、`importSession`、`copySession`：`seq` 重新分配之后摘要的 `covers` 仍然指对，三边的上下文一样 |
 
 ## 怎么跑
 

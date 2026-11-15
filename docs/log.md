@@ -4,7 +4,9 @@
 
 ## 2026-11-15
 
-- **新增** [ADR 0007](adr/0007-deletion-and-retention.md)（提案，会话这一半已实现）：只追加的例外。`truncate`、`remove`、`redact` 三个方法和擦除记录 `ctx.erased`（为什么要留记录：末尾一定前进、`expectSeq` 一定冲突、`watch` 收得到），运行中的 harness 在自己写的条目被擦除时停下，摘要不跟着改，SQLite 用连接级的 `secure_delete` 加 `vacuum()`（附实测：只在删除时打开擦不干净），保留期是应用调的函数；破坏面、代价、没有采用的方案。[ADR 索引](adr/index.md)加一行；[ADR 0003](adr/0003-context-model.md) 头部加修订行指过来，正文不动。
+- **更新** [协议层](protocol.md)：会话一节加「导出、导入、复制」小节——JSON Lines 的格式（头、条目、结束行）、`exportSession`、`importSession`、`copySession` 的签名，导入时哪些 `seq` 引用跟着换、`id` 的三种处理、不是原子的、哪些情况抛什么；契约测试表跟上。以前没有写会话怎么搬到别的存储，「`list` 再 `append`」会让 `covers` 指错位置。[概念](concepts.md)术语表加「导出、导入」。[协议包](../packages/protocol/README.md)导出表加这三个函数和格式的常量、类型。
+- **新增** 例子 [`move-session.ts`](../examples/move-session.ts)：一个压缩过的会话从内存存储导成文件、导进 SQLite、再复制到远端存储，三边的上下文一样；[例子说明](../examples/README.md)的表加一行。
+- **新增** [ADR 0007](adr/0007-deletion-and-retention.md)（已采纳，会话这一半已实现）：只追加的例外。`truncate`、`remove`、`redact` 三个方法和擦除记录 `ctx.erased`（为什么要留记录：末尾一定前进、`expectSeq` 一定冲突、`watch` 收得到），运行中的 harness 在自己写的条目被擦除时停下，摘要不跟着改，SQLite 用连接级的 `secure_delete` 加 `vacuum()`（附实测：只在删除时打开擦不干净），保留期是应用调的函数；破坏面、代价、没有采用的方案。[ADR 索引](adr/index.md)加一行；[ADR 0003](adr/0003-context-model.md) 头部加修订行指过来，正文不动。
 - **更新** [协议层](protocol.md)：`SessionStore` 的签名加三个方法；新的「擦除」小节写每个方法做什么，和 `seq`、`expectSeq`、`watch`、摘要的 `covers`、投影、生命周期事件的关系，以及 `clear` 为什么不在其中；框架事件表加 `ctx.erased`、`ctx.redacted`；harness 的写入规则加第三种围栏（自己写的条目被擦除）；契约测试表和线上形态（三条 `POST` 路径、重试的说法）跟上。
 - **更新** [概念](concepts.md)：术语表加擦除和擦除记录、涂改、保留期，围栏一条和事件 `kind` 一条跟上；设计约束 1「只追加」写明例外只在应用明确删除时发生。
 - **更新** [架构](architecture.md)：存储表加三个方法；新的「删除和保留期」小节写内存存储、`ctx-sqlite`、`ctx-remote` 各怎么做，`pruneSession` 的选项和两条保守的规则，以及擦除和记忆的证据的关系；harness 的围栏、自定义存储的用例表、实现约束里「只追加」一行跟上。

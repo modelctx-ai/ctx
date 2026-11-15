@@ -32,6 +32,8 @@ import {
   type SessionStore,
 } from './session.ts';
 import { ENTRY_VERSION } from './version.ts';
+import { copySession, exportSession, importSession } from './transfer.ts';
+import { project } from './context.ts';
 import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type ToolRegistry } from './tools.ts';
 import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 import {
@@ -92,6 +94,11 @@ function withoutErased(entries: readonly Entry[]): Entry[] {
   return entries.filter((entry) => entry.type !== 'event' || entry.kind !== CTX_EVENTS.erased);
 }
 
+/** 占位置用的条目，自己带 `id`：不和别的存储生成的 `id` 撞。 */
+function padding(count: number): NewEntry[] {
+  return Array.from({ length: count }, (_, n) => userEntry(`pad${n}`, { id: `pad-${n}` }));
+}
+
 const WATCH_TIMEOUT_MS = 2_000;
 
 /** 取迭代器的下一项，超时就失败，免得一个不出数据的 `watch` 把测试挂住。 */
@@ -113,6 +120,152 @@ export function describeSessionStoreContract(
   { describe, test }: ContractTestApi,
 ): void {
   describe(`SessionStore contract: ${name}`, () => {
+    test('导出再导入到另一个存储：seq 重新分配，摘要盖住的还是那几条', async () => {
+      let clock = 1_000;
+      const source = await factory({ now: () => clock++ });
+      const target = await factory({ now: () => clock++ });
+      // 两边的 seq 对不上：源存储先被别的会话占掉一段，目标存储占掉更长的一段。
+      await source.append('pad', batch('p'));
+      await target.append('pad', padding(12));
+      const written = await source.append('s', [...batch('旧'), userEntry('问'), assistantEntry('答')]);
+      const covers = written[3]!.seq;
+      const [summary] = await source.append('s', [summaryEntry('前四句的摘要', covers, { source: 'compactor' })]);
+      await source.append('s', [
+        eventEntry('ctx.compacted', { data: { covers, summaryId: summary!.id } }),
+        userEntry('再问', { key: 'k1', meta: { lang: 'zh' } }),
+      ]);
+
+      const chunks: string[] = [];
+      for await (const chunk of exportSession(source, 's', { pageSize: 3 })) chunks.push(chunk);
+      const result = await importSession(target, chunks, { batchSize: 2 });
+      assert.equal(result.session, 's');
+      assert.equal(result.read, 9);
+      assert.equal(result.written, 9);
+      assert.equal(result.skipped, 0);
+
+      const before = await source.list('s');
+      const after = await target.list('s');
+      assert.deepEqual(texts(after), texts(before));
+      assert.deepEqual(
+        after.map((entry) => [entry.id, entry.at, entry.key, entry.source, entry.meta]),
+        before.map((entry) => [entry.id, entry.at, entry.key, entry.source, entry.meta]),
+        'id、at、key、source、meta 原样带过去',
+      );
+      const moved = after.find((entry) => entry.type === 'summary');
+      assert.ok(moved?.type === 'summary');
+      assert.equal(moved.covers, after[3]!.seq, 'covers 换成目标存储里同一条的 seq');
+      assert.equal(result.remap(covers), after[3]!.seq);
+      assert.equal(result.remap(before[0]!.seq - 1), 0, '第一条之前是会话开头');
+      const compacted = after.find((entry) => entry.type === 'event' && entry.kind === 'ctx.compacted');
+      assert.deepEqual(compacted?.type === 'event' && compacted.data, {
+        covers: after[3]!.seq,
+        summaryId: summary!.id,
+      });
+      assert.deepEqual(project(after).messages, project(before).messages, '投影出来的消息一样');
+      assert.equal(project(after).messages.length, 4, '摘要、问、答、再问');
+    });
+
+    test('导入可以重来：同一份文件导两次只有一份，截断的文件报错之后拿完整的接上', async () => {
+      let clock = 1_000;
+      const source = await factory({ now: () => clock++ });
+      const target = await factory({ now: () => clock++ });
+      const written = await source.append('s', batch('m'));
+      await source.append('s', [summaryEntry('摘要', written[1]!.seq), userEntry('后来')]);
+      let file = '';
+      for await (const chunk of exportSession(source, 's')) file += chunk;
+
+      const lines = file.trimEnd().split('\n');
+      const cut = `${lines.slice(0, 4).join('\n')}\n`;
+      const error = await importSession(target, cut).then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      );
+      assert.equal((error as { type?: string } | undefined)?.type, 'invalid_request', '没有结束行的文件是截断的');
+      assert.deepEqual(texts(await target.list('s')), ['m1', 'm2', 'm3'], '读到的部分已经写进去');
+
+      const resumed = await importSession(target, file);
+      assert.equal(resumed.written, 3);
+      assert.equal(resumed.skipped, 3);
+      const again = await importSession(target, file);
+      assert.equal(again.written, 0);
+      assert.equal(again.skipped, 6);
+      const after = await target.list('s');
+      assert.deepEqual(texts(after), ['m1', 'm2', 'm3', 'm4', '摘要', '后来']);
+      const summary = after[4]!;
+      assert.equal(summary.type === 'summary' && summary.covers, after[1]!.seq, '接上之后 covers 仍然指对');
+      assert.equal(again.remap(written[1]!.seq), after[1]!.seq, '跳过的条目也找得回位置');
+    });
+
+    test('copySession：同一个存储里复制成另一个会话，id 重新生成，引用跟着换', async () => {
+      let clock = 1_000;
+      const store = await factory({ now: () => clock++ });
+      const written = await store.append('a', batch('m'));
+      const [summary] = await store.append('a', [summaryEntry('摘要', written[2]!.seq)]);
+      await store.append('a', [
+        eventEntry('ctx.compacted', { data: { covers: written[2]!.seq, summaryId: summary!.id } }),
+      ]);
+
+      const kept = await copySession(store, 'a', store, 'b', { ids: 'keep' }).then(
+        () => undefined,
+        (thrown: unknown) => thrown,
+      );
+      assert.equal((kept as { type?: string } | undefined)?.type, 'conflict', '保留 id 写不进同一个存储');
+      assert.deepEqual(await store.list('b'), []);
+
+      const result = await copySession(store, 'a', store, 'b');
+      assert.equal(result.written, 6);
+      const original = await store.list('a');
+      const copy = await store.list('b');
+      assert.deepEqual(texts(copy), texts(original));
+      const originalIds = new Set(original.map((entry) => entry.id));
+      assert.ok(
+        copy.every((entry) => !originalIds.has(entry.id)),
+        '每一条都是新的 id',
+      );
+      const copied = copy[4]!;
+      assert.equal(copied.type === 'summary' && copied.covers, copy[2]!.seq);
+      const compacted = copy[5]!;
+      assert.deepEqual(compacted.type === 'event' && compacted.data, { covers: copy[2]!.seq, summaryId: copied.id });
+      assert.deepEqual(texts(await store.list('a')), texts(original), '源会话不动');
+
+      const mapped = await copySession(store, 'a', store, 'c', { ids: (id) => `c:${id}` });
+      const again = await copySession(store, 'a', store, 'c', { ids: (id) => `c:${id}` });
+      assert.equal(mapped.written, 6);
+      assert.equal(again.written, 0, 'id 有固定的映射时重复复制不写第二份');
+      const third = await store.list('c');
+      assert.deepEqual(third[5]!.type === 'event' && third[5]!.data, {
+        covers: third[2]!.seq,
+        summaryId: `c:${summary!.id}`,
+      });
+    });
+
+    test('导出和导入带上擦除：涂改的占位留在原位，擦除记录只留还指得到的位置', async () => {
+      let clock = 1_000;
+      const source = await factory({ now: () => clock++ });
+      const target = await factory({ now: () => clock++ });
+      await target.append('pad', padding(4));
+      const written = await source.append('s', batch('m'));
+      await source.redact('s', [written[1]!.id]);
+      await source.remove('s', [written[2]!.id]);
+      await source.append('s', [userEntry('后来')]);
+
+      const result = await copySession(source, 's', target, 's');
+      const after = await target.list('s');
+      assert.deepEqual(
+        after.map((entry) => (entry.type === 'event' ? entry.kind : entry.type)),
+        ['message', 'ctx.redacted', 'message', 'ctx.erased', 'ctx.erased', 'message'],
+      );
+      assert.equal(result.written, 6);
+      const records = after.filter((entry) => entry.type === 'event' && entry.kind === 'ctx.erased');
+      assert.deepEqual(
+        records.map((entry) => entry.type === 'event' && entry.data),
+        [
+          { op: 'redact', seqs: [after[1]!.seq], count: 1 },
+          { op: 'remove', seqs: [], count: 1 },
+        ],
+      );
+    });
+
     test('list 按 seq 返回：补写的旧记录排在写入的位置，不按 at 插回去', async () => {
       let clock = 1_000;
       const store = await factory({ now: () => clock++ });

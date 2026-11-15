@@ -3,6 +3,7 @@ export * from './message.ts';
 export * from './session.ts';
 export * from './version.ts';
 export * from './erase.ts';
+export * from './transfer.ts';
 export { contentFromLoose, messageFromModelMessage } from './ai-sdk.ts';
 export * from './tokens.ts';
 export * from './context.ts';

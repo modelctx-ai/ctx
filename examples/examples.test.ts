@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'vite-plus/test';
 
 import { main as memory } from './memory.ts';
+import { main as moveSession } from './move-session.ts';
 import { main as remoteSplit } from './remote-split.ts';
 import { main as singleProcess } from './single-process.ts';
 import { main as twoProcesses } from './two-processes.ts';
@@ -33,5 +34,13 @@ describe('examples', () => {
 
   test('memory：一个会话里说的事，另一个会话的上下文里有', async () => {
     assert.match(await memory(quiet), /花生过敏/);
+  });
+
+  test('move-session：内存、SQLite、远端三个实现之间搬会话，上下文不变', async () => {
+    const [memoryView, sqliteView, remoteView] = await moveSession(quiet);
+    assert.equal(memoryView!.length, 3, '摘要加摘要之后的一问一答');
+    assert.match(memoryView![0]!, /周三要见客户/);
+    assert.deepEqual(sqliteView, memoryView);
+    assert.deepEqual(remoteView, memoryView);
   });
 });
