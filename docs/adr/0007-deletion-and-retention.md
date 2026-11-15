@@ -3,12 +3,12 @@ type: Decision Record
 title: 'ADR 0007：会话的擦除和保留期'
 description: '只追加的例外：`truncate`、`remove`、`redact` 和擦除记录 `ctx.erased`，运行中的 harness 怎么看见，SQLite 的 `secure_delete` 和 `vacuum`，保留期是应用调的函数'
 tags: [adr, session, protocol, privacy]
-status: draft
+status: stable
 ---
 
 # ADR 0007：会话的擦除和保留期
 
-- 状态：提案（和实现在同一个提交里，等审阅）
+- 状态：已采纳
 - 实施状态：会话这一半已实施，未发布。记忆那一半（`forget` 级联到画像、画像历史、笔记和向量，「按会话或按用户全部删除」的入口）不在这篇里，单独做
 - 日期：2026-11-15
 - 范围：`ctx-protocol`（`SessionStore`）、`@modelctx-ai/ctx`（内存存储、harness、`pruneSession`）、`ctx-sqlite`、`ctx-remote`
