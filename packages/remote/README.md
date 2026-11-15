@@ -196,27 +196,28 @@ const bob = alice.scope('user:bob'); // 同一个连接，另一个作用域
 
 每个协议方法恰好一个端点。路径里的 `:id` 用 `encodeURIComponent` 转义；查询参数不给就不传给存储，布尔是 `true` / `false`，数字原样（`limit=1.9` 由存储向下取整）。
 
-| 集合 | 协议方法  | HTTP                                                    | 请求体                                         | 响应                            |
-| ---- | --------- | ------------------------------------------------------- | ---------------------------------------------- | ------------------------------- |
-| 笔记 | `add`     | `POST /memory/notes`                                    | `{ notes: NewNote[] }`                         | `{ notes: Note[] }`             |
-|      | `list`    | `GET /memory/notes?session=&pending=&limit=`            | —                                              | `{ notes: Note[] }`             |
-|      | `settle`  | `POST /memory/notes/settle`                             | `{ ids: string[], at }`                        | `{ settled: number }`           |
-|      | `head`    | `GET /memory/notes/head?session=`（必填）               | —                                              | `{ head: number }`              |
-| 事实 | `add`     | `POST /memory/facts`                                    | `{ fact: NewMemoryFact }`                      | `{ fact: MemoryFact }`          |
-|      | `list`    | `GET /memory/facts?subject=&topic=&open=&after=&limit=` | —                                              | `{ facts: MemoryFact[] }`       |
-|      | `search`  | `POST /memory/facts/search`                             | `SearchQuery`（`{ text, topic?, k?, open? }`） | `{ hits: FactHit[] }`           |
-|      | `close`   | `POST /memory/facts/:id/close`                          | `{ at, supersededBy? }`                        | `{}`                            |
-|      | `cite`    | `POST /memory/facts/:id/cite`                           | `{ sources: SourceRef[] }`                     | `{ fact: MemoryFact }`          |
-|      | `touch`   | `POST /memory/facts/touch`                              | `{ ids: string[], at }`                        | `{}`                            |
-|      | `archive` | `POST /memory/facts/archive`                            | `{ ids: string[], at }`                        | `{ archived: number }`          |
-|      | `forget`  | `POST /memory/facts/forget`                             | `{ ids: string[] }`                            | `{ forgotten: number }`         |
-| 程序 | `add`     | `POST /memory/procedures`                               | `{ procedure: NewProcedure }`                  | `{ procedure: Procedure }`      |
-|      | `list`    | `GET /memory/procedures?topic=&active=`                 | —                                              | `{ procedures: Procedure[] }`   |
-|      | `confirm` | `POST /memory/procedures/:id/confirm`                   | `{ evidence: SourceRef[] }`                    | `{ procedure: Procedure }`      |
-|      | `retire`  | `POST /memory/procedures/:id/retire`                    | `{ at }`                                       | `{}`                            |
-| 画像 | `get`     | `GET /memory/core`                                      | —                                              | `{ core: CoreVersion \| null }` |
-|      | `set`     | `PUT /memory/core`                                      | `{ text, at }`                                 | `{}`                            |
-|      | `history` | `GET /memory/core/history?last=`                        | —                                              | `{ versions: CoreVersion[] }`   |
+| 集合 | 协议方法  | HTTP                                                    | 请求体                                                    | 响应                            |
+| ---- | --------- | ------------------------------------------------------- | --------------------------------------------------------- | ------------------------------- |
+| 笔记 | `add`     | `POST /memory/notes`                                    | `{ notes: NewNote[] }`                                    | `{ notes: Note[] }`             |
+|      | `list`    | `GET /memory/notes?session=&pending=&limit=`            | —                                                         | `{ notes: Note[] }`             |
+|      | `settle`  | `POST /memory/notes/settle`                             | `{ ids: string[], at }`                                   | `{ settled: number }`           |
+|      | `head`    | `GET /memory/notes/head?session=`（必填）               | —                                                         | `{ head: number }`              |
+| 事实 | `add`     | `POST /memory/facts`                                    | `{ fact: NewMemoryFact }`                                 | `{ fact: MemoryFact }`          |
+|      | `list`    | `GET /memory/facts?subject=&topic=&open=&after=&limit=` | —                                                         | `{ facts: MemoryFact[] }`       |
+|      | `search`  | `POST /memory/facts/search`                             | `SearchQuery`（`{ text, topic?, k?, open?, archived? }`） | `{ hits: FactHit[] }`           |
+|      | `close`   | `POST /memory/facts/:id/close`                          | `{ at, supersededBy? }`                                   | `{}`                            |
+|      | `cite`    | `POST /memory/facts/:id/cite`                           | `{ sources: SourceRef[] }`                                | `{ fact: MemoryFact }`          |
+|      | `touch`   | `POST /memory/facts/touch`                              | `{ ids: string[], at }`                                   | `{}`                            |
+|      | `archive` | `POST /memory/facts/archive`                            | `{ ids: string[], at }`                                   | `{ archived: number }`          |
+|      | `restore` | `POST /memory/facts/restore`                            | `{ ids: string[] }`                                       | `{ restored: number }`          |
+|      | `forget`  | `POST /memory/facts/forget`                             | `{ ids: string[] }`                                       | `{ forgotten: number }`         |
+| 程序 | `add`     | `POST /memory/procedures`                               | `{ procedure: NewProcedure }`                             | `{ procedure: Procedure }`      |
+|      | `list`    | `GET /memory/procedures?topic=&active=`                 | —                                                         | `{ procedures: Procedure[] }`   |
+|      | `confirm` | `POST /memory/procedures/:id/confirm`                   | `{ evidence: SourceRef[] }`                               | `{ procedure: Procedure }`      |
+|      | `retire`  | `POST /memory/procedures/:id/retire`                    | `{ at }`                                                  | `{}`                            |
+| 画像 | `get`     | `GET /memory/core`                                      | —                                                         | `{ core: CoreVersion \| null }` |
+|      | `set`     | `PUT /memory/core`                                      | `{ text, at }`                                            | `{}`                            |
+|      | `history` | `GET /memory/core/history?last=`                        | —                                                         | `{ versions: CoreVersion[] }`   |
 
 错误：存储抛的 `CtxError` 按 `type` 映射状态码，正文的 `type` 原样保留：`invalid_request` 400、`not_found` 404、`conflict` 409。服务端自己查出的输入不对（缺字段、`limit` 不是数、`pending` 不是 `true` / `false`、`head` 没给 `session`）也是 400 `invalid_request`。客户端把这三种 `type` 转回同 `type` 的 `CtxError`（批量方法照协议跳过认不得的 `id`，不报错）；别的错误照常是 `RemoteError`，例如服务端没挂记忆是 404 `not_found_error`、方法不对是 405 `method_not_allowed`，调用方据此区分「这个 `id` 不存在」和「这个服务没有记忆」。
 

@@ -674,6 +674,7 @@ describe('远程记忆存储', () => {
       ['GET', '/memory/notes/settle'],
       ['POST', '/memory/notes/head'],
       ['GET', '/memory/facts/search'],
+      ['GET', '/memory/facts/restore'],
       ['GET', '/memory/facts/f1/close'],
       ['PUT', '/memory/procedures'],
       ['GET', '/memory/procedures/p1/retire'],
@@ -690,6 +691,10 @@ describe('远程记忆存储', () => {
     expect(((await bad.json()) as { error: { type: string } }).error.type).toBe('invalid_request');
     expect((await call('GET', '/memory/notes/head')).status).toBe(400);
     expect((await call('GET', '/memory/facts?limit=abc')).status).toBe(400);
+    expect((await call('POST', '/memory/facts/search', { text: '茶', archived: 'yes' })).status).toBe(400);
+    expect((await call('POST', '/memory/facts/restore', { ids: 'f1' })).status).toBe(400);
+    const restored = await call('POST', '/memory/facts/restore', { ids: ['missing'] });
+    expect([restored.status, await restored.json()]).toEqual([200, { restored: 0 }]);
     expect((await call('GET', '/memory/procedures?active=yes')).status).toBe(400);
     const missing = await call('POST', '/memory/facts/missing/close', { at: 1 });
     expect(missing.status).toBe(404);

@@ -1,38 +1,8 @@
-import { textOf, type Entry } from '@modelctx-ai/ctx-protocol';
+import { searchTerms, textOf, type Entry } from '@modelctx-ai/ctx-protocol';
 
-// 汉字、假名、谚文按两字一组切，其余按字母数字连成的词切。够全文检索和启发式用，不是分词器。
-const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const WORD = /[\p{L}\p{N}]/u;
-
-/** 文字切成小写的词：拉丁字母和数字按连续的一串，汉字按相邻两字（单个汉字自成一个）。去重。 */
+/** 文字切成小写的词（协议包的 `searchTerms`：字母数字连成的一串、中日韩文字相邻两字），去重。 */
 export function tokens(text: string): Set<string> {
-  const out = new Set<string>();
-  let word = '';
-  let han = '';
-  const flushWord = (): void => {
-    if (word) out.add(word);
-    word = '';
-  };
-  const flushHan = (): void => {
-    if (han.length === 1) out.add(han);
-    else for (let i = 0; i + 1 < han.length; i += 1) out.add(han.slice(i, i + 2));
-    han = '';
-  };
-  for (const char of text.toLowerCase()) {
-    if (CJK.test(char)) {
-      flushWord();
-      han += char;
-    } else if (WORD.test(char)) {
-      flushHan();
-      word += char;
-    } else {
-      flushWord();
-      flushHan();
-    }
-  }
-  flushWord();
-  flushHan();
-  return out;
+  return new Set(searchTerms(text));
 }
 
 /**

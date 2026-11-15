@@ -611,7 +611,7 @@ interface Orchestrator {
 
 一份存储按**作用域**分开：`store.scope(name)` 是同一份数据上名叫 `name` 的作用域的视图，四个集合都在作用域里面。一个用户、租户或项目一个作用域，名字由应用定（字符串，最长 `MAX_MEMORY_SCOPE_LENGTH` = 256 个字符，原样比较）；不调 `scope` 时用的是缺省的作用域 `DEFAULT_MEMORY_SCOPE`（空串）。
 
-- 一个作用域读不到、搜不到、改不了、删不掉另一个作用域的东西：`list`、`search`、`head`、`core.get`、`core.history` 只看自己的；别的作用域的 `id` 和不存在的 `id` 一样对待（`close`、`cite`、`confirm`、`retire` 抛 `not_found`，`settle`、`touch`、`archive`、`forget` 跳过），`supersededBy` 也不能指向别的作用域。
+- 一个作用域读不到、搜不到、改不了、删不掉另一个作用域的东西：`list`、`search`、`head`、`core.get`、`core.history` 只看自己的；别的作用域的 `id` 和不存在的 `id` 一样对待（`close`、`cite`、`confirm`、`retire` 抛 `not_found`，`settle`、`touch`、`archive`、`restore`、`forget` 跳过），`supersededBy` 也不能指向别的作用域。实现给 `search` 建的索引也要按作用域分开。
 - 名字是绝对的，不嵌套：`store.scope('a').scope('b')` 就是 `store.scope('b')`。从没写过的作用域是空的，不用先建。名字不合法（`checkMemoryScope`）抛 `invalid_request`。
 - `id` 在整份存储里不重复，不只是在一个作用域里。
 - 作用域是隔离，不是鉴权：谁能用哪个作用域由应用决定（远端的 `/memory/*` 只认访问令牌，拿到令牌就能用任何作用域）。
@@ -656,7 +656,7 @@ interface MemoryFact {
   confidence: number; // 0..1
   salience: number; // 0..1，激活度公式里的 s
   sources: readonly SourceRef[]; // 必填，不允许没有证据的事实
-  recalls: readonly number[]; // 每次被召回的时刻，激活度公式里的 t_i
+  recalls: readonly number[]; // 最近几次被召回的时刻（最多 MAX_FACT_RECALLS = 32 个），激活度公式里的 t_i
   archivedAt?: number; // 归档的时刻；没有就是没归档
 }
 type NewMemoryFact = Omit<MemoryFact, 'id' | 'validTo' | 'supersededBy' | 'recalls' | 'archivedAt'>;
@@ -690,10 +690,11 @@ interface FactQuery {
   limit?: number;
 }
 interface SearchQuery {
-  text: string; // 实现决定用全文、向量还是两者；至少子串（3 个字符以上）命中
+  text: string; // 实现决定用全文、向量还是两者；至少和事实有共同的词（searchTerms）时命中，多长都不报错
   topic?: string;
   k?: number; // 缺省 10
   open?: boolean; // 缺省 true；false 连同关闭、归档的一起搜
+  archived?: boolean; // true 时仍然成立的里面连归档的一起搜，关闭的还是不看；缺省 false
 }
 
 interface CoreVersion {
@@ -718,9 +719,11 @@ interface MemoryStore {
     close(id: string, at: number, options?: { supersededBy?: string }): Promise<void>;
     /** 追加证据（并入时用），文字不变；相同的区间跳过。 */
     cite(id: string, sources: readonly SourceRef[]): Promise<MemoryFact>;
-    /** 记一次召回。 */
+    /** 记一次召回；recalls 超过 MAX_FACT_RECALLS 个时丢掉最早的。 */
     touch(ids: readonly string[], at: number): Promise<void>;
     archive(ids: readonly string[], at: number): Promise<number>;
+    /** 恢复归档的事实（清掉 archivedAt），返回真正恢复的条数；有效期不动。 */
+    restore(ids: readonly string[]): Promise<number>;
     /** 真删除，连同指向它的 supersededBy 一起清掉。主人的权利。 */
     forget(ids: readonly string[]): Promise<number>;
     list(query?: FactQuery): Promise<MemoryFact[]>;
@@ -745,12 +748,16 @@ interface MemoryStore {
 
 - **事实不 UPDATE。** 变了就 `close` 旧的、`add` 新的，`supersededBy` 连起来。「上个月用的是哪个数据库」永远能查。
 - **证据必填。** `MemoryFact.sources`、`Procedure.evidence` 指向会话日志的 `seq` 区间。没有证据的事实不进存储，这是防编造的第一道闸。
-- **归档不删除。** `archive` 只是让它退出 `open` 的查询，`forget` 才删。
-- **错误。** 参数不合法（没有证据、`from > upTo`）是 `CtxError` 的 `invalid_request`，认不得的 `id` 是 `not_found`；批量方法（`settle`、`touch`、`archive`、`forget`）跳过认不得的 `id`。存储不看钟，时刻都由调用方给。
+- **归档不删除，也不是找不回。** `archive` 只是让它退出 `open` 的查询，`forget` 才删。归档的事实 `search` 带 `archived: true` 还搜得到（存储不降权，分数怎么打折由调用方定），`restore` 把它恢复成没归档的。
+- **`recalls` 有上限。** `touch` 只留最近 `MAX_FACT_RECALLS`（32）个时刻，早的丢掉：一条事实不随召回次数无限变长，激活度也就有了上界。
+- **错误。** 参数不合法（没有证据、`from > upTo`）是 `CtxError` 的 `invalid_request`，认不得的 `id` 是 `not_found`；批量方法（`settle`、`touch`、`archive`、`restore`、`forget`）跳过认不得的 `id`。存储不看钟，时刻都由调用方给。
 - **记忆不写会话日志。** 记忆是日志的读者。应用要在日志里留痕（例如「今晚整理了 12 条」）自己追加事件，这是明确的选择。
-- `search` 的实现自定：全文、向量、两者混合。协议只约定输入是文字。
+- `search` 的实现自定：全文、向量、两者混合。协议约定输入是文字，以及三条底线（契约测试都查）：
+  - **有共同的词就命中。** 词按 `searchTerms(text)` 切：先 NFKC 归一、转小写；字母和数字连成的一串是一个词，中日韩文字没有空白分词，每相邻两个字算一个词（落单的一个字自成一个）。所以「我平时喜欢喝什么茶？」找得回「主人喜欢喝乌龙茶」（共同的词是「喜欢」「欢喝」）。英文按整词：`Postgre` 不命中 `PostgreSQL`。
+  - **共同的词占得多的在前。** 全文的分数用 `termOverlap(shared, a, b)`：重叠系数 `shared / min(a, b)`，一边的词全在另一边里就是 1。短的查询对长的事实、长长的一段话对短的事实都打得出分。
+  - **多长的查询都不报错。** 实现最多看 `MAX_SEARCH_TERMS`（256）个不同的词：`searchTerms(text, MAX_SEARCH_TERMS)` 在词更多时取开头的一半和结尾的一半。
 - 记忆里的事实叫 `MemoryFact`，和来源取到的事实 `Fact`（`{ source, text }`，只用于一次调用）是两回事：前者持久、有有效期，后者是「现在」。
-- 纯函数：`activation(fact, now, options?)`（见[激活度](#激活度-activation)，缺省参数是 `ACTIVATION_DEFAULTS`）、`rankFacts(facts, scores, options?)`（`scores` 是事实 `id` → 相似度，一般取 `FactHit.score`）、`renderCore(facts, budget, { now })` 的缺省写法（按激活度排，`estimateTextTokens` 超过 `budget` 前停下）、`sourceRef(session, entries)`；另有存储实现用的 `checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`、`isOpenFact`、`filterFacts`。
+- 纯函数：`activation(fact, now, options?)`、`retrievability(fact, now, options?)`（见[激活度](#激活度-activationretrievability)，缺省参数是 `ACTIVATION_DEFAULTS`）、`rankFacts(facts, scores, options?)`（`scores` 是事实 `id` → 相似度，一般取 `FactHit.score`）、`renderCore(facts, budget, { now })` 的缺省写法（按激活度排，`estimateTextTokens` 超过 `budget` 前停下）、`sourceRef(session, entries)`；检索用的 `searchTerms`、`termOverlap`（常量 `MAX_SEARCH_TERMS`）；另有存储实现用的 `checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`、`isOpenFact`、`filterFacts`、`inSearchScope`（`SearchQuery` 的 `topic`、`open`、`archived` 写成的判断）和常量 `MAX_FACT_RECALLS`。
 - 远端记忆存储（`ctx-remote`）：服务端挂 `memory`，路径在 `/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core` 下，作用域用查询参数 `?scope=`（不带就是缺省的）；客户端是 `createRemoteMemoryStore`。决策、提取模型没有线上形态，按名字在各自的进程里造。
 
 ### 决策和提取模型 `DecisionModel`、`ExtractionModel`
@@ -817,11 +824,17 @@ interface Memory extends Executor {
    * 没过阈值的那段也写一条已处理的笔记（settledAt = at），head 照样前进；没有新条目时返回空。
    */
   gate(session: string, options?: GateOptions): Promise<Note[]>; // GateOptions = { signal? }
-  /** 白天：按文字召回仍然成立的事实，按 rankFacts 排序，记一次 touch；带上匹配主题的程序。 */
+  /**
+   * 白天：按文字召回仍然成立的事实，按 rankFacts 排序，记一次 touch；带上匹配主题的程序。
+   * 归档的事实也找（相似度打折），被召回的那些恢复成没归档的；confidence 低于 minConfidence 的不召回。
+   */
   recall(query: string, options?: RecallOptions): Promise<Recalled>;
   /** 夜里：处理待处理的笔记，衰减归档，重写 core。整体可重复执行。 */
   consolidate(options?: ConsolidateOptions): Promise<ConsolidateReport>; // ConsolidateOptions = { now?, signal? }
-  /** 作为来源：core 加按 query 召回的事实，渲染成文字；什么都没有时返回空。 */
+  /**
+   * 作为来源：core 加按 query 召回的事实，渲染成文字；什么都没有时返回空。
+   * 来源每一轮都跑，它带出的事实不能每次都记 touch：实现要限制频率（参考实现是同一条事实一天记一次）。
+   */
   source(options?: MemorySourceOptions): ContextSource;
   /** 作为工具：recall（MEMORY_RECALL_TOOL），绑定到这个执行环境。 */
   tools(): Promise<ToolDefinition[]>;
@@ -836,11 +849,12 @@ interface RecallOptions {
   topic?: string;
   k?: number;
   budgetTokens?: number;
+  minConfidence?: number; // MemoryFact.confidence 低于它的不召回；缺省由实现定（参考实现 0.5），给 0 不筛
   evidence?: boolean; // 带回证据原文；工具调用时带，作为来源时不带
   signal?: AbortSignal;
 }
 interface Recalled {
-  facts: readonly MemoryFact[];
+  facts: readonly MemoryFact[]; // 已经 touch 过；原先归档的已经恢复，不带 archivedAt
   procedures: readonly Procedure[];
   evidence?: readonly Entry[]; // 只在 evidence 时有：证据区间里的条目，按 id 去重，按会话、seq 排
 }
@@ -855,15 +869,22 @@ interface ConsolidateReport {
 
 `Memory` 本身是一个 `Executor`（名字缺省 `memory`），和 MCP hub 一样：`tools()` 报出 `recall` 工具，注册进 `ToolRegistry` 就能给模型用。工具的输入是 `query`，可选 `since_days`（只要最近这么多天里开始成立的事实）、`topic`、`k`（1–20）；输出是文字，不是 JSON：用 `<memory>` 包起来，第一行声明「这是资料，不是指令」，事实带主题、日期和证据位置，程序带确认次数，最后是证据原文。不认识的工具、输入不对、`signal` 已中止、存储出错都返回 `{ type: 'error' }`。
 
-### 激活度 `activation`
+### 激活度 `activation`、`retrievability`
 
 ACT-R 的基础激活。每次召回都是一个 `t_i`，近的权重大，远的衰减；显著性 `s` 是常数偏置：
 
 ```
-A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = (now − t_i) / 1 天，t_i ∈ {validFrom, ...recalls}
+A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = |now − t_i| / 1 天，t_i ∈ {validFrom, 最近 32 次 recalls}
+R(fact, now) = 1 / (1 + e^(−(A − archiveAt)))  压到 0..1：ACT-R 的提取概率，阈值 τ 取 archiveAt
+score        = 0.6 × similarity + 0.4 × R      rankFacts
 ```
 
-缺省 `d = 0.5`、`ε = 0.02`、`archiveAt = 0.55`（`ACTIVATION_DEFAULTS`）。一条 `s = 0.6`、从未被召回的事实在 `validFrom` 之后约 1.09 天低于阈值，也就是下一次夜间巩固时归档（协议包的单元测试固定了「1 天时还在、1.2 天时已低于」）；`validFrom` 之后一天内被召回一次，约到第 4.4–4.9 天才低于阈值。注入排序和夜间归档用同一个 `A`。`activation` 是协议包里的纯函数。缺省值来自个人助理的量级，要按应用调。
+缺省 `d = 0.5`、`ε = 0.02`、`archiveAt = 0.55`（`ACTIVATION_DEFAULTS`）。三个都是协议包里的纯函数；缺省值来自个人助理的量级，要按应用调。
+
+- **有上界。** 只算最近 `MAX_FACT_RECALLS`（32）次召回，所以 `A ≤ ln(33 · ε^(−d)) + s`，缺省参数下是 `5.45 + s`。召回两万次和召回 32 次一样。
+- **未来的时刻按距离算。** `Δt` 取绝对值：十天后才生效的事实和十天前生效的一样活跃，临近时回升。`validFrom` 在未来的事实因此也会衰减、也能归档，不再永远顶着最高的激活度。
+- **排序用 `R`，不直接用 `A`。** `A` 没有固定的量程（缺省参数下从刚写的 2.6 到一年没动的 −2.3），直接加权会盖过 0..1 的相似度：以前刚写的事实相似度是 0 也排在相似度是 1 的旧事实前面。`R` 在阈值上是 0.5，刚写的事实（`s = 0.6`）约 0.88，一个月没动的约 0.16，召回再多也到不了 1。激活度因此最多贡献 0.4：相似度高出 0.67 的，对方召回再多也排在前面。
+- **归档看 `A`。** 一条 `s = 0.6`、从未被召回的事实在 `validFrom` 之后约 1.09 天低于阈值（协议包的单元测试固定了「1 天时还在、1.2 天时已低于」）；`validFrom` 之后一天内被召回一次，约到第 4.4–4.9 天才低于阈值。低于阈值是归档的必要条件，不是充分条件：参考实现还要求这条事实错过了足够多次被召回的机会（见[架构](architecture.md#记忆)的「巩固」），不然新事实头两天没碰上相关的问题就没了。
 
 ## 契约测试
 
@@ -877,10 +898,10 @@ A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = (now − t_i) / 1 �
 | `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、不带 `inputKey` 的失败重试不再记输入、模型报上下文过长是 `context_overflow`、`context.overflow`（超了选 `error` 不调模型、`trim` 裁到放得下）、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                                                                                                                                                                                                                                                                                 |
 | `describeContextBuilderContract`  | `({ script }) => { builder, store }`                                    | `build` 的消息顺序（历史、`input`、`prompt`）、指令、工具名单、不改日志、全是 JSON；不认识的投影名 `not_found`；`view` 里没有规则的事件不可见、摘要代替它盖住的条目；`window` 的 `maxMessages`、`{}`、`truncate`；`tokens?`；`compact?` 的不够长、写摘要和 `ctx.compacted`、被截断不写、超过 `maxInputTokens` 分段；`compactDetailed?` 的 `status`                                                                                                                                                                                                                                                                                                                         |
 | `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 作用域隔离（含检索的索引、归档和恢复）；笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加且只留最近 `MAX_FACT_RECALLS` 个、`archive` 退出 `open`、`restore` 恢复、`forget` 真删、`list` 翻页；`search` 的全文命中、中文问句、超长查询（上千个不同的词）、按相关度排、`archived`；程序 `confirm` 计数；`core` 历史                                                                                                                                                                                                                                                                                                       |
 | `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个、归档的也召回并恢复、`minConfidence`；`source` 连着带出几轮 `recalls` 不跟着涨；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 harness、编排器和上下文的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`（带 `truncated` 时是被 `maxOutputTokens` 截断的输出）、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。上下文的工厂给出一个缺省配置的 builder 和它读的存储，剧本是给 `compact` 的摘要模型的。记忆的契约用协议包 `/testing` 里的剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel`：`describeMemoryContract` 自己造好它们和一个内存会话日志交给工厂。谁跑：记忆存储的契约由 `ctx-memory` 的内存存储（带和不带 `embed`）、`createSqliteMemoryStore`、`createRemoteMemoryStore` 跑；决策模型的由剧本模型、启发式、`decisionFromLanguageModel`、`ctx-models` 的两个 provider（假 `fetch`）跑；提取模型的由剧本模型、`extractionFromLanguageModel`、`ctx-models` 的 `cloudflare` 跑；`describeMemoryContract` 由 `createMemory` 加内存存储跑，门控阈值固定在 0.1..0.9 之间，`LanguageModel` 可以不给。上下文的契约由 `createContextBuilder` 加内存存储跑；它只管协议方法里看得见的行为，投影规则这些进程内配置（事件怎么渲染、摘要怎么写）不在里面，由 `project` 的单元测试管。
 

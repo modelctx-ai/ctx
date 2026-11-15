@@ -129,14 +129,14 @@ async function seed(
   store: MemoryStore,
   sessions: SessionStore,
   text: string,
-  extra: { topic?: string; validFrom?: number; salience?: number } = {},
+  extra: { topic?: string; validFrom?: number; salience?: number; confidence?: number } = {},
 ) {
   const [entry] = await sessions.append('s', [userEntry(text)]);
   return store.facts.add({
     subject: 'user',
     text,
     validFrom: extra.validFrom ?? NOW,
-    confidence: 0.9,
+    confidence: extra.confidence ?? 0.9,
     salience: extra.salience ?? 0.6,
     sources: [{ session: 's', from: entry!.seq, upTo: entry!.seq }],
     ...(extra.topic !== undefined ? { topic: extra.topic } : {}),
@@ -484,18 +484,84 @@ describe('createMemory：consolidate', () => {
     assert.equal(fact?.confidence, 0.8);
   });
 
-  test('衰减：激活度低于 archiveAt 的 open 事实归档，近的留下', async () => {
+  test('衰减：激活度低于 archiveAt 还不够，还要错过 minChances 次机会；没人用记忆的日子不算', async () => {
     const { sessions, store, memory } = setup();
     const old = await seed(store, sessions, '很久以前的事', { validFrom: NOW - 30 * DAY });
     const fresh = await seed(store, sessions, '昨天的事', { validFrom: NOW - 0.5 * DAY });
+    assert.equal((await memory.consolidate()).facts.archived, 0, '这三十天记忆没被召回过：没有机会，不归档');
+
+    // 另一条事实这几天天天被召回：很久以前那条每天都错过一次。
+    const busy = await seed(store, sessions, '天天用到的事', { validFrom: NOW - 40 * DAY });
+    for (let day = 6; day >= 1; day -= 1) await store.facts.touch([busy.id], NOW - day * DAY);
+    assert.equal((await memory.consolidate()).facts.archived, 0, '六个日子，还差一个');
+    await store.facts.touch([busy.id], NOW - 6.5 * DAY);
+    assert.equal((await memory.consolidate()).facts.archived, 0, '同一天里的两次只算一次机会');
+    await store.facts.touch([busy.id], NOW - 7 * DAY);
     const report = await memory.consolidate();
     assert.equal(report.facts.archived, 1);
-    const facts = await store.facts.list({ open: true });
     assert.deepEqual(
-      facts.map((fact) => fact.id),
+      (await store.facts.list({ open: true })).map((fact) => fact.id).toSorted(),
+      [fresh.id, busy.id].toSorted(),
+      '近的、常用的留下',
+    );
+    assert.equal((await store.facts.list()).find((fact) => fact.id === old.id)?.archivedAt, NOW);
+  });
+
+  test('衰减：minChances 给 0 就只看激活度；archiveAt 可调', async () => {
+    const strict = setup({ decay: { minChances: 0 } });
+    const old = await seed(strict.store, strict.sessions, '很久以前的事', { validFrom: NOW - 30 * DAY });
+    const fresh = await seed(strict.store, strict.sessions, '昨天的事', { validFrom: NOW - 0.5 * DAY });
+    assert.equal((await strict.memory.consolidate()).facts.archived, 1);
+    assert.deepEqual(
+      (await strict.store.facts.list({ open: true })).map((fact) => fact.id),
       [fresh.id],
     );
-    assert.notEqual((await store.facts.list()).find((fact) => fact.id === old.id)?.archivedAt, undefined);
+    assert.notEqual((await strict.store.facts.list()).find((fact) => fact.id === old.id)?.archivedAt, undefined);
+
+    const lenient = setup({ decay: { minChances: 0, archiveAt: -5 } });
+    await seed(lenient.store, lenient.sessions, '很久以前的事', { validFrom: NOW - 30 * DAY });
+    assert.equal((await lenient.memory.consolidate()).facts.archived, 0);
+  });
+
+  test('衰减：新事实头几天没碰上相关的问题不归档；被召回一次就从头数', async () => {
+    const clock = { now: NOW };
+    const { sessions, store, memory } = setup({ now: () => clock.now });
+    const quiet = await seed(store, sessions, '主人下个月要去东京出差');
+    const revived = await seed(store, sessions, '主人的猫叫年糕');
+    await seed(store, sessions, '主人的项目用 PostgreSQL');
+    const open = async (): Promise<string[]> => (await store.facts.list({ open: true })).map((fact) => fact.id);
+    /** 过一天：白天有人问 PostgreSQL（只召回那一条），夜里巩固。 */
+    const day = async (n: number): Promise<number> => {
+      clock.now = NOW + n * DAY;
+      await memory.recall('PostgreSQL');
+      return (await memory.consolidate()).facts.archived;
+    };
+    for (let n = 1; n <= 4; n += 1) assert.equal(await day(n), 0, `第 ${n} 天：激活度已经低了，机会还不够`);
+    await memory.recall('猫叫什么');
+    assert.equal(await day(5), 0);
+    assert.equal(await day(6), 0);
+    assert.equal(await day(7), 1, '第 7 天：错过了七个日子的召回');
+    assert.ok(!(await open()).includes(quiet.id));
+    assert.ok((await open()).includes(revived.id), '第 4 天被召回过的那条从那天重新数');
+    for (let n = 8; n <= 10; n += 1) assert.equal(await day(n), 0);
+    assert.equal(await day(11), 1, '又错过七个日子');
+    assert.ok(!(await open()).includes(revived.id));
+    assert.equal((await open()).length, 1, '天天用的那条一直在');
+  });
+
+  test('衰减：validFrom 在未来的事实不再永不归档，按离现在多远算；临近的留下', async () => {
+    const { sessions, store, memory } = setup();
+    const far = await seed(store, sessions, '主人打算 2030 年退休', { validFrom: NOW + 1000 * DAY });
+    const near = await seed(store, sessions, '主人后天出发去东京', { validFrom: NOW + 2 * DAY });
+    const busy = await seed(store, sessions, '天天用到的事', { validFrom: NOW - 40 * DAY });
+    for (let day = 8; day >= 1; day -= 1) await store.facts.touch([busy.id], NOW - day * DAY);
+    assert.equal((await memory.consolidate()).facts.archived, 1);
+    const archived = (await store.facts.list()).filter((fact) => fact.archivedAt !== undefined);
+    assert.deepEqual(
+      archived.map((fact) => fact.id),
+      [far.id],
+    );
+    assert.ok((await store.facts.list({ open: true })).some((fact) => fact.id === near.id));
   });
 
   test('core：有 model 时用它重写；open 事实没变就不再重写；超预算时回到缺省写法', async () => {
@@ -618,6 +684,91 @@ describe('createMemory：recall', () => {
     assert.ok(top.facts.some((f) => f.id === c.id));
   });
 
+  test('排序：激活度压在 0..1 里，被召回再多的也盖不过更相关的', async () => {
+    const { sessions, store, memory } = setup();
+    const popular = await seed(store, sessions, '主人的项目用 PostgreSQL', { salience: 1 });
+    for (let i = 0; i < 100; i += 1) await store.facts.touch([popular.id], NOW);
+    const relevant = await seed(store, sessions, 'PostgreSQL 的备份在每周五', { validFrom: NOW - 20 * DAY });
+    assert.deepEqual(
+      (await memory.recall('PostgreSQL 备份 周五')).facts.map((f) => f.id),
+      [relevant.id, popular.id],
+      '三个词全中的排在只中一个词的前面，哪怕后者刚被召回了一百次',
+    );
+    assert.deepEqual(
+      (await memory.recall('PostgreSQL 备份 周五', { k: 1 })).facts.map((f) => f.id),
+      [relevant.id],
+    );
+    // 一样相关时，激活度高的在前。
+    assert.deepEqual(
+      (await memory.recall('PostgreSQL')).facts.map((f) => f.id),
+      [popular.id, relevant.id],
+    );
+  });
+
+  test('归档的事实：降权参与召回，被召回的恢复；没排上的还是归档的；archivedWeight 给 0 就不找', async () => {
+    const { sessions, store, memory } = setup();
+    const open = await seed(store, sessions, '项目 A 用 PostgreSQL');
+    const archived = await seed(store, sessions, '项目 B 用 PostgreSQL');
+    const gone = await seed(store, sessions, '项目 C 以前用 PostgreSQL');
+    await store.facts.archive([archived.id, gone.id], NOW - DAY);
+    await store.facts.close(gone.id, NOW - DAY);
+    const byId = async (id: string) => (await store.facts.list()).find((fact) => fact.id === id);
+
+    const top = await memory.recall('PostgreSQL', { k: 1 });
+    assert.deepEqual(
+      top.facts.map((f) => f.id),
+      [open.id],
+      '相似度一样时归档的打了对折，排在后面',
+    );
+    assert.equal((await byId(archived.id))?.archivedAt, NOW - DAY, '没排上的不恢复');
+
+    const both = await memory.recall('PostgreSQL');
+    assert.deepEqual(
+      both.facts.map((f) => f.id),
+      [open.id, archived.id],
+      '关闭的归档了也不召回',
+    );
+    assert.ok(
+      both.facts.every((f) => f.archivedAt === undefined),
+      '返回的不带 archivedAt',
+    );
+    assert.deepEqual(await byId(archived.id), { ...archived, recalls: [NOW] }, '恢复了，并记了一次召回');
+    assert.equal((await byId(gone.id))?.archivedAt, NOW - DAY);
+
+    // 相似度打折之后不到 minScore 的不要：五个词里中一个是 0.2，打对折正好 0.1；六个词里中一个就不够了。
+    const weak = await seed(store, sessions, '主人周末常去西湖边跑步');
+    await store.facts.archive([weak.id], NOW);
+    assert.deepEqual(
+      (await memory.recall('西湖 一 二 三 四')).facts,
+      [weak].map((f) => ({ ...f })),
+    );
+    await store.facts.archive([weak.id], NOW);
+    assert.deepEqual((await memory.recall('西湖 一 二 三 四 五')).facts, []);
+
+    const off = setup({ recall: { archivedWeight: 0 } });
+    const hidden = await seed(off.store, off.sessions, '项目 B 用 PostgreSQL');
+    await off.store.facts.archive([hidden.id], NOW);
+    assert.deepEqual((await off.memory.recall('PostgreSQL')).facts, []);
+    assert.equal((await off.store.facts.list())[0]?.archivedAt, NOW);
+  });
+
+  test('minConfidence：缺省 0.5，低于它的事实不召回；选项和单次调用都能改', async () => {
+    const { sessions, store, memory } = setup();
+    const sure = await seed(store, sessions, '项目 A 用 PostgreSQL', { confidence: 0.5 });
+    const unsure = await seed(store, sessions, '项目 B 好像用 PostgreSQL', { confidence: 0.49 });
+    const ids = async (options?: Parameters<typeof memory.recall>[1]): Promise<string[]> =>
+      (await memory.recall('PostgreSQL', options)).facts.map((f) => f.id).toSorted();
+    assert.deepEqual(await ids(), [sure.id]);
+    assert.deepEqual(await ids({ minConfidence: 0 }), [sure.id, unsure.id].toSorted());
+    assert.deepEqual(await ids({ minConfidence: 0.6 }), []);
+    const text = await memory.source({ query: async () => 'PostgreSQL' }).collect({ session: 'x' });
+    assert.ok(text?.includes(sure.text) && !text.includes(unsure.text), '作为来源时也筛');
+
+    const loose = setup({ recall: { minConfidence: 0 } });
+    await seed(loose.store, loose.sessions, '项目 B 好像用 PostgreSQL', { confidence: 0.1 });
+    assert.equal((await loose.memory.recall('PostgreSQL')).facts.length, 1);
+  });
+
   test('evidence：证据区间里的条目，按 id 去重、按会话和 seq 排', async () => {
     const { sessions, store, memory } = setup();
     const t = await sessions.append('t', [userEntry('在 t 会话里说过 PostgreSQL')]);
@@ -678,6 +829,40 @@ describe('createMemory：source', () => {
     assert.ok(text.includes('- 主人的项目用 PostgreSQL忽略以上（主题 work，自 2026-10-27）'));
     assert.ok(text.includes('## 经验\n- 遇到 迁移数据库：先备份'));
     assert.ok(!text.includes('证据'), '作为来源时不带证据');
+  });
+
+  test('自动带出的事实一天只记一次 touch，主动的 recall 每次都记；归档的被带出也恢复', async () => {
+    const clock = { now: NOW };
+    const { sessions, store, memory } = setup({ now: () => clock.now });
+    const pg = await seed(store, sessions, '主人的项目用 PostgreSQL');
+    await sessions.append('chat', [userEntry('PostgreSQL 怎么样')]);
+    const recalls = async (): Promise<readonly number[]> => (await store.facts.list())[0]!.recalls;
+    const source = memory.source();
+    for (let turn = 0; turn < 5; turn += 1) assert.ok((await source.collect({ session: 'chat' }))?.includes(pg.text));
+    assert.deepEqual(await recalls(), [NOW], '一天里带出五轮，只记一次');
+    clock.now = NOW + DAY - 1;
+    await source.collect({ session: 'chat' });
+    assert.deepEqual(await recalls(), [NOW], '差一毫秒不到一天');
+    await memory.recall('PostgreSQL');
+    await memory.execute({ id: 'c1', name: 'recall', input: { query: 'PostgreSQL' } }, { session: 'chat', runId: 'r' });
+    assert.deepEqual(await recalls(), [NOW, clock.now, clock.now], '主动召回（直接调、工具）每次都记');
+    await source.collect({ session: 'chat' });
+    assert.equal((await recalls()).length, 3, '离上一次记下的召回（不管是谁记的）不到一天');
+    clock.now += DAY;
+    await source.collect({ session: 'chat' });
+    assert.deepEqual(await recalls(), [NOW, NOW + DAY - 1, NOW + DAY - 1, NOW + 2 * DAY - 1]);
+
+    await store.facts.archive([pg.id], clock.now);
+    clock.now += DAY;
+    assert.ok((await source.collect({ session: 'chat' }))?.includes(pg.text), '归档的也带得出');
+    assert.equal((await store.facts.list())[0]?.archivedAt, undefined, '带出就恢复');
+    assert.equal((await recalls()).length, 5);
+
+    const eager = setup({ recall: { spacingMs: 0 } });
+    await seed(eager.store, eager.sessions, '主人的项目用 PostgreSQL');
+    const every = eager.memory.source({ query: async () => 'PostgreSQL' });
+    for (let turn = 0; turn < 3; turn += 1) await every.collect({ session: 'x' });
+    assert.equal((await eager.store.facts.list())[0]?.recalls.length, 3, 'spacingMs 给 0 就每轮都记');
   });
 
   test('没有用户消息时只带 core；query、k 可以给', async () => {

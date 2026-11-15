@@ -1104,14 +1104,17 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
             switch (first) {
               case 'search': {
                 only('POST', '/memory/facts/search');
-                const input = await body('a SearchQuery { "text", "topic"?, "k"?, "open"? }');
+                const input = await body('a SearchQuery { "text", "topic"?, "k"?, "open"?, "archived"? }');
                 const open = input['open'];
                 if (open !== undefined && typeof open !== 'boolean') invalid('`open` must be a boolean');
+                const archived = input['archived'];
+                if (archived !== undefined && typeof archived !== 'boolean') invalid('`archived` must be a boolean');
                 const search = defined({
                   text: stringField(input, 'text'),
                   topic: input['topic'] === undefined ? undefined : stringField(input, 'topic'),
                   k: input['k'] === undefined ? undefined : numberField(input, 'k'),
                   open,
+                  archived,
                 });
                 sendJson(res, 200, { hits: await memoryStore.facts.search(search) });
                 return;
@@ -1129,6 +1132,12 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
                 sendJson(res, 200, {
                   archived: await memoryStore.facts.archive(idsField(input), numberField(input, 'at')),
                 });
+                return;
+              }
+              case 'restore': {
+                only('POST', '/memory/facts/restore');
+                const input = await body('{ "ids": string[] }');
+                sendJson(res, 200, { restored: await memoryStore.facts.restore(idsField(input)) });
                 return;
               }
               case 'forget': {

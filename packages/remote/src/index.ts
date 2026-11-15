@@ -768,6 +768,9 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
       async archive(ids, at) {
         return (await call<{ archived: number }>('POST', '/facts/archive', { body: { ids, at } })).archived;
       },
+      async restore(ids) {
+        return (await call<{ restored: number }>('POST', '/facts/restore', { body: { ids } })).restored;
+      },
       async forget(ids) {
         return (await call<{ forgotten: number }>('POST', '/facts/forget', { body: { ids } })).forgotten;
       },

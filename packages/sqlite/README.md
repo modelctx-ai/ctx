@@ -123,13 +123,22 @@ const memory = createSqliteMemoryStore({ database: db, prefix: 'memory_' });
 | `<prefix>facts`      | 每行一条事实：`id`（主键）、`scope`、`subject`、`predicate`、`text`、`topic`、`valid_from`、`valid_to`、`superseded_by`、`confidence`、`salience`、`sources`（JSON）、`recalls`（JSON）、`archived_at`。索引 `(scope, id)`、`(scope, subject, id)`、`(scope, topic, id)`；部分索引 `(scope, id) WHERE valid_to IS NULL AND archived_at IS NULL`（`open`）和 `(superseded_by)` |
 | `<prefix>procedures` | 每行一条程序：`seq`、`id`、`scope`、`topic`、`when_text`、`do_text`、`evidence`（JSON）、`confirmations`、`at`、`retired_at`。索引 `(scope, seq)`、`(scope, topic, seq)`                                                                                                                                                                                                      |
 | `<prefix>core`       | 每次 `core.set` 一行：`seq`、`scope`、`text`、`at`；一个作用域里最后一行是它当前的版本。索引 `(scope, seq)`                                                                                                                                                                                                                                                                   |
+| `<prefix>fact_docs`  | 检索的索引，进了索引的事实一条一行：`doc`（整数主键，倒排表里用的短编号）、`scope`、`fact_id`（唯一）、`terms`（这条事实切出了几个不同的词）                                                                                                                                                                                                                                  |
+| `<prefix>fact_terms` | 倒排表，一个词一行：`scope`、`term`、`doc`，主键 `(scope, term, doc)`，没有 rowid。一个作用域的查询只碰自己的词                                                                                                                                                                                                                                                               |
 | `<prefix>meta`       | 结构版本 `memory_schema`                                                                                                                                                                                                                                                                                                                                                      |
 
 - 作用域（`store.scope(name)`）是每张表上的一列 `scope`，每条语句都带它，按 `id` 找的也带：别的作用域的 `id` 和不存在的一样。各作用域共用一个连接和写锁；`database`、`close()` 只在 `createSqliteMemoryStore` 返回的那个对象上，`scope()` 返回的是普通的 `MemoryStore`。
 - `facts.list` 按 `id` 升序（BINARY 比较 UTF-8 字节，和码点序一致），`subject`、`topic`、`open`、`after` 都走索引。
-- `facts.search` 是子串匹配（`instr(lower(text), ?)`，只折叠 ASCII 大小写，`%`、`_` 按字面），不用 FTS5：Node 22 自带的 SQLite 没有编译 FTS5。整个查询是文字的子串时分数是 `0.5 + 0.5 × 查询长度 / 文字长度`（码点数），在 [0.5, 1]；否则按空白切出的词里命中的那些的长度占比打分，在 (0, 0.5)。从高到低，同分按 `id`。
-- 每个写方法在一个 `BEGIN IMMEDIATE` 里做完（库上已有应用的事务时用 SAVEPOINT），单个方法是原子的；跨方法的组合（先 `add` 新事实再 `close` 旧的）由调用方负责。`touch` 用 `json_insert` 在库里追加，`cite`、`confirm` 在写锁里读后写，几个进程同时写不丢。
-- 结构版本独立于会话存储：`<prefix>meta` 里的键是 `memory_schema`，当前是 `2`，和会话存储的 `schema` 不同，所以两边用同一个前缀也不冲突。打开时的规则和会话存储一样：版本不高于 2 时查实际的表、列和索引，缺什么在写锁里补什么；比 2 高时抛错，不打开。版本 1 的库（没有 `scope` 列）打开时自动升级：四张表各加一列，已有的行都落在缺省的作用域里，索引换成以 `scope` 开头的；升级后旧版本的 `ctx-sqlite` 打不开这个库。
+- `facts.search` 走倒排索引。事实写入时用协议包的 `searchTerms` 切成词（先 NFKC 归一、转小写；字母数字连成的一串是一个词，中日韩文字每相邻两个字是一个词），一个词在 `fact_terms` 里一行；查询切成同样的词（最多 `MAX_SEARCH_TERMS` = 256 个，更多时取头尾各一半），每个词按主键查一次。分数是 `termOverlap`：共同的词数除以查询和事实里词少的那一边，0..1；从高到低，同分时共同的词多的在前，再相同按 `id`。和 `ctx-memory` 的内存存储是同一套切词和打分。
+  - 中文问句能命中：「我平时喜欢喝什么茶？」找得回「主人喜欢喝乌龙茶」。英文按整词，`Postgre` 不命中 `PostgreSQL`；标点不是词，只有标点的查询什么都不命中。
+  - 多长的查询都不报错：词是当一个 JSON 参数传进去的（`json_each`），语句的形状不随词数变。
+  - 不扫事实表：只有命中的事实才读。3 万条事实时一个常见词的查询约 7 毫秒，罕见词不到 1 毫秒。索引占的地方大约是事实本身的七成。
+  - 不用 FTS5：它不是每个 Node 自带的 SQLite 都编进去了，自带的分词器也切不了中文（`unicode61` 不切，`trigram` 匹配不到两个字的词）。倒排表是普通的表，`engines` 写的最低版本上一样能用。
+- `facts.touch` 只留最近 `MAX_FACT_RECALLS`（32）个召回时刻，一行不随召回次数变长；`facts.restore` 清掉 `archived_at`。
+- 每个写方法在一个 `BEGIN IMMEDIATE` 里做完（库上已有应用的事务时用 SAVEPOINT），单个方法是原子的；跨方法的组合（先 `add` 新事实再 `close` 旧的）由调用方负责。`touch`、`cite`、`confirm` 在写锁里读后写，几个进程同时写不丢；`add` 和 `forget` 在同一个事务里改索引，失败时一起回滚。
+- 结构版本独立于会话存储：`<prefix>meta` 里的键是 `memory_schema`，当前是 `3`，和会话存储的 `schema` 不同，所以两边用同一个前缀也不冲突。打开时的规则和会话存储一样：版本不高于 3 时查实际的表、列和索引，缺什么在写锁里补什么；比 3 高时抛错，不打开。老库打开时自动升级，升级后旧版本的 `ctx-sqlite` 打不开这个库：
+  - 版本 1（没有 `scope` 列）：四张表各加一列，已有的行都落在缺省的作用域里，索引换成以 `scope` 开头的。
+  - 版本 2（没有检索的索引）：建 `fact_docs`、`fact_terms`，已有的事实（各个作用域的，含关闭、归档的）补进索引；`recalls` 超过 32 个的截到最近的那些。事实多的库第一次打开会慢一些（3 万条约 1 秒），都在一个事务里，中途失败就整个回滚。
 - 通过协议包的契约测试 `describeMemoryStoreContract`。
 
 ## 导出

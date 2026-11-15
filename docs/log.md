@@ -4,6 +4,9 @@
 
 ## 2026-11-15
 
+- **更新** [协议层](protocol.md)的记忆一节：`SearchQuery.archived`、`facts.restore`、`RecallOptions.minConfidence`；`search` 的底线（切词、最多 256 个词、不因查询长报错）；`recalls` 只留最近 32 个；「激活度」一节改成 `activation`、`retrievability`（上界、未来的时刻、排序公式），纯函数的列表加 `searchTerms`、`termOverlap`、`inSearchScope`；契约测试表跟上。原因：检索和遗忘的规则改了（[#44](https://github.com/modelctx-ai/ctx/issues/44)）。
+- **更新** [记忆](memory.md)：新节「想起和忘记的规则」（召回怎么排、什么时候记一次召回、什么时候归档、归档之后怎么找回来、`confidence` 的门槛），失败模式表跟上。[架构](architecture.md)：`createMemory` 的选项、召回的步骤、夜里的衰减；「SQLite 和内存存储」重写（结构版本 3、倒排索引、为什么不用 FTS5、升级）。[ADR 0006](adr/0006-memory.md) 的「决定记录」补一条：七处修订各自的理由，以及还没做的。
+- **更新** [ctx-memory](../packages/memory/README.md)：`recall` 的选项加 `minConfidence`、`archivedWeight`、`spacingMs`，`decay` 加 `minChances`；`recall`、`consolidate`、`source` 的说明跟上；新节「遗忘」，带一张和以前不一样的地方的表；内存存储的 `search` 改写。[ctx-sqlite](../packages/sqlite/README.md)：记忆的表加 `fact_docs`、`fact_terms`，检索一段重写（以前写的子串匹配已经不是实际行为），结构版本 3 和升级。[协议包](../packages/protocol/README.md)导出表加检索和激活度的新名字。[ctx-remote](../packages/remote/README.md)：记忆的路径表加 `restore`，`search` 的请求体加 `archived`。
 - **更新** [协议层](protocol.md)（[#33](https://github.com/modelctx-ai/ctx/issues/33)）：`ContextBuilder` 一节加 `compactDetailed`、`CompactResult`、`CompactOptions.maxInputTokens`、`WindowOptions.truncate`、`PreparedCall.tokens`、`ProjectedMessage.at`，写明压缩分段、检查点、`at` 在未来的条目不算「最近的」；`Harness` 一节加 `OverflowSpec` 和三段语义（超窗兜底、上下文过长的错误、失败的重试不让历史变长）；总则的错误表加 `context_overflow`；契约测试表加 `describeContextBuilderContract`，去掉「`ContextBuilder` 的契约还没写」。原因：上下文超过模型窗口时规范里没有任何兜底，压缩自己也会被同一段历史撑爆。服务商的错误形状写明没有对真实服务验证。
 - **更新** [架构](architecture.md)：「压缩」一节按分段滚动摘要重写（切点、分段、检查点、截断和超时、摘要模型报过长时减半）；投影加第七步「截短」；harness 的步骤加超窗检查和重试去重，`error.type` 一段写明 `context_overflow` 怎么认；`createContextBuilder` 的签名、扩展点表跟上。
 - **更新** [概念](concepts.md)：术语表加「窗口、截短」「压缩、滚动摘要、检查点」「超窗兜底」「上下文过长」四条，「一轮」补上 `error.type`；设计约束 5 写明超窗兜底是应用的配置、缺省关着。

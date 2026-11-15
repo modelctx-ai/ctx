@@ -39,6 +39,7 @@ import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type 
 import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 import {
   MAX_DECISION_QUESTIONS,
+  MAX_FACT_RECALLS,
   MEMORY_RECALL_TOOL,
   checkSourceRef,
   filterFacts,
@@ -2035,6 +2036,22 @@ async function factById(store: MemoryStore, id: string): Promise<MemoryFact | un
   return (await store.facts.list()).find((fact) => fact.id === id);
 }
 
+/** `search` 命中的事实的 `id`，按返回的顺序。 */
+async function searchIds(store: MemoryStore, query: Parameters<MemoryStore['facts']['search']>[0]): Promise<string[]> {
+  return (await store.facts.search(query)).map((hit) => hit.fact.id);
+}
+
+/** 自然的中文问句和它该找回的事实：两边没有一个整句的子串，只有零散的共同的词。 */
+const CHINESE_RECALL: readonly (readonly [question: string, fact: string])[] = [
+  ['我们项目现在用的是什么数据库？', '主人的项目数据库从 MySQL 换成了 PostgreSQL'],
+  ['我平时喜欢喝什么茶？', '主人喜欢喝乌龙茶，不喝咖啡'],
+  ['你还记得我住在哪个城市吗', '主人住在杭州西湖区'],
+  ['数据库一般什么时候备份', '主人每周五下午备份数据库'],
+  ['我家的猫叫什么名字', '主人的猫叫年糕，三岁'],
+  ['我有什么过敏的东西吗', '主人对花生过敏'],
+  ['下个月出差是去哪里', '主人下个月要去东京出差'],
+];
+
 export function describeMemoryStoreContract(
   name: string,
   factory: MemoryStoreFactory,
@@ -2098,6 +2115,7 @@ export function describeMemoryStoreContract(
       await assert.rejects(bob.facts.cite(fact.id, [ref(5)]), hasType('not_found'));
       await bob.facts.touch([fact.id], 20);
       assert.equal(await bob.facts.archive([fact.id], 20), 0);
+      assert.equal(await bob.facts.restore([fact.id]), 0);
       assert.equal(await bob.facts.forget([fact.id]), 0);
       await assert.rejects(bob.procedures.confirm(rule.id, [ref(5)]), hasType('not_found'));
       await assert.rejects(bob.procedures.retire(rule.id, 20), hasType('not_found'));
@@ -2126,6 +2144,30 @@ export function describeMemoryStoreContract(
       await assert.rejects(
         Promise.resolve().then(() => store.scope(`${long}x`).facts.list()),
         hasType('invalid_request'),
+      );
+    });
+
+    test('scope：检索的索引、归档和恢复也按作用域分开', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const alice = store.scope('user:alice');
+      const bob = store.scope('user:bob');
+      const hers = await alice.facts.add(newFact('主人住在杭州西湖区'));
+      const his = await bob.facts.add(newFact('主人住在上海浦东'));
+      const question = '主人住在哪里';
+      assert.deepEqual(await searchIds(alice, { text: question }), [hers.id]);
+      assert.deepEqual(await searchIds(bob, { text: question }), [his.id]);
+      assert.deepEqual(await searchIds(bob, { text: '杭州西湖', open: false }), [], '别的作用域里才有的词搜不到');
+
+      assert.equal(await alice.facts.archive([hers.id], 5), 1);
+      assert.equal(await bob.facts.restore([hers.id]), 0, '恢复不了别的作用域里归档的事实');
+      assert.deepEqual(await searchIds(bob, { text: question, archived: true }), [his.id]);
+      assert.deepEqual(await searchIds(alice, { text: question, archived: true }), [hers.id]);
+      assert.equal(await alice.facts.forget([hers.id]), 1);
+      assert.deepEqual(await searchIds(alice, { text: question, open: false }), []);
+      assert.deepEqual(
+        await searchIds(bob, { text: question }),
+        [his.id],
+        '删掉一个作用域的事实，别的作用域里同样的词还搜得到',
       );
     });
 
@@ -2280,6 +2322,19 @@ export function describeMemoryStoreContract(
       assert.deepEqual((await factById(store, b.id))?.recalls, [200]);
     });
 
+    test(`facts：recalls 只留最近 ${MAX_FACT_RECALLS} 次，早的丢掉，一条事实不随召回次数无限变长`, async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.facts.add(newFact('甲'));
+      const b = await store.facts.add(newFact('乙'));
+      await store.facts.touch([b.id], 1);
+      for (let i = 0; i < MAX_FACT_RECALLS + 5; i += 1) await store.facts.touch([a.id], 1000 + i);
+      const expected = Array.from({ length: MAX_FACT_RECALLS }, (_, i) => 1005 + i);
+      assert.deepEqual((await factById(store, a.id))?.recalls, expected, '留下的是最近的那些，仍按先后');
+      await store.facts.touch([a.id, b.id], 5000);
+      assert.deepEqual((await factById(store, a.id))?.recalls, [...expected.slice(1), 5000]);
+      assert.deepEqual((await factById(store, b.id))?.recalls, [1, 5000], '没满的照常追加');
+    });
+
     test('facts：archive 退出 open 的查询但不删，返回真正归档的条数', async () => {
       const store = await factory(MEMORY_STORE_SETUP);
       const a = await store.facts.add(newFact('甲'));
@@ -2291,6 +2346,28 @@ export function describeMemoryStoreContract(
       assert.equal((await factById(store, b.id))?.archivedAt, 200);
       assert.deepEqual(ids(await store.facts.list({ open: true })), [c.id]);
       assert.equal((await store.facts.list()).length, 3);
+    });
+
+    test('facts：restore 恢复归档的事实，返回真正恢复的条数；有效期不动；恢复之后可以再归档', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.facts.add(newFact('甲'));
+      const b = await store.facts.add(newFact('乙'));
+      const c = await store.facts.add(newFact('丙'));
+      const open = async (): Promise<string[]> => ids(await store.facts.list({ open: true })).toSorted();
+      assert.equal(await store.facts.archive([a.id, b.id], 100), 2);
+      assert.equal(await store.facts.restore([a.id, c.id, 'missing']), 1, '没归档的、认不得的不算');
+      assert.deepEqual(await factById(store, a.id), a, '恢复之后和归档之前一样，没有 archivedAt');
+      assert.equal(await store.facts.restore([a.id, a.id]), 0, '已经恢复的不算');
+      assert.equal(await store.facts.restore([]), 0);
+      assert.deepEqual(await open(), [a.id, c.id].toSorted());
+
+      await store.facts.close(b.id, 150);
+      assert.equal(await store.facts.restore([b.id]), 1);
+      assert.deepEqual(await factById(store, b.id), { ...b, validTo: 150 }, '关闭的恢复了还是关闭的');
+      assert.deepEqual(await open(), [a.id, c.id].toSorted());
+
+      assert.equal(await store.facts.archive([a.id], 300), 1);
+      assert.equal((await factById(store, a.id))?.archivedAt, 300, '再归档记的是新的时刻');
     });
 
     test('facts：forget 真删，并清掉别的事实里指向它的 supersededBy', async () => {
@@ -2391,6 +2468,94 @@ export function describeMemoryStoreContract(
       assert.equal((await hits({ text: '主人的', k: 1 })).length, 1, 'k 限制条数');
       assert.ok((await hits({ text: '主人的' })).length >= 2);
       assert.deepEqual(await hits({ text: '主人的', k: 0 }), []);
+    });
+
+    test('facts：search 的 archived：仍然成立的里面连归档的一起搜，关闭的不搜；open: false 本来就不限', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const open = await store.facts.add(newFact('项目用 Kubernetes 部署'));
+      const archived = await store.facts.add(newFact('以前在 Kubernetes 上跑批处理'));
+      const closed = await store.facts.add(newFact('Kubernetes 的版本是 1.28'));
+      const both = await store.facts.add(newFact('Kubernetes 集群放在机房'));
+      await store.facts.archive([archived.id, both.id], MEMORY_NOW + 1);
+      await store.facts.close(closed.id, MEMORY_NOW + 1);
+      await store.facts.close(both.id, MEMORY_NOW + 2);
+      const found = async (query: { open?: boolean; archived?: boolean }): Promise<Set<string>> =>
+        new Set(await searchIds(store, { text: 'Kubernetes', ...query }));
+      const all = new Set([open.id, archived.id, closed.id, both.id]);
+      assert.deepEqual(await found({}), new Set([open.id]));
+      assert.deepEqual(await found({ archived: false }), new Set([open.id]));
+      assert.deepEqual(await found({ archived: true }), new Set([open.id, archived.id]), '关闭的归档了也不搜');
+      assert.deepEqual(await found({ open: true, archived: true }), new Set([open.id, archived.id]));
+      assert.deepEqual(await found({ open: false }), all);
+      assert.deepEqual(await found({ open: false, archived: false }), all, 'open: false 时 archived 不起作用');
+      const hit = (await store.facts.search({ text: 'Kubernetes', archived: true })).find(
+        (item) => item.fact.id === archived.id,
+      );
+      assert.equal(hit?.fact.archivedAt, MEMORY_NOW + 1, '归档的命中带着 archivedAt，调用方据此降权');
+
+      assert.equal(await store.facts.restore([archived.id]), 1);
+      assert.deepEqual(await found({}), new Set([open.id, archived.id]), '恢复之后缺省的搜索又搜得到');
+    });
+
+    test('facts：search 中文问句：没有空白分词也找得回该找回的那条；没有共同的词就不命中', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const added: MemoryFact[] = [];
+      for (const [, text] of CHINESE_RECALL) added.push(await store.facts.add(newFact(text)));
+      for (const [i, [question, text]] of CHINESE_RECALL.entries()) {
+        const found = await searchIds(store, { text: question });
+        assert.ok(found.includes(added[i]!.id), `「${question}」应该找回「${text}」`);
+      }
+      assert.deepEqual(await store.facts.search({ text: '明天天气怎么样' }), []);
+      assert.deepEqual(await store.facts.search({ text: '' }), [], '空的查询什么都不命中');
+      assert.deepEqual(await store.facts.search({ text: ' ，。？ ' }), [], '只有空白和标点的查询什么都不命中');
+    });
+
+    test('facts：search 超长的查询（上千个不同的词）不报错，开头和结尾的词照样命中', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const head = await store.facts.add(newFact('主人的项目用 PostgreSQL 存数据'));
+      const tail = await store.facts.add(newFact('服务部署在 Kubernetes 集群上'));
+      const other = await store.facts.add(newFact('主人每天早上跑步'));
+      const filler = Array.from({ length: 1500 }, (_, i) => `filler${i}`).join(' ');
+      const hits = await store.facts.search({ text: `PostgreSQL ${filler} Kubernetes` });
+      const found = hits.map((hit) => hit.fact.id);
+      assert.ok(found.includes(head.id), '开头的词命中');
+      assert.ok(found.includes(tail.id), '结尾的词命中');
+      assert.ok(!found.includes(other.id));
+      for (const hit of hits) assert.ok(hit.score > 0 && hit.score <= 1, `score ${hit.score} 在 0..1`);
+
+      // 没有空白的一长段中文：三千个字，接着一句问话。
+      const prose = Array.from({ length: 3000 }, (_, i) => String.fromCodePoint(0x4e00 + ((i * 7) % 2000))).join('');
+      const asked = await store.facts.search({ text: `${prose}。主人每天早上跑步吗`, k: 2 });
+      assert.ok(asked.length <= 2, 'k 照样生效');
+      assert.ok(
+        asked.some((hit) => hit.fact.id === other.id),
+        '长段后面的问话照样命中',
+      );
+      const huge = Array.from({ length: 20_000 }, (_, i) => `w${i}`).join(' ');
+      assert.deepEqual(await store.facts.search({ text: huge }), [], '两万个不同的词也只是没有命中');
+    });
+
+    test('facts：search 按相关度排：共同的词占得多的在前，分数也高；不相关的不出现', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const partial = await store.facts.add(newFact('集群跑在 Kubernetes 上'));
+      const unrelated = await store.facts.add(newFact('主人每天早上跑步'));
+      const full = await store.facts.add(newFact('Kubernetes 集群每周五部署'));
+      const hits = await store.facts.search({ text: '周五 部署 Kubernetes 集群' });
+      assert.deepEqual(
+        hits.map((hit) => hit.fact.id),
+        [full.id, partial.id],
+        '四个词全中的排在只中两个的前面，和写入的先后无关',
+      );
+      assert.ok(hits[0]!.score > hits[1]!.score && hits[1]!.score > 0, JSON.stringify(hits.map((hit) => hit.score)));
+      assert.ok(!hits.some((hit) => hit.fact.id === unrelated.id));
+      // 问句里零散地提到：提到得多的在前。
+      const asked = await searchIds(store, { text: '我们的集群是哪天部署来着？是每周五吗' });
+      assert.deepEqual(asked.slice(0, 2), [full.id, partial.id]);
+      assert.deepEqual(
+        await searchIds(store, { text: '周五 部署 Kubernetes 集群', k: 1 }),
+        [full.id],
+        'k 取的是最相关的',
+      );
     });
 
     test('procedures：add 的 confirmations 是 1；confirm 加 1 并追加证据，相同的证据不算；没有证据抛 invalid_request；认不得的 id 抛 not_found', async () => {
@@ -3134,6 +3299,37 @@ export function describeMemoryContract(
       });
     });
 
+    test('recall：归档的事实也找得回来，被召回的恢复成没归档的', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory, store, now } = fixture;
+        const archived = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据');
+        assert.equal(await store.facts.archive([archived.id], now), 1);
+        const recalled = await memory.recall('PostgreSQL');
+        const found = recalled.facts.find((fact) => fact.id === archived.id);
+        assert.ok(found, '归档的事实也召回');
+        assert.equal(found.archivedAt, undefined, '返回的已经不带 archivedAt');
+        assert.ok(roundTrips(recalled));
+        const after = await factById(store, archived.id);
+        assert.equal(after?.archivedAt, undefined, '被召回就恢复');
+        assert.deepEqual(after?.recalls, [now], '恢复的同时记了一次召回');
+        assert.deepEqual(ids(await store.facts.list({ open: true })), [archived.id]);
+      });
+    });
+
+    test('recall：minConfidence 筛掉置信度低的事实，给 0 就不筛', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory, store } = fixture;
+        const sure = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据', { confidence: 0.9 });
+        const unsure = await seedFact(fixture, '主人的项目好像要换掉 PostgreSQL', { confidence: 0.2 });
+        const strict = await memory.recall('PostgreSQL', { minConfidence: 0.5 });
+        assert.ok(ids(strict.facts).includes(sure.id));
+        assert.ok(!ids(strict.facts).includes(unsure.id), '置信度低于门槛的不召回');
+        assert.deepEqual((await factById(store, unsure.id))?.recalls, [], '没召回的不 touch');
+        const loose = await memory.recall('PostgreSQL', { minConfidence: 0 });
+        assert.ok(ids(loose.facts).includes(sure.id) && ids(loose.facts).includes(unsure.id), '给 0 就不筛');
+      });
+    });
+
     test('source：名字缺省 memory；collect 带出 core 和按最近一条用户消息召回的事实；什么都没有时是空', async () => {
       await withMemory(factory, {}, async (fixture) => {
         const { memory, store, sessions, now } = fixture;
@@ -3153,6 +3349,22 @@ export function describeMemoryContract(
         const named = memory.source({ name: 'memory2', query: async () => 'PostgreSQL', k: 1 });
         assert.equal(named.name, 'memory2');
         assert.ok((await named.collect({ session: 'nobody' }))?.includes(pg.text), '用给的 query 召回');
+      });
+    });
+
+    test('source：同一条事实连着带出几轮，recalls 不跟着涨；主动的 recall 照常记', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory, store, sessions } = fixture;
+        const pg = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据');
+        await sessions.append('chat', [userEntry('PostgreSQL')]);
+        const source = memory.source();
+        for (let round = 0; round < 4; round += 1) {
+          assert.ok((await source.collect({ session: 'chat' }))?.includes(pg.text), `第 ${round + 1} 轮照样带出`);
+        }
+        const auto = (await factById(store, pg.id))?.recalls.length ?? 0;
+        assert.ok(auto <= 1, `来源每一轮都跑，不能每轮都记一次召回：记了 ${auto} 次`);
+        await memory.recall('PostgreSQL');
+        assert.equal((await factById(store, pg.id))?.recalls.length, auto + 1, '主动召回记一次');
       });
     });
 

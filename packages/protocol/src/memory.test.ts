@@ -11,10 +11,16 @@ import {
   DEFAULT_MEMORY_SCOPE,
   checkSourceRef,
   filterFacts,
+  inSearchScope,
   inSourceRef,
   isOpenFact,
+  MAX_FACT_RECALLS,
+  MAX_SEARCH_TERMS,
   rankFacts,
   renderCore,
+  retrievability,
+  searchTerms,
+  termOverlap,
   sameSourceRef,
   sourceRef,
   type ConsolidateReport,
@@ -82,11 +88,43 @@ describe('activation', () => {
     assert.ok(Math.abs(diff - 0.8) < 1e-12);
   });
 
-  test('d、epsilon 可调；晚于 now 的时刻按 Δt = 0 算', () => {
+  test('d、epsilon 可调', () => {
     const f = fact('a', { validFrom: NOW - 2 * DAY });
     assert.ok(Math.abs(activation(f, NOW, { d: 1 }) - (Math.log(1 / 2.02) + 0.6)) < 1e-12);
     assert.ok(Math.abs(activation(f, NOW, { epsilon: 0 }) - (Math.log(2 ** -0.5) + 0.6)) < 1e-12);
-    assert.equal(activation(fact('a', { validFrom: NOW + DAY }), NOW), activation(fact('a'), NOW));
+  });
+
+  test('晚于 now 的时刻按离 now 多远算：未来才生效的事实也衰减，临近时回升', () => {
+    for (const days of [0.5, 1, 10, 400]) {
+      assert.equal(
+        activation(fact('a', { validFrom: NOW + days * DAY }), NOW),
+        activation(fact('a', { validFrom: NOW - days * DAY }), NOW),
+        `${days} 天后生效和 ${days} 天前生效一样`,
+      );
+    }
+    const far = fact('a', { validFrom: NOW + 365 * DAY });
+    assert.ok(activation(far, NOW) < ACTIVATION_DEFAULTS.archiveAt, '一年后才生效的事实不会一直顶着最高的激活度');
+    assert.ok(activation(far, NOW + 364 * DAY) > activation(far, NOW + 300 * DAY), '越临近越高');
+    assert.ok(
+      activation(fact('a', { validFrom: NOW - 3 * DAY, recalls: [NOW + DAY] }), NOW) ===
+        activation(fact('a', { validFrom: NOW - 3 * DAY, recalls: [NOW - DAY] }), NOW),
+      '召回时刻也一样',
+    );
+  });
+
+  test(`只看最近 ${MAX_FACT_RECALLS} 次召回，所以有上界：ln((N + 1) · ε^(−d)) + s`, () => {
+    const bound = Math.log((MAX_FACT_RECALLS + 1) * 0.02 ** -0.5) + 0.6;
+    const many = Array.from({ length: 20_000 }, () => NOW);
+    const flooded = activation(fact('a', { recalls: many }), NOW);
+    assert.ok(Math.abs(flooded - bound) < 1e-9, `两万次刚发生的召回也只到 ${bound}，实际 ${flooded}`);
+    assert.ok(bound < 6.06);
+    const old = Array.from({ length: 1000 }, () => NOW - 300 * DAY);
+    const recent = Array.from({ length: MAX_FACT_RECALLS }, (_, i) => NOW - i * DAY);
+    assert.equal(
+      activation(fact('a', { validFrom: NOW - 400 * DAY, recalls: [...old, ...recent.toReversed()] }), NOW),
+      activation(fact('a', { validFrom: NOW - 400 * DAY, recalls: recent.toReversed() }), NOW),
+      '更早的召回不算',
+    );
   });
 
   test('缺省参数：s = 0.6、从未召回的事实约一天后低于归档阈值', () => {
@@ -96,15 +134,26 @@ describe('activation', () => {
   });
 });
 
+describe('retrievability', () => {
+  test('1 / (1 + e^(−(A − archiveAt)))：在 0..1 里，阈值上是 0.5，随激活度单调', () => {
+    const fresh = retrievability(fact('a'), NOW);
+    assert.ok(Math.abs(fresh - 1 / (1 + Math.exp(0.55 - activation(fact('a'), NOW)))) < 1e-12);
+    assert.ok(fresh > 0.88 && fresh < 0.89, `刚写的事实约 0.88：${fresh}`);
+    const month = retrievability(fact('a', { validFrom: NOW - 30 * DAY }), NOW);
+    assert.ok(month > 0.15 && month < 0.17, `一个月没动的约 0.16：${month}`);
+    // 取一个激活度正好等于阈值的事实：ln((Δt + ε)^(−d)) + s = archiveAt。
+    const at = fact('a', { validFrom: NOW - (Math.exp((0.6 - 0.55) / 0.5) - 0.02) * DAY });
+    assert.ok(Math.abs(retrievability(at, NOW) - 0.5) < 1e-9);
+    assert.ok(Math.abs(retrievability(at, NOW, { archiveAt: 0 }) - 1 / (1 + Math.exp(-0.55))) < 1e-9, 'archiveAt 可调');
+    const flooded = retrievability(fact('a', { recalls: Array.from({ length: 20_000 }, () => NOW) }), NOW);
+    assert.ok(flooded > fresh && flooded < 1, `召回再多也到不了 1：${flooded}`);
+    const ancient = retrievability(fact('a', { validFrom: NOW - 3650 * DAY, salience: 0 }), NOW);
+    assert.ok(ancient > 0 && ancient < 0.02);
+  });
+});
+
 describe('rankFacts', () => {
-  test('0.6 × 相似度 + 0.4 × 激活度，从高到低', () => {
-    const similar = fact('similar', { validFrom: NOW - 10 * DAY });
-    const fresh = fact('fresh');
-    assert.deepEqual(
-      rankFacts([similar, fresh], { similar: 1, fresh: 0 }, { now: NOW }).map((f) => f.id),
-      ['fresh', 'similar'],
-      '刚写的事实激活度高（约 2.56），相似度 1 补不回来',
-    );
+  test('0.6 × 相似度 + 0.4 × retrievability，从高到低', () => {
     const a = fact('a', { validFrom: NOW - 2 * DAY });
     const b = fact('b', { validFrom: NOW - 3 * DAY });
     assert.deepEqual(
@@ -113,9 +162,35 @@ describe('rankFacts', () => {
       '没有相似度时按激活度',
     );
     assert.deepEqual(
-      rankFacts([a, b], { b: 1 }, { now: NOW }).map((f) => f.id),
+      rankFacts([a, b], { a: 0.5, b: 0.5 }, { now: NOW }).map((f) => f.id),
+      ['a', 'b'],
+      '相似度一样时按激活度',
+    );
+    assert.deepEqual(
+      rankFacts([a, b], { b: 0.2 }, { now: NOW }).map((f) => f.id),
       ['b', 'a'],
-      '相似度差 1 抵得过一天的衰减',
+      '相似度差 0.2 抵得过一天的衰减',
+    );
+  });
+
+  test('激活度最多贡献 0.4：相似度高出 0.67 的，对方召回再多、再新也排在前面', () => {
+    const relevant = fact('relevant', { validFrom: NOW - 3650 * DAY, salience: 0 });
+    const flooded = fact('flooded', { recalls: Array.from({ length: 20_000 }, () => NOW), salience: 1 });
+    assert.deepEqual(
+      rankFacts([flooded, relevant], { relevant: 0.9, flooded: 0.2 }, { now: NOW }).map((f) => f.id),
+      ['relevant', 'flooded'],
+    );
+    // 刚写的事实不再盖过相似度：以前激活度直接加权（约 2.56 × 0.4），相似度 1 都补不回来。
+    const similar = fact('similar', { validFrom: NOW - 10 * DAY });
+    const fresh = fact('fresh');
+    assert.deepEqual(
+      rankFacts([fresh, similar], { similar: 1, fresh: 0.2 }, { now: NOW }).map((f) => f.id),
+      ['similar', 'fresh'],
+    );
+    // 差得不多时，激活度仍然说了算。
+    assert.deepEqual(
+      rankFacts([similar, fresh], { similar: 0.5, fresh: 0.4 }, { now: NOW }).map((f) => f.id),
+      ['fresh', 'similar'],
     );
   });
 
@@ -135,6 +210,107 @@ describe('rankFacts', () => {
       list.map((f) => f.id),
       ['x', 'y', 'z'],
     );
+  });
+});
+
+describe('searchTerms', () => {
+  test('字母数字连成的一串是一个词，转小写；标点和空白只是分隔', () => {
+    assert.deepEqual(searchTerms('The project uses PostgreSQL 16, not MySQL-8.'), [
+      'the',
+      'project',
+      'uses',
+      'postgresql',
+      '16',
+      'not',
+      'mysql',
+      '8',
+    ]);
+    assert.deepEqual(searchTerms('  \n\t '), []);
+    assert.deepEqual(searchTerms('，。？！…… %_'), []);
+    assert.deepEqual(searchTerms(''), []);
+  });
+
+  test('中日韩文字按相邻两个字切，落单的一个字自成一个；和字母数字混排时各切各的', () => {
+    assert.deepEqual(searchTerms('乌龙茶'), ['乌龙', '龙茶']);
+    assert.deepEqual(searchTerms('茶'), ['茶']);
+    assert.deepEqual(searchTerms('主人的项目用PostgreSQL存数据'), [
+      '主人',
+      '人的',
+      '的项',
+      '项目',
+      '目用',
+      'postgresql',
+      '存数',
+      '数据',
+    ]);
+    assert.deepEqual(searchTerms('喝茶，看书'), ['喝茶', '看书'], '标点隔开的不连成词');
+    assert.deepEqual(searchTerms('ひらがなとカタカナ'), [
+      'ひら',
+      'らが',
+      'がな',
+      'なと',
+      'とカ',
+      'カタ',
+      'タカ',
+      'カナ',
+    ]);
+    assert.deepEqual(searchTerms('한국어 3급'), ['한국', '국어', '3', '급']);
+    assert.deepEqual(searchTerms('𠮷野家'), ['𠮷野', '野家'], '按码点切，不拆代理对');
+  });
+
+  test('去重，按第一次出现的先后；NFKC 归一把全角和半角并到一起', () => {
+    assert.deepEqual(searchTerms('茶 tea 茶 TEA Tea'), ['茶', 'tea']);
+    assert.deepEqual(searchTerms('数据库的数据'), ['数据', '据库', '库的', '的数']);
+    assert.deepEqual(searchTerms('ＰｏｓｔｇｒｅＳＱＬ　１６'), ['postgresql', '16']);
+    assert.deepEqual(searchTerms('ｶﾀｶﾅ'), searchTerms('カタカナ'));
+  });
+
+  test('max：词比它多时取开头的一半和结尾的一半；不多时全要', () => {
+    const words = Array.from({ length: 10 }, (_, i) => `w${i}`);
+    const text = words.join(' ');
+    assert.deepEqual(searchTerms(text, 10), words);
+    assert.deepEqual(searchTerms(text, 100), words);
+    assert.deepEqual(searchTerms(text, 4), ['w0', 'w1', 'w8', 'w9']);
+    assert.deepEqual(searchTerms(text, 5), ['w0', 'w1', 'w2', 'w8', 'w9']);
+    assert.deepEqual(searchTerms(text, 1), ['w0']);
+    assert.deepEqual(searchTerms(text, 0), []);
+    assert.deepEqual(searchTerms(text, 2.9), ['w0', 'w9']);
+    const long = Array.from({ length: 5000 }, (_, i) => `w${i}`).join(' ');
+    const capped = searchTerms(long, MAX_SEARCH_TERMS);
+    assert.equal(capped.length, MAX_SEARCH_TERMS);
+    assert.equal(capped[0], 'w0');
+    assert.equal(capped.at(-1), 'w4999');
+    assert.equal(new Set(capped).size, MAX_SEARCH_TERMS);
+  });
+});
+
+/** 按 `searchTerms` 切词、`termOverlap` 打分：查询和一段文字的相似度。 */
+function overlapOf(query: string, text: string): number {
+  const wanted = searchTerms(query);
+  const own = new Set(searchTerms(text));
+  return termOverlap(wanted.filter((term) => own.has(term)).length, wanted.length, own.size);
+}
+
+describe('termOverlap', () => {
+  test('共同的词数除以较小的那一边：一边全在另一边里就是 1', () => {
+    assert.equal(termOverlap(2, 2, 10), 1, '短的查询全在长的事实里');
+    assert.equal(termOverlap(5, 300, 5), 1, '短的事实全在长的一段话里');
+    assert.equal(termOverlap(1, 4, 8), 0.25);
+    assert.equal(termOverlap(3, 6, 4), 0.75);
+    assert.equal(termOverlap(0, 4, 8), 0);
+  });
+
+  test('任何一边没有词是 0；不超过 1', () => {
+    assert.equal(termOverlap(0, 0, 8), 0);
+    assert.equal(termOverlap(0, 4, 0), 0);
+    assert.equal(termOverlap(9, 4, 8), 1);
+  });
+
+  test('和 searchTerms 一起：问句和事实的相似度', () => {
+    assert.equal(overlapOf('乌龙茶', '主人喜欢喝乌龙茶，不喝咖啡'), 1);
+    assert.equal(overlapOf('我平时喜欢喝什么茶？', '主人喜欢喝乌龙茶，不喝咖啡'), 0.25);
+    assert.equal(overlapOf('今天天气怎么样', '主人喜欢喝乌龙茶，不喝咖啡'), 0);
+    assert.equal(overlapOf('POSTGRESQL', '项目用 PostgreSQL'), 1);
   });
 });
 
@@ -234,6 +410,22 @@ describe('filterFacts、isOpenFact', () => {
 
   test('open 是没有 validTo 且没归档', () => {
     assert.deepEqual(facts.map(isOpenFact), [true, true, false, true, false, true]);
+  });
+
+  const scope = (query: Parameters<typeof inSearchScope>[1]): string[] =>
+    facts.filter((found) => inSearchScope(found, query)).map((found) => found.id);
+
+  test('inSearchScope：缺省只看 open 的；archived 连归档的一起看，关闭的不看；open: false 不限；topic 按字面', () => {
+    assert.deepEqual(scope({}), ['b', 'a', '😀', 'aa']);
+    assert.deepEqual(scope({ open: true }), ['b', 'a', '😀', 'aa']);
+    assert.deepEqual(scope({ archived: true }), ['b', 'a', '😀', 'Ａ', 'aa']);
+    assert.deepEqual(scope({ open: false }), ['b', 'a', 'c', '😀', 'Ａ', 'aa']);
+    assert.deepEqual(scope({ open: false, archived: false }), ['b', 'a', 'c', '😀', 'Ａ', 'aa']);
+    assert.deepEqual(scope({ topic: 'work' }), ['b', 'a']);
+    assert.deepEqual(scope({ topic: 'work', open: false }), ['b', 'a']);
+    const both = fact('x', { validTo: NOW, archivedAt: NOW });
+    assert.equal(inSearchScope(both, { archived: true }), false, '关闭的归档了也不看');
+    assert.equal(inSearchScope(both, { open: false }), true);
   });
 
   const ids = (query?: Parameters<typeof filterFacts>[1]): string[] => filterFacts(facts, query).map((f) => f.id);
@@ -385,7 +577,7 @@ function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: numb
       async touch(ids, at) {
         for (const id of ids) {
           const found = facts.get(id);
-          if (found) facts.set(id, { ...found, recalls: [...found.recalls, at] });
+          if (found) facts.set(id, { ...found, recalls: [...found.recalls, at].slice(-MAX_FACT_RECALLS) });
         }
       },
       async archive(ids, at) {
@@ -394,6 +586,17 @@ function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: numb
           const found = facts.get(id);
           if (!found || found.archivedAt !== undefined) continue;
           facts.set(id, { ...found, archivedAt: at });
+          count += 1;
+        }
+        return count;
+      },
+      async restore(ids) {
+        let count = 0;
+        for (const id of new Set(ids)) {
+          const found = facts.get(id);
+          if (!found || found.archivedAt === undefined) continue;
+          const { archivedAt: _gone, ...rest } = found;
+          facts.set(id, rest);
           count += 1;
         }
         return count;
@@ -412,13 +615,19 @@ function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: numb
         return filterFacts([...facts.values()], query);
       },
       async search(query) {
-        const hits = [...facts.values()].filter(
-          (found) =>
-            found.text.includes(query.text) &&
-            (query.topic === undefined || found.topic === query.topic) &&
-            (query.open === false || isOpenFact(found)),
-        );
-        return hits.slice(0, countOf(query.k ?? 10)).map((found) => ({ fact: found, score: 1 }));
+        const wanted = searchTerms(query.text, MAX_SEARCH_TERMS);
+        return [...facts.values()]
+          .filter((found) => inSearchScope(found, query))
+          .map((found) => {
+            const own = new Set(searchTerms(found.text));
+            return {
+              fact: found,
+              score: termOverlap(wanted.filter((term) => own.has(term)).length, wanted.length, own.size),
+            };
+          })
+          .filter((hit) => hit.score > 0)
+          .toSorted((a, b) => b.score - a.score)
+          .slice(0, countOf(query.k ?? 10));
       },
     },
     procedures: {
@@ -490,6 +699,50 @@ function fakeMemory(options: {
   const theta = 0.5;
   const name = 'memory';
 
+  /** `auto`：来源自动带出的召回，同一条事实一天只记一次 `touch`。 */
+  async function recallWith(
+    query: string,
+    recallOptions: Parameters<Memory['recall']>[1],
+    auto: boolean,
+  ): Promise<Recalled> {
+    const base = {
+      text: query,
+      k: recallOptions?.k ?? 5,
+      ...(recallOptions?.topic !== undefined ? { topic: recallOptions.topic } : {}),
+    };
+    const minConfidence = recallOptions?.minConfidence ?? 0.5;
+    const hits = [
+      ...(await store.facts.search(base)),
+      // 归档的也找，分数打对折。
+      ...(await store.facts.search({ ...base, archived: true }))
+        .filter((hit) => hit.fact.archivedAt !== undefined)
+        .map((hit) => ({ fact: hit.fact, score: hit.score * 0.5 })),
+    ].filter((hit) => hit.fact.confidence >= minConfidence);
+    const at = now();
+    const ranked = rankFacts(
+      hits.map((hit) => hit.fact),
+      Object.fromEntries(hits.map((hit) => [hit.fact.id, hit.score])),
+      { now: at },
+    ).slice(0, base.k);
+    await store.facts.restore(ranked.filter((found) => found.archivedAt !== undefined).map((found) => found.id));
+    await store.facts.touch(
+      ranked
+        .filter((found) => !auto || found.recalls.every((recalledAt) => Math.abs(at - recalledAt) >= DAY))
+        .map((found) => found.id),
+      at,
+    );
+    const facts = ranked.map(({ archivedAt: _restored, ...found }) => found);
+    const procedures =
+      recallOptions?.topic === undefined
+        ? []
+        : await store.procedures.list({ topic: recallOptions.topic, active: true });
+    const recalled: Recalled = { facts, procedures };
+    if (!recallOptions?.evidence) return recalled;
+    const evidence: Entry[] = [];
+    for (const found of facts) for (const ref of found.sources) evidence.push(...(await readSource(sessions, ref)));
+    return { ...recalled, evidence };
+  }
+
   const memory: Memory = {
     name,
     async gate(session, gateOptions) {
@@ -516,32 +769,8 @@ function fakeMemory(options: {
     },
 
     async recall(query, recallOptions) {
-      const hits = await store.facts.search({
-        text: query,
-        k: recallOptions?.k ?? 5,
-        ...(recallOptions?.topic !== undefined ? { topic: recallOptions.topic } : {}),
-      });
-      const at = now();
-      const facts = rankFacts(
-        hits.map((hit) => hit.fact),
-        Object.fromEntries(hits.map((hit) => [hit.fact.id, hit.score])),
-        { now: at },
-      );
-      await store.facts.touch(
-        facts.map((found) => found.id),
-        at,
-      );
-      const procedures =
-        recallOptions?.topic === undefined
-          ? []
-          : await store.procedures.list({ topic: recallOptions.topic, active: true });
-      const recalled: Recalled = { facts, procedures };
-      if (!recallOptions?.evidence) return recalled;
-      const evidence: Entry[] = [];
-      for (const found of facts) for (const ref of found.sources) evidence.push(...(await readSource(sessions, ref)));
-      return { ...recalled, evidence };
+      return recallWith(query, recallOptions, false);
     },
-
     async consolidate(consolidateOptions) {
       const at = consolidateOptions?.now ?? now();
       const report = { added: 0, merged: 0, superseded: 0, archived: 0 };
@@ -621,7 +850,7 @@ function fakeMemory(options: {
             if (last?.type === 'message') query = textOf(last.message);
           }
           const core = await store.core.get();
-          const facts = query ? (await memory.recall(query, { k: sourceOptions?.k ?? 5 })).facts : [];
+          const facts = query ? (await recallWith(query, { k: sourceOptions?.k ?? 5 }, true)).facts : [];
           const lines = [...(core?.text ? [core.text] : []), ...facts.map((found) => found.text)];
           return lines.length > 0 ? lines.join('\n') : null;
         },

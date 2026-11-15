@@ -574,9 +574,13 @@ interface MemoryOptions {
     k?: number; // 缺省 5
     budgetTokens?: number; // 作为来源时事实文字的预算，缺省不限
     minScore?: number; // 相似度下限，缺省 0.1
+    minConfidence?: number; // confidence 低于它的事实不召回，缺省 0.5
+    archivedWeight?: number; // 归档的事实参与召回时相似度乘多少，缺省 0.5；0 就不找归档的
+    spacingMs?: number; // 来源自动带出的事实多久记一次 touch，缺省一天
     confirmations?: number; // 程序要几次确认才带上，缺省 2
   };
-  decay?: { d?: number; epsilon?: number; archiveAt?: number }; // 缺省 ACTIVATION_DEFAULTS：0.5、0.02、0.55
+  // d、epsilon、archiveAt 缺省 ACTIVATION_DEFAULTS：0.5、0.02、0.55；minChances 是归档前要错过几次机会，缺省 7
+  decay?: { d?: number; epsilon?: number; archiveAt?: number; minChances?: number };
   consolidate?: {
     escalateBelow?: number; // 并入判断的 confidence 低于它、又有 model 时升级，缺省 0.6
     maxPNull?: number; // 提取字段的 pNull 高于它当作没说，缺省 0.3
@@ -623,10 +627,18 @@ if (salience >= theta) await store.notes.add([{ session, from, upTo, at: now, sa
 ### 召回 `recall`
 
 ```
-score(fact) = 0.6 × similarity(query, fact.text) + 0.4 × activation(fact, now)
+score(fact) = 0.6 × similarity(query, fact.text) + 0.4 × retrievability(fact, now)
 ```
 
-取 `open` 的事实做 `search`（给了 `embed` 再和余弦取大的），相似度低于 `recall.minScore`（缺省 0.1）的不要，按 `score` 排，按 `k` 和 `budgetTokens` 截断，`touch` 返回的那些。程序带上没退役、确认不少于 `recall.confirmations`（缺省 2）次、并且主题匹配的（`topic` 选项，或者召回的事实的主题；没有主题时看 `when` / `do` 和 `query` 的相似度）。作为来源时结果渲染成事实文字；作为工具时（`evidence: true`）还带回证据原文。被召回就是一次 `t_i`，衰减从头算：这是「回忆即再巩固」。
+两项都在 0..1（见协议的[激活度](protocol.md#激活度-activationretrievability)）：激活度最多贡献 0.4，召回次数再多也盖不过相似度高出一截的事实。
+
+1. 候选：`open` 的事实做 `search`（给了 `embed` 再和余弦取大的）；归档的事实另搜一次（`archived: true`），相似度乘 `recall.archivedWeight`（缺省 0.5），所以它们排在同样相关的 open 事实后面，也占不了 open 事实的名额。关闭的不要。
+2. 筛：相似度低于 `recall.minScore`（缺省 0.1）的不要；`confidence` 低于 `recall.minConfidence`（缺省 0.5）的不要。0.5 的依据：低于它就是提取模型自己都觉得多半不对；模型没报置信度时适配器填的是 0.5（`extractionFromLanguageModel`）或 `1 − pNull`（`pNull` 不超过 `consolidate.maxPNull` = 0.3，所以不低于 0.7），都不会被筛掉。单次调用用 `RecallOptions.minConfidence` 改。
+3. 排：`rankFacts`，按 `k` 和 `budgetTokens` 截断。
+4. 恢复：返回的事实里原先归档的 `restore`。归档是「暂时用不上」，相关的问题来了就回到 open 里。
+5. `touch`：主动的召回（直接调 `recall`、模型调 `recall` 工具）每次都记。来源（`source()`）自动带出的，同一条事实离它上一次记下的召回不到 `recall.spacingMs`（缺省一天）就不再记。来源每一轮都跑，带出谁又是按激活度排的：以前每轮都记，被带出过的事实激活度越滚越高，别的再也排不上。
+
+程序带上没退役、确认不少于 `recall.confirmations`（缺省 2）次、并且主题匹配的（`topic` 选项，或者召回的事实的主题；没有主题时看 `when` / `do` 和 `query` 的相似度）。作为来源时结果渲染成事实文字；作为工具时（`evidence: true`）还带回证据原文。被召回就是一次 `t_i`，衰减从头算：这是「回忆即再巩固」。
 
 ### 巩固 `consolidate`
 
@@ -656,7 +668,7 @@ sequenceDiagram
     end
     M->>S: notes.settle
   end
-  M->>S: 衰减：activation < archiveAt 的 facts.archive
+  M->>S: 衰减：activation < archiveAt 且错过了 minChances 次机会的 facts.archive
   M->>LM: 从 open facts 重写 core（≤ budgetTokens）
   M->>S: core.set
 ```
@@ -665,7 +677,7 @@ sequenceDiagram
 - 并入：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。措辞相同（空白和句读归一、不分大小写后相等）的直接并入，不调 `decide`；否则有对照的事实放进 `state`，这就是分类问题。置信度低于 `consolidate.escalateBelow`（缺省 0.6）、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是 `add` 新的、`close` 旧的（`supersededBy` 指向新的）。
 - 反思是唯一的开放生成，只在 `lesson` 非空且有 `model` 时做：和同主题已有的程序是同一条就 `confirm`，否则 `add`。`add` 时 `confirmations` 是 1，相同的证据 `confirm` 不计数；召回只带 `confirmations ≥ recall.confirmations`（缺省 2）的。
 - 读不到原文的笔记（会话清掉了）直接 `settle`，什么都不写。既没有 `extraction` 也没有 `model` 时不处理笔记，笔记保持待处理，只做衰减和 `core` 的缺省渲染，第一次告警一次。
-- 衰减：按协议的[激活度](protocol.md#激活度-activation)归档。这一轮刚写入或刚并入的事实不在同一轮归档（提取出的 `validFrom` 可能早于今天）。
+- 衰减：open 的事实同时满足两条才归档。一是[激活度](protocol.md#激活度-activationretrievability)低于 `decay.archiveAt`。二是错过了至少 `decay.minChances`（缺省 7）次机会：这条事实最后一次活动（`validFrom` 或最后一次被召回，取晚的）之后，记忆有这么多个不同的日子（UTC）召回过别的事实，它一次都没轮上。日子从 open 事实的 `recalls` 里数。只看时间的话，一条 `s = 0.6` 的新事实 1.09 天后就归档，头两天没碰上相关的问题就没了；没人用记忆的日子现在不算，主人离开一个月回来也不会全归档。缺省取 7 是一周的节律：只在周末或每周例会上用得到的事实，七个有召回的日子里轮得到一次。`minChances: 0` 回到只看激活度。`validFrom` 在未来的事实按它离现在多远算（和激活度一样折回过去），所以远期的也会归档，临近的不会。这一轮刚写入或刚并入的事实不在同一轮归档（提取出的 `validFrom` 可能早于今天）。归档不是删除：召回还找得到它（降权），被召回就恢复。没有写入时间这个字段，所以提取出的 `since` 很早的事实，从写入的第二夜起仍然按 `validFrom` 算。
 - `core`：有 `model` 时从 open 事实重写；open 事实的集合和上次重写时一样就不再调模型（这个记录在进程里，重启后第一夜会重写一次）；输出为空或超预算时回到 `renderCore`。没有 `model` 时用 `renderCore`。文字和当前版本相同就不写新版本。
 - 幂等：笔记 `settle` 之后不再处理；中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下一夜重做，重做时措辞相同的事实直接并入，同一段证据不会记两次。白天不受影响。
 - 报告里 `facts.added` 只数 `new`，取代的那条新事实算在 `superseded` 里；`escalated` 数调了几次 `LanguageModel` 做并入判断。
@@ -673,7 +685,14 @@ sequenceDiagram
 
 ### SQLite 和内存存储
 
-SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，前缀缺省 `memory_`；结构版本 1 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。`search` 不用 FTS5（Node 22.13 自带的 SQLite 没编进去），用 `instr(lower(text))` 做子串匹配：整句命中的分数是 `0.5 + 0.5 × 查询长度 / 文字长度`，否则按空白切出的词里命中的那些的长度占比乘 0.5。内存存储的 `search` 是子串命中记 1 分，否则按词重叠打分，给了 `embed` 再和余弦取大的。
+SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，加检索用的 `fact_docs`、`fact_terms`，前缀缺省 `memory_`；结构版本 3 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。
+
+两个存储的 `search` 是同一套：协议包的 `searchTerms` 切词（字母数字连成的词、中日韩文字相邻两字），`termOverlap` 打分（共同的词数除以较小的那一边），分数相同时共同的词多的在前、再相同按 `id`。同一组事实、同一个查询，两边的命中和分数一样。
+
+- SQLite 是倒排索引。`fact_terms(scope, term, doc)` 一个词一行，主键以 `scope` 开头；`fact_docs(doc, scope, fact_id, terms)` 给每条事实一个短的整数编号（事实的 `id` 是 UUID，每个词都带着它太占地方）并记下它有几个词。`facts.add` 在同一个事务里写索引，`forget` 把它的词删干净；事实的文字不改，别的方法不动索引。查询的词（最多 `MAX_SEARCH_TERMS` 个）当一个 JSON 参数传进去，`json_each` 展开后每个词按主键查一次，按事实数命中了几个，只有命中的事实才读事实表。语句的形状不随词数变，所以上千个词也不会撑破表达式树；CROSS JOIN 固定了连接顺序，库里没有统计信息时规划器自己排会先扫整个作用域。3 万条事实的库里，一个常见词的查询约 7 毫秒，罕见词不到 1 毫秒（以前是全表 `instr`，19–41 毫秒；900 个词的查询约 4 秒）。
+- 没有用 FTS5：它不是每个 Node 自带的 SQLite 都编进去了（这个包的 `engines` 从 22.13 起），自带的 `unicode61` 分词器不切中文，`trigram` 匹配不到两个字的词。自己切词、用普通表，哪个版本都一样。
+- 版本 2 的库打开时升到 3：建两张表，已有的事实（各个作用域的，含关闭、归档的）补进索引，`recalls` 超过 `MAX_FACT_RECALLS` 个的截到最近的那些。
+- 内存存储每次扫一遍这个作用域的事实，每条事实的词只切一次、按 `id` 记着；给了 `embed` 再和余弦取大的。
 
 ### 模型
 

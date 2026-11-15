@@ -73,6 +73,19 @@ export interface MemoryRecallOptions {
   readonly budgetTokens?: number;
   /** 相似度低于它的命中不要，缺省 0.1。 */
   readonly minScore?: number;
+  /**
+   * `confidence` 低于它的事实不召回，缺省 0.5：提取模型自己都觉得多半不对的，不当成事实交给模型。
+   * 模型没报置信度时适配器填的是 0.5（`extractionFromLanguageModel`）或 `1 − pNull`（不低于 0.7），都不会被筛掉。
+   * 单次调用可以用 `RecallOptions.minConfidence` 改；给 0 就不筛。
+   */
+  readonly minConfidence?: number;
+  /** 归档的事实参与召回时相似度乘多少，缺省 0.5；被召回的那些恢复成没归档的。给 0 就不找归档的。 */
+  readonly archivedWeight?: number;
+  /**
+   * 作为来源（`source()`）自动带出的事实，离它上一次记下的召回不到这么久就不再记 `touch`，缺省一天。
+   * 来源每一轮都跑，带出谁又是按激活度排的：每次都记的话，被带出的越来越靠前。主动的 `recall`（工具或直接调）每次都记。
+   */
+  readonly spacingMs?: number;
   /** 程序要几次独立确认才带上，缺省 2。 */
   readonly confirmations?: number;
 }
@@ -82,8 +95,14 @@ export interface MemoryDecayOptions {
   readonly d?: number;
   /** 缺省 0.02（天）。 */
   readonly epsilon?: number;
-  /** 激活度低于它的 open 事实夜里归档，缺省 0.55。 */
+  /** 激活度低于它的 open 事实夜里可以归档，缺省 0.55。也是排序里 `retrievability` 的中点。 */
   readonly archiveAt?: number;
+  /**
+   * 归档前至少要错过几次机会，缺省 7：这条事实最后一次活动（生效或被召回）之后，记忆有这么多个不同的日子（UTC）
+   * 召回过别的事实，它一次都没轮上。没人用记忆的日子不算，所以新事实不会只因为头几天没碰上相关的问题就归档，
+   * 主人离开一个月回来也不会全没了。给 0 就只看激活度。
+   */
+  readonly minChances?: number;
 }
 
 export interface MemoryConsolidateOptions {
@@ -148,6 +167,10 @@ export const MEMORY_DEFAULTS = {
   gateMaxTokens: 4000,
   k: 5,
   minScore: 0.1,
+  minConfidence: 0.5,
+  archivedWeight: 0.5,
+  spacingMs: 86_400_000, // 1 天
+  minChances: 7,
   confirmations: 2,
   escalateBelow: 0.6,
   maxPNull: 0.3,
@@ -308,11 +331,49 @@ interface MutableReport {
 interface RecallInternal extends RecallOptions {
   /** 只要 `validFrom` 不早于它的事实（工具的 `since_days`）。 */
   readonly since?: number;
+  /** 来源自动带出的召回：`touch` 按 `spacingMs` 限频。 */
+  readonly auto?: boolean;
+}
+
+function dayOf(ms: number): number {
+  return Math.floor(ms / DAY_MS);
+}
+
+/** 这些事实被召回过的日子（UTC 的日序号），升序、去重。 */
+function recallDays(facts: readonly MemoryFact[]): number[] {
+  const days = new Set<number>();
+  for (const fact of facts) for (const at of fact.recalls) days.add(dayOf(at));
+  return [...days].toSorted((a, b) => a - b);
+}
+
+/** 事实最后一次活动的时刻：`validFrom` 和各次召回里最晚的。晚于 `now` 的按离 `now` 多远折回过去，和 `activation` 一样。 */
+function lastActivity(fact: Pick<MemoryFact, 'validFrom' | 'recalls'>, now: number): number {
+  let last = -Infinity;
+  for (const at of [fact.validFrom, ...fact.recalls]) last = Math.max(last, at > now ? 2 * now - at : at);
+  return last;
+}
+
+/** 错过的机会：`days`（升序）里晚于事实最后一次活动那天、又不晚于今天的有几个。 */
+function missedChances(fact: Pick<MemoryFact, 'validFrom' | 'recalls'>, days: readonly number[], now: number): number {
+  const from = dayOf(lastActivity(fact, now));
+  const to = dayOf(now);
+  // 二分找第一个大于 `bound` 的位置。
+  const after = (bound: number): number => {
+    let low = 0;
+    let high = days.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (days[middle]! > bound) high = middle;
+      else low = middle + 1;
+    }
+    return low;
+  };
+  return Math.max(0, after(to) - after(from));
 }
 
 /**
- * 记忆的参考实现：五个操作，按 [记忆](../../docs/memory.md) 的设计。只读会话日志；`gate` 只写笔记，`recall` 只 `touch`，
- * 只有 `consolidate` 改写事实、程序和 `core`。它本身是一个执行环境，报一个 `recall` 工具。
+ * 记忆的参考实现：五个操作，按 [记忆](../../docs/memory.md) 的设计。只读会话日志；`gate` 只写笔记，`recall` 只 `touch`
+ * 和恢复被召回的归档事实，只有 `consolidate` 改写事实、程序和 `core`。它本身是一个执行环境，报一个 `recall` 工具。
  */
 export function createMemory(options: MemoryOptions): Memory {
   const { sessions } = options;
@@ -334,6 +395,9 @@ export function createMemory(options: MemoryOptions): Memory {
     epsilon: options.decay?.epsilon ?? ACTIVATION_DEFAULTS.epsilon,
   };
   const archiveAt = options.decay?.archiveAt ?? ACTIVATION_DEFAULTS.archiveAt;
+  const minChances = options.decay?.minChances ?? MEMORY_DEFAULTS.minChances;
+  const archivedWeight = clamp01(recallOptions.archivedWeight ?? MEMORY_DEFAULTS.archivedWeight);
+  const spacingMs = recallOptions.spacingMs ?? MEMORY_DEFAULTS.spacingMs;
   const escalateBelow = options.consolidate?.escalateBelow ?? MEMORY_DEFAULTS.escalateBelow;
   const maxPNull = options.consolidate?.maxPNull ?? MEMORY_DEFAULTS.maxPNull;
   const coreBudget = options.core?.budgetTokens ?? MEMORY_DEFAULTS.coreBudgetTokens;
@@ -458,11 +522,21 @@ export function createMemory(options: MemoryOptions): Memory {
     return vector;
   }
 
-  /** 事实 id → { 事实, 相似度 }：存储的 `search`，给了 `embed` 再和余弦取大的。只看 open 的。 */
+  /**
+   * 事实 id → { 事实, 相似度 }：存储的 `search`，给了 `embed` 再和余弦取大的。open 的和归档的各搜一次：
+   * 归档的分数乘 `archivedWeight`，而且占不了 open 的名额。关闭的不要。余弦那一路只看 open 的。
+   */
   async function similar(query: string, topic: string | undefined, k: number): Promise<Map<string, FactScore>> {
     const out = new Map<string, FactScore>();
-    const hits = await store.facts.search({ text: query, k, ...(topic !== undefined ? { topic } : {}) });
-    for (const hit of hits) if (isOpenFact(hit.fact)) out.set(hit.fact.id, { fact: hit.fact, score: hit.score });
+    const base = { text: query, k, ...(topic !== undefined ? { topic } : {}) };
+    for (const hit of await store.facts.search(base))
+      if (isOpenFact(hit.fact)) out.set(hit.fact.id, { fact: hit.fact, score: hit.score });
+    if (archivedWeight > 0) {
+      for (const hit of await store.facts.search({ ...base, archived: true })) {
+        if (hit.fact.validTo !== undefined || hit.fact.archivedAt === undefined) continue;
+        out.set(hit.fact.id, { fact: hit.fact, score: hit.score * archivedWeight });
+      }
+    }
     const { embed } = options;
     if (!embed) return out;
     const target = await embed(query);
@@ -504,16 +578,19 @@ export function createMemory(options: MemoryOptions): Memory {
     const now = clock();
     const k = countOf(recallOpts.k ?? recallOptions.k, MEMORY_DEFAULTS.k);
     const budget = recallOpts.budgetTokens ?? recallOptions.budgetTokens ?? Infinity;
+    const minConfidence = recallOpts.minConfidence ?? recallOptions.minConfidence ?? MEMORY_DEFAULTS.minConfidence;
     let facts: MemoryFact[] = [];
     if (query.trim() !== '' && k > 0) {
       const scored = [...(await similar(query, recallOpts.topic, Math.max(4 * k, 20))).values()].filter(
         ({ fact, score }) =>
-          score >= minScore && (recallOpts.since === undefined || fact.validFrom >= recallOpts.since),
+          score >= minScore &&
+          fact.confidence >= minConfidence &&
+          (recallOpts.since === undefined || fact.validFrom >= recallOpts.since),
       );
       const ranked = rankFacts(
         scored.map((item) => item.fact),
         Object.fromEntries(scored.map((item) => [item.fact.id, item.score])),
-        { now, ...decay },
+        { now, ...decay, archiveAt },
       );
       let used = 0;
       for (const fact of ranked) {
@@ -524,13 +601,20 @@ export function createMemory(options: MemoryOptions): Memory {
         used += cost;
       }
       recallOpts.signal?.throwIfAborted();
-      if (facts.length > 0)
+      // 被召回的归档事实恢复：相关的问题终于来了。
+      const archived = facts.filter((fact) => fact.archivedAt !== undefined).map((fact) => fact.id);
+      if (archived.length > 0) await store.facts.restore(archived);
+      // 主动的召回每次都记；来源自动带出的，离上一次记下的召回不到 `spacingMs` 就不再记。
+      const touched = recallOpts.auto
+        ? facts.filter((fact) => fact.recalls.every((at) => Math.abs(now - at) >= spacingMs))
+        : facts;
+      if (touched.length > 0)
         await store.facts.touch(
-          facts.map((fact) => fact.id),
+          touched.map((fact) => fact.id),
           now,
         );
     }
-    facts = facts.map((fact) => ({ ...fact }));
+    facts = facts.map(({ archivedAt: _restored, ...fact }) => fact);
     const procedures = await matchingProcedures(query, recallOpts.topic, facts);
     if (!recallOpts.evidence) return { facts, procedures };
     const evidence = await readRefs([
@@ -834,10 +918,15 @@ export function createMemory(options: MemoryOptions): Memory {
       }
     }
 
-    // 衰减：这一夜刚写、刚并入的不归档（提取出的 validFrom 可能早于今天）。
+    // 衰减：激活度低于阈值、又错过了足够多次机会的归档。这一夜刚写、刚并入的不归档（提取出的 validFrom 可能早于今天）。
     signal?.throwIfAborted();
-    const stale = (await openFacts()).filter(
-      (fact) => !written.has(fact.id) && activation(fact, now, decay) < archiveAt,
+    const candidates = await openFacts();
+    const days = recallDays(candidates);
+    const stale = candidates.filter(
+      (fact) =>
+        !written.has(fact.id) &&
+        activation(fact, now, decay) < archiveAt &&
+        missedChances(fact, days, now) >= minChances,
     );
     report.facts.archived = await store.facts.archive(
       stale.map((fact) => fact.id),
@@ -948,6 +1037,7 @@ export function createMemory(options: MemoryOptions): Memory {
           const core = (await store.core.get())?.text;
           const recalled: Recalled = query.trim()
             ? await recall(query, {
+                auto: true,
                 ...(sourceOpts?.k !== undefined ? { k: sourceOpts.k } : {}),
                 ...(recallOptions.budgetTokens !== undefined ? { budgetTokens: recallOptions.budgetTokens } : {}),
                 ...(signal ? { signal } : {}),

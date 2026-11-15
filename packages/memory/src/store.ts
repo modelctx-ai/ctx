@@ -5,8 +5,12 @@ import {
   DEFAULT_MEMORY_SCOPE,
   CtxError,
   filterFacts,
-  isOpenFact,
+  inSearchScope,
+  MAX_FACT_RECALLS,
+  MAX_SEARCH_TERMS,
   sameSourceRef,
+  searchTerms,
+  termOverlap,
   type CoreVersion,
   type FactHit,
   type MemoryFact,
@@ -16,11 +20,11 @@ import {
   type SourceRef,
 } from '@modelctx-ai/ctx-protocol';
 
-import { cosine, textSimilarity } from './text.ts';
+import { cosine } from './text.ts';
 
 export interface MemoryStoreOptions {
   /**
-   * 给 `search` 用的嵌入。给了就是混合检索：相关度取全文分和余弦里大的那个，余弦不低于 `minCosine` 的也算命中。
+   * 给 `search` 用的嵌入。给了就是混合检索：相关度取词重叠的分和余弦里大的那个，余弦不低于 `minCosine` 的也算命中。
    * 事实的文字不改，向量按 `id` 缓存。
    */
   readonly embed?: (text: string) => Promise<readonly number[]>;
@@ -46,7 +50,8 @@ function appendRefs(existing: readonly SourceRef[], refs: readonly SourceRef[]):
 
 /**
  * 进程内的 `MemoryStore`：全部放在内存里，进程退出就没了；测试、单进程和原型用。`id` 是前缀加补零的序号，
- * 所以 `facts.list` 的 `id` 序就是写入顺序。`search` 是全文（子串命中记 1，否则按词重叠打分），给了 `embed` 再加余弦。
+ * 所以 `facts.list` 的 `id` 序就是写入顺序。`search` 按共同的词打分（`searchTerms` 切词、`termOverlap` 打分，
+ * 和 SQLite 存储同一套），给了 `embed` 再加余弦。每条事实的词只切一次，按 `id` 记着。
  */
 export function createMemoryStore(options: MemoryStoreOptions = {}): MemoryStore {
   return scopeOf({ next: 0, scopes: new Map() }, options, DEFAULT_MEMORY_SCOPE);
@@ -75,6 +80,16 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
   const procedures: Procedure[] = [];
   const versions: CoreVersion[] = [];
   const vectors = new Map<string, Promise<readonly number[]>>();
+  /** 事实 `id` → 它的词。事实的文字不改，切一次就够。 */
+  const terms = new Map<string, ReadonlySet<string>>();
+  const termsOf = (fact: MemoryFact): ReadonlySet<string> => {
+    let found = terms.get(fact.id);
+    if (!found) {
+      found = new Set(searchTerms(fact.text));
+      terms.set(fact.id, found);
+    }
+    return found;
+  };
   const minCosine = options.minCosine ?? 0.3;
   const newId = (prefix: string): string => `${prefix}${String((shared.next += 1)).padStart(8, '0')}`;
   const factOf = (id: string): MemoryFact => {
@@ -164,7 +179,7 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
       async touch(ids, at) {
         for (const id of ids) {
           const found = facts.get(id);
-          if (found) facts.set(id, { ...found, recalls: [...found.recalls, at] });
+          if (found) facts.set(id, { ...found, recalls: [...found.recalls, at].slice(-MAX_FACT_RECALLS) });
         }
       },
       async archive(ids, at) {
@@ -177,11 +192,23 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
         }
         return count;
       },
+      async restore(ids) {
+        let count = 0;
+        for (const id of new Set(ids)) {
+          const found = facts.get(id);
+          if (!found || found.archivedAt === undefined) continue;
+          const { archivedAt: _gone, ...rest } = found;
+          facts.set(id, rest);
+          count += 1;
+        }
+        return count;
+      },
       async forget(ids) {
         let count = 0;
         for (const id of new Set(ids)) {
           if (!facts.delete(id)) continue;
           vectors.delete(id);
+          terms.delete(id);
           count += 1;
         }
         for (const [id, found] of facts) {
@@ -195,21 +222,27 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
         return filterFacts([...facts.values()], query);
       },
       async search(query) {
+        if (typeof query?.text !== 'string') throw new CtxError('invalid_request', 'Search text must be a string.');
         const k = countOf(query.k ?? 10);
         if (k === 0) return [];
-        const candidates = filterFacts([...facts.values()]).filter(
-          (fact) =>
-            (query.topic === undefined || fact.topic === query.topic) && (query.open === false || isOpenFact(fact)),
-        );
+        const candidates = filterFacts([...facts.values()]).filter((fact) => inSearchScope(fact, query));
+        const wanted = searchTerms(query.text, MAX_SEARCH_TERMS);
         const { embed } = options;
         const target = embed && query.text.trim() ? await embed(query.text) : undefined;
-        const hits: FactHit[] = [];
+        const hits: (FactHit & { readonly common: number })[] = [];
         for (const fact of candidates) {
-          const text = textSimilarity(query.text, fact.text);
+          const own = termsOf(fact);
+          let common = 0;
+          for (const term of wanted) if (own.has(term)) common += 1;
+          const text = termOverlap(common, wanted.length, own.size);
           const vector = target && embed ? cosine(target, await vectorOf(fact, embed)) : 0;
-          if (text > 0 || vector >= minCosine) hits.push({ fact, score: Math.max(text, vector) });
+          if (text > 0 || vector >= minCosine) hits.push({ fact, score: Math.max(text, vector), common });
         }
-        return hits.toSorted((a, b) => b.score - a.score).slice(0, k);
+        // 分数相同时共同的词多的在前，再相同保持 `id` 序。
+        return hits
+          .toSorted((a, b) => b.score - a.score || b.common - a.common)
+          .slice(0, k)
+          .map(({ fact, score }) => ({ fact, score }));
       },
     },
     procedures: {
