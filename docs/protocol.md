@@ -28,14 +28,14 @@ status: stable
 
 ## 会话 `SessionStore`
 
-只追加的事件日志。详细语义见 [ADR 0003](adr/0003-context-model.md)。
+只追加的事件日志，详细语义见 [ADR 0003](adr/0003-context-model.md)；例外只有删除（`clear`、`truncate`、`remove`）和涂改（`redact`），见下面的[擦除](#擦除)和 [ADR 0007](adr/0007-deletion-and-retention.md)。
 
 ```ts
 interface EntryBase {
   id: string; // 全局唯一；不给就由存储生成
   session: string; // 由存储填
   v: number; // 写入这一行时的格式版本，读出来的形状永远是当前版本；新条目是 `ENTRY_VERSION`（1），由存储填
-  seq: number; // 会话内位置，由存储按写入顺序填：会话内严格递增、从 1 起，`clear` 后不回退；0 是会话开头
+  seq: number; // 会话内位置，由存储按写入顺序填：会话内严格递增、从 1 起，删除之后不回退、不复用；0 是会话开头
   at: number; // 逻辑时间（毫秒），缺省写入时刻；只用于投影排序和展示，可以早于已有的条目
   key?: string; // 幂等键：同一会话里键相同的第二条跳过
   source?: string; // 谁写的：user、model、harness、应用名
@@ -85,7 +85,10 @@ interface AppendOptions {
 interface SessionStore {
   append(session: string, entries: readonly NewEntry[], options?: AppendOptions): Promise<Entry[]>;
   list(session: string, options?: ListOptions): Promise<Entry[]>;
-  clear(session: string): Promise<number>;
+  clear(session: string): Promise<number>; // 清空整个会话，返回删掉的条数
+  truncate(session: string, upTo: number): Promise<number>; // 删掉 seq ≤ upTo 的条目
+  remove(session: string, ids: readonly string[]): Promise<number>; // 按 id 真删
+  redact(session: string, ids: readonly string[]): Promise<number>; // 按 id 涂改：位置留着，内容换成 ctx.redacted
   sessions(options?: SessionsOptions): Promise<string[]>; // 名字升序
   /** 先给出 after 之后已有的条目，再持续给出新写入的；远端流式读用。 */
   watch?(session: string, options?: WatchOptions): AsyncIterable<Entry>;
@@ -109,12 +112,61 @@ interface SessionStore {
 | `ctx.compacted`   | 上下文        | `CompactedData`：`{ covers, summaryId }`                                 |
 | `ctx.error`       | harness、编排 | `CtxErrorData`：`{ runId?, message, type? }`                             |
 | `ctx.unreadable`  | （不写入）    | `UnreadableData`：`{ v?, type?, error: { type, message } }`，见下面      |
+| `ctx.erased`      | 存储          | `ErasedData`：`{ op, upTo?, seqs?, count }`，见[擦除](#擦除)             |
+| `ctx.redacted`    | 存储          | `RedactedData`：`{ type?, role? }`，被涂改的条目留下的占位               |
 
 这些事件缺省对模型不可见，和应用事件一样由投影规则决定要不要渲染。
 
 `ctx.unreadable` 不是写进去的条目，是读的时候给的占位：存储读到解不了的一行（格式版本比自己认识的高、带不认识的部件）时，缺省抛错——调用方看得到问题，不会拿着缺了一块的历史接着跑。实现可以另给宽松模式（`UnreadableMode` 的 `placeholder`，`ctx-sqlite` 和 `ctx-remote` 客户端的 `unreadable` 选项），这时那一行读成一条 `ctx.unreadable` 事件：`id`、`session`、`seq`、`at` 是那一行自己的，所以 `after`、`watch`、`expectSeq` 照常能用，会话其余部分照常能读；`data` 记着原来的 `v`、`type` 和错误。它是事件，缺省不进模型上下文；因为不是存进去的 `kind`，`list({ kinds })` 筛不出它。`readEntry(raw, mode?, fallback?)` 是这条规则的实现（`upgradeEntry` 加上占位），`unreadableEntry(raw, error)` 构造占位条目。
 
-纯函数：`upgradeEntry`（见下）；`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareEntries`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，`filterSessions(names, options)` 是 `SessionsOptions` 的语义，内存里的存储可以直接用。
+纯函数：`upgradeEntry`（见下）；`userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry` 构造条目；`runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`erasedEntry` 构造框架事件（可选字段不给时不出现在 `data` 里）；`isFrameworkKind`；`compareEntries`、`textOf`；`filterEntries(entries, options)` 是 `ListOptions` 的语义，`filterSessions(names, options)` 是 `SessionsOptions` 的语义，`eraseEntries(entries, erasure)` 是三个擦除方法的语义，内存里的存储可以直接用；`redactedEntry(raw)` 构造涂改之后的占位，`isErased(data, seq)` 判断一条擦除记录动没动某个位置。
+
+### 擦除
+
+```ts
+type EraseOp = 'truncate' | 'remove' | 'redact';
+interface ErasedData {
+  op: EraseOp;
+  upTo?: number; // truncate：被删掉的条目里最大的 seq
+  seqs?: readonly number[]; // remove、redact：动了的条目的 seq，升序
+  count: number; // 动了多少条
+}
+interface RedactedData {
+  type?: string; // 原来的类型：message、event、summary
+  role?: string; // 原来是消息时它的角色
+}
+type Erasure = { op: 'truncate'; upTo: number } | { op: 'remove' | 'redact'; ids: readonly string[] };
+function eraseEntries(
+  entries: readonly Entry[],
+  erasure: Erasure,
+): { entries: Entry[]; touched: Entry[]; erased?: ErasedData };
+```
+
+`clear` 之外的三个方法合称擦除。各自做什么：
+
+| 方法                   | 做什么                                                                                                                                                                                                              |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `truncate(session, n)` | 删掉 `seq ≤ n` 的条目。`n` 小数向下取整，不是有限数时什么都不删。清理被摘要盖住的历史时 `n` 给摘要的 `covers`                                                                                                       |
+| `remove(session, ids)` | 按 `id` 真删。删掉之后它的 `id` 和 `key` 可以再用（和 `clear` 一样）                                                                                                                                                |
+| `redact(session, ids)` | 按 `id` 涂改：条目变成一条 `ctx.redacted` 事件，`id`、`session`、`seq`、`at`、`key`、`source` 留着，`v` 是当前版本，消息、文字、数据、`meta` 都去掉，`data` 是 `RedactedData`。已经涂改过的跳过，所以重复调是空操作 |
+
+共同的规则：
+
+- 都返回真正动了的条数。认不得的 `id`、别的会话的 `id` 跳过，不算错；重复的 `id` 只算一次。
+- 只按 `id`、`seq` 这些列操作，不解码正文：读不了的行（`unsupported_version`、`unsupported_part`）也删得掉、涂得掉，涂改之后就读得了。坏行的 `id` 从宽松模式的 `ctx.unreadable` 占位上拿。
+- **原子**：要么都做，要么都不做，不和并发的 `append` 交错。
+- **留一条记录**：真的动了条目时，存储在同一次操作里追加一条 `ctx.erased`（`ErasedData`，`source: 'store'`），只有位置，没有内容。什么都没动（返回 0）就不追加。
+- **`seq`**：不回退、不复用，剩下的条目 `id`、`seq`、`at` 都不变。因为有那条记录，擦除之后会话的末尾一定往前走一格——哪怕删掉的是最后一条、哪怕整个会话都删了（这时会话里只剩那条记录，`sessions` 还列它）。
+- **`expectSeq`**：所以拿着擦除之前的末尾当前提的写入一定 `conflict` 一次，重读就看得到记录。擦除自己不收 `expectSeq`。
+- **`watch`**：订阅方收得到 `ctx.erased`，照着它改自己手里的副本（镜像、界面）；被删、被涂改的条目本身不会重发。
+- **摘要的 `covers`**：`truncate(session, covers)` 之后摘要照常生效，它代替的条目不在了而已。比 `covers` 小的位置上的更早的摘要也一起删掉。擦除不改摘要的文字：摘要是从被盖住的条目算出来的，删掉条目不会把内容从摘要里拿掉；要一起清，把摘要也 `redact` 掉再重新压缩。被 `redact` 的摘要不再是摘要，被它盖住、还在的条目重新可见。
+- **涂改之后的投影**：`ctx.redacted` 是事件，缺省不进模型上下文；工具调用和结果少了一边由投影补齐或去掉（见[上下文](#上下文-contextbuilder)）。想在原位留一句「已删除」，给 `ctx.redacted` 写一条事件规则，`data.role` 是原来的角色。
+- **生命周期事件**：删掉一轮的 `ctx.run.ended` 而留着它的 `ctx.run.started`，会话会被当成有未结束的运行，要 `recover` 才解开。
+- **运行中的 harness**：见 [Harness](#harness) 的写入规则——这一轮自己写的条目被擦除，它在下一次写入时停下。
+
+`clear` 不在这几条里：它不留记录，会话回到空，末尾回到 0（`seq` 仍然不复用），`sessions` 不再列它，`watch` 的订阅方收不到通知。运行中的 harness 靠「自己的 `ctx.run.started` 不在了」发现它。要留痕迹的清空用 `truncate(session, 末尾)`。
+
+擦除管的是存储里的条目。摘要里的文字、记忆里从这些条目提取的事实、备份，都不在这个保证里；各实现在介质上擦到什么程度见它们的说明（`ctx-sqlite` 见[包说明](../packages/sqlite/README.md#删除和文件大小)）。
 
 ### 消息格式和版本
 
@@ -403,7 +455,7 @@ interface Harness {
 - 模型出错、被取消也写 `ctx.run.ended`，`run` 照常返回，`stopReason` 和 `error` 说明原因；只有写日志本身失败才 reject。远端调用方因此总拿到同一种形状。
 - **一个会话最多一个未结束的运行，跨进程也成立**（只对 `record` 不为 `false` 的运行；`record: false` 的运行不碰日志，不占会话，不会遇到 `session_busy`，也不会被 `recover` 看到）：
   1. 开始：读最后一个生命周期事件（`list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`）。是 `started` 就说明有未结束的运行，`run` 以 `ErrorInfo.type: 'session_busy'`（`retryable: true`）结束，不写任何东西；否则带 `expectSeq` 追加 `ctx.run.started`，冲突就重读重判。
-  2. 运行中：每次写入带 `expectSeq`（本轮上一次写入之后的末尾）。冲突时读自己的 `ctx.run.started` 起的生命周期事件：自己的 `runId` 已经有 `ctx.run.ended`，说明被别人当作断掉的运行收走了；自己的 `ctx.run.started` 不在了，说明会话中途被 `clear` 了。两种都是被围栏，停下，`stopReason: 'aborted'`，不再写 `ctx.run.ended`、`ctx.error` 和产出；都不是就只是别人写了应用事件，用新的末尾重试。
+  2. 运行中：每次写入带 `expectSeq`（本轮上一次写入之后的末尾）。冲突时读自己的 `ctx.run.started` 起的生命周期事件和擦除记录（`kinds: [ctx.run.started, ctx.run.ended, ctx.erased]`）：自己的 `runId` 已经有 `ctx.run.ended`，说明被别人当作断掉的运行收走了；自己的 `ctx.run.started` 不在了，说明会话中途被 `clear` 了，或者 `truncate`、`remove` 删到了它；有 `ctx.erased` 动了这一轮自己写的条目（`isErased`，`redact` 也算），说明这一轮的输入或产出被删了。三种都是被围栏，停下，`stopReason: 'aborted'`，不再写 `ctx.run.ended`、`ctx.error` 和产出——针对已删内容的回答不会写回来。都不是就只是别人写了应用事件，或者擦除的是这一轮之前的历史、别人在这期间写的条目，用新的末尾重试。已经建好的上下文不重建：这一轮的模型仍然看得到被擦除的更早的内容，要一并挡住就先取消这一轮再删。
   3. 同一个 harness 实例自己维护一条进程内的每会话串行队列（只排 `record` 不为 `false` 的运行）：同一进程里的第二个运行等前一个结束再开始，所以 `session_busy` 只会在跨进程或别的 harness 实例上出现。排队时 `signal` 中止，这一轮直接以 `aborted` 结束，什么都不写。队列只是少打一次冲突；编排器自己的队列保留，两层串行不冲突。
   4. 进程崩溃留下的未结束运行会让该会话一直 `session_busy`，直到有编排器 `recover` 它。**所以用 `record` 缺省（写日志）的应用，进程启动时要先 `recover()` 再接新的 `submit`。** 不写日志的运行没有这个要求。
   5. `RunRequest.owner` 写进 `ctx.run.started` 的 `owner`（编排器按自己的 `owner` 填）。
@@ -717,17 +769,17 @@ A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = (now − t_i) / 1 �
 
 `@modelctx-ai/ctx-protocol/testing`，用法见[包说明](../packages/protocol/README.md#实现一个协议)。
 
-| 契约测试                          | 工厂                                                                    | 覆盖                                                                                                                                                                                                                                                                   |
-| --------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`limit`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、`sessions` 的升序和翻页、`watch?` 的读已有、读新写入、中止 |
-| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                                |
-| `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                        |
-| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                            |
-| `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                       |
-| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                                       |
-| `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                       |
-| `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                           |
-| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                          |
+| 契约测试                          | 工厂                                                                    | 覆盖                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`limit`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、擦除（`truncate`、`remove`、`redact` 的条数和剩下的条目、`ctx.erased` 记录、什么都没动时不留记录、末尾前进和旧 `expectSeq` 冲突、`id`/`key` 让不让出来、和并发 `append` 不交错）、`sessions` 的升序和翻页、`watch?` 的读已有、读新写入、读擦除记录、中止 |
+| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                                                                                                                                                                                                                              |
+| `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                                                                                                                                                                                                                      |
+| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                                                                                                                                                                                                                          |
+| `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                                                                                                                                                                                                                     |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                                                                                                                                                                                                                                     |
+| `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                         |
+| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                        |
 
 harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。记忆的契约用协议包 `/testing` 里的剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel`：`describeMemoryContract` 自己造好它们和一个内存会话日志交给工厂。谁跑：记忆存储的契约由 `ctx-memory` 的内存存储（带和不带 `embed`）、`createSqliteMemoryStore`、`createRemoteMemoryStore` 跑；决策模型的由剧本模型、启发式、`decisionFromLanguageModel`、`ctx-models` 的两个 provider（假 `fetch`）跑；提取模型的由剧本模型、`extractionFromLanguageModel`、`ctx-models` 的 `cloudflare` 跑；`describeMemoryContract` 由 `createMemory` 加内存存储跑，门控阈值固定在 0.1..0.9 之间，`LanguageModel` 可以不给。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里。
 
@@ -761,6 +813,9 @@ harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptSte
 |          | `list`            | `GET /sessions/:session/entries?after=&last=&limit=&types=&kinds=` | → `{ entries, more? }`；`types`、`kinds` 逗号分隔（`kind` 里不能有逗号）；一次最多一页，`more: true` 时用最后一条的 `seq` 当 `after` 接着读 |
 |          | `watch`           | `GET /sessions/:session/entries/stream?after=`                     | → NDJSON `Entry`；存储没有 `watch` 时服务端轮询 `list`                                                                                      |
 |          | `clear`           | `DELETE /sessions/:session`                                        | → `{ deleted }`                                                                                                                             |
+|          | `truncate`        | `POST /sessions/:session/entries/truncate`                         | `{ upTo }` → `{ deleted }`；`upTo` 不是数字 400                                                                                             |
+|          | `remove`          | `POST /sessions/:session/entries/remove`                           | `{ ids }` → `{ removed }`；`ids` 不是字符串数组 400                                                                                         |
+|          | `redact`          | `POST /sessions/:session/entries/redact`                           | `{ ids }` → `{ redacted }`                                                                                                                  |
 |          | `sessions`        | `GET /sessions?prefix=&after=&limit=`                              | → `{ sessions }`；名字升序                                                                                                                  |
 | 执行环境 | （列出名字）      | `GET /executors`                                                   | → `{ executors }`                                                                                                                           |
 |          | `tools`           | `GET /executors/:name/tools`                                       | → `{ tools }`                                                                                                                               |
@@ -783,7 +838,7 @@ harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptSte
 - 等很久才有结果的两个请求（`POST /runs`、`POST /executors/:name/execute`）会在结果出来之前先发 200 的响应头，隔一段时间写一个换行当心跳，最后才是 JSON 正文（JSON 允许前面有空白）。头发出去之后才出的错改不了状态码，正文是 `{ error, status }`，`status` 是本来该回的状态码。
 - 到了并发上限回 429（`type: rate_limit_error`，`retryable: true`）。
 - 500 的 `message` 只有一句通用的话和一个编号，原文在服务端的日志里；协议错误（`invalid_request`、`not_found`、`conflict`）照旧带着自己的 `type` 和文字。
-- 客户端可以放心重试的：所有 `GET`、带着 `id` 的 `append`（存储按 `id` 去重）、两个取消。提交运行、执行工具、记忆的写入不幂等，不重试。
+- 客户端可以放心重试的：所有 `GET`、带着 `id` 的 `append`（存储按 `id` 去重）、两个取消。提交运行、执行工具、记忆的写入不幂等，不重试。会话的 `clear` 和三个擦除重发一遍不会多删，但第二次回的条数是 0，本包的客户端不自动重试，调用方想重试可以自己重发。
 
 编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 

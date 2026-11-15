@@ -1,17 +1,17 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 
-import { eventEntry, isConflict, messageEntry, userEntry, type Message } from '@modelctx-ai/ctx-protocol';
+import { eventEntry, isConflict, messageEntry, userEntry, type Entry, type Message } from '@modelctx-ai/ctx-protocol';
 import { describeSessionStoreContract } from '@modelctx-ai/ctx-protocol/testing';
 import { describe, test } from 'vite-plus/test';
 
-import { createSqliteStore } from './index.ts';
+import { createSqliteStore, type SqliteSessionStore, type SqliteStoreOptions } from './index.ts';
 
 describeSessionStoreContract('sqlite', ({ now }) => createSqliteStore({ path: ':memory:', now, pollIntervalMs: 10 }), {
   describe,
@@ -499,6 +499,215 @@ describe('schema 迁移', () => {
       database.prepare(`SELECT count(*) AS n FROM pragma_table_info('ctx_entries') WHERE name = 'thread'`).get()?.['n'],
       1,
     );
+  });
+});
+
+const MARKER = 'MARKER-7f3a9c';
+
+/** 库文件（和还在的 `-wal`）里有没有这段文字。 */
+function onDisk(path: string, text: string): boolean {
+  return [path, `${path}-wal`].some((file) => existsSync(file) && readFileSync(file).includes(text));
+}
+
+/** 一个带标记的会话：200 条消息，每条的正文、`meta` 里都有标记，其中几条长到要用溢出页。 */
+async function seedMarked(path: string, options: Partial<SqliteStoreOptions> = {}) {
+  const store = createSqliteStore({ ...(options.database ? {} : { path }), ...options });
+  const written = await store.append(
+    's',
+    Array.from({ length: 200 }, (_, i) =>
+      userEntry(`${MARKER} 第 ${i} 条 ${i % 50 === 0 ? 'x'.repeat(6_000) + MARKER : ''}`, {
+        meta: { note: MARKER },
+      }),
+    ),
+  );
+  await store.append('keep', [userEntry('别的会话，不带标记')]);
+  return { store, written };
+}
+
+function tempPath(): string {
+  return join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-erase-')), 'ctx.db');
+}
+
+function secureDelete(database: DatabaseSync): unknown {
+  return database.prepare('PRAGMA secure_delete').get()?.['secure_delete'];
+}
+
+describe('删除和涂改', () => {
+  const erasers: [string, (store: SqliteSessionStore, written: readonly Entry[]) => Promise<number>][] = [
+    ['clear', (store) => store.clear('s')],
+    ['truncate', (store, written) => store.truncate('s', written.at(-1)!.seq)],
+    [
+      'remove',
+      (store, written) =>
+        store.remove(
+          's',
+          written.map((entry) => entry.id),
+        ),
+    ],
+    [
+      'redact',
+      (store, written) =>
+        store.redact(
+          's',
+          written.map((entry) => entry.id),
+        ),
+    ],
+  ];
+
+  for (const [name, erase] of erasers) {
+    test(`${name} 之后库文件里找不到被删的内容（secure_delete）；文件不变小`, async () => {
+      const path = tempPath();
+      const { store, written } = await seedMarked(path);
+      assert.equal(secureDelete(store.database), 1, '自己开的库缺省开着');
+      store.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      assert.ok(onDisk(path, MARKER), '删之前标记在文件里');
+      const before = statSync(path).size;
+      assert.equal(await erase(store, written), 200);
+      store.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+      store.close();
+      assert.ok(!onDisk(path, MARKER), '删之后文件里不该再有标记');
+      assert.ok(statSync(path).size >= before, '腾出来的页留在文件里');
+      const reopened = createSqliteStore({ path });
+      assert.deepEqual(await reopened.list('keep', { types: ['message'] }).then((entries) => entries.length), 1);
+      reopened.close();
+    });
+  }
+
+  test('应用传进来的连接也开 secure_delete：在应用的事务里删、直接删，文件里都找不到', async () => {
+    const path = tempPath();
+    const database = new DatabaseSync(path);
+    database.exec('PRAGMA journal_mode = WAL');
+    assert.equal(secureDelete(database), 0);
+    const { store, written } = await seedMarked(path, { database });
+    assert.equal(secureDelete(database), 1);
+    database.exec('BEGIN');
+    assert.equal(
+      await store.redact(
+        's',
+        written.slice(0, 50).map((entry) => entry.id),
+      ),
+      50,
+    );
+    assert.equal(
+      await store.remove(
+        's',
+        written.slice(50, 100).map((entry) => entry.id),
+      ),
+      50,
+    );
+    database.exec('COMMIT');
+    assert.equal(await store.truncate('s', written[149]!.seq), 100, '50 条占位加 50 条消息');
+    assert.equal(await store.clear('s'), 50 + 3, '剩下的 50 条和三条擦除记录');
+    database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    database.close();
+    assert.ok(!onDisk(path, MARKER));
+  });
+
+  test('secureDelete: false 不动连接的设置：删掉的内容还在文件里，vacuum 之后才没有', async () => {
+    const database = new DatabaseSync(':memory:');
+    createSqliteStore({ database, secureDelete: false });
+    assert.equal(secureDelete(database), 0);
+
+    const path = tempPath();
+    const { store } = await seedMarked(path, { secureDelete: false });
+    assert.equal(secureDelete(store.database), 0);
+    assert.equal(await store.clear('s'), 200);
+    store.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    assert.ok(onDisk(path, MARKER), '没开 secure_delete，删除只是把空间标成可用');
+    store.vacuum();
+    store.close();
+    assert.ok(!onDisk(path, MARKER));
+  });
+
+  test('没开 secure_delete 时写的内容，之后开着删再 vacuum，文件里找不到', async () => {
+    const path = tempPath();
+    const { store: plain } = await seedMarked(path, { secureDelete: false });
+    plain.close();
+    const store = createSqliteStore({ path });
+    assert.equal(secureDelete(store.database), 1);
+    assert.equal(await store.clear('s'), 200);
+    // 这时文件里一般还有残留：写入时没开 `secure_delete`，页分裂在页里留下了行内容的旧副本，开着删也擦不到
+    // （SQLite 3.53 上实测如此；这是 SQLite 内部的行为，不在这里断言）。`vacuum()` 重写整个文件才清得掉。
+    store.vacuum();
+    store.close();
+    assert.ok(!onDisk(path, MARKER));
+  });
+
+  test('应用的事务回滚，擦除和擦除记录一起回滚', async () => {
+    const database = new DatabaseSync(':memory:');
+    const store = createSqliteStore({ database });
+    const written = await store.append('s', [userEntry('一'), userEntry('二')]);
+    database.exec('BEGIN');
+    assert.equal(await store.remove('s', [written[0]!.id]), 1);
+    assert.equal((await store.list('s')).length, 2, '事务里看得到：少一条消息，多一条记录');
+    database.exec('ROLLBACK');
+    assert.deepEqual(await store.list('s'), written);
+  });
+
+  test('vacuum 把腾出来的空间还给文件系统；事务里不能调', async () => {
+    const path = tempPath();
+    const { store } = await seedMarked(path);
+    store.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    const before = statSync(path).size;
+    await store.clear('s');
+    store.vacuum();
+    assert.ok(statSync(path).size < before, `${statSync(path).size} 应小于 ${before}`);
+    assert.equal(existsSync(`${path}-wal`) ? statSync(`${path}-wal`).size : 0, 0, 'WAL 截到空');
+    assert.equal((await store.list('keep')).length, 1);
+    store.database.exec('BEGIN');
+    assert.throws(() => store.vacuum(), /cannot run inside a transaction/);
+    store.database.exec('ROLLBACK');
+    store.close();
+  });
+
+  test('读不了的行按 id 删得掉、涂得掉，之后会话照常能读', async () => {
+    const database = new DatabaseSync(':memory:');
+    const strict = createSqliteStore({ database });
+    await strict.append('t', [userEntry('一'), userEntry('二'), userEntry('三'), userEntry('四')]);
+    database.exec(`UPDATE ctx_entries SET v = 2 WHERE seq = 2`);
+    database.exec(
+      `UPDATE ctx_entries SET v = 0, body = '{"message":{"role":"user","content":[{"type":"hologram"}]}}' WHERE seq = 3`,
+    );
+    await assert.rejects(strict.list('t'), (error: Error) => error.name === 'unsupported_version');
+    // 坏行的 id 从宽松模式的占位上拿。
+    const lenient = createSqliteStore({ database, unreadable: 'placeholder' });
+    const bad = (await lenient.list('t')).filter((entry) => entry.type === 'event' && entry.kind === 'ctx.unreadable');
+    assert.deepEqual(
+      bad.map((entry) => entry.seq),
+      [2, 3],
+    );
+    assert.equal(await strict.remove('t', [bad[0]!.id]), 1);
+    assert.equal(await strict.redact('t', [bad[1]!.id]), 1);
+    const entries = await strict.list('t');
+    assert.deepEqual(
+      entries.map((entry) => [entry.seq, entry.type === 'event' ? entry.kind : entry.type]),
+      [
+        [1, 'message'],
+        [3, 'ctx.redacted'],
+        [4, 'message'],
+        [5, 'ctx.erased'],
+        [6, 'ctx.erased'],
+      ],
+    );
+    const placeholder = entries[1]!;
+    assert.deepEqual(placeholder.type === 'event' && placeholder.data, { type: 'message', role: 'user' });
+    assert.equal(placeholder.v, 1, '涂改之后是当前格式');
+  });
+
+  test('一次传的 id 比 SQLite 一条语句能带的多也行', async () => {
+    const store = createSqliteStore({ path: ':memory:' });
+    const written = await store.append(
+      's',
+      Array.from({ length: 1_200 }, (_, i) => userEntry(String(i))),
+    );
+    const ids = written.map((entry) => entry.id);
+    assert.equal(await store.redact('s', ids.slice(0, 1_100)), 1_100);
+    assert.equal(await store.remove('s', ids), 1_200);
+    const [first, second, ...rest] = await store.list('s');
+    assert.deepEqual(rest, []);
+    assert.equal(first?.type === 'event' && (first.data as { count: number }).count, 1_100);
+    assert.equal(second?.type === 'event' && (second.data as { seqs: number[] }).seqs.length, 1_200);
+    store.close();
   });
 });
 

@@ -9,7 +9,7 @@ interface EntryBase {
   readonly session: string;
   /**
    * 条目在会话里的位置：存储按写入顺序分配，会话内严格递增、从 1 开始，`(session, seq)` 唯一。不要求连续，
-   * 不要求跨会话递增，`clear` 之后不回退、不复用。0 表示会话开头。`list`、`watch`、`covers` 都按它。
+   * 不要求跨会话递增，`clear`、`truncate`、`remove` 之后不回退、不复用。0 表示会话开头。`list`、`watch`、`covers` 都按它。
    */
   readonly seq: number;
   /** 逻辑时间（毫秒），只用于投影排序和展示。缺省是写入时刻；导入的旧记录保留原来的时间，所以可以早于已有的条目。 */
@@ -109,8 +109,17 @@ export interface WatchOptions {
 }
 
 /**
- * 会话：只追加的事件日志，放在模型的上下文窗口之外。写进来的条目不再修改，压缩靠追加摘要条目完成。
+ * 会话：只追加的事件日志，放在模型的上下文窗口之外。写进来的条目不再修改，压缩靠追加摘要条目完成；
+ * 例外只有删除：`clear`、`truncate`、`remove` 真删，`redact` 把内容换成占位。
  * `list` 和 `watch` 都按 `seq` 升序返回，也就是写入顺序；模型看到的逻辑顺序是投影的事（`compareEntries`）。
+ *
+ * 擦除（`truncate`、`remove`、`redact`）的共同规则：
+ * - 原子：要么都做，要么都不做，不和并发的 `append` 交错。
+ * - 真的动了条目时，存储在同一次操作里追加一条 `ctx.erased`（`ErasedData`，`source: 'store'`）。所以会话的末尾
+ *   一定往前走一格：拿着旧末尾当 `expectSeq` 的写入会 `conflict` 一次，重读就看得到这条记录；`watch` 的订阅方
+ *   也收得到，照着它改自己手里的副本。什么都没动（返回 0）就不追加，末尾不变。
+ * - `seq` 不回退、不复用；剩下的条目 `id`、`seq`、`at` 都不变。
+ * - 摘要不跟着改：它的文字是从被盖住的条目算出来的，删掉条目不会把内容从摘要里拿掉。
  */
 export interface SessionStore {
   /**
@@ -120,8 +129,28 @@ export interface SessionStore {
    */
   append(session: string, entries: readonly NewEntry[], options?: AppendOptions): Promise<Entry[]>;
   list(session: string, options?: ListOptions): Promise<Entry[]>;
-  /** 清空一个会话，返回删掉的条数。 */
+  /**
+   * 清空一个会话，返回删掉的条数。不留擦除记录：会话回到空，末尾回到 0，`sessions` 不再列它。
+   * `watch` 的订阅方收不到通知；要留痕迹就用 `truncate(session, 末尾)`。
+   */
   clear(session: string): Promise<number>;
+  /**
+   * 删掉 `seq` 小于等于 `upTo` 的条目，返回删掉的条数。清理被摘要盖住的历史时 `upTo` 给摘要的 `covers`；
+   * 比它小的摘要也一起删掉，生效的摘要（`seq` 大于自己的 `covers`）留着。`upTo` 小数向下取整，不是有限数时什么都不删。
+   */
+  truncate(session: string, upTo: number): Promise<number>;
+  /**
+   * 按 `id` 删掉这个会话里的条目，返回删掉的条数。认不得的、别的会话的 `id` 跳过，重复的只算一次。
+   * 读不了的行（`unsupported_version` 之类）也删得掉。删掉之后它的 `id` 和 `key` 可以再用（和 `clear` 一样）。
+   */
+  remove(session: string, ids: readonly string[]): Promise<number>;
+  /**
+   * 按 `id` 涂改这个会话里的条目，返回涂改的条数：`id`、`session`、`seq`、`at`、`key`、`source` 留着，
+   * 别的内容都去掉，条目变成一条 `ctx.redacted` 事件（`RedactedData`，见 `redactedEntry`）。位置还在，所以
+   * `covers`、证据区间照常指得到；`key` 还在，同一个键的重试不会把内容写回来。已经涂改过的、认不得的 `id` 跳过。
+   * 读不了的行也能涂改，涂改之后就读得了。
+   */
+  redact(session: string, ids: readonly string[]): Promise<number>;
   /** 有内容的会话，按名字升序（码点序，也就是 UTF-8 字节序）。翻页：`after` 给上一页最后一个名字。 */
   sessions(options?: SessionsOptions): Promise<string[]>;
   /** 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止。远端流式读用。 */
@@ -267,6 +296,8 @@ export const CTX_EVENTS = {
   compacted: 'ctx.compacted',
   error: 'ctx.error',
   unreadable: 'ctx.unreadable',
+  erased: 'ctx.erased',
+  redacted: 'ctx.redacted',
 } as const;
 
 export type CtxEventKind = (typeof CTX_EVENTS)[keyof typeof CTX_EVENTS];
@@ -311,6 +342,33 @@ export interface UnreadableData {
   readonly error: { readonly type: string; readonly message: string };
 }
 
+/** 擦除的三种操作，和 `SessionStore` 的方法同名。 */
+export type EraseOp = 'truncate' | 'remove' | 'redact';
+
+/**
+ * `ctx.erased` 的 `data`：`truncate`、`remove`、`redact` 真的动了条目之后，存储在同一次操作里追加的记录。
+ * 只有位置，没有内容。
+ */
+export interface ErasedData {
+  readonly op: EraseOp;
+  /** `truncate`：被删掉的条目里最大的 `seq`，`seq` 小于等于它的都不在了。 */
+  readonly upTo?: number;
+  /** `remove`、`redact`：动了的条目的 `seq`，升序。 */
+  readonly seqs?: readonly number[];
+  /** 动了多少条。 */
+  readonly count: number;
+}
+
+/**
+ * `ctx.redacted` 的 `data`：被涂改的条目留下的占位。和 `ctx.unreadable` 不同，它是存进去的，`list({ kinds })` 筛得出。
+ */
+export interface RedactedData {
+  /** 原来的类型（`message`、`event`、`summary`）；读不出来时没有。 */
+  readonly type?: string;
+  /** 原来是消息时它的角色，投影规则想在原位渲染一句「已删除」时用。 */
+  readonly role?: string;
+}
+
 export function isFrameworkKind(kind: string): boolean {
   return kind.startsWith('ctx.');
 }
@@ -338,4 +396,9 @@ export function compactedEntry(data: CompactedData, options?: EntryOptions): New
 
 export function ctxErrorEntry(data: CtxErrorData, options?: EntryOptions): NewEventEntry {
   return ctxEvent(CTX_EVENTS.error, data, options);
+}
+
+/** 擦除记录，存储实现用；`source` 缺省是 `store`。 */
+export function erasedEntry(data: ErasedData, options?: EntryOptions): NewEventEntry {
+  return ctxEvent(CTX_EVENTS.erased, data, { source: 'store', ...options });
 }

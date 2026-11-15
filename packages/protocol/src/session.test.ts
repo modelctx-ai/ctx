@@ -108,6 +108,8 @@ describe('framework events', () => {
       'ctx.compacted',
       'ctx.error',
       'ctx.unreadable',
+      'ctx.erased',
+      'ctx.redacted',
     ]);
     assert.ok(Object.values(CTX_EVENTS).every(isFrameworkKind));
     assert.equal(isFrameworkKind('pet.whisper'), false);

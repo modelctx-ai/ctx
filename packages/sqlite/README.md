@@ -49,6 +49,7 @@ watcher.close();
 | `now`、`id`      | 缺省 `at` 和 `id` 的生成函数                                                                                                                             |
 | `pollIntervalMs` | `watch` 轮询新条目的间隔，缺省 250 毫秒                                                                                                                  |
 | `unreadable`     | 读到解不了的一行（`v` 比这个版本认识的高、带不认识的部件）时怎么办。缺省 `throw`；`placeholder` 把那一行读成 `ctx.unreadable` 事件，会话其余部分照常能读 |
+| `secureDelete`   | 在连接上打开 `PRAGMA secure_delete`，缺省 `true`，传 `database` 时也设。`false` 不动连接的设置。见[删除和文件大小](#删除和文件大小)                      |
 
 ## 表
 
@@ -63,7 +64,32 @@ watcher.close();
 - `watch(session, { after, signal })` 轮询 `list(session, { after })`，先给出已有的再给出新写入的；`signal` 中止后迭代结束。
 - 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），`body` 就是 `JSON.stringify` 的结果，不做编码。有循环引用的条目写入时报错。
 - `v` 列记写入这一行时的格式版本（新行是 `1`，列加上之前的行是 `0`）。读每一行经协议包的 `upgradeEntry` 升到当前形状：0.2 及以前存的 AI SDK 消息（二进制和 URL 带 `\u0000ctx` 标记）转成 `Message`，旧摘要的 `covers: { at, seq }` 读成 `seq`；旧行不会被改写。比自己认识的更高的 `v` 读时抛 `unsupported_version`；开了 `unreadable: 'placeholder'` 时那一行读成一条 `ctx.unreadable` 事件（`id`、`seq`、`at` 不变，`data` 里是原来的 `v`、`type` 和错误），`list`、`watch` 不会断在它上面。
+- `truncate`、`remove`、`redact` 在写锁里做，`ctx.erased` 记录在同一个事务里插入；库上已有应用的事务时用 SAVEPOINT，应用回滚就一起回滚。`remove`、`redact` 只按列操作，不解码正文，读不了的行（`v` 太高、带不认识的部件）也删得掉、涂得掉——坏行的 `id` 用 `unreadable: 'placeholder'` 读出来的占位拿。`redact` 把那一行改成 `type = 'event'`、正文是 `ctx.redacted` 占位、`meta` 清空、`v` 写当前版本。一次传的 `id` 没有个数限制（分批执行，每条语句 500 个）。
 - 通过协议包的契约测试 `describeSessionStoreContract`（含 `watch`）。
+
+## 删除和文件大小
+
+`clear`、`truncate`、`remove` 删行，`redact` 改行。被删掉的内容还在不在库文件里、文件会不会变小，是两件事：
+
+| 问题                     | 回答                                                                                                                                                                                                                                   |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 删掉的内容还在库文件里吗 | 连接上开着 `secure_delete`（缺省）时不在：SQLite 把腾出来的空间当场用零覆写。测试里写 200 条带标记的消息，`clear`（或 `truncate`、`remove`、`redact`）之后 checkpoint、关库，库文件里找不到标记                                        |
+| `-wal` 文件呢            | 改动先进 `-wal`，旧的页也可能还在里面，直到 checkpoint 把它截断：`store.vacuum()`，或者只要这一步的话 `store.database.exec('PRAGMA wal_checkpoint(TRUNCATE)')`。最后一个连接正常关库时 SQLite 也会做                                   |
+| 文件什么时候变小         | 自己不会。删除腾出来的页留在文件里，之后的写入先用它们，所以一边写一边删的库大小是稳定的。要把空间还给文件系统，调 `store.vacuum()`                                                                                                    |
+| 什么时候要 `vacuum()`    | 删了一大批、想要回磁盘空间时；以及要清掉没开 `secure_delete` 时留下的内容时（见下）。它重写整个库文件，要独占库：别的连接正在读写时等 `busy_timeout`，等不到就抛；不能在事务里调。库是应用传进来的 `database` 时，应用自己的表一起重写 |
+
+`secure_delete` 的三个注意：
+
+- **它是连接上的开关，不存进库文件。** 本包每次打开都设（传 `database` 时设在应用的连接上，应用在这条连接上对自己的表的删除也会覆写，多一些写入）。同一个库的别的连接——应用另开的、别的没用本包的进程——各管各的。不要这个行为就传 `secureDelete: false`，那删除只是把空间标成可用，内容留到被新数据盖住或 `vacuum()` 为止。
+- **写入时也要开着。** 没开的时候，页分裂会在页里留下行内容的旧副本，它们不属于任何一行，之后开着 `secure_delete` 删也擦不到。所以升级到这个版本之前写的内容、`secureDelete: false` 时写的内容、别的连接写的内容，删掉之后库文件里还可能有残留，只有 `vacuum()` 清得掉。升级之后想对旧数据也有保证：删完调一次 `vacuum()`。（在 Node 22.23 自带的 SQLite 3.53.4 上实测；这是 SQLite 内部的行为，没有文档保证。）
+- **它只管库文件里的字节。** 文件系统的日志和快照、SSD 的重映射块、备份、从库，都不在它的范围里；摘要里的文字、记忆里提取出来的事实也不会跟着删。
+
+```ts
+const store = createSqliteStore({ path: 'ctx.db' });
+await store.redact('user:42', [entryId]); // 内容当场覆写，位置留着
+await pruneSession(store, 'user:42', { maxAgeMs: 30 * 24 * 60 * 60 * 1000 }); // 核心包的保留期，走 truncate
+store.vacuum(); // 要回磁盘空间，顺带把 -wal 截到空
+```
 
 ## 结构版本和迁移
 
@@ -108,9 +134,9 @@ const memory = createSqliteMemoryStore({ database: db, prefix: 'memory_' });
 
 ## 导出
 
-| 导出                                            | 说明                                                                                |
-| ----------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `createSqliteStore(options)`                    | 返回 `SqliteSessionStore`：`SessionStore`（含 `watch`）加上 `database` 和 `close()` |
-| `SqliteStoreOptions`、`SqliteSessionStore`      | 类型                                                                                |
-| `createSqliteMemoryStore(options)`              | 返回 `SqliteMemoryStore`：`MemoryStore` 加上 `database` 和 `close()`                |
-| `SqliteMemoryStoreOptions`、`SqliteMemoryStore` | 类型                                                                                |
+| 导出                                            | 说明                                                                                            |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `createSqliteStore(options)`                    | 返回 `SqliteSessionStore`：`SessionStore`（含 `watch`）加上 `database`、`vacuum()` 和 `close()` |
+| `SqliteStoreOptions`、`SqliteSessionStore`      | 类型                                                                                            |
+| `createSqliteMemoryStore(options)`              | 返回 `SqliteMemoryStore`：`MemoryStore` 加上 `database` 和 `close()`                            |
+| `SqliteMemoryStoreOptions`、`SqliteMemoryStore` | 类型                                                                                            |

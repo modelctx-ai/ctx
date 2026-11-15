@@ -30,16 +30,16 @@ ctx 是框架，yoyo 是用它做出来的第一个程序：一个常驻的桌�
 
 ## 契约
 
-| 边界           | 契约                                                                                                                                                                                        |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| yoyo → ctx     | 7 个包的公开 API（`dist/*.d.ts`）：`@modelctx-ai/ctx`、`ctx-protocol`、`ctx-sqlite`、`ctx-mcp`、`ctx-gateway`、`ctx-models`、`ctx-memory`，版本范围 `^0.3.0`；`ctx-exec`、`ctx-remote` 不用 |
-| yoyo → ctx     | `~/.yoyo/yoyo.db` 里 `ctx_` 前缀的表（`ctx-sqlite` 会话存储，结构版本 3）和 `memory_` 前缀的表（记忆存储，结构版本 1）；常驻进程和命令行共用这个库，要用同一个 ctx 版本，不支持滚动升级     |
-| yoyo → dsh-pet | `openapi.yaml` 描述的 HTTP 接口，前缀 `/dsh-pet-7340`：`/state`（长轮询）、`/lock` 和 `/lock/release`、`/broadcast`、`/anim`、`/chat`（对话记忆）、`/menu/item` 和 `/menu/events` 等        |
-| yoyo → dsh-pet | 独立模式的运行状态文件 `~/.dsh/dsh-pet/standalone-runtime.json`：端口和本机令牌，写接口带请求头 `x-dsh-pet-token`                                                                           |
-| yoyo → dsh-pet | `POST /standalone-ai/settings`：把桌宠右键对话的模型地址指向 yoyo 里的 ctx-gateway，密钥填一次性的本机令牌                                                                                  |
-| yoyo → dsh-pet | 环境变量 `YOYO_PET_MENU`：yoyo 的补丁让桌面窗口按它藏掉自带菜单项、把 yoyo 的项提到第一层；没打补丁的桌宠不认                                                                               |
-| dsh-pet → yoyo | OpenAI Chat Completions：`POST /v1/chat/completions`，SSE 流式                                                                                                                              |
-| yoyo → LLM     | 导演和右键对话都经 ctx 和 AI SDK 调模型；网关不转发                                                                                                                                         |
+| 边界           | 契约                                                                                                                                                                                                                                                                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| yoyo → ctx     | 7 个包的公开 API（`dist/*.d.ts`）：`@modelctx-ai/ctx`、`ctx-protocol`、`ctx-sqlite`、`ctx-mcp`、`ctx-gateway`、`ctx-models`、`ctx-memory`，版本范围 `^0.3.0`；`ctx-exec`、`ctx-remote` 不用                                                                                                                                |
+| yoyo → ctx     | `~/.yoyo/yoyo.db` 里 `ctx_` 前缀的表（`ctx-sqlite` 会话存储，结构版本 3）和 `memory_` 前缀的表（记忆存储，结构版本 1）；常驻进程和命令行共用这个库，要用同一个 ctx 版本，不支持滚动升级。`createSqliteStore` 会在 yoyo 传进来的连接上打开 `secure_delete`（连接级，不进库文件），yoyo 在这条连接上对自己的表的删除也会覆写 |
+| yoyo → dsh-pet | `openapi.yaml` 描述的 HTTP 接口，前缀 `/dsh-pet-7340`：`/state`（长轮询）、`/lock` 和 `/lock/release`、`/broadcast`、`/anim`、`/chat`（对话记忆）、`/menu/item` 和 `/menu/events` 等                                                                                                                                       |
+| yoyo → dsh-pet | 独立模式的运行状态文件 `~/.dsh/dsh-pet/standalone-runtime.json`：端口和本机令牌，写接口带请求头 `x-dsh-pet-token`                                                                                                                                                                                                          |
+| yoyo → dsh-pet | `POST /standalone-ai/settings`：把桌宠右键对话的模型地址指向 yoyo 里的 ctx-gateway，密钥填一次性的本机令牌                                                                                                                                                                                                                 |
+| yoyo → dsh-pet | 环境变量 `YOYO_PET_MENU`：yoyo 的补丁让桌面窗口按它藏掉自带菜单项、把 yoyo 的项提到第一层；没打补丁的桌宠不认                                                                                                                                                                                                              |
+| dsh-pet → yoyo | OpenAI Chat Completions：`POST /v1/chat/completions`，SSE 流式                                                                                                                                                                                                                                                             |
+| yoyo → LLM     | 导演和右键对话都经 ctx 和 AI SDK 调模型；网关不转发                                                                                                                                                                                                                                                                        |
 
 ## 依赖和使用
 

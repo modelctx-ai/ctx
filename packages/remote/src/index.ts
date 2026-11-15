@@ -264,6 +264,7 @@ const APPEND_LOOKBACK = 200;
 /**
  * 远端的会话存储。`watch` 读 `GET …/entries/stream` 的 NDJSON，连接断了按最后读到的 `seq` 重连；
  * `signal` 中止后迭代正常结束。`append` 发出前给没有 `id` 的条目补上，连不上时重试不会记两遍。
+ * `clear`、`truncate`、`remove`、`redact` 不重试：重发一遍不会多删，但拿到的条数会是 0。
  */
 export function createRemoteSessionStore(options: RemoteSessionStoreOptions): SessionStore & {
   watch(session: string, options?: WatchOptions): AsyncIterable<Entry>;
@@ -350,6 +351,20 @@ export function createRemoteSessionStore(options: RemoteSessionStoreOptions): Se
     list,
     async clear(session: string): Promise<number> {
       return (await connection.json<{ deleted: number }>('DELETE', `/sessions/${segment(session)}`)).deleted;
+    },
+    async truncate(session: string, upTo: number): Promise<number> {
+      // 不是有限数过不了 JSON（会变成 null）；按协议这种情况什么都不删。
+      if (!Number.isFinite(upTo)) return 0;
+      const body = { upTo };
+      return (await connection.json<{ deleted: number }>('POST', `${entriesPath(session)}/truncate`, { body })).deleted;
+    },
+    async remove(session: string, ids: readonly string[]): Promise<number> {
+      const body = { ids };
+      return (await connection.json<{ removed: number }>('POST', `${entriesPath(session)}/remove`, { body })).removed;
+    },
+    async redact(session: string, ids: readonly string[]): Promise<number> {
+      const body = { ids };
+      return (await connection.json<{ redacted: number }>('POST', `${entriesPath(session)}/redact`, { body })).redacted;
     },
     async sessions(sessionsOptions: SessionsOptions = {}): Promise<string[]> {
       const { prefix, after, limit } = sessionsOptions;

@@ -1,9 +1,12 @@
 import {
   checkExpectSeq,
   ENTRY_VERSION,
+  eraseEntries,
+  erasedEntry,
   filterEntries,
   filterSessions,
   type Entry,
+  type Erasure,
   type SessionStore,
   type WatchOptions,
 } from '@modelctx-ai/ctx-protocol';
@@ -21,7 +24,7 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
   const ids = new Set<string>();
   /** 每个会话上等新条目的 `watch`。 */
   const waiters = new Map<string, Set<() => void>>();
-  /** 全局递增，满足协议要求的会话内递增；`clear` 不重置，所以不会复用。 */
+  /** 全局递增，满足协议要求的会话内递增；`clear` 和擦除都不重置，所以不会复用。 */
   let seq = 0;
 
   function session(name: string): { entries: Entry[]; keys: Set<string> } {
@@ -58,6 +61,29 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
     });
   }
 
+  /**
+   * `truncate`、`remove`、`redact`：改条目和追加 `ctx.erased` 在同一个同步段里，中间不会插进别的写入。
+   * 删掉的条目让出 `id` 和 `key`；涂改的留着。
+   */
+  function erase(name: string, erasure: Erasure): number {
+    const target = sessions.get(name);
+    if (!target) return 0;
+    const { entries, touched, erased } = eraseEntries(target.entries, erasure);
+    if (!erased) return 0;
+    if (erasure.op !== 'redact') {
+      for (const entry of touched) {
+        ids.delete(entry.id);
+        if (entry.key !== undefined) target.keys.delete(entry.key);
+      }
+    }
+    seq += 1;
+    const record = { ...erasedEntry(erased), id: id(), session: name, seq, at: now(), v: ENTRY_VERSION } as Entry;
+    ids.add(record.id);
+    target.entries = [...entries, record];
+    wake(name);
+    return erased.count;
+  }
+
   return {
     async append(name, drafts, appendOptions) {
       const target = session(name);
@@ -87,6 +113,15 @@ export function createMemoryStore(options: MemoryStoreOptions = {}): SessionStor
       for (const entry of found.entries) ids.delete(entry.id);
       sessions.delete(name);
       return found.entries.length;
+    },
+    async truncate(name, upTo) {
+      return erase(name, { op: 'truncate', upTo });
+    },
+    async remove(name, entryIds) {
+      return erase(name, { op: 'remove', ids: entryIds });
+    },
+    async redact(name, entryIds) {
+      return erase(name, { op: 'redact', ids: entryIds });
     },
     async sessions(sessionsOptions) {
       return filterSessions(

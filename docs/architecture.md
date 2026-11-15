@@ -42,9 +42,9 @@ flowchart TB
 | 概念                    | 说明                                                                                                                         |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | 会话 `session`          | 一个 agent 实例的日志的名字，例如 `pet:main`、`user:42`。条目按会话存放                                                      |
-| 条目 `Entry`            | 会话里的一条记录，分 `message`、`event`、`summary` 三种，写入后不再修改                                                      |
+| 条目 `Entry`            | 会话里的一条记录，分 `message`、`event`、`summary` 三种，写入后不再修改（应用明确擦除的除外）                                |
 | 位置 `seq`              | 存储按写入顺序分配的序号，会话内严格递增、从 1 起。`at` 是逻辑时间（毫秒），只用于投影排序和展示                             |
-| 会话存储 `SessionStore` | 只追加的持久化边界：`append`、`list`、`clear`、`sessions`、`watch`                                                           |
+| 会话存储 `SessionStore` | 只追加的持久化边界：`append`、`list`、`sessions`、`watch`，加上删除 `clear`、`truncate`、`remove` 和涂改 `redact`            |
 | 投影 `project()`        | 把条目渲染成这一次交给模型的 `Message[]`（ctx 自己的 JSON 消息，harness 调模型时转成 AI SDK 的），每次调用重新计算，不改日志 |
 | 来源 `ContextSource`    | 调用那一刻才去取的上下文，取到的文字叫事实 `Fact`，不写日志                                                                  |
 | 上下文 `ContextBuilder` | `createContextBuilder()`：投影 + 来源 + 压缩，把会话组装成一次调用的指令、消息和工具名单                                     |
@@ -169,11 +169,42 @@ sequenceDiagram
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `append(session, entries, { expectSeq? })`            | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）。给了 `expectSeq` 而会话末尾 `seq` 不等于它（空会话是 0）时整批不写，抛 `conflict`（`retryable`），检查先于去重                                                                                    |
 | `list(session, { after, last, limit, types, kinds })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；`limit` 取过滤之后最早的 N 条，和 `after` 配合翻页（和 `last` 同时给时先取 `last`）；`kinds` 只要 `kind` 在其中的事件（消息和摘要不返回），与 `types` 取交集；都可以组合，`last` 在过滤之后取 |
-| `clear(session)`                                      | 删掉整个会话，返回条数                                                                                                                                                                                                                                                                                                    |
+| `clear(session)`                                      | 删掉整个会话，返回条数。不留记录，末尾回到 0                                                                                                                                                                                                                                                                              |
+| `truncate(session, upTo)`                             | 删掉 `seq ≤ upTo` 的条目，返回条数。`upTo` 小数向下取整，不是有限数时不删                                                                                                                                                                                                                                                 |
+| `remove(session, ids)`                                | 按 `id` 真删，返回条数；认不得的、别的会话的 `id` 跳过。读不了的行也删得掉                                                                                                                                                                                                                                                |
+| `redact(session, ids)`                                | 按 `id` 涂改：条目变成 `ctx.redacted` 事件，`id`、`seq`、`at`、`key`、`source` 留着，内容和 `meta` 去掉；已经涂改过的跳过                                                                                                                                                                                                 |
 | `sessions({ prefix, after, limit })`                  | 有内容的会话，按名字升序（码点序）。`prefix` 按字面匹配，`after` 是上一页最后一个名字（不含），`limit` 限条数，小数向下取整，不是正数时返回空；都不给就是全部                                                                                                                                                             |
 | `watch(session, { after, signal })`                   | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                                                                                                                                                                                                     |
 
-实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，一次读一页，缺省每 250ms，别的进程写进同一个库的也能读到；`unreadable: 'placeholder'` 时解不了的行读成 `ctx.unreadable` 事件，见[协议层](protocol.md#会话-sessionstore)）。条目只追加；除了 `clear`，没有删除和修改。
+实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，一次读一页，缺省每 250ms，别的进程写进同一个库的也能读到；`unreadable: 'placeholder'` 时解不了的行读成 `ctx.unreadable` 事件，见[协议层](protocol.md#会话-sessionstore)）。条目只追加；框架自己不删不改，删除和涂改只在应用调下面这几个方法时发生。
+
+### 删除和保留期
+
+`truncate`、`remove`、`redact` 的规则在[协议层](protocol.md#擦除)，为什么这样定在 [ADR 0007](adr/0007-deletion-and-retention.md)。参考实现怎么做：
+
+- **内存存储**：三个方法都走协议包的纯函数 `eraseEntries`，改条目和追加 `ctx.erased` 在同一个同步段里；`seq` 是全局计数器，擦除不重置它。`remove`、`truncate` 让出 `id` 和 `key`，`redact` 留着。
+- **`ctx-sqlite`**：在写锁里（`BEGIN IMMEDIATE`，应用已有事务时用 SAVEPOINT）删行或改行，同一个事务里插入 `ctx.erased`，所以应用的事务回滚时擦除一起回滚。`remove`、`redact` 只按列操作，不解码正文；`id` 多的时候分批，每条语句 500 个。`redact` 把行改成 `type = 'event'`、正文是占位、`meta` 清空、`v` 写当前版本。连接上开着 `secure_delete`，被删、被改掉的内容当场用零覆写；文件不会变小，`vacuum()` 才还空间，细节见[包说明](../packages/sqlite/README.md#删除和文件大小)。
+- **`ctx-remote`**：三条 `POST` 路径原样转给服务端挂的存储；客户端不重试它们。
+- **`pruneSession(store, session, { keep?, maxAgeMs?, now?, pageSize? })`**（核心包）是保留期：应用自己调，没有定时器。它读生效的摘要（`latestSummary`），把 `seq ≤ covers` 的条目交给 `truncate`，返回删掉的条数；摘要自己和它之后的条目不动，所以模型看到的上下文不变。
+
+  | 选项       | 作用                                                                                                                     |
+  | ---------- | ------------------------------------------------------------------------------------------------------------------------ |
+  | （都不给） | 被盖住的全删                                                                                                             |
+  | `keep`     | 被盖住的条目里最后写入的 N 条留着                                                                                        |
+  | `maxAgeMs` | 从最早的条目起往后删，删到第一条 `at` 还在保留期内的为止；补写的旧记录 `at` 早、`seq` 大，排在它前面的没过期就不会删到它 |
+  | 两个都给   | 两个条件都放行的才删                                                                                                     |
+
+  选项不是有限的非负数时一条都不删。没有摘要的会话不删。会话里有未结束的运行（最后一个生命周期事件是 `ctx.run.started`）时最多删到它前一条，删到了那一轮会被围栏。给了 `keep` 或 `maxAgeMs` 时要一页一页读被盖住的条目（只为了它们的 `seq` 和 `at`），都不给时只读摘要。
+
+  ```ts
+  import { pruneSession } from '@modelctx-ai/ctx';
+
+  await context.compact();
+  // 被摘要盖住的历史只留最近 30 天的。
+  await pruneSession(store, 'pet:main', { maxAgeMs: 30 * 24 * 60 * 60 * 1000 });
+  ```
+
+- 擦除和记忆：记忆的笔记和事实用 `seq` 区间指回日志当证据，`truncate`、`remove` 之后证据区间里可能读不到条目，`redact` 之后读到的是占位；还没过门控（`gate`）的条目被删掉就进不了记忆，所以先 `gate` 再清。从这些条目提取出来的事实、画像不会跟着删，那是记忆自己的删除。
 
 ## 投影
 
@@ -318,7 +349,7 @@ await context.append(eventEntry('whisper', { text }));
 
 新摘要已经包含旧摘要，所以只有最新的一条生效；之后 `view()` 从它读起。什么时候压缩由应用决定（例如定时、超过阈值），ctx 不自动压缩。
 
-窗口和压缩的区别：窗口只影响这一次交给模型的内容，什么都不写；压缩写下一个检查点，以后每次投影都从它开始，被压缩的原条目仍在日志里。
+窗口和压缩的区别：窗口只影响这一次交给模型的内容，什么都不写；压缩写下一个检查点，以后每次投影都从它开始，被压缩的原条目仍在日志里，要删由应用调 [`pruneSession`](#删除和保留期)。
 
 ## 上下文来源
 
@@ -500,7 +531,7 @@ await orchestrator.close(); // 不再收新运行，等运行中的结束
 - `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外），补一条 `ctx.run.ended`（`stopReason: 'error'`，`source: 'orchestrator'`），不续跑。
 - 结束的运行只留状态给 `status` 查，最多 `retainEnded` 个（缺省 1000），再多就从最早结束的开始忘，忘掉之后 `status` 返回 `undefined`；请求和结果在运行结束时就放手，常驻进程的内存不随运行数增长。留着状态的 `runId` 不能再 `submit`。
 - `owner`：写进每个运行的 `ctx.run.started`；`recover()` 只收 `owner` 相同的断点（都没配置也算相同），两个进程共用一个库时各配一个名字。写 `ctx.run.ended` 时带 `expectSeq`，读和写之间会话有新条目就跳过那个运行。
-- 用缺省 `record`（写日志）的应用，进程崩溃留下的未结束运行会让该会话一直 `session_busy`，所以启动时要先 `recover()` 再 `submit`；`record: false` 的运行不留生命周期事件，没有这个要求。harness 里同一会话最多一个未结束的运行（跨进程也成立；同一个 harness 实例内部先按会话排队，一个接一个，`session_busy` 只出现在跨进程或别的 harness 实例上，`record: false` 不排），每次写入带 `expectSeq`，被 `recover` 结束的运行在下一次写入时发现自己被围栏，以 `aborted` 停下、不再写 `ctx.run.ended`；运行中途会话被 `clear` 也一样（冲突后发现自己的 `ctx.run.started` 不在了），删掉的会话不会被这一轮的收尾写回来。
+- 用缺省 `record`（写日志）的应用，进程崩溃留下的未结束运行会让该会话一直 `session_busy`，所以启动时要先 `recover()` 再 `submit`；`record: false` 的运行不留生命周期事件，没有这个要求。harness 里同一会话最多一个未结束的运行（跨进程也成立；同一个 harness 实例内部先按会话排队，一个接一个，`session_busy` 只出现在跨进程或别的 harness 实例上，`record: false` 不排），每次写入带 `expectSeq`，被 `recover` 结束的运行在下一次写入时发现自己被围栏，以 `aborted` 停下、不再写 `ctx.run.ended`；运行中途会话被 `clear` 也一样（冲突后发现自己的 `ctx.run.started` 不在了），删掉的会话不会被这一轮的收尾写回来。`truncate`、`remove`、`redact` 追加的 `ctx.erased` 让这一轮的下一次写入必然冲突一次，harness 在冲突后把它和生命周期事件一起读（一次 `list`，`kinds` 多一项）：记录动了这一轮自己写的条目（`recorded` 里的 `seq`）就同样停下，动的是更早的历史或别人写的条目就换个末尾接着写。
 
 ## 记忆
 
@@ -783,7 +814,7 @@ sequenceDiagram
 
 | 扩展点                 | 接口                             | 做法                                                                                                     |
 | ---------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| 会话存储               | `SessionStore`                   | 实现四个方法（`watch` 可选），跑 `describeSessionStoreContract`                                          |
+| 会话存储               | `SessionStore`                   | 实现七个方法（`watch` 可选），跑 `describeSessionStoreContract`                                          |
 | 执行环境               | `Executor`                       | `execute` 出错返回 `{ type: 'error' }`，跑 `describeExecutorContract`                                    |
 | Harness、编排器        | `Harness`、`Orchestrator`        | 跑 `describeHarnessContract`、`describeOrchestratorContract`；模型用 `createScriptedModel(script)`       |
 | 钩子                   | `Hooks`                          | `createHarness({ hooks: { beforeModel, beforeTool, afterTool } })`                                       |
@@ -814,18 +845,19 @@ describeSessionStoreContract('pg', ({ now }) => createPgStore({ url: 'postgres:/
 });
 ```
 
-| 用例            | 要求                                                                                                                                                         |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 位置            | `list` 按 `seq` 升序；补写的旧记录排在写入的位置，`list(after)`、`watch(after)` 仍然给出它；`seq` 会话内递增、从 1 起，`clear` 后不回退                      |
-| 同一时刻        | 按写入先后                                                                                                                                                   |
-| 去重            | 同会话重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按会话隔离；一批里有重复的，其余照写                                                           |
-| 原子            | 并发追加的两批不交错                                                                                                                                         |
-| 查询            | `after`、`last`、`types`、`kinds` 可以组合；`last` 向下取整，`0`、负数、`NaN`、`Infinity` 返回空；`kinds` 只返回事件，与 `types` 取交集，`last` 在过滤之后取 |
-| 往返            | 消息分段（含工具调用的对象入参、图片 `URL`）、事件 `data`、摘要 `covers`、`source`、`meta` 原样读回；`seq` 递增                                              |
-| 二进制和 URL    | `Buffer`、`ArrayBuffer`、带标签的 `{ type: 'data' }` 读回来字节不变（容器可以换成 `Uint8Array`）；`URL`（包括 `{ type: 'url' }` 里的）读回来还是 `URL`       |
-| 像标记的数据    | 事件 `data` 里 `{ $url }`、`{ $bytes }` 这类普通对象原样读回                                                                                                 |
-| 会话            | `clear` 返回删掉的条数；`sessions()` 只列有内容的会话，名字升序（码点序）；`prefix` 按字面匹配（`%`、`_`、`\` 不特殊），`after`、`limit` 翻页不重不漏        |
-| `watch`（有时） | 先给出 `after` 之后已有的，再给出新写入的，只看这个会话；`signal` 中止后迭代正常结束                                                                         |
+| 用例            | 要求                                                                                                                                                          |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 位置            | `list` 按 `seq` 升序；补写的旧记录排在写入的位置，`list(after)`、`watch(after)` 仍然给出它；`seq` 会话内递增、从 1 起，`clear` 后不回退                       |
+| 同一时刻        | 按写入先后                                                                                                                                                    |
+| 去重            | 同会话重复的 `key`、全局重复的 `id` 跳过，只返回真正写入的；键按会话隔离；一批里有重复的，其余照写                                                            |
+| 原子            | 并发追加的两批不交错                                                                                                                                          |
+| 查询            | `after`、`last`、`types`、`kinds` 可以组合；`last` 向下取整，`0`、负数、`NaN`、`Infinity` 返回空；`kinds` 只返回事件，与 `types` 取交集，`last` 在过滤之后取  |
+| 往返            | 消息分段（含工具调用的对象入参、图片 `URL`）、事件 `data`、摘要 `covers`、`source`、`meta` 原样读回；`seq` 递增                                               |
+| 二进制和 URL    | `Buffer`、`ArrayBuffer`、带标签的 `{ type: 'data' }` 读回来字节不变（容器可以换成 `Uint8Array`）；`URL`（包括 `{ type: 'url' }` 里的）读回来还是 `URL`        |
+| 像标记的数据    | 事件 `data` 里 `{ $url }`、`{ $bytes }` 这类普通对象原样读回                                                                                                  |
+| 会话            | `clear` 返回删掉的条数；`sessions()` 只列有内容的会话，名字升序（码点序）；`prefix` 按字面匹配（`%`、`_`、`\` 不特殊），`after`、`limit` 翻页不重不漏         |
+| 擦除            | `truncate`、`remove`、`redact` 返回真正动了的条数，剩下的条目原样；动了才追加一条 `ctx.erased`，末尾前进，旧的 `expectSeq` 冲突一次；和并发的 `append` 不交错 |
+| `watch`（有时） | 先给出 `after` 之后已有的，再给出新写入的，只看这个会话；`signal` 中止后迭代正常结束                                                                          |
 
 ### 模型服务商
 
@@ -872,7 +904,7 @@ export const projection: ProjectionOptions = {
 | Node 专属的东西放在适配包   | `node:sqlite` 在 ctx-sqlite；`node:http`、`node:crypto`、`node:stream` 在 ctx-gateway；stdio 子进程在 ctx-mcp；`node:assert` 在 `@modelctx-ai/ctx/testing` 子路径（测试框架由调用方传入）                                                                                                                                                                                                                                             |
 | 实现包只依赖协议包          | ctx-sqlite、ctx-mcp、ctx-gateway、ctx-exec、ctx-remote 的 `peerDependencies` 是 `@modelctx-ai/ctx-protocol`，测试要用内存存储时才把 `@modelctx-ai/ctx` 放进 devDependencies；核心包把协议包当 peer，并原样转出它的全部导出。ctx-models、ctx-memory 把协议包和 `ai` 都当 peer（ctx-models 返回协议的 `DecisionModel`、`ExtractionModel`）。应用里只有一份协议包、一份 `ai`，`SessionStore`、`Executor`、`LanguageModel` 都是同一个类型 |
 | AI SDK 的工具函数从核心包拿 | `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`stepCountIs` 和 `ModelMessage`、`LanguageModel`、`ToolSet` 等类型从 `@modelctx-ai/ctx` 转出，应用不用单独依赖 `ai`                                                                                                                                                                                                                                                                 |
-| 只追加                      | 条目写入后不改；压缩是追加摘要；只有 `clear(session)` 删除                                                                                                                                                                                                                                                                                                                                                                            |
+| 只追加                      | 条目写入后不改；压缩是追加摘要；框架自己不删，只有应用调 `clear`、`truncate`、`remove`、`redact` 才删或涂改                                                                                                                                                                                                                                                                                                                           |
 | 存储和渲染分开              | 存储只存原始条目，怎么交给模型由投影决定；改规则不用迁移数据，对旧条目同样生效                                                                                                                                                                                                                                                                                                                                                        |
 | 局部失败不打断调用          | 来源出错或超时跳过；MCP 服务器连不上或超时只记状态；工具出错变成给模型看的错误；模型出错 harness 照常返回；流式回复写日志失败只告警（`recorded` reject）                                                                                                                                                                                                                                                                              |
 | 函数加接口                  | 公开 API 是函数（`createX()` / `startX()` 工厂和 `project()` 这类纯函数）和接口，没有要继承或 `new` 的类                                                                                                                                                                                                                                                                                                                              |

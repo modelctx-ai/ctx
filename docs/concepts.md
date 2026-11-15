@@ -52,29 +52,32 @@ flowchart LR
 
 ## 术语
 
-| 术语                          | 说明                                                                                                                                                                                                                |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 会话 `session`                | 日志的名字，字符串，例如 `user:42`、`pet:main`。原来叫 `thread`，见 [ADR 0004](adr/0004-protocol-and-implementation.md)                                                                                             |
-| 条目 `Entry`                  | 日志里的一条：`message`（ctx 自己的 JSON 消息 `Message`）、`event`（应用或框架的事件）、`summary`（压缩点）。写入后不改                                                                                             |
-| 位置 `seq`                    | 条目在会话里的写入序号：会话内严格递增，`list`、`watch`、`covers` 都按它；逻辑时间 `at` 只用于投影排序                                                                                                              |
-| 消息 `Message`、版本 `v`      | ctx 自己的 JSON 消息格式，是 AI SDK `ModelMessage` 的子集，和它互转；每个条目带写入时的格式版本 `v`，旧行读时升级（`upgradeEntry`），不改写存量                                                                     |
-| 写入前提 `expectSeq`          | `append` 的选项：会话末尾的 `seq` 不等于它就整批不写，抛 `conflict`。没有租约，`seq` 就是围栏令牌                                                                                                                   |
-| 围栏                          | 一轮运行写入时发现自己的 `runId` 已被别人写了 `ctx.run.ended`（被 `recover` 收走）：以 `aborted` 停下，不再写。一个会话最多一个未结束的运行，否则新的一轮以 `session_busy` 结束                                     |
-| 所有者 `owner`                | 部署者给编排器的稳定实例名，写进 `ctx.run.started`；`recover` 只收同一个 `owner` 的断点                                                                                                                             |
-| 上下文配置 `ContextSpec`      | `AgentSpec.context`：按名字选事实的来源、位置和投影，能序列化                                                                                                                                                       |
-| 事实 `Fact`                   | 来源在调用那一刻取到的文字，只用于这一次，不写日志                                                                                                                                                                  |
-| 投影 `Projection`             | 把条目渲染成这一次交给模型的消息                                                                                                                                                                                    |
-| 事件 `kind`                   | 事件的类型名，`{domain}.{action}` 写法。框架保留 `ctx.` 前缀（`ctx.run.started`、`ctx.run.ended`、`ctx.compacted`、`ctx.error`，常量 `CTX_EVENTS`），应用自定其余。事件缺省对模型不可见，投影规则决定怎么渲染       |
-| 一轮 `run`                    | harness 的一次运行：一个输入进去，若干次模型调用和工具调用，一个 `stopReason`（`end_turn`、`max_steps`、`max_tokens`、`aborted`、`error`）出来。`runId` 标识它                                                      |
-| 工具调用 `ToolCall`           | `{ id, name, input }`；结果 `ToolOutput` 是文字、JSON、内容块或错误，和 AI SDK 的工具结果互转                                                                                                                       |
-| 执行上下文 `ExecutionContext` | 一次工具调用附带的环境：会话、`runId`、取消信号                                                                                                                                                                     |
-| 钩子 `Hooks`                  | harness 在调模型前后、执行工具前后给应用的切入点；权限确认是「执行工具前」的一个钩子                                                                                                                                |
-| 笔记 `Note`                   | 写入门控的结果：日志里值得夜里处理的一段（`session`、`from`、`upTo` 是 `seq` 区间）加显著性、类别、主题。不复制内容。                                                                                               |
-| 记忆里的事实 `MemoryFact`     | 一句能独立成立的话，带主语、`validFrom` / `validTo`、来源 `SourceRef`、召回时刻 `recalls`。写入后不改文字：变了就 `close` 旧的、`add` 新的。和来源取到的事实 `Fact`（`{ source, text }`，只用于一次调用）是两回事。 |
-| 程序 `Procedure`              | 从经验归纳的规则：`when`、`do`、`evidence`、`confirmations`。确认次数够了才生效。                                                                                                                                   |
-| 画像 `core`                   | 仍然成立的事实压成的一段话，每夜重写，常驻上下文，保留历史版本。                                                                                                                                                    |
-| 激活度 `activation`           | `ln Σ (Δtᵢ + ε)^−d + s`：召回越近越多越高，显著性 `s` 是偏置。注入排序和夜间归档都用它。                                                                                                                            |
-| 决策模型、提取模型            | System One 模型：单次前向，返回概率或带类型的字段，不生成文字。`DecisionModel.decide({ state, questions })`、`ExtractionModel.extract({ state, fields })`。                                                         |
+| 术语                          | 说明                                                                                                                                                                                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 会话 `session`                | 日志的名字，字符串，例如 `user:42`、`pet:main`。原来叫 `thread`，见 [ADR 0004](adr/0004-protocol-and-implementation.md)                                                                                                                                       |
+| 条目 `Entry`                  | 日志里的一条：`message`（ctx 自己的 JSON 消息 `Message`）、`event`（应用或框架的事件）、`summary`（压缩点）。写入后不改                                                                                                                                       |
+| 位置 `seq`                    | 条目在会话里的写入序号：会话内严格递增，`list`、`watch`、`covers` 都按它；逻辑时间 `at` 只用于投影排序                                                                                                                                                        |
+| 消息 `Message`、版本 `v`      | ctx 自己的 JSON 消息格式，是 AI SDK `ModelMessage` 的子集，和它互转；每个条目带写入时的格式版本 `v`，旧行读时升级（`upgradeEntry`），不改写存量                                                                                                               |
+| 写入前提 `expectSeq`          | `append` 的选项：会话末尾的 `seq` 不等于它就整批不写，抛 `conflict`。没有租约，`seq` 就是围栏令牌                                                                                                                                                             |
+| 围栏                          | 一轮运行写入时发现自己的 `runId` 已被别人写了 `ctx.run.ended`（被 `recover` 收走），或者自己写的条目被清掉、被擦除：以 `aborted` 停下，不再写。一个会话最多一个未结束的运行，否则新的一轮以 `session_busy` 结束                                               |
+| 擦除、擦除记录 `ctx.erased`   | 只追加的例外：`truncate`（删掉 `seq ≤ upTo` 的）、`remove`（按 `id` 真删）、`redact`（按 `id` 涂改）。真的动了条目时存储追加一条 `ctx.erased`（只有位置），所以末尾一定前进、旧的 `expectSeq` 一定冲突一次、`watch` 收得到                                    |
+| 涂改 `redact`、`ctx.redacted` | 条目的内容换成占位事件 `ctx.redacted`，`id`、`seq`、`at`、`key` 留着：位置还在，摘要的 `covers` 和记忆的证据照常指得到，同一个幂等键的重试写不回来                                                                                                            |
+| 保留期                        | 应用自己调的清理：`pruneSession` 删掉被摘要盖住的旧历史，按条数或时间留一部分。框架里没有定时器                                                                                                                                                               |
+| 所有者 `owner`                | 部署者给编排器的稳定实例名，写进 `ctx.run.started`；`recover` 只收同一个 `owner` 的断点                                                                                                                                                                       |
+| 上下文配置 `ContextSpec`      | `AgentSpec.context`：按名字选事实的来源、位置和投影，能序列化                                                                                                                                                                                                 |
+| 事实 `Fact`                   | 来源在调用那一刻取到的文字，只用于这一次，不写日志                                                                                                                                                                                                            |
+| 投影 `Projection`             | 把条目渲染成这一次交给模型的消息                                                                                                                                                                                                                              |
+| 事件 `kind`                   | 事件的类型名，`{domain}.{action}` 写法。框架保留 `ctx.` 前缀（`ctx.run.started`、`ctx.run.ended`、`ctx.compacted`、`ctx.error`、`ctx.unreadable`、`ctx.erased`、`ctx.redacted`，常量 `CTX_EVENTS`），应用自定其余。事件缺省对模型不可见，投影规则决定怎么渲染 |
+| 一轮 `run`                    | harness 的一次运行：一个输入进去，若干次模型调用和工具调用，一个 `stopReason`（`end_turn`、`max_steps`、`max_tokens`、`aborted`、`error`）出来。`runId` 标识它                                                                                                |
+| 工具调用 `ToolCall`           | `{ id, name, input }`；结果 `ToolOutput` 是文字、JSON、内容块或错误，和 AI SDK 的工具结果互转                                                                                                                                                                 |
+| 执行上下文 `ExecutionContext` | 一次工具调用附带的环境：会话、`runId`、取消信号                                                                                                                                                                                                               |
+| 钩子 `Hooks`                  | harness 在调模型前后、执行工具前后给应用的切入点；权限确认是「执行工具前」的一个钩子                                                                                                                                                                          |
+| 笔记 `Note`                   | 写入门控的结果：日志里值得夜里处理的一段（`session`、`from`、`upTo` 是 `seq` 区间）加显著性、类别、主题。不复制内容。                                                                                                                                         |
+| 记忆里的事实 `MemoryFact`     | 一句能独立成立的话，带主语、`validFrom` / `validTo`、来源 `SourceRef`、召回时刻 `recalls`。写入后不改文字：变了就 `close` 旧的、`add` 新的。和来源取到的事实 `Fact`（`{ source, text }`，只用于一次调用）是两回事。                                           |
+| 程序 `Procedure`              | 从经验归纳的规则：`when`、`do`、`evidence`、`confirmations`。确认次数够了才生效。                                                                                                                                                                             |
+| 画像 `core`                   | 仍然成立的事实压成的一段话，每夜重写，常驻上下文，保留历史版本。                                                                                                                                                                                              |
+| 激活度 `activation`           | `ln Σ (Δtᵢ + ε)^−d + s`：召回越近越多越高，显著性 `s` 是偏置。注入排序和夜间归档都用它。                                                                                                                                                                      |
+| 决策模型、提取模型            | System One 模型：单次前向，返回概率或带类型的字段，不生成文字。`DecisionModel.decide({ state, questions })`、`ExtractionModel.extract({ state, fields })`。                                                                                                   |
 
 ## 和 Anthropic 公开实践的对应
 
@@ -95,7 +98,7 @@ ctx 的拆法参考了 Anthropic 公开的工程和研究材料。对应关系�
 
 ## 设计约束
 
-1. **只追加。** 会话日志只追加，压缩追加摘要，窗口只影响这一次投影。原条目一直在（[ADR 0003](adr/0003-context-model.md)）。
+1. **只追加。** 会话日志只追加，压缩追加摘要，窗口只影响这一次投影。原条目一直在（[ADR 0003](adr/0003-context-model.md)），直到应用明确删掉它：`clear`、`truncate`、`remove` 真删，`redact` 涂改，都留下擦除记录（`clear` 除外），框架自己从不删（[ADR 0007](adr/0007-deletion-and-retention.md)）。
 2. **协议只收发 JSON。** 除 `AbortSignal` 和进程内的 `LanguageModel`，协议方法的参数和返回都能序列化，所以每个组件都能放到进程边界另一侧（[ADR 0004](adr/0004-protocol-and-implementation.md)）。
 3. **身份是字符串。** 会话、工具、执行环境、运行都用字符串 id 指代，跨边界时不用传对象。
 4. **可丢弃。** harness 和执行环境可以随时崩、随时换；会话日志是唯一的真相，续跑从日志读。

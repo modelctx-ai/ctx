@@ -4,7 +4,15 @@
  */
 import { describe, test } from 'vite-plus/test';
 
-import { checkExpectSeq, filterEntries, filterSessions, type Entry, type SessionStore } from './session.ts';
+import { eraseEntries, type Erasure } from './erase.ts';
+import {
+  checkExpectSeq,
+  erasedEntry,
+  filterEntries,
+  filterSessions,
+  type Entry,
+  type SessionStore,
+} from './session.ts';
 import { ENTRY_VERSION } from './version.ts';
 import { describeExecutorContract, describeSessionStoreContract, describeToolRegistryContract } from './testing.ts';
 import {
@@ -22,6 +30,18 @@ function fakeStore(now: () => number): SessionStore {
   const waiters = new Set<() => void>();
   let seq = 0;
   let nextId = 0;
+
+  function erase(session: string, erasure: Erasure): number {
+    const { entries, touched, erased } = eraseEntries(sessions.get(session) ?? [], erasure);
+    if (!erased) return 0;
+    if (erasure.op !== 'redact') for (const entry of touched) ids.delete(entry.id);
+    seq += 1;
+    const record = { ...erasedEntry(erased), id: `e${(nextId += 1)}`, session, seq, at: now(), v: ENTRY_VERSION };
+    ids.add(record.id);
+    sessions.set(session, [...entries, record]);
+    for (const wake of waiters) wake();
+    return erased.count;
+  }
 
   const store: SessionStore = {
     async append(session, drafts, options) {
@@ -54,6 +74,9 @@ function fakeStore(now: () => number): SessionStore {
       sessions.delete(session);
       return list.length;
     },
+    truncate: async (session, upTo) => erase(session, { op: 'truncate', upTo }),
+    remove: async (session, entryIds) => erase(session, { op: 'remove', ids: entryIds }),
+    redact: async (session, entryIds) => erase(session, { op: 'redact', ids: entryIds }),
     async sessions(options) {
       return filterSessions([...sessions.keys()], options);
     },

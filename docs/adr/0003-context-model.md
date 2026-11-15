@@ -11,6 +11,7 @@ status: stable
 - 状态：已采纳
 - 日期：2026-10-23
 - 修订：2026-10-26，按 [ADR 0005](0005-session-position-writes-format.md)：消息改用 ctx 自己的 JSON 格式 `Message`（决定 1），位置改用 `seq`（决定 3 和摘要检查点），顺序的说法（多处同时写）
+- 修订：2026-11-15，[ADR 0007](0007-deletion-and-retention.md)（提案）给「写进去就不改」（决定 1）和「除了 `clear` 没有删除」「改不了过去」（代价）加了例外：`truncate`、`remove`、`redact`。下面的正文没有改
 
 ## 背景
 
