@@ -80,23 +80,30 @@ createServer((req, res) => {
 
 ### 选项
 
-| 选项                   | 缺省             | 说明                                                                                                                                               |
-| ---------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `store`                | —                | `SessionStore`，挂在 `/sessions`                                                                                                                   |
-| `executors`            | —                | `Executor[]` 或 `{ 名字: Executor }`，挂在 `/executors/:name`                                                                                      |
-| `harness`              | —                | `Harness`，挂在 `/runs`                                                                                                                            |
-| `orchestrator`         | —                | `Orchestrator`，挂在 `/orchestrator`                                                                                                               |
-| `memory`               | —                | `MemoryStore`，挂在 `/memory`（见「记忆」）                                                                                                        |
-| `accessToken`          | —                | 要求 `Authorization: Bearer <token>`，常量时间比较；方案名不分大小写。空串（或全是空白）抛错                                                       |
-| `allowUnauthenticated` | `false`          | 只有 `startRemote` 看它：`host` 不是本机地址又没有 `accessToken` 时拒绝启动，除非写 `true`                                                         |
-| `allowedHosts`         | 监听地址         | 只接受这些 `Host`（`host:port`），挡 DNS rebinding。`startRemote` 监听本机时认 `localhost`、`127.0.0.1`、`[::1]`；`createRemoteHandler` 不给就不查 |
-| `allowedOrigins`       | 无               | 带 `Origin` 的请求只放行这些来源；缺省浏览器网页发来的请求一律 403                                                                                 |
-| `maxBodyBytes`         | 4 MiB            | 请求体上限，超过 413                                                                                                                               |
-| `basePath`             | `''`             | 路径前缀                                                                                                                                           |
-| `pollIntervalMs`       | 250              | 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔                                                                                    |
-| `retainResultsMs`      | 10 分钟          | 经这个服务提交给编排器的运行，结束后结果留多久（客户端的 `done` 从这里取）                                                                         |
-| `logger`               | 不出声           | 协议的 `Logger`，处理出错时 `warn`                                                                                                                 |
-| `host`、`port`         | `127.0.0.1`、`0` | 只有 `startRemote`：监听地址；返回 `{ origin, baseUrl, close }`，`close` 断开所有连接、不关组件                                                    |
+| 选项                   | 缺省                       | 说明                                                                                                                                                                     |
+| ---------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `store`                | —                          | `SessionStore`，挂在 `/sessions`                                                                                                                                         |
+| `executors`            | —                          | `Executor[]` 或 `{ 名字: Executor }`，挂在 `/executors/:name`                                                                                                            |
+| `harness`              | —                          | `Harness`，挂在 `/runs`                                                                                                                                                  |
+| `orchestrator`         | —                          | `Orchestrator`，挂在 `/orchestrator`                                                                                                                                     |
+| `memory`               | —                          | `MemoryStore`，挂在 `/memory`（见「记忆」）                                                                                                                              |
+| `allowedModels`        | 不限                       | `/runs` 和 `/orchestrator/runs` 只收这些模型名，别的 400。模型名是调用方写的、密钥是服务端的，对外的服务该列出来                                                         |
+| `allowedSettings`      | `DEFAULT_ALLOWED_SETTINGS` | 调用方的 `agent.settings` 里收哪些键，别的 400。缺省是采样参数、`maxRetries`、`timeoutMs`，不含 `headers` 和 `providerOptions`（它们会原样进服务端发给模型服务商的请求） |
+| `accessToken`          | —                          | 要求 `Authorization: Bearer <token>`，常量时间比较；方案名不分大小写。空串（或全是空白）抛错                                                                             |
+| `allowUnauthenticated` | `false`                    | 只有 `startRemote` 看它：`host` 不是本机地址又没有 `accessToken` 时拒绝启动，除非写 `true`                                                                               |
+| `allowedHosts`         | 监听地址                   | 只接受这些 `Host`（`host:port`），挡 DNS rebinding。`startRemote` 监听本机时认 `localhost`、`127.0.0.1`、`[::1]`；`createRemoteHandler` 不给就不查                       |
+| `allowedOrigins`       | 无                         | 带 `Origin` 的请求只放行这些来源；缺省浏览器网页发来的请求一律 403                                                                                                       |
+| `maxBodyBytes`         | 4 MiB                      | 请求体上限，超过 413                                                                                                                                                     |
+| `basePath`             | `''`                       | 路径前缀                                                                                                                                                                 |
+| `maxListEntries`       | 1000                       | `GET …/entries` 一次最多回多少条；更长时响应带 `more: true`，本包的客户端自己接着读                                                                                      |
+| `pollIntervalMs`       | 250                        | 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔                                                                                                          |
+| `retainResultsMs`      | 10 分钟                    | 经这个服务提交给编排器的运行，结束后结果在内存里留多久（最多 1000 个）。过了这段时间或者服务重启过，挂着 `store` 时从会话日志的 `ctx.run.ended` 还原                     |
+| `heartbeatMs`          | 15 秒                      | 没有数据可发时隔多久发一次心跳，0 是不发。见「长请求和断线」                                                                                                             |
+| `maxRuns`              | 32                         | `POST /runs` 同时跑的上限，满了 429                                                                                                                                      |
+| `maxExecutions`        | 64                         | `POST /executors/:name/execute` 同时跑的上限，满了 429                                                                                                                   |
+| `maxStreams`           | 256                        | 同时开着的 `entries/stream` 和 `orchestrator/events` 流的上限，满了 429                                                                                                  |
+| `logger`               | 不出声                     | 协议的 `Logger`。内部出的错在这里 `warn`，带着回给调用方的那个编号（`ref`）                                                                                              |
+| `host`、`port`         | `127.0.0.1`、`0`           | 只有 `startRemote`：监听地址；返回 `{ origin, baseUrl, close }`，`close` 断开所有连接、不关组件                                                                          |
 
 ## 客户端
 
@@ -129,14 +136,36 @@ console.log((await handle.done).text);
 await orchestrator.close(); // 只关这个客户端
 ```
 
-| 工厂                                                                    | 行为                                                                                                                                                                                                                                         |
-| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `createRemoteSessionStore({ baseUrl, accessToken?, fetch?, headers? })` | `SessionStore`。`watch` 读 NDJSON 流，`signal` 中止后迭代正常结束；服务端的存储没有 `watch` 时由服务端轮询                                                                                                                                   |
-| `createRemoteExecutor({ …, name })`                                     | `Executor`：`tools()`、`execute()`。连不上返回 `{ type: 'error', retryable: true }`，服务端拒绝（4xx/5xx）返回错误结果（5xx 可重试），都不抛；`signal` 中止时断开请求，服务端的执行跟着中止                                                  |
-| `createRemoteHarness(…)`                                                | `Harness`：`run`、`stream`。`agent.model` 不是字符串就抛。`signal` 中止时发 `DELETE /runs/:runId`，`run` 照常返回 `stopReason: aborted`；`stream` 提前不读就断开连接，服务端同样中止并写 `ctx.run.ended`                                     |
-| `createRemoteOrchestrator({ …, waitMs? })`                              | `Orchestrator`：`submit`、`status`、`cancel`、`recover`、`events`、`close`。`done` 用长轮询 `GET /orchestrator/runs/:id?wait=` 实现（每次最多等 `waitMs`，缺省 25 秒）；`close` 只关这个客户端：不再提交、结束它的事件流、等它提交的运行结束 |
+| 工厂                                                                                         | 行为                                                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createRemoteSessionStore({ baseUrl, accessToken?, fetch?, headers?, retry?, unreadable? })` | `SessionStore`。`watch` 读 NDJSON 流，连接断了按最后读到的 `seq` 重连，`signal` 中止后迭代正常结束；服务端的存储没有 `watch` 时由服务端轮询。`list` 自己翻页。`append` 发出前给没有 `id` 的条目补上，响应丢了重试不会记两遍。`unreadable` 见下                                                                                                                                                        |
+| `createRemoteExecutor({ …, name })`                                                          | `Executor`：`tools()`、`execute()`。连不上返回 `{ type: 'error', retryable: true }`，服务端拒绝（4xx/5xx）返回错误结果（5xx 和 429 可重试），都不抛；`signal` 中止时断开请求，服务端的执行跟着中止。`execute` 不自动重试：工具可能已经跑了                                                                                                                                                            |
+| `createRemoteHarness(…)`                                                                     | `Harness`：`run`、`stream`。`agent.model` 不是字符串就抛。`signal` 中止时发 `DELETE /runs/:runId`，`run` 照常返回 `stopReason: aborted`；`stream` 提前不读就断开连接，服务端同样中止并写 `ctx.run.ended`                                                                                                                                                                                              |
+| `createRemoteOrchestrator({ …, waitMs? })`                                                   | `Orchestrator`：`submit`、`status`、`cancel`、`recover`、`events`、`close`。`done` 用长轮询 `GET /orchestrator/runs/:id?wait=&session=` 实现（每次最多等 `waitMs`，缺省 25 秒），连不上时按 `retry` 重试，服务重启后结果从会话日志还原（服务端要挂着 `store`）；`close` 只关这个客户端：不再提交、结束它的事件流、等它提交的运行结束。`events` 断了不重连（事件没有位置可以续接），要不漏就看会话日志 |
+
+选项的类型是 `RemoteClientOptions`（`baseUrl`、`accessToken?`、`headers?`、`fetch?`、`retry?: RetryOptions`），会话存储是 `RemoteSessionStoreOptions`（多一个 `unreadable?`），执行环境是 `RemoteExecutorOptions`（多一个 `name`），编排器是 `RemoteOrchestratorOptions`（多一个 `waitMs?`）。
 
 服务端返回的 `{ error }` 变成抛出的 `RemoteError`：一个 `Error`，带 `status`（HTTP 状态码）、`type`、`retryable?`、`statusCode?`、`responseBody?`（后两个是上游接口的状态码和响应正文，服务端有才带；`status` 仍是本次 HTTP 响应的）；`isRemoteError(error)` 判断。NDJSON 流中途出错时最后一行是 `{ error }`，客户端同样抛出。
+
+### 长请求和断线
+
+- **心跳**。服务端在没有数据可发时每 `heartbeatMs`（缺省 15 秒）发一次心跳：NDJSON 流里是一个空行；`POST /runs` 和 `execute` 等结果时先发 200 的响应头，再隔一段时间写一个换行，最后才是 JSON 正文。所以一轮跑多久、一个工具跑多久，连接都不会因为空闲被掐。
+- **Node 的 `fetch` 有 300 秒的缺省超时**（undici 的 `headersTimeout` 和 `bodyTimeout`：等响应头、等下一块正文各 300 秒）。服务端开着心跳时碰不到它；`heartbeatMs: 0`、或者中间的代理把心跳吃掉时，超过 5 分钟的请求会以 `fetch failed` 断开，服务端随之中止那一轮。这时换一个不设超时的 `fetch`：
+
+  ```ts
+  import { Agent } from 'undici';
+
+  const dispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  const harness = createRemoteHarness({
+    baseUrl,
+    accessToken,
+    fetch: (input, init) => fetch(input, { ...init, dispatcher } as RequestInit),
+  });
+  ```
+
+- **重试**。`retry: { retries?, minDelayMs?, maxDelayMs? }`（缺省 4 次，200 毫秒起每次翻倍、带抖动，最多 5 秒）。连不上、连接中途断了、服务端回 429/502/503/504 时重试，只用在重试了也不会多做一遍的请求上：所有 `GET`、会话的 `append`、两个取消、`watch` 的重连、编排器的 `done`。提交运行、执行工具、记忆的写入不重试。
+- **`append` 重试后的返回值**。第一次其实写成功、只是响应丢了的条目，重试时会被存储按 `id` 去重跳过；客户端从会话末尾（最近 200 条）把它们找回来放进返回值。带 `expectSeq` 的一批重试时得到的冲突，如果自己的条目已经在了，算成功，不抛 `conflict`。
+- **比客户端新的条目**。服务端先升级、条目的 `v` 比这个客户端认识的高时，`list`、`watch`、`append` 的返回值缺省抛 `unsupported_version`；`unreadable: 'placeholder'` 时那一条换成 `ctx.unreadable` 事件，其余照常（见[协议层](../../docs/protocol.md#会话-sessionstore)）。
 
 ## 记忆
 
@@ -188,29 +217,31 @@ console.log((await memory.core.get())?.text);
 
 JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个值）。路径里的会话名、执行环境名、`runId` 用 `encodeURIComponent` 转义。
 
-| 组件     | 协议方法         | HTTP                                                              | 请求体                                             | 响应                                                         |
-| -------- | ---------------- | ----------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------ |
-| 会话     | `append`         | `POST /sessions/:session/entries`                                 | `{ entries: NewEntry[], expectSeq? }`              | `{ entries: Entry[] }`                                       |
-|          | `list`           | `GET /sessions/:session/entries?after=&last=&types=a,b&kinds=x,y` | —                                                  | `{ entries: Entry[] }`                                       |
-|          | `watch`          | `GET /sessions/:session/entries/stream?after=`                    | —                                                  | NDJSON，每行一个 `Entry`                                     |
-|          | `clear`          | `DELETE /sessions/:session`                                       | —                                                  | `{ deleted: number }`                                        |
-|          | `sessions`       | `GET /sessions?prefix=&after=&limit=`                             | —                                                  | `{ sessions: string[] }`                                     |
-| 执行环境 | （列出）         | `GET /executors`                                                  | —                                                  | `{ executors: string[] }`                                    |
-|          | `tools`          | `GET /executors/:name/tools`                                      | —                                                  | `{ tools: ToolDefinition[] }`                                |
-|          | `execute`        | `POST /executors/:name/execute`                                   | `{ call: ToolCall, context: { session, runId? } }` | `{ output: ToolOutput }`                                     |
-| Harness  | `run`            | `POST /runs`                                                      | `RunRequest` 去掉 `signal`，可加 `aborted: true`   | `RunResult`                                                  |
-|          | `stream`         | `POST /runs?stream=1`                                             | 同上                                               | NDJSON，每行一个 `RunEvent`                                  |
-|          | （`signal`）     | `DELETE /runs/:runId`                                             | —                                                  | `{ cancelled: boolean }`                                     |
-| 编排     | `submit`         | `POST /orchestrator/runs`                                         | 同 `POST /runs`                                    | `{ runId, session }`                                         |
-|          | `status`、`done` | `GET /orchestrator/runs/:runId?wait=<ms>`                         | —                                                  | `{ runId, status, session?, result?, error? }`，不认识的 404 |
-|          | `cancel`         | `DELETE /orchestrator/runs/:runId`                                | —                                                  | `{ cancelled: boolean }`                                     |
-|          | `recover`        | `POST /orchestrator/recover`                                      | —                                                  | `{ recovered: RecoveredRun[] }`                              |
-|          | `events`         | `GET /orchestrator/events`                                        | —                                                  | NDJSON，每行一个 `OrchestratorEvent`                         |
+| 组件     | 协议方法         | HTTP                                                                     | 请求体                                             | 响应                                                              |
+| -------- | ---------------- | ------------------------------------------------------------------------ | -------------------------------------------------- | ----------------------------------------------------------------- |
+| 会话     | `append`         | `POST /sessions/:session/entries`                                        | `{ entries: NewEntry[], expectSeq? }`              | `{ entries: Entry[] }`                                            |
+|          | `list`           | `GET /sessions/:session/entries?after=&last=&limit=&types=a,b&kinds=x,y` | —                                                  | `{ entries: Entry[], more?: true }`，一次最多 `maxListEntries` 条 |
+|          | `watch`          | `GET /sessions/:session/entries/stream?after=`                           | —                                                  | NDJSON，每行一个 `Entry`                                          |
+|          | `clear`          | `DELETE /sessions/:session`                                              | —                                                  | `{ deleted: number }`                                             |
+|          | `sessions`       | `GET /sessions?prefix=&after=&limit=`                                    | —                                                  | `{ sessions: string[] }`                                          |
+| 执行环境 | （列出）         | `GET /executors`                                                         | —                                                  | `{ executors: string[] }`                                         |
+|          | `tools`          | `GET /executors/:name/tools`                                             | —                                                  | `{ tools: ToolDefinition[] }`                                     |
+|          | `execute`        | `POST /executors/:name/execute`                                          | `{ call: ToolCall, context: { session, runId? } }` | `{ output: ToolOutput }`                                          |
+| Harness  | `run`            | `POST /runs`                                                             | `RunRequest` 去掉 `signal`，可加 `aborted: true`   | `RunResult`                                                       |
+|          | `stream`         | `POST /runs?stream=1`                                                    | 同上                                               | NDJSON，每行一个 `RunEvent`                                       |
+|          | （`signal`）     | `DELETE /runs/:runId`                                                    | —                                                  | `{ cancelled: boolean }`                                          |
+| 编排     | `submit`         | `POST /orchestrator/runs`                                                | 同 `POST /runs`                                    | `{ runId, session }`                                              |
+|          | `status`、`done` | `GET /orchestrator/runs/:runId?wait=<ms>&session=`                       | —                                                  | `{ runId, status, session?, result?, error? }`，不认识的 404      |
+|          | `cancel`         | `DELETE /orchestrator/runs/:runId`                                       | —                                                  | `{ cancelled: boolean }`                                          |
+|          | `recover`        | `POST /orchestrator/recover`                                             | —                                                  | `{ recovered: RecoveredRun[] }`                                   |
+|          | `events`         | `GET /orchestrator/events`                                               | —                                                  | NDJSON，每行一个 `OrchestratorEvent`                              |
 
-- 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），线上不做编码，`JSON.stringify`、`JSON.parse` 直接用。0.2 的编码（带 `\u0000ctx` 标记的对象）删掉了，所以客户端和服务端要一起升到 0.3。条目带 `v`，客户端读到比自己认识的更高的版本时抛 `unsupported_version`。
+- 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），线上不做编码，`JSON.stringify`、`JSON.parse` 直接用。0.2 的编码（带 `\u0000ctx` 标记的对象）删掉了，所以客户端和服务端要一起升到 0.3。条目带 `v`，客户端读到比自己认识的更高的版本时抛 `unsupported_version`（或者按 `unreadable: 'placeholder'` 换成占位条目）。
+- NDJSON 流里的空行是心跳，跳过。`POST /runs` 和 `POST /executors/:name/execute` 的 JSON 正文前面可能有换行（也是心跳）；这时状态码已经是 200，之后才出的错写成 `{ error, status }`，`status` 是本来该回的状态码。
+- `list` 的响应带 `more: true` 时后面还有：用最后一条的 `seq` 当 `after` 接着读。`last` 是从末尾数的，只读一页。
 - `append` 带 `expectSeq` 而前提不满足时，服务端回 409（`{ error: { type: 'conflict', retryable: true } }`），客户端转成协议的 `conflict`（`CtxError`，`isConflict(error)` 认得），调用方不必认识 HTTP。
 - harness 的取消：客户端断开（`stream` 不读了、进程崩了）时服务端中止这一轮；`signal` 中止时客户端发 `DELETE /runs/:runId`，同一个 `POST /runs` 照常回 `RunResult`（`stopReason: aborted`）。`DELETE` 比 `POST` 先到时服务端记一分钟，那一轮到了就以已中止开始。`signal` 在发出前已经中止时请求体带 `aborted: true`，服务端照样写 `ctx.run.started` / `ctx.run.ended`。
-- `GET /orchestrator/runs/:runId?wait=<ms>` 是长轮询：这一轮没结束时最多等 `wait` 毫秒（上限 30 秒）再回；结束了就带上 `result`（或 harness 抛错时的 `error`）。
+- `GET /orchestrator/runs/:runId?wait=<ms>` 是长轮询：这一轮没结束时最多等 `wait` 毫秒（上限 30 秒）再回；结束了就带上 `result`（或 harness 抛错时的 `error`）。结果不在内存里了（过了 `retainResultsMs`、服务重启过，或者编排器已经不认识这个 `runId`）而请求带着 `session`、服务端又挂着 `store` 时，从会话日志还原：找这一轮的 `ctx.run.ended`，`recorded` 是它和 `ctx.run.started` 之间的条目，`messages` 是其中模型写的消息，`status` 按 `stopReason` 推出来。
 - `GET /orchestrator/events` 先订阅再回响应头：客户端拿到响应头以后提交的运行，事件一定在这条流里。客户端在提交前会等自己正在建立的事件流连上。
 - 编排器的路径放在 `/orchestrator` 下，和 harness 的 `/runs` 分开：同一个服务可以同时挂两者，`POST /runs` 是「现在跑一轮、等结果」，`POST /orchestrator/runs` 是「排队」。
 
@@ -224,7 +255,10 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 - `Host` 只认监听地址（`allowedHosts`），挡 DNS rebinding；不对 403。
 - 带 `Origin` 的请求一律 403，除非在 `allowedOrigins` 里：浏览器网页不能顺手调本机的服务。
 - 请求体上限 4 MiB（`maxBodyBytes`），超过 413。
-- 错误正文统一 `{ error: { message, type } }`，`type` 是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`method_not_allowed`、`conflict_error`、`request_too_large`、`server_error`、`harness_error` 之一；会话的 `append` 冲突是 `conflict`，`/memory/*` 转发的协议错误是 `invalid_request`、`not_found`、`conflict`（见「记忆」）。
+- 并发有上限（`maxRuns`、`maxExecutions`、`maxStreams`），满了 429（`rate_limit_error`，`retryable: true`）。
+- 调用方能指定的东西过白名单：`allowedModels` 限模型名，`allowedSettings` 限 `agent.settings` 的键（缺省不收 `headers`、`providerOptions`）。
+- 内部出的错（存储、harness、执行环境抛的）回给调用方的只有 `internal error (ref xxxxxxxx)`，原文连同编号进 `logger`：错误文字里常有路径、SQL、上游的响应。协议错误（`CtxError` 的 `invalid_request`、`not_found`、`conflict`）照旧带着自己的 `type` 和文字。
+- 错误正文统一 `{ error: { message, type } }`，`type` 是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`method_not_allowed`、`conflict_error`、`request_too_large`、`rate_limit_error`、`server_error`、`harness_error` 之一；会话的 `append` 冲突是 `conflict`，`/memory/*` 转发的协议错误是 `invalid_request`、`not_found`、`conflict`（见「记忆」）。
 
 服务端不替组件做隔离：挂一个 `ctx-exec` 执行环境就是把这台机器上的命令行交给持有 token 的人。要隔离，把执行环境的服务端放进容器。
 

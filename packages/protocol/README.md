@@ -32,22 +32,24 @@ Node ≥22。
 
 ## 纯函数
 
-| 导出                                                                                     | 说明                                                                                                     |
-| ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry`              | 构造新条目                                                                                               |
-| `runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`isFrameworkKind` | 框架事件                                                                                                 |
-| `compareEntries`、`filterEntries`、`filterSessions`、`textOf`                            | 投影顺序、`ListOptions`、`SessionsOptions` 的语义、消息文字                                              |
-| `headSeq`、`isConflict`、`checkExpectSeq`、`conflictError`                               | `expectSeq` 前提：读末尾、认 `conflict`、存储实现里检查并抛错                                            |
-| `ENTRY_VERSION`、`upgradeEntry`                                                          | 条目格式版本；存储读每一行时调 `upgradeEntry(raw)`，旧版本升到当前形状，更高版本抛 `unsupported_version` |
-| `project`、`latestSummary`、`defaultSummaryMessage`                                      | 条目渲染成 `Message[]`：摘要、事件规则、窗口                                                             |
-| `defineSource`、`collectFacts`、`renderFacts`                                            | 上下文来源和事实（`collectFacts` 并行、单个来源有超时）                                                  |
-| `estimateTokens`、`estimateTextTokens`                                                   | 不依赖分词器的 token 估算                                                                                |
-| `isValidToolName`、`matchesTool`、`selectTools`、`errorOutput`                           | 工具名校验、工具筛选、错误结果                                                                           |
-| `toolOutputToAiSdk`、`toolOutputFromAiSdk`                                               | `ToolOutput` 和 AI SDK 工具结果 `output` 互转                                                            |
-| `modelName`、`agentSpecToJson`                                                           | 模型名的字符串写法；`AgentSpec` 的可序列化部分                                                           |
-| `activation`、`rankFacts`、`renderCore`、`ACTIVATION_DEFAULTS`                           | 记忆的 ACT-R 激活度、召回排序（`0.6 × 相似度 + 0.4 × 激活度`）、`core` 的缺省写法（按 token 预算截断）   |
-| `sourceRef`、`checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`           | 证据区间：从条目算、存储写入前校验（抛 `invalid_request`）、去重、判断条目在不在区间里                   |
-| `isOpenFact`、`filterFacts`                                                              | `FactQuery` 的语义（`open`、按 `id` 码点序翻页）                                                         |
+| 导出                                                                                     | 说明                                                                                                                  |
+| ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `userEntry`、`assistantEntry`、`messageEntry`、`eventEntry`、`summaryEntry`              | 构造新条目                                                                                                            |
+| `runStartedEntry`、`runEndedEntry`、`compactedEntry`、`ctxErrorEntry`、`isFrameworkKind` | 框架事件                                                                                                              |
+| `compareEntries`、`filterEntries`、`filterSessions`、`textOf`                            | 投影顺序、`ListOptions`、`SessionsOptions` 的语义、消息文字                                                           |
+| `headSeq`、`isConflict`、`checkExpectSeq`、`conflictError`                               | `expectSeq` 前提：读末尾、认 `conflict`、存储实现里检查并抛错                                                         |
+| `ENTRY_VERSION`、`upgradeEntry`                                                          | 条目格式版本；存储读每一行时调 `upgradeEntry(raw)`，旧版本升到当前形状，更高版本抛 `unsupported_version`              |
+| `readEntry`、`unreadableEntry`、`UnreadableMode`、`UnreadableData`                       | 读到解不了的一行时怎么办：`readEntry(raw, mode)` 缺省抛，`placeholder` 模式读成 `ctx.unreadable` 占位事件（位置不变） |
+| `project`、`latestSummary`、`defaultSummaryMessage`                                      | 条目渲染成 `Message[]`：摘要、事件规则、窗口                                                                          |
+| `defineSource`、`collectFacts`、`renderFacts`                                            | 上下文来源和事实（`collectFacts` 并行、单个来源有超时）                                                               |
+| `estimateTokens`、`estimateTextTokens`、`estimateFileTokens`                             | 不依赖分词器的 token 估算：文字分中日韩、ASCII、其余三类，附件按类型和大小                                            |
+| `isValidToolName`、`matchesTool`、`selectTools`、`errorOutput`                           | 工具名校验、工具筛选、错误结果                                                                                        |
+| `toolOutputToAiSdk`、`toolOutputFromAiSdk`                                               | `ToolOutput` 和 AI SDK 工具结果 `output` 互转                                                                         |
+| `checkJsonSchema`、`limitToolOutput`                                                     | 工具边界：按 JSON Schema 查工具输入（只查认识的关键字，返回给模型看的问题）；结果超过上限时截断并注明                 |
+| `modelName`、`agentSpecToJson`、`REDACTED_HEADER`                                        | 模型名的字符串写法；`AgentSpec` 的可序列化部分（`settings.headers` 的值换成 `REDACTED_HEADER`）                       |
+| `activation`、`rankFacts`、`renderCore`、`ACTIVATION_DEFAULTS`                           | 记忆的 ACT-R 激活度、召回排序（`0.6 × 相似度 + 0.4 × 激活度`）、`core` 的缺省写法（按 token 预算截断）                |
+| `sourceRef`、`checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`           | 证据区间：从条目算、存储写入前校验（抛 `invalid_request`）、去重、判断条目在不在区间里                                |
+| `isOpenFact`、`filterFacts`                                                              | `FactQuery` 的语义（`open`、按 `id` 码点序翻页）                                                                      |
 
 ## 实现一个协议
 
