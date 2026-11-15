@@ -122,6 +122,32 @@ describe('orchestrator', () => {
     await orchestrator.close();
   });
 
+  test('结束的运行只留状态，最多 retainEnded 个；再多就忘最早的，内存不随运行数增长', async () => {
+    const harness: Harness = {
+      run: async (request) => ({ runId: request.runId!, text: '', messages: [], recorded: [], stopReason: 'end_turn' }),
+    };
+    const orchestrator = createOrchestrator({ harness, retainEnded: 2 });
+    for (const runId of ['r1', 'r2', 'r3']) {
+      await (
+        await orchestrator.submit({ session: runId, agent, input: 'x', runId })
+      ).done;
+    }
+    assert.deepEqual(await Promise.all(['r1', 'r2', 'r3'].map((id) => orchestrator.status(id))), [
+      undefined,
+      'completed',
+      'completed',
+    ]);
+    await assert.rejects(orchestrator.submit({ session: 's', agent, input: 'x', runId: 'r3' }), /already submitted/);
+    assert.equal(await orchestrator.cancel('r3'), false, '结束的运行取消不了');
+    await orchestrator.close();
+
+    const forgetful = createOrchestrator({ harness, retainEnded: 0 });
+    const run = await forgetful.submit({ session: 's', agent, input: 'x' });
+    assert.equal((await run.done).stopReason, 'end_turn', '调用方手里的 done 不受影响');
+    assert.equal(await forgetful.status(run.runId), undefined);
+    await forgetful.close();
+  });
+
   test('harness 抛错时状态是 failed，done reject', async () => {
     const harness: Harness = {
       run: async () => {

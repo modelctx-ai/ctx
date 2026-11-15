@@ -2,6 +2,13 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-11-15
+
+- **更新** [ctx-gateway](../packages/gateway/README.md)、[架构](architecture.md)的网关一节：请求处理表加 `routes`（缺省只转发聊天补全和模型列表），写明空的 `accessToken` 抛错、对外监听没有令牌拒绝启动（`allowUnauthenticated`）。对应的代码变更见 [CHANGELOG](../CHANGELOG.md)。
+- **更新** [ctx-remote](../packages/remote/README.md)：同样的鉴权规则；服务端示例补上 `allowedHosts`（原来照着示例写，客户端会得到 `403 host not allowed`）。
+- **更新** [ctx-models](../packages/models/README.md)：`apiKey` 一行写明 `anthropic` 换了 `baseUrl` 必须显式给密钥。
+- **更新** [协议层](protocol.md)的 harness 写入规则和[架构](architecture.md)的编排器一节：运行中途会话被 `clear` 也算被围栏；编排器的 `retainEnded`。[核心包](../packages/core/README.md)的导出表跟上。
+
 ## 2026-10-30
 
 - **更新** 文档按 [Open Knowledge Format](https://github.com/GoogleCloudPlatform/open-knowledge-format/blob/main/SPEC.md) v0.2 组织：[概念](concepts.md)、[协议层](protocol.md)、[记忆](memory.md)、[架构](architecture.md)、[实践：yoyo](repos.md) 和六篇 ADR 加 frontmatter（`type`、`title`、`description`、`tags`、`status`），正文不动；[索引](index.md)从表格改成 OKF 的条目列表，描述和各篇的 `description` 一致，根上声明 `okf_version`；决策记录拆到新的 [adr/index.md](adr/index.md)，根索引只留一条。文件不搬家，外部链接（yoyo、各包 README）不受影响。[AGENTS.md](../AGENTS.md) 加「文档怎么组织」，ADR 和包的链接跟上。

@@ -17,10 +17,20 @@ export interface GatewayOptions {
   readonly upstream: UpstreamOptions;
   /** 只作用于 `POST <basePath>/chat/completions`，其余路径原样转发。 */
   readonly rewrite?: Rewrite;
-  /** 要求调用方带 `Authorization: Bearer <accessToken>`。真密钥只留在网关里。 */
+  /**
+   * 转发哪些请求，写成 `'<方法> <basePath 之后的路径>'`，缺省 `DEFAULT_ROUTES`（`POST /chat/completions`、`GET /models`）；
+   * `'*'` 是全部。别的回 404、不转发：调用方的令牌不该等于上游密钥的全部权限（文件、微调、删除）。
+   */
+  readonly routes?: readonly string[] | '*';
+  /**
+   * 要求调用方带 `Authorization: Bearer <accessToken>`。真密钥只留在网关里。不给就不查；空串（或全是空白）直接抛错，
+   * 免得 `process.env.X ?? ''` 这类写法悄悄变成不鉴权。
+   */
   readonly accessToken?: string;
-  /** 缺省 `127.0.0.1`。 */
+  /** 缺省 `127.0.0.1`。不是本机地址时必须给 `accessToken`，或者写明 `allowUnauthenticated: true`。 */
   readonly host?: string;
+  /** 听在非本机地址上又不要鉴权（前面另有一层在管）时写 `true`；不写就拒绝启动。只有 `startGateway` 看它。 */
+  readonly allowUnauthenticated?: boolean;
   /** 缺省 0：随机端口。 */
   readonly port?: number;
   /** 对外的路径前缀，缺省 `/v1`；`''` 或 `/` 表示挂在根上。 */
@@ -45,6 +55,9 @@ export interface Gateway {
   readonly baseUrl: string;
   close(): Promise<void>;
 }
+
+/** 缺省转发的请求：聊天补全和模型列表。 */
+export const DEFAULT_ROUTES: readonly string[] = ['POST /chat/completions', 'GET /models'];
 
 class HttpError extends Error {
   readonly status: number;
@@ -115,9 +128,30 @@ function isChatRequest(value: unknown): value is ChatCompletionRequest {
 
 const LOOPBACK = ['localhost', '127.0.0.1', '::1'];
 
+function isLoopback(host: string): boolean {
+  return LOOPBACK.includes(host) || host.startsWith('127.');
+}
+
+/** 给了 `accessToken` 却是空的：当成配置写错，不当成「不要鉴权」。 */
+function checkAccessToken(token: string | undefined): void {
+  if (token !== undefined && !token.trim()) {
+    throw new Error('`accessToken` is empty. Leave it out to run without authentication, or pass a real token.');
+  }
+}
+
+/** `'post  /models/'` 这样的写法也认：方法大写，路径去掉结尾的 `/`。 */
+function routeSet(routes: readonly string[]): Set<string> {
+  return new Set(
+    routes.map((route) => {
+      const [method = '', ...path] = route.trim().split(/\s+/);
+      return `${method.toUpperCase()} ${normalizePath(path.join(' '))}`;
+    }),
+  );
+}
+
 /** 监听地址本身；监听本机（或所有地址）时，本机的几种写法都认。 */
 function defaultHosts(host: string, port: number): string[] {
-  const local = LOOPBACK.includes(host) || host.startsWith('127.') || host === '0.0.0.0' || host === '::';
+  const local = isLoopback(host) || host === '0.0.0.0' || host === '::';
   const names = local ? [host, ...LOOPBACK] : [host];
   return names.flatMap((name) => {
     const bare = name.includes(':') ? `[${name}]` : name;
@@ -129,8 +163,10 @@ function defaultHosts(host: string, port: number): string[] {
 export function createGatewayHandler(
   options: GatewayOptions,
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  checkAccessToken(options.accessToken);
   const upstream = options.upstream.baseUrl.replace(/\/+$/, '');
   const basePath = normalizePath(options.basePath ?? '/v1');
+  const routes = options.routes === '*' ? undefined : routeSet(options.routes ?? DEFAULT_ROUTES);
   const limit = options.maxBodyBytes ?? 4 * 1024 * 1024;
   const fetcher = options.fetch ?? fetch;
   const hosts = options.allowedHosts ? lowered(options.allowedHosts) : undefined;
@@ -156,6 +192,10 @@ export function createGatewayHandler(
       return;
     }
     const rest = url.pathname.slice(basePath.length);
+    if (routes && !routes.has(`${(req.method ?? 'GET').toUpperCase()} ${normalizePath(rest)}`)) {
+      sendError(res, 404, 'not found');
+      return;
+    }
     const controller = new AbortController();
     res.on('close', () => {
       if (!res.writableFinished) controller.abort();
@@ -218,9 +258,19 @@ export function createGatewayHandler(
   };
 }
 
-/** 起一个只听本机的网关。Host 头缺省只认监听地址（见 `allowedHosts`）。 */
-export function startGateway(options: GatewayOptions): Promise<Gateway> {
+/**
+ * 起一个网关，缺省只听本机。Host 头缺省只认监听地址（见 `allowedHosts`）。
+ * 听在非本机地址上而没有 `accessToken` 时拒绝启动，除非写明 `allowUnauthenticated: true`。
+ */
+export async function startGateway(options: GatewayOptions): Promise<Gateway> {
   const host = options.host ?? '127.0.0.1';
+  checkAccessToken(options.accessToken);
+  if (!isLoopback(host) && !options.accessToken && options.allowUnauthenticated !== true) {
+    throw new Error(
+      `Refusing to listen on ${host} without \`accessToken\`: anyone who can reach it could spend the upstream key. ` +
+        'Pass `accessToken`, or `allowUnauthenticated: true` if something in front of it authenticates.',
+    );
+  }
   const basePath = normalizePath(options.basePath ?? '/v1');
   // 端口要等监听上才知道，处理函数到那时再建。
   let handler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined;

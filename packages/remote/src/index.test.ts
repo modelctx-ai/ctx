@@ -34,7 +34,7 @@ import {
   createRemoteSessionStore,
   isRemoteError,
 } from './index.ts';
-import { startRemote, type RemoteServer, type StartRemoteOptions } from './server.ts';
+import { createRemoteHandler, startRemote, type RemoteServer, type StartRemoteOptions } from './server.ts';
 
 const api = { describe, test };
 const accessToken = 'test-token-0123456789';
@@ -314,6 +314,19 @@ describe('鉴权和安全缺省', () => {
     const store = createRemoteSessionStore({ baseUrl, accessToken: 'wrong' });
     const error: unknown = await store.sessions().catch((caught: unknown) => caught);
     expect(isRemoteError(error) && [error.status, error.type]).toEqual([401, 'authentication_error']);
+  });
+
+  test('空的 accessToken 直接报错；听在非本机地址上没有 token 就不启动', async () => {
+    const store = createMemoryStore();
+    for (const empty of ['', '   ']) {
+      expect(() => createRemoteHandler({ store, accessToken: empty })).toThrow(/`accessToken` is empty/);
+      await expect(startRemote({ store, accessToken: empty })).rejects.toThrow(/`accessToken` is empty/);
+    }
+    await expect(startRemote({ store, host: '0.0.0.0' })).rejects.toThrow(/Refusing to listen on 0\.0\.0\.0/);
+    for (const extra of [{ accessToken: 't' }, { allowUnauthenticated: true }]) {
+      const open = await startRemote({ store, host: '0.0.0.0', ...extra });
+      await open.close();
+    }
   });
 
   test('带 Origin 是 403，除非在白名单', async () => {

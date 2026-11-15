@@ -33,8 +33,9 @@ const server = await startRemote({
   executors: [createProcessExecutor({ name: 'sandbox', cwd: '/workspace' })],
   store: createSqliteStore({ path: '/data/ctx.db' }),
   accessToken,
-  host: '0.0.0.0', // 容器里要对外听；这时一定要给 accessToken，并按需给 allowedHosts
+  host: '0.0.0.0', // 容器里要对外听；这时不给 accessToken 会拒绝启动
   port: 8080,
+  allowedHosts: ['10.0.0.2:8080'], // 客户端连的地址；监听 0.0.0.0 时缺省只认本机的几种写法
 });
 console.log(server.baseUrl);
 ```
@@ -79,22 +80,23 @@ createServer((req, res) => {
 
 ### 选项
 
-| 选项              | 缺省             | 说明                                                                                                                                               |
-| ----------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `store`           | —                | `SessionStore`，挂在 `/sessions`                                                                                                                   |
-| `executors`       | —                | `Executor[]` 或 `{ 名字: Executor }`，挂在 `/executors/:name`                                                                                      |
-| `harness`         | —                | `Harness`，挂在 `/runs`                                                                                                                            |
-| `orchestrator`    | —                | `Orchestrator`，挂在 `/orchestrator`                                                                                                               |
-| `memory`          | —                | `MemoryStore`，挂在 `/memory`（见「记忆」）                                                                                                        |
-| `accessToken`     | —                | 要求 `Authorization: Bearer <token>`，常量时间比较；方案名不分大小写                                                                               |
-| `allowedHosts`    | 监听地址         | 只接受这些 `Host`（`host:port`），挡 DNS rebinding。`startRemote` 监听本机时认 `localhost`、`127.0.0.1`、`[::1]`；`createRemoteHandler` 不给就不查 |
-| `allowedOrigins`  | 无               | 带 `Origin` 的请求只放行这些来源；缺省浏览器网页发来的请求一律 403                                                                                 |
-| `maxBodyBytes`    | 4 MiB            | 请求体上限，超过 413                                                                                                                               |
-| `basePath`        | `''`             | 路径前缀                                                                                                                                           |
-| `pollIntervalMs`  | 250              | 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔                                                                                    |
-| `retainResultsMs` | 10 分钟          | 经这个服务提交给编排器的运行，结束后结果留多久（客户端的 `done` 从这里取）                                                                         |
-| `logger`          | 不出声           | 协议的 `Logger`，处理出错时 `warn`                                                                                                                 |
-| `host`、`port`    | `127.0.0.1`、`0` | 只有 `startRemote`：监听地址；返回 `{ origin, baseUrl, close }`，`close` 断开所有连接、不关组件                                                    |
+| 选项                   | 缺省             | 说明                                                                                                                                               |
+| ---------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `store`                | —                | `SessionStore`，挂在 `/sessions`                                                                                                                   |
+| `executors`            | —                | `Executor[]` 或 `{ 名字: Executor }`，挂在 `/executors/:name`                                                                                      |
+| `harness`              | —                | `Harness`，挂在 `/runs`                                                                                                                            |
+| `orchestrator`         | —                | `Orchestrator`，挂在 `/orchestrator`                                                                                                               |
+| `memory`               | —                | `MemoryStore`，挂在 `/memory`（见「记忆」）                                                                                                        |
+| `accessToken`          | —                | 要求 `Authorization: Bearer <token>`，常量时间比较；方案名不分大小写。空串（或全是空白）抛错                                                       |
+| `allowUnauthenticated` | `false`          | 只有 `startRemote` 看它：`host` 不是本机地址又没有 `accessToken` 时拒绝启动，除非写 `true`                                                         |
+| `allowedHosts`         | 监听地址         | 只接受这些 `Host`（`host:port`），挡 DNS rebinding。`startRemote` 监听本机时认 `localhost`、`127.0.0.1`、`[::1]`；`createRemoteHandler` 不给就不查 |
+| `allowedOrigins`       | 无               | 带 `Origin` 的请求只放行这些来源；缺省浏览器网页发来的请求一律 403                                                                                 |
+| `maxBodyBytes`         | 4 MiB            | 请求体上限，超过 413                                                                                                                               |
+| `basePath`             | `''`             | 路径前缀                                                                                                                                           |
+| `pollIntervalMs`       | 250              | 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔                                                                                    |
+| `retainResultsMs`      | 10 分钟          | 经这个服务提交给编排器的运行，结束后结果留多久（客户端的 `done` 从这里取）                                                                         |
+| `logger`               | 不出声           | 协议的 `Logger`，处理出错时 `warn`                                                                                                                 |
+| `host`、`port`         | `127.0.0.1`、`0` | 只有 `startRemote`：监听地址；返回 `{ origin, baseUrl, close }`，`close` 断开所有连接、不关组件                                                    |
 
 ## 客户端
 
@@ -216,7 +218,8 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 
 照 `ctx-gateway` 的做法：
 
-- `startRemote` 缺省只听 `127.0.0.1`。要对外听（容器、内网）时改 `host`，这时一定给 `accessToken`，最好放在 TLS 终结的反向代理后面。
+- `startRemote` 缺省只听 `127.0.0.1`。要对外听（容器、内网）时改 `host`，这时必须给 `accessToken`，否则拒绝启动；前面另有一层在鉴权时写 `allowUnauthenticated: true`。最好放在 TLS 终结的反向代理后面。
+- `accessToken` 给了空串直接抛错：`process.env.X ?? ''` 这类写法不会悄悄变成不鉴权。
 - `Authorization: Bearer <accessToken>`，常量时间比较；没带或不对 401。
 - `Host` 只认监听地址（`allowedHosts`），挡 DNS rebinding；不对 403。
 - 带 `Origin` 的请求一律 403，除非在 `allowedOrigins` 里：浏览器网页不能顺手调本机的服务。

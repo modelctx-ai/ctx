@@ -175,6 +175,49 @@ describe('围栏：被 recover 结束的运行', () => {
   });
 });
 
+describe('围栏：运行中途会话被 clear', () => {
+  test('收尾时发现自己的 started 不在了：以 aborted 停下，什么都不写回去', async () => {
+    const { store, harness } = setup();
+    const { model, entered, release } = gatedModel();
+    const running = harness.run({ session: 's', agent: { model }, input: '在吗', runId: 'r1' });
+    await entered;
+    assert.equal(await store.clear('s'), 2);
+    release();
+    const result = await running;
+    assert.equal(result.stopReason, 'aborted');
+    assert.deepEqual(await store.list('s'), [], '删掉的会话不会被这一轮的回答写回来');
+  });
+
+  test('stream 一样', async () => {
+    const { store, harness } = setup();
+    const { model, entered, release } = gatedModel();
+    let stopReason: string | undefined;
+    const reading = (async () => {
+      for await (const event of harness.stream({ session: 's', agent: { model }, input: '在吗', runId: 'r1' })) {
+        if (event.type === 'run.ended') stopReason = event.result.stopReason;
+      }
+    })();
+    await entered;
+    await store.clear('s');
+    release();
+    await reading;
+    assert.equal(stopReason, 'aborted');
+    assert.deepEqual(await store.list('s'), []);
+  });
+
+  test('清掉之后别人又写了新条目（末尾比原来还靠后）：照样停下，不接在新内容后面', async () => {
+    const { store, harness } = setup();
+    const { model, entered, release } = gatedModel();
+    const running = harness.run({ session: 's', agent: { model }, input: '在吗', runId: 'r1' });
+    await entered;
+    await store.clear('s');
+    await store.append('s', [userEntry('新的开头'), eventEntry('app.note'), eventEntry('app.note')]);
+    release();
+    assert.equal((await running).stopReason, 'aborted');
+    assert.deepEqual(roles(await store.list('s')), ['user', 'app.note', 'app.note']);
+  });
+});
+
 describe('owner', () => {
   test('写进 ctx.run.started；请求自己带的 owner 优先', async () => {
     const { store, harness } = setup();

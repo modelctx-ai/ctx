@@ -97,16 +97,21 @@ export function writeSchemaVersion(database: DatabaseSync, prefix: string, key: 
 export function withWriteLock<T>(database: DatabaseSync, name: string, work: () => T): T {
   const savepoint = database.isTransaction;
   database.exec(savepoint ? `SAVEPOINT ${name}` : 'BEGIN IMMEDIATE');
-  let result: T;
   try {
-    result = work();
+    const result = work();
+    // 提交也在 try 里：它失败（比如别的连接正读着、等不到锁）时事务还开着，不回滚的话
+    // 下一次调用会把它当成应用的事务，写进去的东西永远不落盘。
+    database.exec(savepoint ? `RELEASE ${name}` : 'COMMIT');
+    return result;
   } catch (error) {
-    database.exec(savepoint ? `ROLLBACK TO ${name}` : 'ROLLBACK');
-    if (savepoint) database.exec(`RELEASE ${name}`);
+    try {
+      database.exec(savepoint ? `ROLLBACK TO ${name}` : 'ROLLBACK');
+      if (savepoint) database.exec(`RELEASE ${name}`);
+    } catch {
+      // 回滚自己失败时（事务已经被 SQLite 收掉）留着原来的错误。
+    }
     throw error;
   }
-  database.exec(savepoint ? `RELEASE ${name}` : 'COMMIT');
-  return result;
 }
 
 /** 表上实际有的列和索引。`table_info` 不列生成列，`table_xinfo` 才列。 */

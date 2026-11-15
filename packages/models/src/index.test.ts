@@ -85,6 +85,32 @@ describe('models', () => {
     }
   });
 
+  test('anthropic 换了地址又没给密钥：直接报错，环境里的 ANTHROPIC_API_KEY 只给官方地址', () => {
+    const env = process.env['ANTHROPIC_API_KEY'];
+    process.env['ANTHROPIC_API_KEY'] = 'sk-ant-from-env';
+    try {
+      for (const apiKey of [undefined, '']) {
+        assert.throws(
+          () =>
+            createModel({
+              provider: 'anthropic',
+              baseUrl: 'https://third.example/anthropic',
+              model: 'x',
+              ...(apiKey !== undefined ? { apiKey } : {}),
+            }),
+          /custom `baseUrl` need `apiKey`/,
+        );
+      }
+      // 官方地址（写不写都算）照旧可以靠环境变量。
+      createModel({ provider: 'anthropic', model: 'x' });
+      createModel({ provider: 'anthropic', baseUrl: 'https://api.anthropic.com', model: 'x' });
+      createModel({ provider: 'anthropic', baseUrl: 'https://third.example/anthropic', apiKey: 'k', model: 'x' });
+    } finally {
+      if (env === undefined) delete process.env['ANTHROPIC_API_KEY'];
+      else process.env['ANTHROPIC_API_KEY'] = env;
+    }
+  });
+
   test('可以注册别的服务商，未知服务商报清楚的错', () => {
     const mock = new MockLanguageModelV4();
     const registry = createModelRegistry().register('mock', () => mock);

@@ -61,9 +61,17 @@ function anthropicBase(url: string | undefined): string {
 
 export const anthropic: ModelFactory = (spec) => {
   const headers = headersOf(spec);
+  const baseURL = anthropicBase(spec.baseUrl);
+  // 没给密钥时 SDK 会读环境里的 `ANTHROPIC_API_KEY`。它只该发给官方地址：换了地址还读，密钥就到了别人手里。
+  if (!spec.apiKey && baseURL !== ANTHROPIC_DEFAULT_BASE) {
+    throw new Error(
+      'anthropic models with a custom `baseUrl` need `apiKey`: ' +
+        'the ANTHROPIC_API_KEY environment variable is only used for the official endpoint.',
+    );
+  }
   // 总是显式给地址，环境里的 ANTHROPIC_BASE_URL 不会悄悄把请求改到别处。
   const provider = createAnthropic({
-    baseURL: anthropicBase(spec.baseUrl),
+    baseURL,
     ...(spec.apiKey ? { apiKey: spec.apiKey } : {}),
     ...(headers ? { headers } : {}),
   });
