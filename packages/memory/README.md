@@ -63,24 +63,26 @@ const slowExtractor = extractionFromLanguageModel(llm);
 
 ## 选项
 
-| 选项            | 说明                                                                                                                                 |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `store`         | `MemoryStore`                                                                                                                        |
-| `sessions`      | 会话日志，只用 `list`                                                                                                                |
-| `decision`      | 门控和并入判断。缺省是 `createHeuristicDecisionModel`，「惊讶」接 `store.facts.search`，「重复」看这个进程最近 7 天门控过的段落      |
-| `extraction`    | 夜里提取。缺省：有 `model` 时 `extractionFromLanguageModel(model)`，没有就不处理笔记                                                 |
-| `model`         | `ModelRef`：反思、重写 `core`、升级。名字要配 `models`（和 harness 一样），否则 `createMemory` 抛 `invalid_request`                  |
-| `topics`        | 主题名 → 说明。门控的 `topic` 选择题另加 `other`；选中 `other` 的笔记不带主题                                                        |
-| `kinds`         | kind → 说明，缺省 `pref` / `obs` / `fail` / `ok`（`DEFAULT_KINDS`）                                                                  |
-| `subject`       | 新事实的 `subject`，缺省 `user`                                                                                                      |
-| `gate`          | `theta`（缺省 0.6）、`auto`（缺省开）、`entries`（缺省 `{ types: ['message'] }`）、`maxTokens`（一段最多多少估算 token，缺省 4000）  |
-| `recall`        | `k`（缺省 5）、`budgetTokens`（作为来源时的预算，缺省不限）、`minScore`（缺省 0.1）、`confirmations`（程序要几次确认才带上，缺省 2） |
-| `decay`         | `d`、`epsilon`、`archiveAt`，缺省 0.5、0.02、0.55（`ACTIVATION_DEFAULTS`）                                                           |
-| `consolidate`   | `escalateBelow`（缺省 0.6）、`maxPNull`（缺省 0.3）、`maxTokens`（一次提取的原文上限，缺省 6000）                                    |
-| `core`          | `budgetTokens`，缺省 2000                                                                                                            |
-| `embed`         | 召回时再加一路余弦，和存储 `search` 的分取大的；向量按事实 `id` 缓存在进程里                                                         |
-| `name`          | 执行环境的名字，缺省 `memory`                                                                                                        |
-| `now`、`logger` | 时钟（缺省 `Date.now`）、告警                                                                                                        |
+| 选项            | 说明                                                                                                                                           |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `store`         | `MemoryStore`                                                                                                                                  |
+| `sessions`      | 会话日志，只用 `list`                                                                                                                          |
+| `decision`      | 门控和并入判断。缺省是 `createHeuristicDecisionModel`，「惊讶」接 `store.facts.search`，「重复」看这个进程最近 7 天门控过的段落                |
+| `extraction`    | 夜里提取。缺省：有 `model` 时 `extractionFromLanguageModel(model)`，没有就不处理笔记                                                           |
+| `model`         | `ModelRef`：反思、重写 `core`、升级。名字要配 `models`（和 harness 一样），否则 `createMemory` 抛 `invalid_request`                            |
+| `topics`        | 主题名 → 说明。门控的 `topic` 选择题另加 `other`；选中 `other` 的笔记不带主题                                                                  |
+| `kinds`         | kind → 说明，缺省 `pref` / `obs` / `fail` / `ok`（`DEFAULT_KINDS`）                                                                            |
+| `subject`       | 新事实的 `subject`，缺省 `user`                                                                                                                |
+| `scope`         | 用 `store` 的哪个作用域（`store.scope(scope)`）；不给就用传进来的 `store` 本身。见「几个用户共用一份存储」                                     |
+| `ownsSession`   | `(session) => boolean`，这份记忆管哪些会话，缺省都管。不归它管的：`gate` 抛 `invalid_request`，来源不注入，`recall` 工具返回错误，证据不读原文 |
+| `gate`          | `theta`（缺省 0.6）、`auto`（缺省开）、`entries`（缺省 `{ types: ['message'] }`）、`maxTokens`（一段最多多少估算 token，缺省 4000）            |
+| `recall`        | `k`（缺省 5）、`budgetTokens`（作为来源时的预算，缺省不限）、`minScore`（缺省 0.1）、`confirmations`（程序要几次确认才带上，缺省 2）           |
+| `decay`         | `d`、`epsilon`、`archiveAt`，缺省 0.5、0.02、0.55（`ACTIVATION_DEFAULTS`）                                                                     |
+| `consolidate`   | `escalateBelow`（缺省 0.6）、`maxPNull`（缺省 0.3）、`maxTokens`（一次提取的原文上限，缺省 6000）                                              |
+| `core`          | `budgetTokens`，缺省 2000                                                                                                                      |
+| `embed`         | 召回时再加一路余弦，和存储 `search` 的分取大的；向量按事实 `id` 缓存在进程里                                                                   |
+| `name`          | 执行环境的名字，缺省 `memory`                                                                                                                  |
+| `now`、`logger` | 时钟（缺省 `Date.now`）、告警                                                                                                                  |
 
 缺省值都在 `MEMORY_DEFAULTS` 里。
 
@@ -118,6 +120,25 @@ const slowExtractor = extractionFromLanguageModel(llm);
 | `extractionFromLanguageModel(model, opts)` | 一次 `generateText`，要每个字段的 `{ value, pNull, confidence }`，按类型规整（数字字符串转数、`integer` 取整、`decimals` 四舍五入、日期校验）。输入为空时不调模型；取不出来的字段返回 `{ value: null, pNull: 0.5, confidence: 0 }`                                                                                                                                      |
 
 两个 LM 适配器只在回答解析失败时兜底；模型调用本身失败时 reject。
+
+## 几个用户共用一份存储
+
+一份记忆（一个 `createMemory`）只管一个作用域：事实、程序、画像、笔记都在里面。几个用户共用一份 `MemoryStore`（一个 SQLite 文件、一个远端服务）时，每个用户建一个 `createMemory`，各给各的 `scope`；不分的话一个人的事实会出现在另一个人的召回里，画像互相覆盖，新事实还能把别人的旧事实关掉。
+
+```ts
+function memoryFor(user: string) {
+  return createMemory({
+    store, // 共用的那一份
+    scope: `user:${user}`,
+    sessions,
+    // 会话存储也是共用的时候：只读这个用户自己的会话
+    ownsSession: (session) => session.startsWith(`${user}:`),
+    model,
+  });
+}
+```
+
+`consolidate` 也是每个作用域各跑各的。作用域是隔离，不是鉴权：哪个请求该用哪个用户的记忆，由应用在调用 `memoryFor` 之前定。
 
 ## 存储
 

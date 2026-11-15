@@ -3,7 +3,9 @@
  * 只用 `fetch`、`TextDecoder`、`AbortController`，不用 `node:` 模块，任何运行时都能跑。服务端在 `./server`。
  */
 import {
+  checkMemoryScope,
   CtxError,
+  DEFAULT_MEMORY_SCOPE,
   ENTRY_VERSION,
   errorOutput,
   unreadableEntry,
@@ -241,6 +243,11 @@ function messageOf(error: unknown): string {
 
 function entriesPath(session: string): string {
   return `/sessions/${segment(session)}/entries`;
+}
+
+export interface RemoteMemoryStoreOptions extends RemoteClientOptions {
+  /** 读写哪个作用域，缺省是 `DEFAULT_MEMORY_SCOPE`。之后也可以用返回值的 `scope(name)` 换。 */
+  readonly scope?: string;
 }
 
 export interface RemoteSessionStoreOptions extends RemoteClientOptions {
@@ -678,11 +685,17 @@ function count(value: number | undefined): string | undefined {
  * 远端的记忆存储。服务端存储抛的 `CtxError`（`invalid_request`、`not_found`、`conflict`）转回同 `type` 的 `CtxError`，
  * 调用方不必认识 HTTP；连不上、服务端没挂记忆（404 `not_found_error`）等仍是 `RemoteError` 或 `fetch` 的错误。
  */
-export function createRemoteMemoryStore(options: RemoteClientOptions): MemoryStore {
-  const connection = connect(options);
-  async function call<T>(method: string, path: string, init?: RequestInit): Promise<T> {
+export function createRemoteMemoryStore(options: RemoteMemoryStoreOptions): MemoryStore {
+  return remoteMemoryScope(connect(options), options.scope ?? DEFAULT_MEMORY_SCOPE);
+}
+
+function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
+  checkMemoryScope(scope);
+  async function call<T>(method: string, path: string, init: RequestInit = {}): Promise<T> {
     try {
-      return await connection.json<T>(method, `/memory${path}`, init);
+      // 缺省的作用域不带参数，和没有作用域的服务端说的是同一种话。
+      const scoped = scope === DEFAULT_MEMORY_SCOPE ? init : { ...init, query: { ...init.query, scope } };
+      return await connection.json<T>(method, `/memory${path}`, scoped);
     } catch (error) {
       if (isRemoteError(error) && error.type !== undefined && CTX_ERROR_TYPES.includes(error.type)) {
         throw new CtxError(
@@ -695,6 +708,7 @@ export function createRemoteMemoryStore(options: RemoteClientOptions): MemorySto
     }
   }
   return {
+    scope: (name) => remoteMemoryScope(connection, name),
     notes: {
       async add(notes) {
         return (await call<{ notes: Note[] }>('POST', '/notes', { body: { notes } })).notes;

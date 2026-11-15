@@ -51,7 +51,7 @@ function metaOf(database: DatabaseSync, table: string): Record<string, string> {
 const busyTimeout = (database: DatabaseSync): unknown => database.prepare('PRAGMA busy_timeout').get()?.['timeout'];
 
 describe('sqlite memory store', () => {
-  test('新库：四张表、meta 的 memory_schema 是 1，表名前缀缺省 memory_', () => {
+  test('新库：四张表、meta 的 memory_schema 是 2，表名前缀缺省 memory_', () => {
     const store = createSqliteMemoryStore({ path: ':memory:' });
     const tables = (
       store.database.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`).all() as {
@@ -62,7 +62,7 @@ describe('sqlite memory store', () => {
       tables.filter((name) => name.startsWith('memory_')),
       ['memory_core', 'memory_facts', 'memory_meta', 'memory_notes', 'memory_procedures'],
     );
-    assert.deepEqual(metaOf(store.database, 'memory_meta'), { memory_schema: '1' });
+    assert.deepEqual(metaOf(store.database, 'memory_meta'), { memory_schema: '2' });
     store.close();
   });
 
@@ -97,7 +97,7 @@ describe('sqlite memory store', () => {
     await sessions.append('s', [userEntry('我喜欢乌龙茶')]);
     const fact = await memory.facts.add(newFact('主人喜欢乌龙茶'));
     assert.deepEqual(metaOf(database, 'ctx_meta'), { schema: '3' });
-    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '1' });
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '2' });
     // 两边按任意顺序重开都不改结构。
     const before = schemaOf(database);
     createSqliteMemoryStore({ database, prefix: 'memory_' });
@@ -114,7 +114,7 @@ describe('sqlite memory store', () => {
     const database = new DatabaseSync(':memory:');
     const sessions = createSqliteStore({ database, prefix: 'ctx_' });
     const memory = createSqliteMemoryStore({ database, prefix: 'ctx_' });
-    assert.deepEqual(metaOf(database, 'ctx_meta'), { memory_schema: '1', schema: '3' });
+    assert.deepEqual(metaOf(database, 'ctx_meta'), { memory_schema: '2', schema: '3' });
     createSqliteStore({ database, prefix: 'ctx_' });
     createSqliteMemoryStore({ database, prefix: 'ctx_' });
     await sessions.append('s', [userEntry('一')]);
@@ -186,23 +186,39 @@ describe('sqlite memory store：查询', () => {
         .map((row) => row.detail)
         .join('\n');
     const base = 'SELECT * FROM memory_facts';
-    assert.match(plan(`${base} WHERE subject = ? ORDER BY id`, 'user'), /INDEX memory_facts_subject \(subject=\?\)/);
+    // 每个查询都带作用域，索引以 `scope` 开头。
     assert.match(
-      plan(`${base} WHERE topic = ? AND id > ? ORDER BY id`, 'work', 'a'),
-      /INDEX memory_facts_topic \(topic=\? AND id>\?\)/,
+      plan(`${base} WHERE scope = ? AND subject = ? ORDER BY id`, 'u', 'user'),
+      /INDEX memory_facts_scope_subject \(scope=\? AND subject=\?\)/,
     );
     assert.match(
-      plan(`${base} WHERE valid_to IS NULL AND archived_at IS NULL AND id > ? ORDER BY id`, 'a'),
-      /INDEX memory_facts_open \(id>\?\)/,
+      plan(`${base} WHERE scope = ? AND topic = ? AND id > ? ORDER BY id`, 'u', 'work', 'a'),
+      /INDEX memory_facts_scope_topic \(scope=\? AND topic=\? AND id>\?\)/,
     );
     assert.match(
-      plan(`${base} WHERE id > ? ORDER BY id LIMIT 2`, 'a'),
-      /INDEX sqlite_autoindex_memory_facts_1 \(id>\?\)/,
+      plan(`${base} WHERE scope = ? AND valid_to IS NULL AND archived_at IS NULL AND id > ? ORDER BY id`, 'u', 'a'),
+      /INDEX memory_facts_scope_open \(scope=\? AND id>\?\)/,
     );
-    assert.doesNotMatch(plan(`${base} WHERE subject = ? ORDER BY id`, 'user'), /TEMP B-TREE/, '不另外排序');
     assert.match(
-      plan('SELECT coalesce(max(up_to), 0) FROM memory_notes WHERE session = ?', 's'),
-      /INDEX memory_notes_head/,
+      plan(`${base} WHERE scope = ? AND id > ? ORDER BY id LIMIT 2`, 'u', 'a'),
+      /INDEX memory_facts_scope\w* \(scope=\? AND id>\?\)/,
+    );
+    assert.match(
+      plan(`${base} WHERE id = ? AND scope = ?`, 'a', 'u'),
+      /INDEX sqlite_autoindex_memory_facts_1 \(id=\?\)/,
+    );
+    assert.doesNotMatch(
+      plan(`${base} WHERE scope = ? AND subject = ? ORDER BY id`, 'u', 'user'),
+      /TEMP B-TREE/,
+      '不另外排序',
+    );
+    assert.match(
+      plan('SELECT coalesce(max(up_to), 0) FROM memory_notes WHERE scope = ? AND session = ?', 'u', 's'),
+      /INDEX memory_notes_scope_head/,
+    );
+    assert.match(
+      plan('SELECT text, at FROM memory_core WHERE scope = ? ORDER BY seq DESC LIMIT 1', 'u'),
+      /INDEX memory_core_scope/,
     );
   });
 
@@ -278,7 +294,30 @@ describe('sqlite memory store：结构版本和迁移', () => {
     const before = schemaOf(database);
     createSqliteMemoryStore({ database });
     assert.deepEqual(schemaOf(database), before);
-    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '1' });
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '2' });
+  });
+
+  test('版本 1 升到 2：加 scope 列，旧数据落在缺省的作用域里，旧索引换成带 scope 的', async () => {
+    const database = new DatabaseSync(':memory:');
+    database.exec(PARTIAL_V1);
+    const store = createSqliteMemoryStore({ database });
+    const indexes = schemaOf(database).filter((line) => line.includes('INDEX'));
+    for (const old of ['memory_notes_head ', 'memory_notes_pending ', 'memory_facts_subject ', 'memory_facts_topic ']) {
+      assert.ok(!indexes.some((line) => line.includes(old)), `旧索引 ${old}删掉了`);
+    }
+    assert.ok(indexes.some((line) => line.includes('memory_facts_scope_subject')));
+    assert.deepEqual(ids(await store.notes.list()), ['n-old']);
+    assert.deepEqual(ids(await store.facts.list()), ['f-old']);
+    assert.deepEqual((await store.facts.search({ text: '旧库' })).length, 1);
+    const other = store.scope('user:alice');
+    assert.deepEqual(await other.notes.list(), []);
+    assert.deepEqual(await other.facts.list(), []);
+    assert.equal(await other.notes.head('s'), 0);
+    assert.equal(await other.facts.forget(['f-old']), 0);
+    const mine = await other.facts.add(newFact('新作用域里的事实'));
+    assert.deepEqual(ids(await other.facts.list()), [mine.id]);
+    assert.deepEqual(ids(await store.facts.list()), ['f-old']);
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '2' });
   });
 
   test('在应用的事务里补齐，回滚后回到原来的结构', () => {
@@ -296,14 +335,14 @@ describe('sqlite memory store：结构版本和迁移', () => {
     const path = tempPath();
     createSqliteMemoryStore({ path }).close();
     const raw = new DatabaseSync(path);
-    raw.exec(`UPDATE memory_meta SET value = '2' WHERE key = 'memory_schema'`);
-    raw.exec('DROP INDEX memory_facts_open');
+    raw.exec(`UPDATE memory_meta SET value = '3' WHERE key = 'memory_schema'`);
+    raw.exec('DROP INDEX memory_facts_scope_open');
     const before = schemaOf(raw);
     raw.close();
-    assert.throws(() => createSqliteMemoryStore({ path }), /memory schema in this database is version 2, newer than/);
+    assert.throws(() => createSqliteMemoryStore({ path }), /memory schema in this database is version 3, newer than/);
     const check = new DatabaseSync(path);
     assert.deepEqual(schemaOf(check), before, '没有补索引');
-    assert.deepEqual(metaOf(check, 'memory_meta'), { memory_schema: '2' });
+    assert.deepEqual(metaOf(check, 'memory_meta'), { memory_schema: '3' });
     check.close();
   });
 

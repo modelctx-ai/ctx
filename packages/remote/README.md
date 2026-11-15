@@ -143,7 +143,7 @@ await orchestrator.close(); // 只关这个客户端
 | `createRemoteHarness(…)`                                                                     | `Harness`：`run`、`stream`。`agent.model` 不是字符串就抛。`signal` 中止时发 `DELETE /runs/:runId`，`run` 照常返回 `stopReason: aborted`；`stream` 提前不读就断开连接，服务端同样中止并写 `ctx.run.ended`                                                                                                                                                                                              |
 | `createRemoteOrchestrator({ …, waitMs? })`                                                   | `Orchestrator`：`submit`、`status`、`cancel`、`recover`、`events`、`close`。`done` 用长轮询 `GET /orchestrator/runs/:id?wait=&session=` 实现（每次最多等 `waitMs`，缺省 25 秒），连不上时按 `retry` 重试，服务重启后结果从会话日志还原（服务端要挂着 `store`）；`close` 只关这个客户端：不再提交、结束它的事件流、等它提交的运行结束。`events` 断了不重连（事件没有位置可以续接），要不漏就看会话日志 |
 
-选项的类型是 `RemoteClientOptions`（`baseUrl`、`accessToken?`、`headers?`、`fetch?`、`retry?: RetryOptions`），会话存储是 `RemoteSessionStoreOptions`（多一个 `unreadable?`），执行环境是 `RemoteExecutorOptions`（多一个 `name`），编排器是 `RemoteOrchestratorOptions`（多一个 `waitMs?`）。
+选项的类型是 `RemoteClientOptions`（`baseUrl`、`accessToken?`、`headers?`、`fetch?`、`retry?: RetryOptions`），会话存储是 `RemoteSessionStoreOptions`（多一个 `unreadable?`），记忆存储是 `RemoteMemoryStoreOptions`（多一个 `scope?`），执行环境是 `RemoteExecutorOptions`（多一个 `name`），编排器是 `RemoteOrchestratorOptions`（多一个 `waitMs?`）。
 
 服务端返回的 `{ error }` 变成抛出的 `RemoteError`：一个 `Error`，带 `status`（HTTP 状态码）、`type`、`retryable?`、`statusCode?`、`responseBody?`（后两个是上游接口的状态码和响应正文，服务端有才带；`status` 仍是本次 HTTP 响应的）；`isRemoteError(error)` 判断。NDJSON 流中途出错时最后一行是 `{ error }`，客户端同样抛出。
 
@@ -185,6 +185,13 @@ await memory.facts.touch(
   Date.now(),
 );
 console.log((await memory.core.get())?.text);
+```
+
+作用域：客户端的 `scope(name)`（或者选项 `scope`）让之后的每个请求带上 `?scope=<name>`，服务端据此取 `memory.scope(name)`；不带就是缺省的作用域。作用域只是隔离，不是鉴权——拿到访问令牌的调用方可以用任何作用域，要按用户限制的话在前面放一层自己的服务。
+
+```ts
+const alice = createRemoteMemoryStore({ baseUrl: server.baseUrl, accessToken, scope: 'user:alice' });
+const bob = alice.scope('user:bob'); // 同一个连接，另一个作用域
 ```
 
 每个协议方法恰好一个端点。路径里的 `:id` 用 `encodeURIComponent` 转义；查询参数不给就不传给存储，布尔是 `true` / `false`，数字原样（`limit=1.9` 由存储向下取整）。

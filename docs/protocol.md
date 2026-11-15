@@ -457,6 +457,14 @@ interface Orchestrator {
 
 记忆的存储。四个集合，每个集合几个方法；全部只收发 JSON，可以放到进程边界另一侧。身份是字符串。
 
+一份存储按**作用域**分开：`store.scope(name)` 是同一份数据上名叫 `name` 的作用域的视图，四个集合都在作用域里面。一个用户、租户或项目一个作用域，名字由应用定（字符串，最长 `MAX_MEMORY_SCOPE_LENGTH` = 256 个字符，原样比较）；不调 `scope` 时用的是缺省的作用域 `DEFAULT_MEMORY_SCOPE`（空串）。
+
+- 一个作用域读不到、搜不到、改不了、删不掉另一个作用域的东西：`list`、`search`、`head`、`core.get`、`core.history` 只看自己的；别的作用域的 `id` 和不存在的 `id` 一样对待（`close`、`cite`、`confirm`、`retire` 抛 `not_found`，`settle`、`touch`、`archive`、`forget` 跳过），`supersededBy` 也不能指向别的作用域。
+- 名字是绝对的，不嵌套：`store.scope('a').scope('b')` 就是 `store.scope('b')`。从没写过的作用域是空的，不用先建。名字不合法（`checkMemoryScope`）抛 `invalid_request`。
+- `id` 在整份存储里不重复，不只是在一个作用域里。
+- 作用域是隔离，不是鉴权：谁能用哪个作用域由应用决定（远端的 `/memory/*` 只认访问令牌，拿到令牌就能用任何作用域）。
+- 证据（`SourceRef`）指向会话日志，会话本身不分作用域：哪个会话归哪个作用域由应用保证，参考实现的 `createMemory` 有 `ownsSession` 可以再挡一道。
+
 ```ts
 /** 指向会话日志里的一段，证据永远指向原文。1 ≤ from ≤ upTo。 */
 interface SourceRef {
@@ -542,6 +550,8 @@ interface CoreVersion {
 }
 
 interface MemoryStore {
+  /** 同一份数据上另一个作用域的视图；名字是绝对的。 */
+  scope(scope: string): MemoryStore;
   notes: {
     add(notes: readonly NewNote[]): Promise<Note[]>;
     list(query?: NoteQuery): Promise<Note[]>; // 按写入顺序
@@ -589,7 +599,7 @@ interface MemoryStore {
 - `search` 的实现自定：全文、向量、两者混合。协议只约定输入是文字。
 - 记忆里的事实叫 `MemoryFact`，和来源取到的事实 `Fact`（`{ source, text }`，只用于一次调用）是两回事：前者持久、有有效期，后者是「现在」。
 - 纯函数：`activation(fact, now, options?)`（见[激活度](#激活度-activation)，缺省参数是 `ACTIVATION_DEFAULTS`）、`rankFacts(facts, scores, options?)`（`scores` 是事实 `id` → 相似度，一般取 `FactHit.score`）、`renderCore(facts, budget, { now })` 的缺省写法（按激活度排，`estimateTextTokens` 超过 `budget` 前停下）、`sourceRef(session, entries)`；另有存储实现用的 `checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`、`isOpenFact`、`filterFacts`。
-- 远端记忆存储（`ctx-remote`）：服务端挂 `memory`，路径在 `/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core` 下；客户端是 `createRemoteMemoryStore`。决策、提取模型没有线上形态，按名字在各自的进程里造。
+- 远端记忆存储（`ctx-remote`）：服务端挂 `memory`，路径在 `/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core` 下，作用域用查询参数 `?scope=`（不带就是缺省的）；客户端是 `createRemoteMemoryStore`。决策、提取模型没有线上形态，按名字在各自的进程里造。
 
 ### 决策和提取模型 `DecisionModel`、`ExtractionModel`
 

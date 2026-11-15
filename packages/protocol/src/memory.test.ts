@@ -7,6 +7,8 @@ import {
   MEMORY_RECALL_TOOL,
   activation,
   checkEvidence,
+  checkMemoryScope,
+  DEFAULT_MEMORY_SCOPE,
   checkSourceRef,
   filterFacts,
   inSourceRef,
@@ -294,12 +296,26 @@ function appendRefs(existing: readonly SourceRef[], refs: readonly SourceRef[]):
 }
 
 function fakeMemoryStore(): MemoryStore {
+  const scopes = new Map<string, MemoryStore>();
+  const counter = { next: 0 };
+  const scopeOf = (name: string): MemoryStore => {
+    checkMemoryScope(name);
+    let store = scopes.get(name);
+    if (!store) {
+      store = fakeScope(scopeOf, counter);
+      scopes.set(name, store);
+    }
+    return store;
+  };
+  return scopeOf(DEFAULT_MEMORY_SCOPE);
+}
+
+function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: number }): MemoryStore {
   const notes: Note[] = [];
   const facts = new Map<string, MemoryFact>();
   const procedures: Procedure[] = [];
   const versions: CoreVersion[] = [];
-  let next = 0;
-  const newId = (prefix: string): string => `${prefix}${(next += 1)}`;
+  const newId = (prefix: string): string => `${prefix}${(counter.next += 1)}`;
   const factOf = (id: string): MemoryFact => {
     const found = facts.get(id);
     if (!found) throw notFound(id);
@@ -312,6 +328,7 @@ function fakeMemoryStore(): MemoryStore {
   };
 
   return {
+    scope: scopeOf,
     notes: {
       async add(drafts) {
         for (const draft of drafts) checkSourceRef(draft);

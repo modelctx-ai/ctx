@@ -1344,6 +1344,94 @@ export function describeMemoryStoreContract(
   { describe, test }: ContractTestApi,
 ): void {
   describe(`MemoryStore contract: ${name}`, () => {
+    test('scope：四个集合按作用域分开，互相读不到、搜不到', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const alice = store.scope('user:alice');
+      const bob = store.scope('user:bob');
+      const procedure = { when: '部署前', do: '先跑测试', evidence: [ref(1)], at: 5 };
+
+      const [note] = await alice.notes.add([{ session: 's', from: 1, upTo: 3, at: 10, salience: 0.8 }]);
+      const fact = await alice.facts.add(newFact('喜欢喝乌龙茶'));
+      const rule = await alice.procedures.add(procedure);
+      await alice.core.set('alice 的画像', 1);
+      assert.ok(note);
+
+      assert.deepEqual(ids(await alice.notes.list()), [note.id]);
+      assert.equal(await alice.notes.head('s'), 3);
+      assert.deepEqual(ids(await alice.facts.list()), [fact.id]);
+      assert.deepEqual(ids((await alice.facts.search({ text: '乌龙茶' })).map((hit) => hit.fact)), [fact.id]);
+      assert.deepEqual(ids(await alice.procedures.list()), [rule.id]);
+      assert.equal((await alice.core.get())?.text, 'alice 的画像');
+
+      for (const other of [bob, store]) {
+        assert.deepEqual(await other.notes.list(), []);
+        assert.equal(await other.notes.head('s'), 0, 'head 按作用域：同一个会话在别的作用域里没被门控过');
+        assert.deepEqual(await other.facts.list(), []);
+        assert.deepEqual(await other.facts.search({ text: '乌龙茶', open: false }), []);
+        assert.deepEqual(await other.procedures.list(), []);
+        assert.equal(await other.core.get(), null);
+        assert.deepEqual(await other.core.history(), []);
+      }
+
+      // 同样的东西写进另一个作用域是另一条，画像各是各的。
+      const same = await bob.facts.add(newFact('喜欢喝乌龙茶'));
+      await bob.core.set('bob 的画像', 2);
+      assert.notEqual(same.id, fact.id, 'id 在整份存储里不重复');
+      assert.deepEqual(ids(await bob.facts.list()), [same.id]);
+      assert.equal((await alice.core.get())?.text, 'alice 的画像');
+      assert.deepEqual(
+        (await alice.core.history()).map((version) => version.text),
+        ['alice 的画像'],
+      );
+    });
+
+    test('scope：别的作用域的 id 和不存在的一样，改不了也删不掉', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const alice = store.scope('user:alice');
+      const bob = store.scope('user:bob');
+      const [note] = await alice.notes.add([{ session: 's', from: 1, upTo: 3, at: 10, salience: 0.8 }]);
+      const fact = await alice.facts.add(newFact('住在杭州'));
+      const rule = await alice.procedures.add({ when: '部署前', do: '先跑测试', evidence: [ref(1)], at: 5 });
+      const mine = await bob.facts.add(newFact('住在上海'));
+      assert.ok(note);
+
+      assert.equal(await bob.notes.settle([note.id], 20), 0);
+      await assert.rejects(bob.facts.close(fact.id, 20), hasType('not_found'));
+      await assert.rejects(bob.facts.close(mine.id, 20, { supersededBy: fact.id }), hasType('not_found'));
+      await assert.rejects(bob.facts.cite(fact.id, [ref(5)]), hasType('not_found'));
+      await bob.facts.touch([fact.id], 20);
+      assert.equal(await bob.facts.archive([fact.id], 20), 0);
+      assert.equal(await bob.facts.forget([fact.id]), 0);
+      await assert.rejects(bob.procedures.confirm(rule.id, [ref(5)]), hasType('not_found'));
+      await assert.rejects(bob.procedures.retire(rule.id, 20), hasType('not_found'));
+
+      assert.deepEqual(await alice.notes.list(), [note], '笔记没被处理');
+      assert.deepEqual(await alice.facts.list(), [fact], '事实没被关闭、引用、召回、归档或删除');
+      assert.deepEqual(await alice.procedures.list(), [rule], '程序没被确认或退役');
+      assert.deepEqual(await bob.facts.list(), [mine], '没成的 close 不留下半截');
+    });
+
+    test('scope：名字是绝对的，不嵌套；空串是缺省的作用域；不合法的名字抛 invalid_request', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const fact = await store.facts.add(newFact('缺省作用域里的事实'));
+      const nested = await store.scope('a').scope('b').facts.add(newFact('b 里的事实'));
+      assert.deepEqual(ids(await store.scope('b').facts.list()), [nested.id]);
+      assert.deepEqual(await store.scope('a').facts.list(), []);
+      assert.deepEqual(ids(await store.scope('a').scope('').facts.list()), [fact.id]);
+      assert.deepEqual(ids(await store.scope('b').scope('').facts.list()), [fact.id]);
+      // 名字原样比较：大小写、前后空白都算不同的作用域。
+      assert.deepEqual(await store.scope('B').facts.list(), []);
+      assert.deepEqual(await store.scope('b ').facts.list(), []);
+      const long = 'x'.repeat(256);
+      const inLong = await store.scope(long).facts.add(newFact('长名字'));
+      assert.deepEqual(ids(await store.scope(long).facts.list()), [inLong.id]);
+      // 远端的实现到真正请求时才知道名字不合法，所以连同一次读一起看。
+      await assert.rejects(
+        Promise.resolve().then(() => store.scope(`${long}x`).facts.list()),
+        hasType('invalid_request'),
+      );
+    });
+
     test('notes：add 按输入顺序返回并生成 id；list 按写入顺序，session、pending、limit 可组合', async () => {
       const store = await factory(MEMORY_STORE_SETUP);
       const [a, b] = await store.notes.add([

@@ -4,6 +4,8 @@
 
 ## 2026-11-15
 
+- **更新** [协议层](protocol.md)的记忆存储一节：作用域（`scope(name)`、隔离的范围、名字的规则、不是鉴权）；线上形态的 `?scope=`。[记忆](memory.md)的失败模式表加两行（多用户串、事件里的指令）。[ADR 0006](adr/0006-memory.md) 的「决定记录」补两条：为什么是视图而不是每个方法多一个参数、为什么不复用 `subject`；提取和证据用门控的筛选。
+- **更新** [ctx-memory](../packages/memory/README.md)：选项 `scope`、`ownsSession`，新节「几个用户共用一份存储」。[ctx-remote](../packages/remote/README.md)：记忆的作用域和 `RemoteMemoryStoreOptions`。[协议包](../packages/protocol/README.md)导出表加作用域的三个名字。[ctx-sqlite](../packages/sqlite/README.md)：记忆的表加 `scope` 列、索引和结构版本 2 的升级。
 - **更新** [ADR 0002](adr/0002-packages.md)：加「实施状态」（发布工作流、`scripts/release.mjs`、打包冒烟检查、发一版的步骤、`engines` 核对的结论、还要维护者在 npm 上做的三步）和「决定记录」（占位版本是九个包、暂不引入 changesets、预发布发到 `next`）；「发布」里的包数和工作流步骤改对。[AGENTS.md](../AGENTS.md) 的命令表加 `pnpm smoke`、`pnpm release:version`。
 - **更新** [协议层](protocol.md)：`ListOptions.limit` 和翻页的写法；读不了的条目（`ctx.unreadable`、`readEntry`、宽松模式）和滚动升级的顺序（读的一方先升，没有降级路径）——以前只写了「更高的版本抛错」，没说新旧版本共用一个库时怎么办；投影的输出保证（工具调用和结果成对、开头合法）；窗口的两处配置谁盖谁、`build` 的 `maxTokens` 管整次调用；token 估算的口径；工具边界上输入校验归 harness、输出截断归执行环境加 harness 兜底；`agentSpecToJson` 给请求头打码；线上形态加心跳、`more`、`{ error, status }`、429、500 不回原文、哪些请求可以重试。
 - **更新** [架构](architecture.md)：投影从五步改成六步（加配对），窗口裁剪和 token 估算跟上；「调用」写明请求的 `window` 和 `build` 的预算口径；harness 的工具步骤加输入检查和结果截断；MCP 一节加上限、调用时限、断开和重连、`list_changed`；存储表加 `limit`。

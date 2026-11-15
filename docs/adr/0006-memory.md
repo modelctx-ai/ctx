@@ -126,3 +126,6 @@ ACT-R 的基础激活 `A = ln Σ (Δt_i + ε)^(−d) + s`：每次召回是一�
   - `ExtractionRequest` 传不了 Clairic 的 `reference_date`、`null_threshold`。
   - `score` 的档数协议不设上限，Clef / Jev 的文档写最多 10 档；适配器不检查。
   - `ExtractionField` 的 `list.items` 没有 `date`。
+
+- 2026-11-15：`MemoryStore` 加作用域（`scope(name)`），四个集合都按它分开。原先的形状默认一个进程一个用户：`subject` 只写不滤，`core` 全局一份，几个用户共用一份存储时事实、画像互相可见、互相覆盖。没有选「每个方法多一个参数」：视图的写法不改已有方法的签名，隔离由存储保证而不是靠每个调用点记得传；也没有复用 `subject`：它说的是事实关于谁（`user`、`project:agent`），一个用户的记忆里可以有几个 `subject`。`createMemory` 一份只管一个作用域（选项 `scope`），多用户的服务每个用户建一份；另加 `ownsSession`，因为会话日志不分作用域。
+- 2026-11-15：提取和证据读日志时用和门控一样的筛选（`gate.entries`，缺省只有消息）。原先 `consolidate` 按区间读原文不带筛选，区间里的事件、摘要也进了提取，等于绕过了「工具输出不进事实」这条防线。

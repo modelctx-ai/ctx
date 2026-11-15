@@ -4,6 +4,10 @@
 
 ## 未发布
 
+- **新增** 记忆按作用域隔离（不兼容：自己实现 `MemoryStore` 的要加一个方法）。`MemoryStore.scope(name)` 是同一份数据上另一个作用域的视图，笔记、事实、程序、画像都在作用域里面：互相读不到、搜不到、改不了、删不掉，别的作用域的 `id` 和不存在的一样（`not_found`，批量方法跳过）。不调 `scope` 就是缺省的作用域（`DEFAULT_MEMORY_SCOPE`，空串），已有的数据都在里面，单用户的用法不用改。协议包另导出 `MAX_MEMORY_SCOPE_LENGTH`、`checkMemoryScope`；契约测试 `describeMemoryStoreContract` 加隔离用例。`createMemoryStore`、`createSqliteMemoryStore`、`createRemoteMemoryStore`（新选项 `scope`，线上是 `?scope=`）都实现了。以前几个用户共用一份存储时事实出现在别人的召回里、画像互相覆盖、新事实能关掉别人的旧事实。`ctx-sqlite` 的记忆结构版本升到 2（四张表加 `scope` 列，索引换成以它开头的），老库打开时自动升级，升级后旧版本打不开。
+- **新增** `createMemory` 的 `scope`（用存储的哪个作用域）和 `ownsSession`（这份记忆管哪些会话：不归它管的，`gate` 抛 `invalid_request`，来源不注入，`recall` 工具返回错误，证据不读原文）。
+- **修复** 记忆的提取和证据只读门控看过的条目（`gate.entries`，缺省只有消息）。以前 `consolidate` 按区间读原文不带筛选，区间里的事件和摘要也进了提取；`recall` 工具带回的证据原文同样。**行为变化**：靠事件内容提取事实的应用要在 `gate.entries` 里放行事件。
+- **修复** 反思、并入升级、重写画像问 `LanguageModel` 时，资料统一包在 `<state>` 里并去掉里面的 `<state>`、`<memory>` 标签（和决策、提取同一个包装），原文不能提前关掉包裹。
 - **修复** 投影（`project`）总是产出模型接口收得下的消息序列：工具结果找不到对应的调用就去掉，工具调用没有结果就补一条错误结果（`providerExecuted` 的除外），窗口裁剪后没有摘要时不以助手消息开头。以前运行断在工具调用之后、或者窗口正好裁在一组工具往返中间时，下一轮会被服务商以 400 拒绝。合并 20 万条事件的 `fold` 组不再栈溢出。
 - **修复** 窗口和 token 预算：请求带的 `window` 整个换掉 builder 配的上限（`{}` 是不裁剪），但 `estimate` 始终用 builder 的——以前请求带了 `window` 就把应用接的分词器换回缺省估算。`build` 的 `maxTokens` 先扣掉指令、事实、工具定义、`input`、`prompt` 的估算，剩下的才是历史的预算。**行为变化**：同样的 `maxTokens`，`build` 留下的历史比以前少。
 - **修复** token 估算：文字分中日韩（一字 1）、ASCII（4 个字符 1）、其余（2 个字符 1）三类，以前西里尔、阿拉伯文字按 ASCII 算，低估一半；附件走新导出的 `estimateFileTokens(mediaType, data)`，按类型和大小算，以前一律 256，一份几 MB 的 PDF 和一张小图一样。
