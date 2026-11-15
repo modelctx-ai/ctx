@@ -1,5 +1,5 @@
-import type { Message } from './message.ts';
-import type { ToolFileData, ToolOutput } from './tools.ts';
+import type { AssistantPart, Message, ToolPart, UserPart } from './message.ts';
+import type { ToolContentPart, ToolFileData, ToolOutput } from './tools.ts';
 
 /** 每条消息的格式开销，按常见聊天模板粗估。 */
 const MESSAGE_OVERHEAD = 4;
@@ -111,4 +111,155 @@ export function estimateTokens(message: Message): number {
     }
   }
   return total;
+}
+
+// ---- 截短 ----
+
+/** 中间省略了多少，写给模型看。 */
+function omissionNote(omitted: number): string {
+  return `\n[… ${omitted} characters omitted to fit the context window …]\n`;
+}
+
+/** 留头和尾各一段，中间换成说明；不把一对代理项切成两半。`keep` 是留下的字符数（UTF-16 码元）。 */
+function clipMiddle(text: string, keep: number): string {
+  let head = Math.ceil((keep * 2) / 3);
+  let tail = text.length - (keep - head);
+  const before = text.charCodeAt(head - 1);
+  if (head > 0 && before >= 0xd800 && before <= 0xdbff) head -= 1;
+  const after = text.charCodeAt(tail);
+  if (tail < text.length && after >= 0xdc00 && after <= 0xdfff) tail += 1;
+  return `${text.slice(0, head)}${omissionNote(tail - head)}${text.slice(tail)}`;
+}
+
+/**
+ * 把一段文字截到估算不超过 `maxTokens`：留头（约三分之二）和尾，中间换成一句写明省略了多少字符的说明。
+ * 没超的原样返回。预算小到连说明都放不下时只剩说明，这时结果仍可能超过 `maxTokens`。
+ * `estimate` 缺省是 `estimateTextTokens`；截短一条消息里的一段时，可以传「换上这段文字之后整条消息多大」。
+ */
+export function truncateText(
+  text: string,
+  maxTokens: number,
+  estimate: (text: string) => number = estimateTextTokens,
+): string {
+  if (estimate(text) <= maxTokens) return text;
+  let low = 0;
+  let high = Math.max(0, text.length - 1);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (estimate(clipMiddle(text, middle)) <= maxTokens) low = middle;
+    else high = middle - 1;
+  }
+  return clipMiddle(text, low);
+}
+
+/** 内联的文件（base64、文字）换成的那句说明；地址和服务商引用本来就不占地方，不换。 */
+function omittedFile(mediaType: string): string {
+  return `[${mediaType} file omitted: too large for the context window]`;
+}
+
+function isInlineFile(data: ToolFileData): boolean {
+  return data.type === 'data' || data.type === 'text';
+}
+
+type AnyPart = UserPart | AssistantPart | ToolPart;
+
+/** 一个部件里能截的文字有多少（估算），不能截的是 0。用来挑先截哪个。 */
+function shrinkable(part: AnyPart): number {
+  switch (part.type) {
+    case 'text':
+      return estimateTextTokens(part.text);
+    case 'file':
+      return isInlineFile(part.data) ? estimateFileTokens(part.mediaType, part.data) : 0;
+    case 'tool-result':
+      return estimateOutput(part.output);
+    default:
+      return 0;
+  }
+}
+
+/** 工具结果里内联的文件换成说明，文字留着。 */
+function withoutInlineFiles(parts: readonly ToolContentPart[]): ToolContentPart[] {
+  return parts.map((part) =>
+    part.type === 'file' && isInlineFile(part.data) ? { type: 'text', text: omittedFile(part.mediaType) } : part,
+  );
+}
+
+/** 工具结果写成一段文字，截短时用。 */
+function outputAsText(output: ToolOutput): string {
+  switch (output.type) {
+    case 'text':
+      return output.text;
+    case 'json':
+      return JSON.stringify(output.value) ?? 'null';
+    case 'error':
+      return output.message;
+    default:
+      return withoutInlineFiles(output.parts)
+        .map((part) => (part.type === 'text' ? part.text : `[${part.mediaType} file]`))
+        .join('\n');
+  }
+}
+
+/**
+ * 把一条消息截到 `estimate(message)` 不超过 `maxTokens`，尽力而为：从最大的部件截起，文字留头尾，工具结果
+ * 先把内联的文件换成说明、再把内容写成文字截短（错误结果只截信息、去掉 `data`），内联的文件换成一句说明。
+ * 推理、工具调用的输入、服务商自定义内容、批准请求不动：截了它们，签名对不上或者调用不再合法。
+ * 所以结果仍可能超过 `maxTokens`。没超的原样返回（同一个对象）。
+ */
+export function truncateMessage(
+  message: Message,
+  maxTokens: number,
+  estimate: (message: Message) => number = estimateTokens,
+): Message {
+  if (estimate(message) <= maxTokens) return message;
+  if (typeof message.content === 'string') {
+    const fit = (text: string): number => estimate({ ...message, content: text } as Message);
+    return { ...message, content: truncateText(message.content, maxTokens, fit) } as Message;
+  }
+  const parts: AnyPart[] = [...message.content];
+  const rebuilt = (): Message => ({ ...message, content: parts }) as Message;
+  const done = new Set<number>();
+  while (estimate(rebuilt()) > maxTokens) {
+    let index = -1;
+    let size = 0;
+    for (let i = 0; i < parts.length; i += 1) {
+      const candidate = done.has(i) ? 0 : shrinkable(parts[i]!);
+      if (candidate > size) {
+        size = candidate;
+        index = i;
+      }
+    }
+    if (index < 0) break;
+    done.add(index);
+    const part = parts[index]!;
+    const replaced = (next: AnyPart): number => {
+      const copy = [...parts];
+      copy[index] = next;
+      return estimate({ ...message, content: copy } as Message);
+    };
+    if (part.type === 'text') {
+      parts[index] = { ...part, text: truncateText(part.text, maxTokens, (text) => replaced({ ...part, text })) };
+    } else if (part.type === 'file') {
+      parts[index] = { type: 'text', text: omittedFile(part.mediaType) };
+    } else if (part.type === 'tool-result') {
+      const { output } = part;
+      if (output.type === 'content') {
+        // 先只去掉内联的文件：够了就不动文字。
+        const lighter: ToolOutput = { type: 'content', parts: withoutInlineFiles(output.parts) };
+        if (replaced({ ...part, output: lighter }) <= maxTokens) {
+          parts[index] = { ...part, output: lighter };
+          continue;
+        }
+      }
+      const wrap = (text: string): ToolOutput =>
+        output.type === 'error'
+          ? { type: 'error', message: text, ...(output.retryable !== undefined ? { retryable: output.retryable } : {}) }
+          : { type: 'text', text };
+      const text = truncateText(outputAsText(output), maxTokens, (candidate) =>
+        replaced({ ...part, output: wrap(candidate) }),
+      );
+      parts[index] = { ...part, output: wrap(text) };
+    }
+  }
+  return rebuilt();
 }

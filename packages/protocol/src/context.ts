@@ -1,7 +1,7 @@
 import type { Message, MessageContent } from './message.ts';
 import { compareEntries, type Entry, type EventEntry, type MessageEntry, type SummaryEntry } from './session.ts';
 import type { ModelRef } from './harness.ts';
-import { estimateTokens } from './tokens.ts';
+import { estimateTokens, truncateMessage } from './tokens.ts';
 import type { ToolDefinition } from './tools.ts';
 import type { Awaitable } from './types.ts';
 
@@ -88,6 +88,12 @@ export interface WindowOptions {
   readonly maxMessages?: number;
   /** 估算 token 的预算（摘要计入）。 */
   readonly maxTokens?: number;
+  /**
+   * 放不下时截短消息，不只是整条丢（`truncateMessage`：文字留头尾，工具结果截短，内联的文件换成说明）：
+   * 先给单条消息封顶（超过历史预算一半的截到一半），再从最旧的丢起；丢到只剩最后一组还超，从最大的接着截，直到放得下。
+   * 缺省不截：宁可超预算也原样交出最后一组。没给 `maxTokens` 时不起作用。
+   */
+  readonly truncate?: boolean;
 }
 
 /** 进程内投影另可换掉 token 估算。 */
@@ -113,6 +119,11 @@ export interface ProjectedMessage {
    */
   readonly from: number;
   readonly upTo: number;
+  /**
+   * 这条消息来自的条目里最晚的 `at`；摘要消息是摘要条目的 `at`。压缩用它认出 `at` 还在未来的条目
+   * （把到期时间当 `at` 的提醒）：它们一直排在最后，但不算「最近的」。
+   */
+  readonly at: number;
   /** 摘要消息固定在最前面，不参与裁剪。 */
   readonly pinned: boolean;
   readonly tokens: number;
@@ -124,6 +135,8 @@ export interface Projection {
   readonly tokens: number;
   /** 被窗口裁掉的消息条数。 */
   readonly dropped: number;
+  /** 因为 `window.truncate` 被截短的消息条数。 */
+  readonly truncated: number;
   readonly summary?: SummaryEntry;
 }
 
@@ -204,7 +217,7 @@ function paired(group: readonly ProjectedMessage[], estimate: (message: Message)
         output: { type: 'error', message: MISSING_RESULT },
       })),
     };
-    out.push({ message, from: first.from, upTo: first.upTo, pinned: false, tokens: estimate(message) });
+    out.push({ message, from: first.from, upTo: first.upTo, at: first.at, pinned: false, tokens: estimate(message) });
   }
   // 整组只剩孤立的工具结果、又都被去掉了：这一组不要。
   return first.message.role === 'tool' ? out.filter((item) => item !== first) : out;
@@ -215,7 +228,7 @@ function windowed(
   rest: readonly ProjectedMessage[],
   window: ProjectionWindow | undefined,
   estimate: (message: Message) => number,
-): { kept: ProjectedMessage[]; dropped: number } {
+): { kept: ProjectedMessage[]; dropped: number; truncated: number } {
   const maxMessages = window?.maxMessages;
   const maxTokens = window?.maxTokens;
   let dropped = 0;
@@ -228,9 +241,15 @@ function windowed(
     }
     groups.push(paired(group, estimate));
   }
-  if (maxMessages === undefined && maxTokens === undefined) return { kept: [...pinned, ...groups.flat()], dropped };
+  if (maxMessages === undefined && maxTokens === undefined) {
+    return { kept: [...pinned, ...groups.flat()], dropped, truncated: 0 };
+  }
 
   const pinnedTokens = pinned.reduce((sum, item) => sum + item.tokens, 0);
+  // 要截短时先给单条消息封顶：一条巨大的工具结果或粘贴进来的长文不该把别的历史全挤掉。
+  const cut = new Set<ProjectedMessage>();
+  const truncating = window?.truncate === true && maxTokens !== undefined;
+  if (truncating) capped(groups, maxTokens - pinnedTokens, estimate, cut);
   let count = groups.reduce((sum, group) => sum + group.length, 0);
   let tokens = pinnedTokens + groups.reduce((sum, group) => sum + group.reduce((s, item) => s + item.tokens, 0), 0);
   const over = (): boolean =>
@@ -249,7 +268,73 @@ function windowed(
   if (dropped > before && pinned.length === 0 && groups.some((group) => group[0]?.message.role === 'user')) {
     while (groups[0]?.[0]?.message.role !== 'user') drop();
   }
-  return { kept: [...pinned, ...groups.flat()], dropped };
+  const kept = [...pinned, ...groups.flat()];
+  if (truncating && tokens > maxTokens) fitted(kept, tokens - maxTokens, estimate, cut);
+  return { kept, dropped, truncated: kept.filter((item) => cut.has(item)).length };
+}
+
+/** 一条消息最少留这么多 token：再截就只剩说明了。 */
+const MIN_TRUNCATED_TOKENS = 32;
+
+/** 把 `item` 截到 `maxTokens` 以内；截不动（或没变小）就原样返回。截过的记进 `cut`。 */
+function shortened(
+  item: ProjectedMessage,
+  maxTokens: number,
+  estimate: (message: Message) => number,
+  cut: Set<ProjectedMessage>,
+): ProjectedMessage {
+  const message = truncateMessage(item.message, maxTokens, estimate);
+  const tokens = estimate(message);
+  if (message === item.message || tokens >= item.tokens) return item;
+  const next = { ...item, message, tokens };
+  cut.delete(item);
+  cut.add(next);
+  return next;
+}
+
+/**
+ * 单条消息封顶：超过历史预算一半的截到一半。从最新的一组往回做，累计超过预算就停：更早的反正要被裁掉，不用白截。
+ * 就地改 `groups`。
+ */
+function capped(
+  groups: ProjectedMessage[][],
+  budget: number,
+  estimate: (message: Message) => number,
+  cut: Set<ProjectedMessage>,
+): void {
+  const cap = Math.max(MIN_TRUNCATED_TOKENS, Math.floor(budget / 2));
+  let total = 0;
+  for (let index = groups.length - 1; index >= 0 && total <= budget; index -= 1) {
+    const group = groups[index]!;
+    for (let i = 0; i < group.length; i += 1) {
+      if (group[i]!.tokens > cap) group[i] = shortened(group[i]!, cap, estimate, cut);
+      total += group[i]!.tokens;
+    }
+  }
+}
+
+/**
+ * 裁到不能再裁还超 `excess` 个 token：从最大的消息截起，每条最多截掉还超出的那么多。摘要（`pinned`）最后才动。
+ * 截不动的（推理、工具调用的输入）留着，所以结果仍可能超。就地改 `kept`。
+ */
+function fitted(
+  kept: ProjectedMessage[],
+  excess: number,
+  estimate: (message: Message) => number,
+  cut: Set<ProjectedMessage>,
+): void {
+  const order = kept
+    .map((item, index) => ({ index, tokens: item.tokens, pinned: item.pinned }))
+    .toSorted((a, b) => Number(a.pinned) - Number(b.pinned) || b.tokens - a.tokens);
+  let left = excess;
+  for (const { index } of order) {
+    if (left <= 0) break;
+    const item = kept[index]!;
+    if (item.tokens <= MIN_TRUNCATED_TOKENS) continue;
+    const next = shortened(item, Math.max(MIN_TRUNCATED_TOKENS, item.tokens - left), estimate, cut);
+    left -= item.tokens - next.tokens;
+    kept[index] = next;
+  }
 }
 
 /**
@@ -257,7 +342,8 @@ function windowed(
  * 1. 摘要之前的条目由摘要代替，摘要固定放在最前；
  * 2. 消息条目原样带上；事件按规则渲染，`fold` 的同类事件连在一起时合成一组；
  * 3. 工具调用和结果按 `id` 配对：没有调用的结果去掉，没有结果的调用补一条错误结果；
- * 4. 有窗口时从最旧的消息开始裁，工具调用和结果成组进出；裁过之后开头不留助手消息（前面有摘要时除外）。
+ * 4. 有窗口时从最旧的消息开始裁，工具调用和结果成组进出；裁过之后开头不留助手消息（前面有摘要时除外）；
+ *    `window.truncate` 时先给单条消息封顶，裁到只剩最后一组还超 `maxTokens` 就接着截短剩下的消息。
  */
 export function project(entries: readonly Entry[], options: ProjectionOptions = {}): Projection {
   const estimate = options.window?.estimate ?? estimateTokens;
@@ -268,17 +354,20 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
     | EventEntry
   )[];
 
-  const make = (message: Message, from: number, upTo: number, pinned = false): ProjectedMessage => ({
+  const make = (message: Message, from: number, upTo: number, at: number, pinned = false): ProjectedMessage => ({
     message,
     from,
     upTo,
+    at,
     pinned,
     tokens: estimate(message),
   });
 
   const pinned: ProjectedMessage[] = [];
   if (summary)
-    pinned.push(make((options.summary ?? defaultSummaryMessage)(summary), summary.covers, summary.covers, true));
+    pinned.push(
+      make((options.summary ?? defaultSummaryMessage)(summary), summary.covers, summary.covers, summary.at, true),
+    );
 
   const rest: ProjectedMessage[] = [];
   const rules = options.events ?? {};
@@ -288,7 +377,7 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
     const entry = shown[i]!;
     if (entry.type === 'message') {
       const message = options.message ? options.message(entry) : entry.message;
-      if (message) rest.push(make(message, entry.seq, entry.seq));
+      if (message) rest.push(make(message, entry.seq, entry.seq, entry.at));
       continue;
     }
     const rule = rules[entry.kind]!;
@@ -308,15 +397,18 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
       if (member.seq < from) from = member.seq;
       if (member.seq > upTo) upTo = member.seq;
     }
-    for (const message of asList(rule.render(group))) rest.push(make(message, from, upTo));
+    // 一组按 `at` 排好了，最后一条的 `at` 最晚。
+    const at = group.at(-1)!.at;
+    for (const message of asList(rule.render(group))) rest.push(make(message, from, upTo, at));
   }
 
-  const { kept, dropped } = windowed(pinned, rest, options.window, estimate);
+  const { kept, dropped, truncated } = windowed(pinned, rest, options.window, estimate);
   const result: Projection = {
     messages: kept.map((item) => item.message),
     items: kept,
     tokens: kept.reduce((sum, item) => sum + item.tokens, 0),
     dropped,
+    truncated,
     ...(summary ? { summary } : {}),
   };
   return result;
@@ -343,6 +435,34 @@ export interface ContextSpec {
   readonly facts?: boolean | FactsSpec;
   /** builder 里注册的投影配置名；缺省 `default`。不认识的名字，`build`、`view` 以 `not_found` 失败，不回退。 */
   readonly projection?: string;
+  /** 整次调用超过模型窗口时怎么办；缺省不检查。见 `OverflowSpec`。 */
+  readonly overflow?: OverflowSpec;
+}
+
+/** 超窗之后压缩用的参数：`CompactOptions` 里能序列化的那几项。摘要模型不在这里选（见 `OverflowSpec.compact`）。 */
+export type OverflowCompactSpec = Pick<
+  CompactOptions,
+  'keep' | 'minimum' | 'instructions' | 'maxInputTokens' | 'maxOutputTokens' | 'timeoutMs'
+>;
+
+/**
+ * 超窗兜底：harness 在 `build` 之后估算整次调用，超过 `maxTokens` 就按 `strategy` 处理，处理完还超，这一轮不调模型，
+ * 以 `context_overflow` 结束。全是 JSON，随 `AgentSpec.context` 过线、记进 `ctx.run.started`。
+ */
+export interface OverflowSpec {
+  /**
+   * 整次调用（指令、事实、工具定义、历史、这一轮的输入和提示）估算 token 的上限。一般取模型的窗口减去留给输出的部分，
+   * 再留些余量：估算不分词，会有出入。
+   */
+  readonly maxTokens: number;
+  /**
+   * 超了先做什么。`compact`（缺省）：先压缩（`ContextBuilder.compact`），压完还超、压缩没做成或 builder 没有
+   * `compact`，再裁剪；`trim`：只裁剪，什么都不写；`error`：什么都不做，这一轮以 `context_overflow` 结束。
+   * 裁剪是按 `window: { maxTokens, truncate: true }` 重新 `build`：从最旧的消息丢起，只剩最后一组还超就截短它。
+   */
+  readonly strategy?: 'compact' | 'trim' | 'error';
+  /** 压缩的参数。摘要模型用 builder 配的；builder 没配时 harness 用这一轮的模型。 */
+  readonly compact?: OverflowCompactSpec;
 }
 
 export interface BuildRequest {
@@ -373,6 +493,11 @@ export interface PreparedCall {
   readonly tools: readonly string[];
   readonly facts: readonly Fact[];
   readonly projection: Projection;
+  /**
+   * 整次调用的估算 token：指令、事实、工具定义、消息（历史、`input`、`prompt`）合起来，按 builder 自己的估算。
+   * harness 的超窗检查（`OverflowSpec`）用它；builder 不给时 harness 用缺省的估算自己算。
+   */
+  readonly tokens?: number;
 }
 
 export interface ViewOptions {
@@ -389,9 +514,45 @@ export interface CompactOptions {
   /** 更早的消息少于这么多条就不压缩。 */
   readonly minimum?: number;
   readonly instructions?: string;
+  /**
+   * 一次交给摘要模型的输入（压缩指令、已有的摘要、这一段记录）估算 token 的上限，一般取摘要模型的窗口减去
+   * `maxOutputTokens` 再留余量。要压的历史超过它就分段：一段一段滚动摘要，上一段的摘要带进下一段。
+   * 缺省由实现定（参考实现 24000）。
+   */
+  readonly maxInputTokens?: number;
+  /** 每次摘要输出的上限。 */
   readonly maxOutputTokens?: number;
+  /** 整次压缩（分段时含每一段的模型调用）最多多久。 */
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+}
+
+/**
+ * 一次压缩怎么收场：
+ * - `compacted`：该压的都进了摘要；
+ * - `not_needed`：历史不够长（切点之前不到 `minimum` 条），没调模型，什么都没写；
+ * - `truncated`：某一段的摘要被 `maxOutputTokens` 截断，那一段没写，停在那里。调大 `maxOutputTokens` 再来；
+ * - `empty`：模型没给出文字，那一段没写，停在那里；
+ * - `input_too_long`：分段之后还是放不下——已有的摘要加压缩指令就占满了 `maxInputTokens`，或者摘要模型自己报
+ *   上下文过长、把一段减半到底也不行。调大 `maxInputTokens`、调小 `maxOutputTokens`，或者换窗口更大的摘要模型。
+ *
+ * 后三种停下之前落的检查点留着（`summary` 是最后一个），再调一次从那里接着压。
+ */
+export type CompactStatus = 'compacted' | 'not_needed' | 'truncated' | 'empty' | 'input_too_long';
+
+/** `compactDetailed` 的结果。全是 JSON。 */
+export interface CompactResult {
+  readonly status: CompactStatus;
+  /** 这次写下的最后一条摘要，也就是现在生效的那条；这次一条都没写时没有。 */
+  readonly summary?: SummaryEntry;
+  /** 调了几次摘要模型。 */
+  readonly calls: number;
+  /** 已经进了（写下的）摘要的消息条数。 */
+  readonly compacted: number;
+  /** 该进摘要、这次没进去的消息条数；`compacted` 时是 0。 */
+  readonly remaining: number;
+  /** 进摘要的输入之前被截短的消息条数：超长的工具输出，或者单条就超过一段预算的消息。 */
+  readonly shortened: number;
 }
 
 /**
@@ -402,6 +563,12 @@ export interface ContextBuilder {
   build(request: BuildRequest): Promise<PreparedCall>;
   /** 当前视图：摘要 + 之后的条目，按规则渲染。 */
   view(session: string, options?: ViewOptions): Promise<Projection>;
-  /** 把较早的历史压成一条摘要并追加，同时记一条 `ctx.compacted`。历史不够长时返回 null。 */
+  /**
+   * 把较早的历史压成摘要并追加，同时记 `ctx.compacted`；历史太长时分段滚动摘要（见 `CompactOptions.maxInputTokens`）。
+   * 返回这次写下的、现在生效的摘要；一条都没写（历史不够长、摘要被截断、输入放不下）时返回 null，
+   * 要分清是哪一种用 `compactDetailed`。
+   */
   compact?(session: string, options?: CompactOptions): Promise<SummaryEntry | null>;
+  /** 和 `compact` 做同一件事，返回怎么收场的（`CompactResult.status`），应用据此决定下一步。 */
+  compactDetailed?(session: string, options?: CompactOptions): Promise<CompactResult>;
 }

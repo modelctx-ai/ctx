@@ -30,7 +30,8 @@ export interface ScriptedModelOptions {
 
 /**
  * 按契约测试的剧本回答的假模型（基于 `ai/test` 的 `MockLanguageModelV4`）：每调一次（流式或非流式）取下一步，
- * 剧本用完后再调就抛错。给 `describeHarnessContract`、`describeOrchestratorContract` 的工厂用。
+ * 剧本用完后再调就抛错；`text` 那一步带 `truncated` 时 `finishReason` 是 `length`。
+ * 给 `describeHarnessContract`、`describeOrchestratorContract`、`describeContextBuilderContract` 的工厂用。
  */
 export function createScriptedModel(
   script: readonly ModelScriptStep[],
@@ -52,9 +53,10 @@ export function createScriptedModel(
     doGenerate: async (): Promise<GenerateResult> => {
       const step = next();
       if (step.type === 'text') {
+        const finish = step.truncated ? 'length' : 'stop';
         return {
           content: [{ type: 'text', text: step.text }],
-          finishReason: { unified: 'stop', raw: 'stop' },
+          finishReason: { unified: finish, raw: finish },
           usage,
           warnings: [],
         };
@@ -74,7 +76,11 @@ export function createScriptedModel(
           { type: 'text-start', id: '1' },
           { type: 'text-delta', id: '1', delta: step.text },
           { type: 'text-end', id: '1' },
-          { type: 'finish', finishReason: { unified: 'stop', raw: 'stop' }, usage },
+          {
+            type: 'finish',
+            finishReason: step.truncated ? { unified: 'length', raw: 'length' } : { unified: 'stop', raw: 'stop' },
+            usage,
+          },
         );
       } else {
         parts.push(

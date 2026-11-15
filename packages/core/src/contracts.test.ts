@@ -7,6 +7,7 @@ import { createOrchestrator } from './orchestrator.ts';
 import { createMemoryStore } from './store.ts';
 import {
   createScriptedModel,
+  describeContextBuilderContract,
   describeExecutorContract,
   describeHarnessContract,
   describeOrchestratorContract,
@@ -48,6 +49,15 @@ function fixture({ script }: ModelScript) {
 }
 
 describeHarnessContract('ai-sdk', fixture, api);
+
+describeContextBuilderContract(
+  'local',
+  ({ script }) => {
+    const store = createMemoryStore();
+    return { store, builder: createContextBuilder({ store, model: createScriptedModel(script) }) };
+  },
+  api,
+);
 
 describeOrchestratorContract(
   'local',

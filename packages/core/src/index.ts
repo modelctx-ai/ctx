@@ -23,6 +23,7 @@ export {
 } from './tools.ts';
 export {
   createContextBuilder,
+  DEFAULT_COMPACT_INPUT_TOKENS,
   type ContextBuilderOptions,
   type FactsPlacement,
   type LocalContextBuilder,

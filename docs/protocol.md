@@ -14,17 +14,17 @@ status: stable
 
 ## 总则
 
-| 规则         | 说明                                                                                                                                 |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| 接口加工厂   | 协议是 `interface`，实现是 `createX(options): X`。不用类继承                                                                         |
-| 只收发 JSON  | 方法参数和返回值都能 `JSON.stringify`。例外：`AbortSignal`、进程内的 `LanguageModel`。跨边界时模型用名字字符串                       |
-| 消息         | ctx 自己的 `Message`，全是 JSON（二进制是 base64 字符串，URL 是字符串），存储和线上都不需要编码；和 AI SDK 互转在 `@modelctx-ai/ctx` |
-| 字符串身份   | `session`、工具名、执行环境名、`runId` 都是字符串                                                                                    |
-| 流是事件序列 | 流式结果用 `AsyncIterable<Event>` 表达，跨边界是 NDJSON 或 SSE                                                                       |
-| 可选方法     | 协议里标 `?` 的方法实现可以不提供，调用方要检查                                                                                      |
-| 取消         | 需要取消的方法收 `signal?: AbortSignal`                                                                                              |
-| 错误         | 抛 `Error`；跨边界时是 `{ error: ErrorInfo }`，`ErrorInfo` 是 `{ message, type?, retryable?, statusCode?, responseBody? }`           |
-| 契约测试     | `@modelctx-ai/ctx-protocol/testing` 的 `describeXContract(name, factory, { describe, test })`，实现跑它（见[契约测试](#契约测试)）   |
+| 规则         | 说明                                                                                                                                                                                                                 |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 接口加工厂   | 协议是 `interface`，实现是 `createX(options): X`。不用类继承                                                                                                                                                         |
+| 只收发 JSON  | 方法参数和返回值都能 `JSON.stringify`。例外：`AbortSignal`、进程内的 `LanguageModel`。跨边界时模型用名字字符串                                                                                                       |
+| 消息         | ctx 自己的 `Message`，全是 JSON（二进制是 base64 字符串，URL 是字符串），存储和线上都不需要编码；和 AI SDK 互转在 `@modelctx-ai/ctx`                                                                                 |
+| 字符串身份   | `session`、工具名、执行环境名、`runId` 都是字符串                                                                                                                                                                    |
+| 流是事件序列 | 流式结果用 `AsyncIterable<Event>` 表达，跨边界是 NDJSON 或 SSE                                                                                                                                                       |
+| 可选方法     | 协议里标 `?` 的方法实现可以不提供，调用方要检查                                                                                                                                                                      |
+| 取消         | 需要取消的方法收 `signal?: AbortSignal`                                                                                                                                                                              |
+| 错误         | 抛 `Error`；跨边界时是 `{ error: ErrorInfo }`，`ErrorInfo` 是 `{ message, type?, retryable?, statusCode?, responseBody? }`；`type` 是机器可读的类别（`not_found`、`conflict`、`session_busy`、`context_overflow`……） |
+| 契约测试     | `@modelctx-ai/ctx-protocol/testing` 的 `describeXContract(name, factory, { describe, test })`，实现跑它（见[契约测试](#契约测试)）                                                                                   |
 
 ## 会话 `SessionStore`
 
@@ -260,6 +260,7 @@ function copySession(
 interface WindowOptions {
   maxMessages?: number; // 摘要不算
   maxTokens?: number; // 估算，摘要计入
+  truncate?: boolean; // 放不下时截短消息，不只是整条丢；缺省不截
 }
 interface BuildRequest {
   session: string;
@@ -278,22 +279,35 @@ interface PreparedCall {
   tools: readonly string[]; // 这次给模型的工具名
   facts: readonly Fact[];
   projection: Projection;
+  tokens?: number; // 整次调用的估算：指令、事实、工具定义、消息；harness 的超窗检查用它
 }
 interface CompactOptions {
   model?: ModelRef;
   keep?: number; // 最近多少条原样保留
   minimum?: number; // 更早的少于这么多条就不压缩
   instructions?: string;
-  maxOutputTokens?: number;
-  timeoutMs?: number;
+  maxInputTokens?: number; // 一次交给摘要模型的输入的上限（估算）；历史超过它就分段滚动摘要
+  maxOutputTokens?: number; // 每次摘要输出的上限
+  timeoutMs?: number; // 整次压缩，分段时含每一段
   signal?: AbortSignal;
+}
+type CompactStatus = 'compacted' | 'not_needed' | 'truncated' | 'empty' | 'input_too_long';
+interface CompactResult {
+  status: CompactStatus;
+  summary?: SummaryEntry; // 这次写下的最后一条摘要（现在生效的）；一条都没写时没有
+  calls: number; // 调了几次摘要模型
+  compacted: number; // 已经进了摘要的消息条数
+  remaining: number; // 该进、这次没进去的条数
+  shortened: number; // 进摘要的输入之前被截短的消息条数
 }
 interface ContextBuilder {
   build(request: BuildRequest): Promise<PreparedCall>;
   /** 当前视图：摘要 + 之后的条目，按规则渲染。网关用它。 */
   view(session: string, options?: { window?: WindowOptions; projection?: string }): Promise<Projection>;
-  /** 把较早的历史压成一条摘要并追加，同时记 ctx.compacted。历史不够长时返回 null。 */
+  /** 把较早的历史压成摘要并追加，同时记 ctx.compacted。这次没写下摘要时返回 null。 */
   compact?(session: string, options?: CompactOptions): Promise<SummaryEntry | null>;
+  /** 同 compact，返回怎么收场的。 */
+  compactDetailed?(session: string, options?: CompactOptions): Promise<CompactResult>;
 }
 
 interface ContextSource {
@@ -318,17 +332,24 @@ interface EventRule {
 }
 interface Projection {
   messages: Message[];
-  items: readonly ProjectedMessage[]; // 每条带 upTo、pinned、tokens
+  items: readonly ProjectedMessage[]; // 每条带 from、upTo、at、pinned、tokens
   tokens: number;
-  dropped: number;
+  dropped: number; // 被窗口丢掉的消息条数
+  truncated: number; // 因为 window.truncate 被截短的消息条数
   summary?: SummaryEntry;
 }
 ```
 
 - 参考实现 = 投影规则（事件渲染、摘要渲染、消息改写、窗口）+ 来源 + 压缩，就是今天 `createContext` 里的 `prepare`、`view`、`compact`。
-- 投影、来源收集和 token 估算是纯函数，放在协议包：`project(entries, options)`、`latestSummary`、`defaultSummaryMessage`、`collectFacts(sources, { session, timeoutMs?, onError? })`、`renderFacts`、`defineSource`、`estimateTokens`、`estimateTextTokens`、`estimateFileTokens`。语义见[架构](architecture.md#投影)。
+- 投影、来源收集、token 估算和截短是纯函数，放在协议包：`project(entries, options)`、`latestSummary`、`defaultSummaryMessage`、`collectFacts(sources, { session, timeoutMs?, onError? })`、`renderFacts`、`defineSource`、`estimateTokens`、`estimateTextTokens`、`estimateFileTokens`、`truncateText`、`truncateMessage`。语义见[架构](architecture.md#投影)。
 - 投影的输出是模型接口收得下的消息序列，不管日志里是什么样、窗口裁在哪：工具结果找不到对应的调用（调用被裁掉了、或者本来就没有）就去掉；工具调用没有结果（运行断在中间）就补一条错误结果（`No result was recorded for this tool call.`），服务商自己执行的调用（`providerExecuted`）除外；窗口裁剪之后，开头不留孤立的工具结果，没有摘要时也不以助手消息开头（接着裁到下一条用户消息）。
 - 窗口的两处配置：请求里的 `window`（`BuildRequest`、`ViewOptions`、`AgentSpec`）给了就**整个换掉** builder 配置的上限，`{}` 表示不裁剪；`estimate` 是函数、过不了线，始终用 builder 的。`build` 的 `maxTokens` 管的是整次调用：指令、事实、工具定义、`input`、`prompt` 的估算先从里面扣掉，剩下的才是历史的预算；`view` 没有这些，`maxTokens` 就是历史的预算。
+- `window.truncate`：缺省窗口只会整组地丢，至少留下最后一组，哪怕它自己就超预算（一条 25 万 token 的工具结果、一段粘贴进来的长文）。给了 `truncate: true`（要同时有 `maxTokens`）就再多做两步：先给单条消息封顶，超过历史预算一半的截到一半，免得它把别的历史全挤掉；丢到只剩最后一组还超，从最大的消息接着截，直到放得下。截短用 `truncateMessage(message, maxTokens, estimate?)`：文字留头尾、中间写明省略了多少字符（`truncateText(text, maxTokens, estimate?)`），工具结果先把内联的文件换成一句说明、再把内容写成文字截短（错误结果只截信息、去掉 `data`），消息里内联的文件换成说明；推理、工具调用的输入、服务商自定义内容不动（截了签名对不上、调用不再合法），所以结果仍可能超。截短只发生在这一次投影里，日志不变；`Projection.truncated` 是被截短的条数。
+- 压缩（`compact?`、`compactDetailed?`）：
+  - **分段。** 要压的历史超过 `maxInputTokens`（压缩指令、已有的摘要、这一段记录合起来的估算）就一段一段滚动摘要：每段连同到目前为止的摘要交给模型，得到的新摘要带进下一段。工具调用的输入和工具结果在进摘要的输入之前截短；单条消息就超过一段的预算时也截短，不然永远过不去。
+  - **检查点。** 每段压完就追加一条 `summary` 和一条 `ctx.compacted`（`covers` 落在这一段和下一段之间；工具调用和它的结果不切到两边）。中途模型出错、超时、被截断，已经压好的留着，再调一次从那里接着压。所以一次压缩可以留下多条摘要，生效的只有最后一条。
+  - **收场。** `compactDetailed` 的 `status`：`compacted` 该压的都进了摘要；`not_needed` 历史不够长，没调模型；`truncated` 某一段的摘要被 `maxOutputTokens` 截断，那一段不写、停在那里；`empty` 模型没给出文字，同样不写；`input_too_long` 分段之后还是放不下——已有的摘要加指令就占满了 `maxInputTokens`，或者摘要模型自己报上下文过长、一段减半到底也不行。`compact` 是它的简写：返回这次写下的最后一条摘要，一条都没写就是 `null`。模型调用本身的错误（网络、超时）照常抛出。
+  - **`at` 在未来的条目。** 把到期时间当 `at` 的事件一直排在视图的最后。数「最近 `keep` 条」时不算它们：写在切点之前的进摘要，写在切点之后的照常留在视图里。以前它的 `seq` 会把 `covers` 钉在自己前面，之后写的消息永远压不了。`ProjectedMessage.at` 是这条消息来自的条目里最晚的 `at`。
 - token 估算不分词：中日韩文字一个字算 1，ASCII 4 个字符算 1，其余文字 2 个字符算 1；附件按 `estimateFileTokens(mediaType, data)`——内联文字按字数，base64 按解码后的大小（图片 64 KiB 以内 256、更大 1600；文本类按字节数除以 4；其余每 20 字节 1 个、至少 256），地址和服务商引用不知道大小，按 256。要准就在 `window.estimate` 里接分词器。
 - `ProjectionOptions` 里有函数，是进程内 builder 的配置，不经过协议方法；协议方法里只出现能序列化的 `WindowOptions`。
 - 提示缓存：事实追加在指令末尾会让 system 前缀每次都变，参考实现提供把事实放进最后一条临时用户消息的选项。
@@ -454,6 +475,15 @@ interface AgentSpec {
 interface ContextSpec {
   facts?: boolean | FactsSpec; // false 不收事实；缺省收
   projection?: string; // builder 里注册的投影配置名；缺省 default
+  overflow?: OverflowSpec; // 整次调用超过模型窗口时怎么办；缺省不检查
+}
+interface OverflowSpec {
+  maxTokens: number; // 整次调用估算 token 的上限：模型的窗口减去留给输出的，再留余量
+  strategy?: 'compact' | 'trim' | 'error'; // 缺省 compact：先压缩，还超再裁剪
+  compact?: Pick<
+    CompactOptions,
+    'keep' | 'minimum' | 'instructions' | 'maxInputTokens' | 'maxOutputTokens' | 'timeoutMs'
+  >;
 }
 interface FactsSpec {
   sources?: readonly string[]; // 只用这些来源（ContextSource.name）；缺省全部
@@ -483,7 +513,7 @@ interface RunResult {
   recorded: readonly Entry[];
   stopReason: StopReason;
   usage?: Usage;
-  error?: ErrorInfo; // stopReason 是 error 时；上游 HTTP 接口出错时带 statusCode 和 responseBody
+  error?: ErrorInfo; // stopReason 是 error 时；上游 HTTP 接口出错时带 statusCode 和 responseBody；上下文过长时 type 是 context_overflow
 }
 type RunEvent =
   | { type: 'run.started'; runId: string; session: string }
@@ -514,8 +544,15 @@ interface Harness {
 ```
 
 - `AgentSpec.context` 按一轮选事实和投影。函数（来源的 `collect`、投影的 `render`）不能序列化，所以只按名字选，和 `ToolSelection` 同一个思路：代码里向 builder 注册（`createContextBuilder({ sources, projection, projections })`），`context` 里引用名字。harness 把 `agent.context` 原样放进 `BuildRequest`；`RunRequest` 不加字段，`agent` 本来就是完整的。`context` 是 JSON，`ctx.run.started` 的 `agent` 会记下这一轮用的配置，远端不用改路由。第三方 builder 忽略 `context` 会静默回到缺省，harness 契约测试用「不认识的投影名必须以 `not_found` 结束」暴露它。
-- 一轮里 harness 做的事：`ctx.run.started` → 记输入 → `ContextBuilder.build` → 调模型 → 对每个工具调用：`beforeTool` → 找到绑定的执行环境 → `execute` → `afterTool` → 工具结果回到模型，直到停下 → 记产出 → `ctx.run.ended`。
+- 一轮里 harness 做的事：`ctx.run.started` → 记输入 → `ContextBuilder.build` →（配了 `context.overflow` 时）超窗检查 → 调模型 → 对每个工具调用：`beforeTool` → 找到绑定的执行环境 → `execute` → `afterTool` → 工具结果回到模型，直到停下 → 记产出 → `ctx.run.ended`。
 - 模型出错、被取消也写 `ctx.run.ended`，`run` 照常返回，`stopReason` 和 `error` 说明原因；只有写日志本身失败才 reject。远端调用方因此总拿到同一种形状。
+- **超窗兜底（`AgentSpec.context.overflow`，缺省关着）。** `build` 之后 harness 估算整次调用（`PreparedCall.tokens`；builder 不给时用 `estimateTokens`、`estimateTextTokens` 自己算指令、消息和交给模型的工具定义），不超过 `maxTokens` 就照常往下走。超了按 `strategy`：
+  1. `compact`（缺省）：调 `ContextBuilder.compact`（参数取 `overflow.compact`，`keep` 至少按 1 算——这一轮刚记下的输入不进摘要），写下了摘要就重新 `build`。摘要模型用 builder 配的；builder 没配时用这一轮的模型，所以配置里不带模型名，远端的调用方不能借它指定任意模型。builder 没有 `compact`、压缩没做成（记一条告警）、压完还超，都接着走下一步。不写日志的运行（`record: false`）跳过这一步：压缩要追加摘要，而它一条都不该写。
+  2. 裁剪（`compact` 的下一步，或者 `strategy: 'trim'` 直接到这里）：带着 `window: { ...agent.window, maxTokens, truncate: true }` 重新 `build`，从最旧的消息丢起，单条消息超预算时截短。什么都不写。
+  3. 还超（指令、工具定义、`input` 本身就放不下），或者 `strategy: 'error'`：这一轮不调模型，以 `stopReason: 'error'`、`error.type: 'context_overflow'`（`retryable: false`）结束，照常写 `ctx.error` 和 `ctx.run.ended`。
+     配置全是 JSON，随 `agent.context` 过线、记进 `ctx.run.started`；`maxTokens` 不是正数、`strategy` 不认识时这一轮以 `invalid_request` 结束。检查只在第一次调模型之前做：工具步骤里长出来的上下文靠工具结果的长度上限和下面的错误映射兜着。
+- **上下文过长的错误。** 服务商拒绝一次调用、说上下文超过了模型的窗口时，harness 把它映射成 `stopReason: 'error'`、`error.type: 'context_overflow'`、`retryable: false`（`ctx.error` 的 `type` 同样），`statusCode`、`responseBody` 照旧带着。不另加 `StopReason`：它和 `session_busy`、`not_found` 一样是「这一轮没跑成」的一种，已有的 `stopReason === 'error'` 分支（编排器的 `failed`、远端的状态码）都不用改，要区分的看 `error.type`。纯函数 `isContextOverflow(error)` 只看 `type`，`CtxError`、`ErrorInfo`、远端客户端转出来的错误都认；常量 `CONTEXT_OVERFLOW`。AI SDK 没有专门的错误类型，参考实现按 HTTP 413 和各服务商常见的错误码、消息认（见[架构](architecture.md#harness)），**各服务商的错误形状没有对真实服务验证**；认不出来的照旧是 `api_call`。应用看到 `context_overflow` 之后的下一步：`compactDetailed` 压缩再重试，或者给 agent 配上 `context.overflow`。
+- **失败的重试不让历史变长。** 输入在调模型之前就写进日志，这一轮失败了它也留着。重试有两种认法：给了 `inputKey` 的由存储按键去重；没给的，harness 看上一轮是不是以 `error` 或 `aborted` 结束、日志里最后一条不是框架写的条目是不是同样内容的用户消息（它后面只有 `ctx.*` 事件和没盖住它的摘要），是就不再记一遍，`recorded` 里也没有它。上一轮成功了、换了一句话、两轮之间应用写过别的条目，都照常记。以前不带 `inputKey` 的重试每失败一次历史就长一条，上下文过长时越重试越长。
 - **一个会话最多一个未结束的运行，跨进程也成立**（只对 `record` 不为 `false` 的运行；`record: false` 的运行不碰日志，不占会话，不会遇到 `session_busy`，也不会被 `recover` 看到）：
   1. 开始：读最后一个生命周期事件（`list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`）。是 `started` 就说明有未结束的运行，`run` 以 `ErrorInfo.type: 'session_busy'`（`retryable: true`）结束，不写任何东西；否则带 `expectSeq` 追加 `ctx.run.started`，冲突就重读重判。
   2. 运行中：每次写入带 `expectSeq`（本轮上一次写入之后的末尾）。冲突时读自己的 `ctx.run.started` 起的生命周期事件和擦除记录（`kinds: [ctx.run.started, ctx.run.ended, ctx.erased]`）：自己的 `runId` 已经有 `ctx.run.ended`，说明被别人当作断掉的运行收走了；自己的 `ctx.run.started` 不在了，说明会话中途被 `clear` 了，或者 `truncate`、`remove` 删到了它；有 `ctx.erased` 动了这一轮自己写的条目（`isErased`，`redact` 也算），说明这一轮的输入或产出被删了。三种都是被围栏，停下，`stopReason: 'aborted'`，不再写 `ctx.run.ended`、`ctx.error` 和产出——针对已删内容的回答不会写回来。都不是就只是别人写了应用事件，或者擦除的是这一轮之前的历史、别人在这期间写的条目，用新的末尾重试。已经建好的上下文不重建：这一轮的模型仍然看得到被擦除的更早的内容，要一并挡住就先取消这一轮再删。
@@ -837,14 +874,15 @@ A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = (now − t_i) / 1 �
 | `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 存进去的是拷贝、会话名（空串、`.`、`..` 每个方法都拒绝，别的名字往返）、排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`limit`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、擦除（`truncate`、`remove`、`redact` 的条数和剩下的条目、`ctx.erased` 记录、什么都没动时不留记录、末尾前进和旧 `expectSeq` 冲突、`id`/`key` 让不让出来、和并发 `append` 不交错）、`sessions` 的升序和翻页、导出再导入（另一个存储里 `covers` 指对位置、投影一致、重复导入只有一份、截断的文件接得上、同一个存储里复制、擦除记录的位置）、`watch?` 的读已有、读新写入、读擦除记录、中止 |
 | `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、不带 `inputKey` 的失败重试不再记输入、模型报上下文过长是 `context_overflow`、`context.overflow`（超了选 `error` 不调模型、`trim` 裁到放得下）、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                                                                                                                                                                                                                                                                                 |
+| `describeContextBuilderContract`  | `({ script }) => { builder, store }`                                    | `build` 的消息顺序（历史、`input`、`prompt`）、指令、工具名单、不改日志、全是 JSON；不认识的投影名 `not_found`；`view` 里没有规则的事件不可见、摘要代替它盖住的条目；`window` 的 `maxMessages`、`{}`、`truncate`；`tokens?`；`compact?` 的不够长、写摘要和 `ctx.compacted`、被截断不写、超过 `maxInputTokens` 分段；`compactDetailed?` 的 `status`                                                                                                                                                                                                                                                                                                                         |
 | `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加、`archive` 退出 `open`、`forget` 真删、`list` 翻页；`search` 至少全文命中；程序 `confirm` 计数；`core` 历史                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
-harness 和编排器的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。记忆的契约用协议包 `/testing` 里的剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel`：`describeMemoryContract` 自己造好它们和一个内存会话日志交给工厂。谁跑：记忆存储的契约由 `ctx-memory` 的内存存储（带和不带 `embed`）、`createSqliteMemoryStore`、`createRemoteMemoryStore` 跑；决策模型的由剧本模型、启发式、`decisionFromLanguageModel`、`ctx-models` 的两个 provider（假 `fetch`）跑；提取模型的由剧本模型、`extractionFromLanguageModel`、`ctx-models` 的 `cloudflare` 跑；`describeMemoryContract` 由 `createMemory` 加内存存储跑，门控阈值固定在 0.1..0.9 之间，`LanguageModel` 可以不给。`ContextBuilder` 的契约还没写：它的行为大半在投影规则这些进程内配置里。
+harness、编排器和上下文的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`（带 `truncated` 时是被 `maxOutputTokens` 截断的输出）、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。上下文的工厂给出一个缺省配置的 builder 和它读的存储，剧本是给 `compact` 的摘要模型的。记忆的契约用协议包 `/testing` 里的剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel`：`describeMemoryContract` 自己造好它们和一个内存会话日志交给工厂。谁跑：记忆存储的契约由 `ctx-memory` 的内存存储（带和不带 `embed`）、`createSqliteMemoryStore`、`createRemoteMemoryStore` 跑；决策模型的由剧本模型、启发式、`decisionFromLanguageModel`、`ctx-models` 的两个 provider（假 `fetch`）跑；提取模型的由剧本模型、`extractionFromLanguageModel`、`ctx-models` 的 `cloudflare` 跑；`describeMemoryContract` 由 `createMemory` 加内存存储跑，门控阈值固定在 0.1..0.9 之间，`LanguageModel` 可以不给。上下文的契约由 `createContextBuilder` 加内存存储跑；它只管协议方法里看得见的行为，投影规则这些进程内配置（事件怎么渲染、摘要怎么写）不在里面，由 `project` 的单元测试管。
 
 ## 托管矩阵
 

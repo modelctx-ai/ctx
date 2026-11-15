@@ -8,7 +8,7 @@ status: stable
 
 # ADR 0005：会话位置、并发写入、消息格式版本、AgentSpec 上下文配置
 
-- 状态：已采纳（2026-10-26 用户审阅后按「决定记录」修订）
+- 状态：已采纳（2026-10-26 用户审阅后按「决定记录」修订；2026-11-15 再补一条）
 - 实施状态：已实施（2026-10-26）。阶段 1 位置 `21bad8f`，阶段 5 分页和 `kinds` `197a719`，阶段 3 消息格式和版本 `8fc54dc`，阶段 2 `expectSeq`、围栏、`owner` `b4ebe71`，阶段 4 `AgentSpec.context` `32d91ca`，收尾（所有包升 0.3.0、修订 ADR 0003/0004、文档同步）是本行所在的提交。
 - 日期：2026-10-26
 - 范围：`ctx-protocol`、`@modelctx-ai/ctx`、`ctx-sqlite`、`ctx-remote`、`ctx-gateway`；yoyo 作为实践
@@ -280,3 +280,7 @@ sessions(options?: { prefix?: string; after?: string; limit?: number }): Promise
 4. **所有包一起升 0.3，不留 `Cursor` 别名：同意。**
 5. **结构版本。** `ctx-sqlite` 的 `meta.schema` 已被 #1 升到 2，本 ADR 的改动升到 3；#1 之后的 0.2.x 拒绝打开 schema 3 的库，更早的版本不检查，要停机后一起升级。
 6. **yoyo 的破坏面按真实代码重写。** 结论是决定 2 与 yoyo 不冲突，因此没有改决定本身，只在决定 2 加了"只约束 `record` 不为 `false` 的运行"的范围说明。
+
+2026-11-15 的补充：
+
+7. **`ContextSpec` 加 `overflow`**（[#33](https://github.com/modelctx-ai/ctx/issues/33)）。决定 4 说 `AgentSpec.context` 只做「按名字选」事实和投影。超窗兜底（估算上限、先压缩还是只裁剪、压缩的参数）也是一个 agent 一轮的上下文怎么组装的一部分，同样全是 JSON，所以放在同一个字段里：`context.overflow`。它不带函数、不带模型名（压缩用 builder 配的模型，没配用这一轮的），决定 4 的三条结论照旧成立：`RunRequest` 不加字段，`ctx-remote` 的路由不用改，`ctx.run.started` 记下这一轮用的配置。裁剪用的 `WindowOptions.truncate` 也是可序列化的布尔值。
