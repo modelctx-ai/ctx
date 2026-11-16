@@ -584,6 +584,13 @@ function truncatedText(text: string, limit: number): string {
 }
 
 /**
+ * harness 对一次工具结果的长度兜底，缺省 20 万字符（大约 5 万到 20 万 token）。该截断、分页的是执行环境，它知道怎么
+ * 截才有用；这一层只保证哪个执行环境忘了也不会把一次结果原样塞满上下文。`describeHarnessContract` 没给
+ * `maxToolOutputChars` 时按它查。
+ */
+export const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 200_000;
+
+/**
  * 工具结果的长度兜底：超过 `maxChars` 个字符（UTF-16 码元）时截断并注明省略了多少，没超的原样返回（同一个对象）。
  * 文字和错误信息直接截；`json` 序列化后超了就换成截断的文字；`content` 里各段合起来算，内联的文件数据
  * （base64、文字）按字符数计，放不下的那个文件换成一句说明，超的那段文字截断、后面的文字不要了。

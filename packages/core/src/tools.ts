@@ -1,5 +1,6 @@
 import {
   checkJsonSchema,
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   errorOutput,
   isValidToolName,
   limitToolOutput,
@@ -64,12 +65,6 @@ export interface ToolSetOptions {
 
 /** 不在这里执行的工具的输出结构：别处执行，结果经日志回来，这里不校验。 */
 const EXTERNAL_OUTPUT = jsonSchema({});
-
-/**
- * 工具结果长度的兜底，20 万字符（大约 5 万到 20 万 token）。该截断、分页的是执行环境，它知道怎么截才有用；
- * 这一层只保证哪个执行环境忘了也不会把一次结果原样塞满上下文。
- */
-export const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 200_000;
 
 /** 缺省的分发：找到绑定的执行环境执行。找不到、或执行环境本身抛错，都变成给模型看的错误。 */
 export function dispatchTo(executors: Executors | undefined): ToolDispatch {

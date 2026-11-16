@@ -1,5 +1,6 @@
 import {
   CTX_EVENTS,
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   limitToolOutput,
   pendingToolCalls,
   toolResultEntry,
@@ -7,8 +8,6 @@ import {
   type PendingToolCall,
   type SessionStore,
 } from '@modelctx-ai/ctx-protocol';
-
-import { DEFAULT_MAX_TOOL_OUTPUT_CHARS } from './tools.ts';
 
 export interface RunPendingToolsOptions {
   /** 执行这些调用的执行环境。出错返回 `{ type: 'error' }` 的照常记成结果；抛出的不记，留给下一次。 */

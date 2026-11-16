@@ -39,10 +39,14 @@ describeToolRegistryContract('local', () => createToolRegistry(), api);
 function fixture({ script }: ModelScript) {
   const store = createMemoryStore();
   const tools = createToolRegistry();
-  tools.executor.register({ name: 'echo', description: '原样返回输入', inputSchema: { type: 'object' } }, (input) => ({
-    type: 'json',
-    value: input,
-  }));
+  tools.executor.register(
+    {
+      name: 'echo',
+      description: '原样返回输入',
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+    },
+    (input) => ({ type: 'json', value: input }),
+  );
   tools.add(tools.executor.definition('echo')!);
   const harness = createHarness({ store, context: createContextBuilder({ store }), tools });
   return { store, harness, agent: { model: createScriptedModel(script) } };

@@ -4,6 +4,8 @@
 
 ## 2026-11-16
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#40](https://github.com/modelctx-ai/ctx/issues/40)）：工具输出的兜底写明缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`、可配；一致性等级的 `execute` 加上执行前查输入、超长结果截断；契约测试表和工厂一段写新用例、回显工具的 `inputSchema` 要求、`maxToolOutputChars`。[ctx-protocol](../packages/protocol/README.md) 的导出表加 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`，契约一节写同样的要求；[核心包](../packages/core/README.md)写明这个常量来自协议包；[ctx-remote](../packages/remote/README.md) 的一致性模式写 `maxToolOutputChars` 和 `--max-tool-output-chars`。
+
 - **更新** [ctx-remote](../packages/remote/README.md)（[#39](https://github.com/modelctx-ai/ctx/issues/39)）：选项表加 `maxPendingRuns`；编排器客户端的 `events` 改成断了重连、断开那一阵的事件收不到；「重试」一条加上 `events` 的重连；上限一条加上经编排器提交的运行。
 
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#35](https://github.com/modelctx-ai/ctx/issues/35)）：`StepMeta` 加 `estimatedInputTokens`、`calibration`，`PreparedCall` 加 `calibration`，token 估算一条写 harness 记下估算、builder 拿实际用量收紧下一轮。[架构](architecture.md)的调用一节写校准怎么找样本、为什么不来回摆、什么时候不校准；[ctx](../packages/core/README.md) 的导出加 `calibrate`、`MAX_CALIBRATION`。

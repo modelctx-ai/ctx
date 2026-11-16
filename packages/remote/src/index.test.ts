@@ -135,7 +135,11 @@ function localHarness(script: readonly ModelScriptStep[], delayMs = 0) {
   const store = createMemoryStore();
   const tools = createToolRegistry();
   tools.executor.register(
-    { name: 'echo', description: '原样返回输入', inputSchema: { type: 'object' } },
+    {
+      name: 'echo',
+      description: '原样返回输入',
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+    },
     async (input, context) => {
       if ((input as { wait?: unknown } | null)?.wait === true) await waitForAbort(context.signal, 5_000);
       return { type: 'json', value: input };

@@ -31,6 +31,8 @@ export interface ConformanceOptions extends Omit<RemoteClientOptions, 'baseUrl'>
   readonly components?: readonly ConformanceComponent[];
   /** harness 跑哪几级（`HarnessLevel`），缺省全部。 */
   readonly harnessLevels?: readonly HarnessLevel[];
+  /** 被测的 harness 一次工具结果最多留多少字符，缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`（`HarnessContractOptions` 的同名项）。 */
+  readonly maxToolOutputChars?: number;
 }
 
 /** 编排器的契约里模型每一步等多久：第二轮提交、取消的请求到达时第一轮还在跑。 */
@@ -56,7 +58,7 @@ function agentOf(created: ConformanceInstance): AgentSpec {
  * 只要提供这个入口、实现了线上形态，就能这样验证。`api` 是测试框架的 `describe`、`test`（`node:test`、Vitest 都行）。
  */
 export function describeConformance(baseUrl: string, options: ConformanceOptions, api: ContractTestApi): void {
-  const { components = CONFORMANCE_COMPONENTS, harnessLevels, ...client } = options;
+  const { components = CONFORMANCE_COMPONENTS, harnessLevels, maxToolOutputChars, ...client } = options;
   const root = baseUrl.replace(/\/+$/, '');
   const origin = new URL(root).origin;
 
@@ -114,7 +116,10 @@ export function describeConformance(baseUrl: string, options: ConformanceOptions
         };
       },
       api,
-      harnessLevels ? { levels: harnessLevels } : {},
+      {
+        ...(harnessLevels ? { levels: harnessLevels } : {}),
+        ...(maxToolOutputChars !== undefined ? { maxToolOutputChars } : {}),
+      },
     );
   }
   if (components.includes('orchestrator')) {

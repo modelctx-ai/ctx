@@ -12,7 +12,6 @@ export {
 export {
   closeExecutorSessions,
   createToolRegistry,
-  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   dispatchTo,
   toToolSet,
   type Executors,

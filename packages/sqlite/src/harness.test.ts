@@ -25,20 +25,27 @@ import { createSqliteStore } from './index.ts';
 
 const api = { describe, test };
 
+/** 工具结果的上限调小：契约按它查截断，也让超长结果的用例轻一些。 */
+const maxToolOutputChars = 2_000;
+
 /** SQLite 存储 + 回显工具 + 按剧本回答的模型。 */
 function fixture({ script }: ModelScript) {
   const store = createSqliteStore({ path: ':memory:' });
   const tools = createToolRegistry();
-  tools.executor.register({ name: 'echo', description: '原样返回输入', inputSchema: { type: 'object' } }, (input) => ({
-    type: 'json',
-    value: input,
-  }));
+  tools.executor.register(
+    {
+      name: 'echo',
+      description: '原样返回输入',
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+    },
+    (input) => ({ type: 'json', value: input }),
+  );
   tools.add(tools.executor.definition('echo')!);
-  const harness = createHarness({ store, context: createContextBuilder({ store }), tools });
+  const harness = createHarness({ store, context: createContextBuilder({ store }), tools, maxToolOutputChars });
   return { store, harness, agent: { model: createScriptedModel(script) } };
 }
 
-describeHarnessContract('sqlite（核心包 harness）', fixture, api);
+describeHarnessContract('sqlite（核心包 harness）', fixture, api, { maxToolOutputChars });
 
 describeOrchestratorContract(
   'sqlite（核心包编排器）',

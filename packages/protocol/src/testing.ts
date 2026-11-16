@@ -35,7 +35,15 @@ import {
 import { ENTRY_VERSION } from './version.ts';
 import { copySession, exportSession, importSession } from './transfer.ts';
 import { project } from './context.ts';
-import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type ToolRegistry } from './tools.ts';
+import {
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+  selectTools,
+  type Executor,
+  type ToolDefinition,
+  type ToolFilter,
+  type ToolOutput,
+  type ToolRegistry,
+} from './tools.ts';
 import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 import {
   MAX_DECISION_QUESTIONS,
@@ -1315,7 +1323,10 @@ export interface HarnessFixture {
   readonly harness: Harness;
   /** harness 写日志用的存储，用例从这里读日志。 */
   readonly store: SessionStore;
-  /** 一个能跑的 agent：模型按剧本回答（流式和非流式都要支持），工具里有回显工具。 */
+  /**
+   * 一个能跑的 agent：模型按剧本回答（流式和非流式都要支持），工具里有回显工具：`inputSchema` 要求 `text` 是字符串
+   * （`{ type: 'object', properties: { text: { type: 'string' } } }`，别的键不限），结果里原样带着输入。
+   */
   readonly agent: AgentSpec;
 }
 
@@ -1367,7 +1378,40 @@ export const HARNESS_LEVELS: readonly HarnessLevel[] = ['trace', 'execute', 'res
 export interface HarnessContractOptions {
   /** 跑哪几级，缺省全部。参考实现全过；适配器按自己做到的跑，并在文档里写明。 */
   readonly levels?: readonly HarnessLevel[];
+  /**
+   * 被测的 harness 一次工具结果最多留多少字符，缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`。`execute` 级回显一个比它长的输入，
+   * 查日志里的结果截到了它以内（另留一千字符给说明）。
+   */
+  readonly maxToolOutputChars?: number;
 }
+
+/** 日志里的工具结果，按顺序。 */
+function toolResults(entries: readonly Entry[]): { id: string; output: ToolOutput }[] {
+  return entries.flatMap((entry) =>
+    entry.type === 'message' && entry.message.role === 'tool'
+      ? entry.message.content.flatMap((part) =>
+          part.type === 'tool-result' ? [{ id: part.id, output: part.output }] : [],
+        )
+      : [],
+  );
+}
+
+/** 工具结果里给模型看的文字：错误信息、序列化的 `json`、`content` 各段（内联文件的数据也算）连起来。 */
+function outputText(output: ToolOutput): string {
+  if (output.type === 'text') return output.text;
+  if (output.type === 'error') return output.message;
+  if (output.type === 'json') return JSON.stringify(output.value) ?? 'null';
+  return output.parts
+    .map((part) => {
+      if (part.type === 'text') return part.text;
+      if (part.data.type === 'data') return part.data.data;
+      return part.data.type === 'text' ? part.data.text : '';
+    })
+    .join('');
+}
+
+/** 截断时给说明留的字符数。 */
+const TRUNCATION_NOTE_CHARS = 1_000;
 
 export function describeHarnessContract(
   name: string,
@@ -1378,6 +1422,10 @@ export function describeHarnessContract(
   const levels = new Set(options.levels ?? HARNESS_LEVELS);
   for (const level of levels) {
     if (!HARNESS_LEVELS.includes(level)) throw new Error(`Unknown harness level "${level}".`);
+  }
+  const maxToolOutputChars = options.maxToolOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
+  if (!Number.isSafeInteger(maxToolOutputChars) || maxToolOutputChars <= 0) {
+    throw new Error(`maxToolOutputChars must be a positive integer, got ${String(options.maxToolOutputChars)}.`);
   }
   const atLevel = (level: HarnessLevel, title: string, fn: () => Promise<void>): void => {
     if (levels.has(level)) test(`[${level}] ${title}`, fn);
@@ -1478,6 +1526,76 @@ export function describeHarnessContract(
       ]);
       const tool = log.find((entry) => entry.type === 'message' && entry.message.role === 'tool');
       assert.ok(JSON.stringify(tool).includes(text), '工具结果在日志里');
+    });
+
+    atLevel(
+      'execute',
+      '工具输入不合 inputSchema：不执行，问题作为 { type: "error" } 回给模型；改对了再调照常执行',
+      async () => {
+        const text = randomMarker();
+        const { harness, store, agent } = await factory({
+          script: [
+            { type: 'tool-call', id: 'call-1', input: { text: 42 } },
+            { type: 'tool-call', id: 'call-2', input: { text } },
+            { type: 'text', text: '好了' },
+          ],
+        });
+        const result = await harness.run({ session: 's', agent: { ...agent, maxSteps: 4 }, input: '回显一下' });
+        assert.equal(result.text, '好了');
+        assert.equal(result.stopReason, 'end_turn');
+        const log = await store.list('s');
+        assert.deepEqual(kinds(log), [
+          CTX_EVENTS.runStarted,
+          'user',
+          'assistant',
+          'tool',
+          'assistant',
+          'tool',
+          'assistant',
+          CTX_EVENTS.runEnded,
+        ]);
+        const [invalid, valid] = toolResults(log);
+        assert.ok(invalid && valid, '两次调用都有结果');
+        assert.equal(invalid.id, 'call-1');
+        assert.equal(invalid.output.type, 'error', '回显工具不会回错误：这是执行前拦下的');
+        assert.ok(outputText(invalid.output).length > 0, '说明哪里不对');
+        assert.equal(valid.id, 'call-2');
+        assert.notEqual(valid.output.type, 'error');
+        assert.ok(outputText(valid.output).includes(text), '改对了的照常回显');
+      },
+    );
+
+    atLevel('execute', '工具结果超过上限：截到上限以内并注明省略了多少，模型拿到截过的结果接着跑', async () => {
+      const marker = randomMarker();
+      // 回显的结果比上限长得多；填充用的 `x` 里没有数字，截过的结果里有数字就是说明里省略了多少。
+      const text = `${marker}${'x'.repeat(maxToolOutputChars + 4 * TRUNCATION_NOTE_CHARS)}`;
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'tool-call', id: 'call-1', input: { text } },
+          { type: 'text', text: '好了' },
+        ],
+      });
+      const result = await harness.run({ session: 's', agent, input: '回显一个很长的' });
+      assert.equal(result.text, '好了');
+      assert.equal(result.stopReason, 'end_turn');
+      const log = await store.list('s');
+      assert.deepEqual(kinds(log), [
+        CTX_EVENTS.runStarted,
+        'user',
+        'assistant',
+        'tool',
+        'assistant',
+        CTX_EVENTS.runEnded,
+      ]);
+      const [cut] = toolResults(log);
+      assert.ok(cut, '日志里有工具结果');
+      const shown = outputText(cut.output);
+      assert.ok(
+        shown.length <= maxToolOutputChars + TRUNCATION_NOTE_CHARS,
+        `结果有 ${shown.length} 个字符，上限 ${maxToolOutputChars}`,
+      );
+      assert.ok(shown.includes(marker), '截的是回显的结果，不是换成别的');
+      assert.match(shown.replace(marker, ''), /\d/, '注明省略了多少');
     });
 
     atLevel(
