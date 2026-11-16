@@ -500,7 +500,7 @@ interface RunRequest {
   runId?: string; // 不给就生成
   signal?: AbortSignal;
 }
-type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'aborted' | 'error';
+type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'requires_action' | 'aborted' | 'error';
 interface Usage {
   inputTokens?: number; // 含缓存读到的和写进缓存的
   outputTokens?: number;
@@ -525,6 +525,7 @@ interface RunResult {
   recorded: readonly Entry[];
   stopReason: StopReason;
   usage?: Usage;
+  pending?: readonly ToolCall[]; // stopReason 是 requires_action 时，等着别处执行的调用
   error?: ErrorInfo; // stopReason 是 error 时；上游 HTTP 接口出错时带 statusCode 和 responseBody；上下文过长时 type 是 context_overflow
 }
 type RunEvent =
@@ -560,6 +561,7 @@ interface Harness {
 - 一轮里 harness 做的事：`ctx.run.started` → 记输入 → `ContextBuilder.build` →（配了 `context.overflow` 时）超窗检查 → 调模型 → 对每个工具调用：`beforeTool` → 找到绑定的执行环境 → `execute` → `afterTool` → 工具结果回到模型，直到停下 → `ctx.run.ended`。
 - **每一步即时落日志。** 产出不等这一轮结束：模型这一步要调工具时，调用（助手消息）在工具执行之前写下；步骤结束时写这一步剩下的（工具结果，或者没有工具调用时的助手消息）；最后写 `ctx.run.ended`。每次写入都带 `expectSeq`。所以进程在任何时刻崩掉，日志里都有已经做完的步骤，至少有「调用已发出、结果未知」。这一轮半路结束（出错、被取消）时，已经写下的步骤留着；写下了调用、还没等到结果的工具调用先补一条错误结果，再写 `ctx.error` 和 `ctx.run.ended`。
 - 模型出错、被取消也写 `ctx.run.ended`，`run` 照常返回，`stopReason` 和 `error` 说明原因；只有写日志本身失败才 reject。远端调用方因此总拿到同一种形状。
+- **工具调用经日志往返（[ADR 0008](adr/0008-tool-calls-through-the-log.md)）。** 绑定到「外部执行环境」的工具（由 harness 的实现配置，参考实现是 `createHarness({ external })`）交给模型，但不在 harness 这一侧执行：模型调用了它们，这一轮写下调用后以 `requires_action` 结束，`pending` 列出这些调用，不占会话。执行方追加结果：`toolResultEntry(call, output)` 是一条 `tool` 消息，带幂等键 `ctx.tool-result:<id>`（`TOOL_RESULT_KEY_PREFIX`），同一次调用只记一条。结果齐了以后，下一轮不带输入接着跑。`pendingToolCalls(entries)` 是纯函数，给出等待中的调用（`PendingToolCall`：`call`、`runId`、带调用的条目的 `seq`）：以 `requires_action` 结束的那一轮留下的，去掉后面已经追加了结果的；之后又有运行以别的原因结束，之前等着的就作废。结果一直不来时由应用决定：照常提交下一轮，投影给缺结果的调用补一条「没有记录到结果」。
 - **超窗兜底（`AgentSpec.context.overflow`，缺省关着）。** `build` 之后 harness 估算整次调用（`PreparedCall.tokens`；builder 不给时用 `estimateTokens`、`estimateTextTokens` 自己算指令、消息和交给模型的工具定义），不超过 `maxTokens` 就照常往下走。超了按 `strategy`：
   1. `compact`（缺省）：调 `ContextBuilder.compact`（参数取 `overflow.compact`，`keep` 至少按 1 算——这一轮刚记下的输入不进摘要），写下了摘要就重新 `build`。摘要模型用 builder 配的；builder 没配时用这一轮的模型，所以配置里不带模型名，远端的调用方不能借它指定任意模型。builder 没有 `compact`、压缩没做成（记一条告警）、压完还超，都接着走下一步。不写日志的运行（`record: false`）跳过这一步：压缩要追加摘要，而它一条都不该写。
   2. 裁剪（`compact` 的下一步，或者 `strategy: 'trim'` 直接到这里）：带着 `window: { ...agent.window, maxTokens, truncate: true }` 重新 `build`，从最旧的消息丢起，单条消息超预算时截短。什么都不写。

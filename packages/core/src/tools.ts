@@ -55,7 +55,15 @@ export interface ToolSetOptions {
   readonly validateInput?: boolean | ((definition: ToolDefinition) => boolean);
   /** 结果超过这么多字符时截断并注明（`limitToolOutput`），缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`；0 或 Infinity 不限。 */
   readonly maxOutputChars?: number;
+  /**
+   * 不在这里执行的工具：交给模型的定义照旧，但不带 `execute`，模型调用它时 AI SDK 停下这一轮，调用留给别处执行
+   * （harness 以 `requires_action` 结束）。
+   */
+  readonly external?: (definition: ToolDefinition) => boolean;
 }
+
+/** 不在这里执行的工具的输出结构：别处执行，结果经日志回来，这里不校验。 */
+const EXTERNAL_OUTPUT = jsonSchema({});
 
 /**
  * 工具结果长度的兜底，20 万字符（大约 5 万到 20 万 token）。该截断、分页的是执行环境，它知道怎么截才有用；
@@ -97,6 +105,15 @@ export function toToolSet(
   const maxOutputChars = options.maxOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
   const out: ToolSet = {};
   for (const definition of definitions) {
+    if (options.external?.(definition)) {
+      out[definition.name] = dynamicTool({
+        ...(definition.description !== undefined ? { description: definition.description } : {}),
+        inputSchema: jsonSchema(definition.inputSchema as Parameters<typeof jsonSchema>[0]),
+        outputSchema: EXTERNAL_OUTPUT,
+        toModelOutput: ({ output }) => toolOutputToAiSdk(output as ToolOutput) as ToolResultPart['output'],
+      });
+      continue;
+    }
     out[definition.name] = dynamicTool({
       ...(definition.description !== undefined ? { description: definition.description } : {}),
       inputSchema: jsonSchema(definition.inputSchema as Parameters<typeof jsonSchema>[0]),

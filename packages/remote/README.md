@@ -163,6 +163,8 @@ await orchestrator.close(); // 只关这个客户端
   });
   ```
 
+- **长任务走编排器，不走 `POST /runs`**。同步的 `POST /runs` 在客户端断开时会中止这一轮：跑几十分钟的任务过不了带空闲超时、又会吃掉心跳的代理。长任务用 `POST /orchestrator/runs` 提交，`done` 靠 `GET /orchestrator/runs/:id?wait=` 的长轮询拿结果，断了重连不影响服务端那一轮。
+- **在内网的执行环境**。执行环境只能出站连接时，不要把它挂成服务端的 `executors`：让 harness 把它列进 `external`（[ADR 0008](../../docs/adr/0008-tool-calls-through-the-log.md)），内网的 worker 用 `createRemoteSessionStore` 连过来，`runPendingTools` 执行等待中的调用、把结果追加回会话。
 - **重试**。`retry: { retries?, minDelayMs?, maxDelayMs? }`（缺省 4 次，200 毫秒起每次翻倍、带抖动，最多 5 秒）。连不上、连接中途断了、服务端回 429/502/503/504 时重试，只用在重试了也不会多做一遍的请求上：所有 `GET`、会话的 `append`、两个取消、`watch` 的重连、编排器的 `done`。提交运行、执行工具、记忆的写入不重试。
 - **`append` 重试后的返回值**。第一次其实写成功、只是响应丢了的条目，重试时会被存储按 `id` 去重跳过；客户端从会话末尾（最近 200 条）把它们找回来放进返回值。带 `expectSeq` 的一批重试时得到的冲突，如果自己的条目已经在了，算成功，不抛 `conflict`。
 - **比客户端新的条目**。服务端先升级、条目的 `v` 比这个客户端认识的高时，`list`、`watch`、`append` 的返回值缺省抛 `unsupported_version`；`unreadable: 'placeholder'` 时那一条换成 `ctx.unreadable` 事件，其余照常（见[协议层](../../docs/protocol.md#会话-sessionstore)）。

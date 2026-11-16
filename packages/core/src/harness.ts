@@ -99,6 +99,12 @@ export interface HarnessOptions {
    * 0 或 Infinity 不限。
    */
   readonly maxToolOutputChars?: number;
+  /**
+   * 在别处执行的执行环境的名字：绑定到它们的工具交给模型，但不在这里执行。模型调用了它们，这一轮写下调用后以
+   * `requires_action` 结束（`RunResult.pending`），不占会话；执行方把结果追加进日志（`toolResultEntry`，
+   * 或 `runPendingTools`），下一轮不带输入接着跑。这里列了的名字，不给 `executors` 也不告警。
+   */
+  readonly external?: readonly string[];
 }
 
 /** `createContext` 用的额外开关，不在协议里。 */
@@ -189,6 +195,21 @@ interface Produced {
   readonly finishReason: FinishReason;
   readonly steps: number;
   readonly usage: LanguageModelUsage | undefined;
+  /** 最后一步里没有结果的工具调用：交给别处执行的。 */
+  readonly pending: readonly ToolCall[];
+}
+
+/** 一步的内容里有调用、没有结果的工具调用（服务商执行的不算）。 */
+function pendingOf(content: ReadonlyArray<ContentPart<ToolSet>> | undefined): ToolCall[] {
+  if (!content) return [];
+  const answered = new Set(
+    content.flatMap((part) => (part.type === 'tool-result' || part.type === 'tool-error' ? [part.toolCallId] : [])),
+  );
+  return content.flatMap((part) =>
+    part.type === 'tool-call' && part.providerExecuted !== true && !answered.has(part.toolCallId)
+      ? [{ id: part.toolCallId, name: part.toolName, input: (part.input ?? null) as ToolCall['input'] }]
+      : [],
+  );
 }
 
 /**
@@ -416,6 +437,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   const { store, context, tools, hooks = {} } = options;
   const logger = options.logger ?? silentLogger;
   const executors = executorMap(options.executors);
+  const external = new Set(options.external ?? []);
   if (hasExecutor(tools) && !executors.has(tools.executor.name)) executors.set(tools.executor.name, tools.executor);
   const base = dispatchTo([...executors.values()]);
   /** `addTool` 加进注册表的工具自己校验输入。 */
@@ -433,7 +455,9 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   function warnMissingExecutors(definitions: readonly ToolDefinition[]): void {
     const missing = new Map<string, string[]>();
     for (const definition of definitions) {
-      if (executors.has(definition.executor) || warned.has(definition.executor)) continue;
+      if (executors.has(definition.executor) || external.has(definition.executor) || warned.has(definition.executor)) {
+        continue;
+      }
       missing.set(definition.executor, [...(missing.get(definition.executor) ?? []), definition.name]);
     }
     for (const [name, toolNames] of missing) {
@@ -718,6 +742,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         dispatch,
         validateInput: options.validateToolInput ?? ((definition) => !selfValidated(definition.name)),
         ...(options.maxToolOutputChars !== undefined ? { maxOutputChars: options.maxToolOutputChars } : {}),
+        ...(external.size > 0 ? { external: (definition: ToolDefinition) => external.has(definition.executor) } : {}),
       }),
       toolCount: definitions.length,
       maxSteps: agent.maxSteps ?? (definitions.length > 0 ? 5 : 1),
@@ -864,7 +889,9 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     await state.writing;
     if (state.stepError !== undefined) return fail(state, state.stepError, signal);
     const messages = [...produced.messages];
-    const stopReason = stopReasonOf(produced.finishReason, produced.steps, ready.maxSteps);
+    const { pending } = produced;
+    const stopReason =
+      pending.length > 0 ? 'requires_action' : stopReasonOf(produced.finishReason, produced.steps, ready.maxSteps);
     const usage = usageOf(produced.usage);
     await write(state, [
       ...messages.slice(state.logged).map((message) => messageEntry(message, { source: 'model' })),
@@ -877,6 +904,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       recorded: state.recorded,
       stopReason,
       ...(usage ? { usage } : {}),
+      ...(pending.length > 0 ? { pending } : {}),
     };
   }
 
@@ -1000,6 +1028,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
           finishReason: raw.finishReason,
           steps: raw.steps.length,
           usage: raw.usage,
+          pending: pendingOf(raw.steps.at(-1)?.content),
         },
         controller.signal,
       );
@@ -1100,6 +1129,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
               finishReason: event.finishReason,
               steps: event.steps.length,
               usage: event.totalUsage,
+              pending: pendingOf(event.steps.at(-1)?.content),
             },
             controller.signal,
           ),

@@ -43,6 +43,7 @@ export {
   type OrchestratorOptions,
 } from './orchestrator.ts';
 export { pruneSession, type PruneOptions } from './retention.ts';
+export { runPendingTools, type PendingToolsResult, type RunPendingToolsOptions } from './pending.ts';
 export * from './errors.ts';
 export * from './context.ts';
 export {

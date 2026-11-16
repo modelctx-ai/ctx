@@ -2,7 +2,7 @@ import type { LanguageModel } from 'ai';
 
 import type { Message, MessageContent } from './message.ts';
 import type { ContextSpec, PreparedCall, WindowOptions } from './context.ts';
-import type { Entry } from './session.ts';
+import { CTX_EVENTS, messageEntry, type Entry, type EntryOptions, type NewMessageEntry } from './session.ts';
 import type { ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
 import type { Awaitable, ErrorInfo, JsonObject, JsonValue } from './types.ts';
 
@@ -98,9 +98,10 @@ export interface RunRequest {
 
 /**
  * 一轮为什么停：`end_turn` 模型自己停下，`max_steps` 到了步数上限，`max_tokens` 输出被 `maxOutputTokens` 截断，
+ * `requires_action` 留下了要在别处执行的工具调用（`RunResult.pending`），等结果追加进日志后不带输入再跑一轮接着走，
  * `aborted` 被取消，`error` 出错。
  */
-export type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'aborted' | 'error';
+export type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'requires_action' | 'aborted' | 'error';
 
 /** token 用量。服务商不给的项就没有，缓存和推理三项是 0 时也不写；各服务商的字段怎么映射过来，没有对真实服务验证。 */
 export interface Usage {
@@ -150,6 +151,8 @@ export interface RunResult {
   readonly recorded: readonly Entry[];
   readonly stopReason: StopReason;
   readonly usage?: Usage;
+  /** `stopReason` 是 `requires_action` 时，等着别处执行、还没有结果的工具调用。 */
+  readonly pending?: readonly ToolCall[];
   /** `stopReason` 是 `error` 时的原因。 */
   readonly error?: ErrorInfo;
 }
@@ -215,4 +218,65 @@ export interface Hooks {
 export interface Harness {
   run(request: RunRequest): Promise<RunResult>;
   stream?(request: RunRequest): AsyncIterable<RunEvent>;
+}
+
+/** 等着别处执行的一次工具调用：哪一轮留下的，调用写在哪条条目里。 */
+export interface PendingToolCall {
+  readonly call: ToolCall;
+  readonly runId: string;
+  /** 带这次调用的助手消息的 `seq`。 */
+  readonly seq: number;
+}
+
+/**
+ * 会话里等着别处执行、还没有结果的工具调用：以 `requires_action` 结束的那一轮留下的调用，去掉后面已经追加了结果的。
+ * 之后又有运行以别的原因结束（结果没等来，下一轮照常跑了），之前留下的就不再算等待中。条目按 `seq` 排好。
+ * 服务商执行的调用不算。
+ */
+export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
+  let open = new Map<string, PendingToolCall>();
+  let run: { runId: string; calls: Map<string, PendingToolCall> } | undefined;
+  for (const entry of entries) {
+    if (entry.type === 'event' && (entry.kind === CTX_EVENTS.runStarted || entry.kind === CTX_EVENTS.runEnded)) {
+      const data = (entry.data ?? {}) as { runId?: unknown; stopReason?: unknown };
+      if (typeof data.runId !== 'string') continue;
+      if (entry.kind === CTX_EVENTS.runStarted) {
+        run = { runId: data.runId, calls: new Map() };
+        continue;
+      }
+      // 这一轮停下来等结果：它留下的调用等待中；别的结束方式让之前等着的都作废。
+      open = data.stopReason === 'requires_action' && run?.runId === data.runId ? new Map(run.calls) : new Map();
+      run = undefined;
+      continue;
+    }
+    if (entry.type !== 'message' || typeof entry.message.content === 'string') continue;
+    for (const part of entry.message.content) {
+      if (part.type === 'tool-call' && part.providerExecuted !== true && run) {
+        run.calls.set(part.id, {
+          call: { id: part.id, name: part.name, input: part.input },
+          runId: run.runId,
+          seq: entry.seq,
+        });
+      } else if (part.type === 'tool-result') {
+        open.delete(part.id);
+        run?.calls.delete(part.id);
+      }
+    }
+  }
+  return [...open.values()];
+}
+
+/** `toolResultEntry` 用的幂等键前缀：同一次调用的结果只记一次，两个 worker 都执行了也只留先到的。 */
+export const TOOL_RESULT_KEY_PREFIX = 'ctx.tool-result:';
+
+/** 别处执行完一次工具调用，追加回会话的 `tool` 消息。带幂等键 `ctx.tool-result:<id>`。 */
+export function toolResultEntry(
+  call: Pick<ToolCall, 'id' | 'name'>,
+  output: ToolOutput,
+  options: EntryOptions = {},
+): NewMessageEntry {
+  return messageEntry(
+    { role: 'tool', content: [{ type: 'tool-result', id: call.id, name: call.name, output }] },
+    { key: `${TOOL_RESULT_KEY_PREFIX}${call.id}`, ...options },
+  );
 }

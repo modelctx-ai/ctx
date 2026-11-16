@@ -4,6 +4,8 @@
 
 ## 2026-11-16
 
+- **新增** [ADR 0008](adr/0008-tool-calls-through-the-log.md)：工具调用经日志往返（#21）。等待态是 `StopReason` 的 `requires_action`，结果是带幂等键的 `tool` 消息，走这条路的工具由 harness 的 `external` 名单决定（为什么不按「没有实例」、不在 `ToolDefinition` 上标注），三个待定问题的答案，代价，还没做的两件。[ADR 索引](adr/index.md)跟上。
+- **更新** [协议层](protocol.md)的 Harness 一节加「工具调用经日志往返」，`StopReason`、`RunResult.pending` 跟上；[架构](architecture.md)写 `external`、`runPendingTools` 怎么做；[概念](concepts.md)术语表加「等待外部执行 `requires_action`」。[ctx](../packages/core/README.md) 加「工具在别处执行」一节和导出，[ctx-protocol](../packages/protocol/README.md) 的纯函数表加三项，[ctx-remote](../packages/remote/README.md) 的「长请求和断线」写明长任务走编排器、内网的执行环境怎么接。
 - **新增** [ctx-otel](../packages/otel/README.md)：安装、用法（编排器的事件驱动 `traceSession`）、span 和属性表、导出。[架构](architecture.md)加「追踪」一节，写 span 怎么从条目派生。
 - **更新** [ADR 0002](adr/0002-packages.md)：拆分和依赖关系两张表加 `ctx-otel`，「实施状态」的包数改成十个，「决定记录」记下为什么单独成包、`@opentelemetry/api` 为什么是 peer。[文档索引](index.md)的「包」、根目录 README 的包表和 `overrides`、[实践：yoyo](repos.md)的产物表跟上；`AGENTS.md` 的包数跟上。
 - **更新** [协议层](protocol.md)的 Harness 一节（[#46](https://github.com/modelctx-ai/ctx/issues/46)）：`Usage` 加缓存读写和推理三项，新写 `StepMeta` 和「用量」一条；`RunEvent` 加 `reasoning.delta` 和三个对齐点的 `seq`。[架构](architecture.md)写每一步的 `meta.step` 取哪些字段、`model.ended` 等写完再发。[概念](concepts.md)术语表加「步骤元数据 `meta.step`」「对齐点 `seq`（流）」。[ctx-protocol](../packages/protocol/README.md) 的纯函数表加 `stepMetaOf`。
