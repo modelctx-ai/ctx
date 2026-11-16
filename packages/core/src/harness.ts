@@ -14,6 +14,7 @@ import {
   errorOutput,
   messageEntry,
   runEndedEntry,
+  runParentProblem,
   runStartedEntry,
   silentLogger,
   toolPermission,
@@ -27,6 +28,7 @@ import {
   type Executor,
   type Harness,
   type Hooks,
+  type InheritSpec,
   type JsonObject,
   type JsonValue,
   type RunBudget,
@@ -248,6 +250,19 @@ function checkAgentExtras(agent: RunRequest['agent'], offered: readonly string[]
   }
   if (output !== undefined && (typeof output.schema !== 'object' || output.schema === null)) {
     throw new CtxError('invalid_request', 'AgentSpec.output.schema must be a JSON Schema object.');
+  }
+}
+
+/** `RunRequest.parent` 和 `AgentSpec.context.inherit` 的形状。在 `build` 之前查：`inherit` 不对就不该去读别的会话。 */
+function checkLineage(parent: RunRequest['parent'], inherit: InheritSpec | undefined): void {
+  const problem = runParentProblem(parent);
+  if (problem !== undefined) throw new CtxError('invalid_request', `${problem}.`);
+  if (inherit === undefined) return;
+  if (typeof inherit.session !== 'string' || inherit.session === '') {
+    throw new CtxError('invalid_request', 'AgentSpec.context.inherit.session must be a non-empty string.');
+  }
+  if (inherit.upTo !== undefined && (!Number.isInteger(inherit.upTo) || inherit.upTo < 0)) {
+    throw new CtxError('invalid_request', 'AgentSpec.context.inherit.upTo must be a non-negative integer (a seq).');
   }
 }
 
@@ -634,6 +649,10 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         runId: state.runId,
         agent: agentSpecToJson(agent),
         ...(state.request.owner !== undefined ? { owner: state.request.owner } : {}),
+        // 形状不对的不记；`setup` 随后以 `invalid_request` 结束这一轮。
+        ...(state.request.parent !== undefined && runParentProblem(state.request.parent) === undefined
+          ? { parent: { ...state.request.parent } }
+          : {}),
       },
       { source: 'harness' },
     );
@@ -795,8 +814,10 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
             ? { facts: extras.facts }
             : {}),
       ...(agent.context?.projection !== undefined ? { projection: agent.context.projection } : {}),
+      ...(agent.context?.inherit !== undefined ? { inherit: agent.context.inherit } : {}),
       signal,
     };
+    checkLineage(request.parent, agent.context?.inherit);
     let prepared = await context.build(building);
     const overflow = agent.context?.overflow;
     if (overflow) prepared = await fit(prepared, building, overflow, state.record, model, signal);

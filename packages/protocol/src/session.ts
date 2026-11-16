@@ -1,5 +1,5 @@
 import type { Message, MessageContent } from './message.ts';
-import type { StopReason, Usage } from './harness.ts';
+import type { RunParent, StopReason, Usage } from './harness.ts';
 import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 
 interface EntryBase {
@@ -323,6 +323,8 @@ export interface RunStartedData {
   readonly agent: JsonObject;
   /** 这一轮属于哪个编排器实例（`createOrchestrator({ owner })`）；`recover` 只收同一个 `owner` 的运行。 */
   readonly owner?: string;
+  /** 这一轮是别的 agent 派来的（`RunRequest.parent`）。 */
+  readonly parent?: RunParent;
 }
 
 /** `ctx.run.ended` 的 `data`。崩溃恢复靠「有 started 没有 ended」找出断掉的运行。 */

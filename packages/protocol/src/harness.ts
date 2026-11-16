@@ -145,7 +145,32 @@ export interface RunRequest {
   readonly runId?: string;
   /** 写进 `ctx.run.started` 的 `owner`：这一轮属于哪个编排器实例，`recover` 据此只收自己的运行。编排器按自己的 `owner` 填。 */
   readonly owner?: string;
+  /** 这一轮是别的 agent 派来的：记进 `ctx.run.started`，回看子会话时知道它从哪来。见 `RunParent`。 */
+  readonly parent?: RunParent;
   readonly signal?: AbortSignal;
+}
+
+/**
+ * 子运行的来处：父会话、父运行，和父会话里派它的那次工具调用。父会话那一侧，那次调用的结果是 `ChildRunResult`
+ * （`childRunOutput`），两边各记一半，从哪边都找得到另一边。
+ */
+export interface RunParent {
+  readonly session: string;
+  readonly runId: string;
+  readonly toolCallId?: string;
+}
+
+/** `parent` 的形状不对时说明哪里不对，对就是 `undefined`。harness 和 remote 服务端用它校验。 */
+export function runParentProblem(parent: unknown): string | undefined {
+  if (parent === undefined) return undefined;
+  if (typeof parent !== 'object' || parent === null || Array.isArray(parent))
+    return 'RunRequest.parent must be an object';
+  const { session, runId, toolCallId } = parent as Record<string, unknown>;
+  if (typeof session !== 'string' || session === '') return 'RunRequest.parent.session must be a non-empty string';
+  if (typeof runId !== 'string' || runId === '') return 'RunRequest.parent.runId must be a non-empty string';
+  if (toolCallId !== undefined && typeof toolCallId !== 'string')
+    return 'RunRequest.parent.toolCallId must be a string';
+  return undefined;
 }
 
 /**
@@ -341,4 +366,111 @@ export function toolResultEntry(
     { role: 'tool', content: [{ type: 'tool-result', id: call.id, name: call.name, output }] },
     { key: `${TOOL_RESULT_KEY_PREFIX}${call.id}`, ...options },
   );
+}
+
+// ---- 父子运行 ----
+
+/** 一次子运行在哪：子会话和子运行的 `runId`。 */
+export interface ChildRunRef {
+  readonly session: string;
+  readonly runId: string;
+}
+
+/**
+ * 派子 agent 的那次工具调用的结果（JSON 输出的 `value`；子运行出错或被取消时是错误输出的 `data`）。`child` 指向子运行，
+ * 其余是子运行结果里能序列化、父 agent 用得上的部分。`usage` 是子运行自己的，不含它再派出去的。
+ */
+export interface ChildRunResult {
+  readonly child: ChildRunRef;
+  readonly stopReason: StopReason;
+  readonly text?: string;
+  readonly output?: JsonValue;
+  readonly usage?: Usage;
+  readonly error?: { readonly message: string; readonly type?: string };
+}
+
+/** 父会话那一侧的工具结果：子运行正常结束是 `json`，以 `error` 或 `aborted` 结束是 `error`，两种都带 `ChildRunResult`。 */
+export function childRunOutput(child: ChildRunRef, result: Omit<RunResult, 'messages' | 'recorded'>): ToolOutput {
+  const value: ChildRunResult = {
+    child: { session: child.session, runId: child.runId },
+    stopReason: result.stopReason,
+    ...(result.text !== '' ? { text: result.text } : {}),
+    ...(result.output !== undefined ? { output: result.output } : {}),
+    ...(result.usage !== undefined ? { usage: result.usage } : {}),
+    ...(result.error !== undefined
+      ? {
+          error: {
+            message: result.error.message,
+            ...(result.error.type !== undefined ? { type: result.error.type } : {}),
+          },
+        }
+      : {}),
+  };
+  if (result.stopReason !== 'error' && result.stopReason !== 'aborted') return { type: 'json', value: toJson(value) };
+  const reason = result.error?.message ?? result.stopReason;
+  return {
+    type: 'error',
+    message: `The subagent run in session "${child.session}" ended with ${result.stopReason}: ${reason}`,
+    data: toJson(value),
+  };
+}
+
+function toJson(value: ChildRunResult): JsonValue {
+  return value as unknown as JsonValue;
+}
+
+function childRunResultOf(value: unknown): ChildRunResult | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { child, stopReason } = value as { child?: unknown; stopReason?: unknown };
+  if (typeof child !== 'object' || child === null || typeof stopReason !== 'string') return undefined;
+  const { session, runId } = child as { session?: unknown; runId?: unknown };
+  if (typeof session !== 'string' || typeof runId !== 'string') return undefined;
+  return value as ChildRunResult;
+}
+
+/** 父会话里一次派出去的子运行：哪次工具调用、在哪条条目里，和那次调用记下的结果。 */
+export interface ChildRun extends ChildRunResult {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  /** 记下这个结果的 `tool` 消息的 `seq`。 */
+  readonly seq: number;
+}
+
+/** 父会话的条目里派出去的子运行，按出现的顺序。认的是 `childRunOutput` 的形状：`child.session`、`child.runId`、`stopReason`。 */
+export function childRunsOf(entries: readonly Entry[]): ChildRun[] {
+  const found: ChildRun[] = [];
+  for (const entry of entries) {
+    if (entry.type !== 'message' || typeof entry.message.content === 'string') continue;
+    for (const part of entry.message.content) {
+      if (part.type !== 'tool-result') continue;
+      const output = part.output;
+      const result = childRunResultOf(
+        output.type === 'json' ? output.value : output.type === 'error' ? output.data : undefined,
+      );
+      if (result) found.push({ ...result, toolCallId: part.id, toolName: part.name, seq: entry.seq });
+    }
+  }
+  return found;
+}
+
+const USAGE_KEYS = [
+  'inputTokens',
+  'outputTokens',
+  'totalTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+] as const;
+
+/** 把几份用量逐项加起来；哪一项都没有的就不写。父运行连同子运行的总用量：`addUsage(parent.usage, ...childRunsOf(entries).map((run) => run.usage))`。 */
+export function addUsage(...usages: readonly (Usage | undefined)[]): Usage {
+  const sum: Partial<Record<(typeof USAGE_KEYS)[number], number>> = {};
+  for (const usage of usages) {
+    if (!usage) continue;
+    for (const key of USAGE_KEYS) {
+      const value = usage[key];
+      if (typeof value === 'number') sum[key] = (sum[key] ?? 0) + value;
+    }
+  }
+  return sum;
 }

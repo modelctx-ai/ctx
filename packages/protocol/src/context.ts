@@ -437,6 +437,19 @@ export interface ContextSpec {
   readonly projection?: string;
   /** 整次调用超过模型窗口时怎么办；缺省不检查。见 `OverflowSpec`。 */
   readonly overflow?: OverflowSpec;
+  /** 把另一个会话（一般是父会话）的投影接在这个会话的历史前面。见 `InheritSpec`。 */
+  readonly inherit?: InheritSpec;
+}
+
+/**
+ * 子 agent 带着父会话的上下文：`build` 时先投影 `session` 里 `seq` 不超过 `upTo` 的条目，再接上本会话的历史。
+ * 只读不写，父会话之后的变化不影响已经写进子会话的东西。上下文怎么给子 agent（全新、一段摘要、父的投影）是应用的决定：
+ * 全新就是不给它，摘要就是写进子运行的输入。窗口先给本会话的历史，剩下的才给父会话，放不下时先丢父会话最旧的。
+ */
+export interface InheritSpec {
+  readonly session: string;
+  /** 只取到这个 `seq` 为止，缺省全部。派子 agent 时取那次工具调用之前，子 agent 不会看到一个没有结果的调用。 */
+  readonly upTo?: number;
 }
 
 /** 超窗之后压缩用的参数：`CompactOptions` 里能序列化的那几项。摘要模型不在这里选（见 `OverflowSpec.compact`）。 */
@@ -481,6 +494,8 @@ export interface BuildRequest {
   readonly facts?: boolean | FactsSpec;
   /** 投影配置名，缺省 `default`（来自 `AgentSpec.context.projection`）。不认识的名字以 `not_found` 失败。 */
   readonly projection?: string;
+  /** 接在历史前面的另一个会话的投影（来自 `AgentSpec.context.inherit`）。 */
+  readonly inherit?: InheritSpec;
   readonly signal?: AbortSignal;
 }
 

@@ -244,6 +244,32 @@ result.output; // 按 schema 解析过的回答；不合是 stopReason 'error'�
 - `deny` 的工具不执行，模型看到拒绝；`ask` 的写下调用后以 `requires_action` 停下，和外部执行的工具一样：应用确认了就 `runPendingTools(store, session, { executor })`，不确认就追加 `toolResultEntry(call, errorOutput('用户拒绝了'))`，再不带输入跑一轮。
 - `budget` 只在步骤之间检查，超了 `stopReason` 是 `max_budget`；正在进行的模型调用和工具不会被打断，硬上限用 `settings.timeoutMs`。
 
+### 子 agent
+
+一个 agent 把活交给另一个 agent：`createSubagentTool` 做一个工具，模型调用它就在子会话上跑一轮。子会话的 `ctx.run.started` 记下 `parent`，父会话的工具结果指向子会话：
+
+```ts
+import { childRunsOf, createSubagentTool } from '@modelctx-ai/ctx';
+
+const research = createSubagentTool({
+  name: 'research',
+  description: '把一个需要查资料的问题交给研究员',
+  runner: harness, // 或者编排器
+  agent: { model: 'deepseek-chat', instructions: '你是研究员。' },
+  context: 'inherit', // 带上父会话到这次调用之前的内容；缺省 'fresh'
+  store,
+});
+tools.executor.register(research.definition, research.execute);
+tools.add(tools.executor.definition('research')!);
+
+await harness.run({ session: 'user:42', agent, input: '帮我查查这个' });
+for (const run of childRunsOf(await store.list('user:42'))) console.log(run.child.session, run.stopReason, run.usage);
+```
+
+- 父运行取消时子运行跟着取消；经编排器派的，`cancel(父 runId)` 一并取消子运行。
+- 用量不自动往上加：`addUsage(result.usage, ...childRunsOf(entries).map((run) => run.usage))`。
+- 编排模式（路由、群聊、层级）不在这里，应用自己组合。
+
 ### 崩溃后续跑
 
 harness 每一步都即时写日志：工具调用在执行之前写下，结果在这一步结束时写下。进程在工具执行时被杀掉，日志里有已经做完的步骤和「调用已发出、结果未知」的那一次。下一个进程启动时 `recover()` 给结果未知的调用补一条错误结果，配了 `resume` 的再从日志接着跑：
@@ -298,11 +324,12 @@ await orchestrator.submit({ session: 'user:42', agent: agents.mailer, input: '�
 | `toToolSet(definitions, executors, { session?, runId?, dispatch?, validateInput?, maxOutputChars?, external? })`、`dispatchTo(executors)`、`DEFAULT_MAX_TOOL_OUTPUT_CHARS` | 定义包成 AI SDK `ToolSet`，`execute` 转给绑定的执行环境。执行前按 `inputSchema` 查输入，不合就不执行、把问题回给模型（`validateInput: false` 关掉，也可以给按定义决定的函数）；结果超过 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`，20 万字符）截断并注明                                                                                                                                                                                                   |
 | `createContextBuilder({ store, projection?, projections?, sources?, sourceTimeoutMs?, logger?, factsPlacement?, model?, models?, now? })`、`DEFAULT_COMPACT_INPUT_TOKENS`  | `ContextBuilder`：`build`、`view`、`compact`、`compactDetailed`，另加 `facts(session, signal?, { sources? })`、`recompact`。`compact` 按 `maxInputTokens`（缺省 `DEFAULT_COMPACT_INPUT_TOKENS`，24000 个估算 token）分段滚动摘要，每段落一个检查点；`now` 是压缩用的钟（认 `at` 在未来的条目、算 `timeoutMs`），缺省 `Date.now`                                                                                                                                         |
 | `createHarness({ store, context, tools?, executors?, external?, models?, hooks?, logger?, source?, validateToolInput?, maxToolOutputChars? })`                             | `Harness`：`run`、`stream`。后两个选项就是 `toToolSet` 的 `validateInput`、`maxOutputChars`；`external` 是在别处执行的执行环境的名字，绑定到它们的工具被调用时这一轮以 `requires_action` 结束                                                                                                                                                                                                                                                                           |
-| `createOrchestrator({ harness, store?, owner?, resume?, retainEnded?, logger? })`                                                                                          | `Orchestrator`：`submit`、`status`、`cancel`、`events`、`close`；给了 `store` 才有 `recover`，它给悬空的工具调用补错误结果、补 `ctx.run.ended`；`resume(run)` 返回 `AgentSpec` 时接着跑（`InterruptedRun`：`session`、`runId`、记下的 `agent`、`interrupted`）。结束的运行只留状态，最多 `retainEnded` 个（缺省 1000）                                                                                                                                                  |
+| `createOrchestrator({ harness, store?, owner?, resume?, retainEnded?, logger? })`                                                                                          | `Orchestrator`：`submit`、`status`、`cancel`、`events`、`close`；给了 `store` 才有 `recover`，它给悬空的工具调用补错误结果、补 `ctx.run.ended`；`resume(run)` 返回 `AgentSpec` 时接着跑（`InterruptedRun`：`session`、`runId`、记下的 `agent`、`interrupted`、子运行的 `parent`）；`cancel` 连带取消以它为 `parent` 的运行。结束的运行只留状态，最多 `retainEnded` 个（缺省 1000）                                                                                      |
 | `createContext(options)`                                                                                                                                                   | 门面：`append`、`entries`、`view`、`facts`、`prepare`、`generate`、`stream`、`compact`、`compactDetailed`，以及 `builder`、`executor`、`harness`                                                                                                                                                                                                                                                                                                                        |
 | `describeError`、`redact`、`errorInfo`、`isContextOverflowError`                                                                                                           | 给日志和界面用的错误摘要；去密钥；`RunResult.error` 的形状（上下文过长时 `type` 是 `context_overflow`）；判断一个错误是不是服务商说的「上下文过长」（按 HTTP 413 和常见的错误码、消息，没有对真实服务验证）                                                                                                                                                                                                                                                             |
 | `toModelMessages`、`fromModelMessages`（单条是 `toModelMessage`、`fromModelMessage`）、`toUserContent`、`fromUserContent`                                                  | ctx 的 `Message` 和 AI SDK 的 `ModelMessage`、`UserContent` 互转；遇到子集之外的部件抛 `unsupported_part`，harness 把这一轮以 `error` 结束。`createContext()` 仍收 AI SDK 的 `UserContent`，在边界上转                                                                                                                                                                                                                                                                  |
 | `runPendingTools(store, session, { executor, tools?, source?, maxOutputChars?, signal? })`、`RunPendingToolsOptions`、`PendingToolsResult`                                 | 执行方的一步（[ADR 0008](https://github.com/modelctx-ai/ctx/blob/main/docs/adr/0008-tool-calls-through-the-log.md)）：最后一轮以 `requires_action` 结束时，把归这个执行环境的等待中的调用逐个执行，结果作为 `toolResultEntry` 追加进会话；返回 `executed` 和 `remaining`                                                                                                                                                                                                |
+| `createSubagentTool({ name, runner, agent, session?, input?, context?, store?, inputSchema?, description? })`、`SubagentTool`、`SubagentToolOptions`、`SubagentContext`    | 派子 agent 的工具，返回 `{ definition, execute }`，注册进函数执行环境。子运行带 `parent`，结果是 `childRunOutput`；`runner` 是 `Harness` 时父的 `signal` 传下去，是 `Orchestrator` 时中止就 `cancel`；`context: 'inherit'` 设 `AgentSpec.context.inherit`，要给 `store`                                                                                                                                                                                                 |
 | `pruneSession(store, session, { keep?, maxAgeMs?, now?, pageSize? })`、`PruneOptions`                                                                                      | 保留期：删掉被生效的摘要盖住的历史（走 `truncate`），返回删掉的条数。`keep` 留最后写入的 N 条，`maxAgeMs` 留 `at` 在这段时间之内的，都不给就全删；有未结束的运行时不删到它。没有定时器，应用自己决定什么时候调（见[架构](https://github.com/modelctx-ai/ctx/blob/main/docs/architecture.md#删除和保留期)）                                                                                                                                                              |
 | `findLossySummaries(store, { session? })`、`recompactLossy(builder, finding, options)`                                                                                     | 升级后修复：列出 0.2 写的、有条目被新规则盖住的摘要，再用模型重新压缩一次（见[协议层](https://github.com/modelctx-ai/ctx/blob/main/docs/protocol.md#消息格式和版本)）                                                                                                                                                                                                                                                                                                   |
 | `tool`、`dynamicTool`、`jsonSchema`、`zodSchema`、`asSchema`、`stepCountIs`，`ModelMessage`、`LanguageModel`、`ToolSet` 等类型                                             | 从 `ai` 转出，应用不用单独依赖 `ai`                                                                                                                                                                                                                                                                                                                                                                                                                                     |

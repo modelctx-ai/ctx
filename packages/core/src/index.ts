@@ -44,6 +44,7 @@ export {
 } from './orchestrator.ts';
 export { pruneSession, type PruneOptions } from './retention.ts';
 export { runPendingTools, type PendingToolsResult, type RunPendingToolsOptions } from './pending.ts';
+export { createSubagentTool, type SubagentContext, type SubagentTool, type SubagentToolOptions } from './subagent.ts';
 export * from './errors.ts';
 export * from './context.ts';
 export {

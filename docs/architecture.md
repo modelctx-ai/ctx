@@ -523,6 +523,30 @@ for await (const event of harness.stream({
 
 `stream` 的事件：`run.started` → 每一步 `model.started`、`reasoning.delta`、`text.delta`、`tool.called`、`tool.returned`、`model.ended` → 出错时 `error` → `run.ended`（带去掉 `messages`、`recorded` 的结果）。调用方提前不读时取消模型调用，照样写 `ctx.run.ended`（`aborted`）。`model.ended` 等这一步写进日志再发，带上写到的 `seq`；`run.started`、`run.ended` 带 `ctx.run.started`、`ctx.run.ended` 的 `seq`。
 
+### 子 agent
+
+`createSubagentTool({ name, runner, agent, session?, input?, context?, store?, inputSchema?, description? })` 是派子 agent 的工具，返回 `{ definition, execute }`，注册进函数执行环境：
+
+```ts
+import { createSubagentTool } from '@modelctx-ai/ctx';
+
+const research = createSubagentTool({
+  name: 'research',
+  description: '把一个需要查资料的问题交给研究员',
+  runner: harness, // 或者编排器：子运行排进它的队列
+  agent: { model: 'deepseek-chat', instructions: '你是研究员。', tools: { names: ['web_search'] } },
+  context: 'inherit', // 带上父会话到这次调用之前的投影；缺省 'fresh'
+  store,
+});
+tools.executor.register(research.definition, research.execute);
+tools.add(tools.executor.definition('research')!);
+```
+
+- 模型调用它：子会话缺省是 `<父会话>/<工具名>/<调用 id>`，输入缺省取 `task`。先生成子运行的 `runId`，`parent` 是父会话、父 `runId` 和调用 id。`runner` 是 harness 就直接 `run`，带上工具调用的 `signal`，父运行取消时子运行跟着中止；是编排器就 `submit`，`signal` 中止时 `cancel(子 runId)`。
+- 结果是 `childRunOutput({ session, runId }, result)`。子运行以 `error` 或 `aborted` 结束时，模型看到一条错误；父会话的日志里，结果照样指向子会话。
+- `context: 'inherit'` 在 `store` 里找到带着这次调用的那条助手消息，取它前一个 `seq` 作 `inherit.upTo`：子 agent 看得到父会话到这里的投影，看不到那个还没有结果的调用。builder 先投影本会话（`reserve` 是指令、事实、工具、输入），再用剩下的窗口投影父会话，两段拼起来：父会话在前，本会话的摘要生效。
+- 子会话和父会话同名会排在自己后面，永远等不到，这时直接回错误。`agent.tools` 不限制时子 agent 也拿得到这个工具，要不要允许递归由应用的工具选择决定。
+
 ## 编排器
 
 `createOrchestrator({ harness, store?, owner?, resume?, retainEnded?, logger? })` 是进程内队列：每个会话一条队列，同一会话的运行串行，不同会话并行。
@@ -548,9 +572,9 @@ await orchestrator.close(); // 不再收新运行，等运行中的结束
 ```
 
 - 状态：`completed` 跑完；`failed` 是 `stopReason: 'error'` 或 harness 抛错（`done` 跟着 reject）；`cancelled` 是被 `cancel` 或请求的 `signal` 取消。
-- `cancel(runId)`：排队中的直接取消，`done` 给出 `stopReason: 'aborted'` 的空结果，不调 harness；运行中的中止传给 harness 的 `signal`。跑完的或不认识的返回 `false`。
+- `cancel(runId)`：排队中的直接取消，`done` 给出 `stopReason: 'aborted'` 的空结果，不调 harness；运行中的中止传给 harness 的 `signal`。跑完的或不认识的返回 `false`。先把这个编排器里 `request.parent.runId` 是它的运行（排队的、运行中的）一个个 `cancel`，子运行再往下传。
 - `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外）。找到断点的会话再读一次末尾、一次这一轮 `ctx.run.started` 之后的消息（`types: ['message']`），写下了调用、没有结果的工具调用（服务商执行的不算）补一条错误结果，和 `ctx.run.ended`（`stopReason: 'error'`）一批写，`source: 'orchestrator'`。
-- `resume(run)`：给了才续跑。`run` 带 `session`、`runId`、`ctx.run.started` 里记下的 `agent`（`agentSpecToJson` 的结果：模型只剩名字，请求头打了码，不能原样拿来跑）和补了结果的调用个数 `interrupted`；返回 `AgentSpec` 就在这个会话上 `submit` 一轮不带输入的运行，`RecoveredRun.resumed` 是它的 `runId`；返回 `undefined` 只结束不续跑。续跑的那一轮从日志接着走：做完的工具不再执行，结果未知的那次由模型看到错误结果后自己决定。
+- `resume(run)`：给了才续跑。`run` 带 `session`、`runId`、`ctx.run.started` 里记下的 `agent`（`agentSpecToJson` 的结果：模型只剩名字，请求头打了码，不能原样拿来跑）、补了结果的调用个数 `interrupted`，是子运行时还有 `ctx.run.started` 里的 `parent`；返回 `AgentSpec` 就在这个会话上 `submit` 一轮不带输入的运行，`RecoveredRun.resumed` 是它的 `runId`；返回 `undefined` 只结束不续跑。续跑的那一轮从日志接着走：做完的工具不再执行，结果未知的那次由模型看到错误结果后自己决定。
 - 结束的运行只留状态给 `status` 查，最多 `retainEnded` 个（缺省 1000），再多就从最早结束的开始忘，忘掉之后 `status` 返回 `undefined`；请求和结果在运行结束时就放手，常驻进程的内存不随运行数增长。留着状态的 `runId` 不能再 `submit`。
 - `owner`：写进每个运行的 `ctx.run.started`；`recover()` 只收 `owner` 相同的断点（都没配置也算相同），两个进程共用一个库时各配一个名字。写 `ctx.run.ended` 时带 `expectSeq`，读和写之间会话有新条目就跳过那个运行。
 - 用缺省 `record`（写日志）的应用，进程崩溃留下的未结束运行会让该会话一直 `session_busy`，所以启动时要先 `recover()` 再 `submit`；`record: false` 的运行不留生命周期事件，没有这个要求。harness 里同一会话最多一个未结束的运行（跨进程也成立；同一个 harness 实例内部先按会话排队，一个接一个，`session_busy` 只出现在跨进程或别的 harness 实例上，`record: false` 不排），每次写入带 `expectSeq`，被 `recover` 结束的运行在下一次写入时发现自己被围栏，以 `aborted` 停下、不再写 `ctx.run.ended`；运行中途会话被 `clear` 也一样（冲突后发现自己的 `ctx.run.started` 不在了），删掉的会话不会被这一轮的收尾写回来。`truncate`、`remove`、`redact` 追加的 `ctx.erased` 让这一轮的下一次写入必然冲突一次，harness 在冲突后把它和生命周期事件一起读（一次 `list`，`kinds` 多一项）：记录动了这一轮自己写的条目（`recorded` 里的 `seq`）就同样停下，动的是更早的历史或别人写的条目就换个末尾接着写。

@@ -4,6 +4,7 @@ import {
   isConflict,
   messageEntry,
   runEndedEntry,
+  runParentProblem,
   silentLogger,
   type AgentSpec,
   type Entry,
@@ -14,6 +15,7 @@ import {
   type OrchestratorEvent,
   type RecoveredRun,
   type RunHandle,
+  type RunParent,
   type RunRequest,
   type RunResult,
   type RunStatus,
@@ -30,6 +32,11 @@ export interface InterruptedRun {
   readonly agent: JsonObject;
   /** 补了错误结果的悬空工具调用有几个。 */
   readonly interrupted: number;
+  /**
+   * 它是别的 agent 派来的子运行（`ctx.run.started` 的 `parent`）。父运行多半也断了：父运行续跑时模型会重新决定派不派，
+   * 子运行单独续跑可能白做一遍，所以一般只续跑没有 `parent` 的。
+   */
+  readonly parent?: RunParent;
 }
 
 export interface OrchestratorOptions {
@@ -57,6 +64,12 @@ export interface OrchestratorOptions {
 
 export interface LocalOrchestrator extends Orchestrator {
   events(options?: { readonly signal?: AbortSignal }): AsyncIterable<OrchestratorEvent>;
+}
+
+/** `ctx.run.started` 里形状对的 `parent`。 */
+function parentOf(data: unknown): { parent?: RunParent } {
+  const parent = (data as { parent?: unknown } | undefined)?.parent;
+  return parent !== undefined && runParentProblem(parent) === undefined ? { parent: parent as RunParent } : {};
 }
 
 interface Run {
@@ -194,6 +207,10 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
     async cancel(runId) {
       const run = runs.get(runId);
       if (!run) return false;
+      // 取消沿着父子链往下传：这个编排器里以它为 `parent` 的运行一起取消。
+      for (const child of runs.values()) {
+        if (child.request.parent?.runId === runId && child.runId !== runId) await orchestrator.cancel(child.runId);
+      }
       if (run.status === 'queued') {
         emit(run, 'cancelled');
         run.done.resolve(skipped(run));
@@ -286,6 +303,7 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
             runId,
             agent: ((data as { agent?: unknown }).agent ?? {}) as JsonObject,
             interrupted: open.size,
+            ...parentOf(data),
           });
           if (agent === undefined || closed) {
             recovered.push({ session, runId });

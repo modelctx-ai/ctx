@@ -107,15 +107,15 @@ interface SessionStore {
 - 生效的摘要是 `covers` 最大的那条；`covers` 相同时 `seq` 大的（后写的）生效。
 - 事件 `kind` 用 `{domain}.{action}`。框架保留 `ctx.` 前缀，常量是 `CTX_EVENTS`：
 
-| `kind`            | 谁写          | `data`                                                                   |
-| ----------------- | ------------- | ------------------------------------------------------------------------ |
-| `ctx.run.started` | harness       | `RunStartedData`：`{ runId, agent }`，`agent` 是 `agentSpecToJson(spec)` |
-| `ctx.run.ended`   | harness       | `RunEndedData`：`{ runId, stopReason, usage? }`                          |
-| `ctx.compacted`   | 上下文        | `CompactedData`：`{ covers, summaryId }`                                 |
-| `ctx.error`       | harness、编排 | `CtxErrorData`：`{ runId?, message, type? }`                             |
-| `ctx.unreadable`  | （不写入）    | `UnreadableData`：`{ v?, type?, error: { type, message } }`，见下面      |
-| `ctx.erased`      | 存储          | `ErasedData`：`{ op, upTo?, seqs?, count }`，见[擦除](#擦除)             |
-| `ctx.redacted`    | 存储          | `RedactedData`：`{ type?, role? }`，被涂改的条目留下的占位               |
+| `kind`            | 谁写          | `data`                                                                                    |
+| ----------------- | ------------- | ----------------------------------------------------------------------------------------- |
+| `ctx.run.started` | harness       | `RunStartedData`：`{ runId, agent, owner?, parent? }`，`agent` 是 `agentSpecToJson(spec)` |
+| `ctx.run.ended`   | harness       | `RunEndedData`：`{ runId, stopReason, usage? }`                                           |
+| `ctx.compacted`   | 上下文        | `CompactedData`：`{ covers, summaryId }`                                                  |
+| `ctx.error`       | harness、编排 | `CtxErrorData`：`{ runId?, message, type? }`                                              |
+| `ctx.unreadable`  | （不写入）    | `UnreadableData`：`{ v?, type?, error: { type, message } }`，见下面                       |
+| `ctx.erased`      | 存储          | `ErasedData`：`{ op, upTo?, seqs?, count }`，见[擦除](#擦除)                              |
+| `ctx.redacted`    | 存储          | `RedactedData`：`{ type?, role? }`，被涂改的条目留下的占位                                |
 
 这些事件缺省对模型不可见，和应用事件一样由投影规则决定要不要渲染。
 
@@ -496,6 +496,11 @@ interface ContextSpec {
   facts?: boolean | FactsSpec; // false 不收事实；缺省收
   projection?: string; // builder 里注册的投影配置名；缺省 default
   overflow?: OverflowSpec; // 整次调用超过模型窗口时怎么办；缺省不检查
+  inherit?: InheritSpec; // 把另一个会话（一般是父会话）的投影接在前面
+}
+interface InheritSpec {
+  session: string;
+  upTo?: number; // 只取到这个 seq，缺省全部
 }
 interface OverflowSpec {
   maxTokens: number; // 整次调用估算 token 的上限：模型的窗口减去留给输出的，再留余量
@@ -518,7 +523,14 @@ interface RunRequest {
   prompt?: MessageContent; // 临时的最后一条，不写日志
   record?: boolean; // 缺省写日志
   runId?: string; // 不给就生成
+  owner?: string; // 编排器实例名
+  parent?: RunParent; // 这一轮是别的 agent 派来的
   signal?: AbortSignal;
+}
+interface RunParent {
+  session: string; // 父会话
+  runId: string; // 父运行
+  toolCallId?: string; // 父会话里派它的那次工具调用
 }
 type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'max_budget' | 'requires_action' | 'aborted' | 'error';
 interface Usage {
@@ -607,6 +619,15 @@ interface Harness {
 - `text.delta`、`reasoning.delta` 不落日志，像 Managed Agents 的 event delta；其余事件各有对应的日志条目。`run.started`、`model.ended`、`run.ended` 带 `seq`，是流和日志对齐的点：发出它的时候日志已经写到这个 `seq`（`ctx.run.started`、这一步的最后一条、`ctx.run.ended`）。流断了，从最后收到的 `seq` 起 `watch(session, { after })` 或 `list({ after })` 接着读日志，不会漏也不会重；不写日志的运行没有 `seq`。
 - **用量。** `Usage` 的缓存和推理三项是可选的，服务商不给或者是 0 就没有（服务商没给明细时 AI SDK 的适配也常填 0，分不出来）；`inputTokens` 含缓存读到的和写进缓存的，算费用时按各家的价格分开算。整轮的合计在 `RunResult.usage` 和 `ctx.run.ended` 的 `usage`；每一步的在这一步助手消息的 `meta.step`（`StepMeta`，用 `stepMetaOf(entry)` 读），还带服务商响应里的模型标识——请求的是别名、走了回落时看得出实际用了哪个。价格表不在协议里：应用按 `provider`、`modelId` 和这几项自己算。各服务商的用量字段经 AI SDK 映射过来，**没有对真实服务验证**。
 - 纯函数：`modelName(model)` 把进程内模型记成 `<provider>/<modelId>`；`agentSpecToJson(spec)` 是写进 `ctx.run.started` 的可序列化部分。`settings.headers` 只留名字，值换成 `REDACTED_HEADER`（`[redacted]`）：请求头里常有凭证，而日志只追加、读得到会话的人都看得到。
+- **父子运行**（#48）。一个 agent 把活交给另一个 agent，是父运行里的一次工具调用在子会话上跑一轮。两边各记一半：
+  - 子会话：`RunRequest.parent`（父会话、父 `runId`、那次工具调用的 id）原样记进 `ctx.run.started` 的 `parent`。形状不对（`runParentProblem(parent)` 给出原因）时这一轮以 `invalid_request` 结束，`parent` 不记。
+  - 父会话：那次工具调用的结果是 `ChildRunResult`：`{ child: { session, runId }, stopReason, text?, output?, usage?, error? }`。`childRunOutput(child, result)` 生成它，子运行以 `error` 或 `aborted` 结束时是 `type: 'error'` 的输出、`ChildRunResult` 放在 `data`。`childRunsOf(entries)` 从父会话的条目里找出这些结果，回看父会话就找得到每个子会话。
+  - 用量不自动往上加：`RunResult.usage` 只是这一轮自己的，子运行的在 `ChildRunResult.usage`。要整棵树的就 `addUsage(parent.usage, ...childRunsOf(entries).map((run) => run.usage))`，再往下一层照样读子会话。
+  - 取消沿着链往下传：父运行被取消，它派出、还没结束的子运行跟着取消。进程内经工具调用的 `signal`；经编排器派的，`cancel(父 runId)` 一并取消以它为 `parent` 的运行（递归）。跨进程的取消靠执行方：拿着父的 `signal` 去调远端的 `cancel`。
+  - `recover` 仍然一个会话一个会话地收，`InterruptedRun.parent` 带上 `ctx.run.started` 里的 `parent`，续不续跑由 `resume` 决定：父运行多半也断了，父运行续跑时模型会重新决定派不派。
+  - 子 agent 的上下文是应用的决定：全新（缺省，子会话里只有它自己的），带一段摘要（写进子运行的输入），或者带父会话的投影（`AgentSpec.context.inherit`：`build` 时先投影 `inherit.session` 里 `seq` 不超过 `upTo` 的条目，再接本会话的历史；窗口先给本会话，放不下时先丢父会话最旧的）。`inherit` 只读不写，形状不对是 `invalid_request`。
+  - 进程级的 harness（Claude Code、dsh 这类）自己起子代理时，适配器把子代理的轨迹写进子会话、带同样的 `parent`，父会话那一侧写 `ChildRunResult`，回看时和进程内派的一样。
+  - 不做的：编排模式（路由、群聊、层级）是应用的事，协议只约定父子关系怎么记。
 - `Hooks` 是 harness 实现的构造参数，不在 `RunRequest` 里：它们是函数，不能跨边界。
 - 权限确认是 `beforeTool` 的一种实现：返回 `{ allow: false }` 时工具结果是一条错误，模型会看到原因，这一轮继续。
 - 参考实现基于 AI SDK 的 `generateText` / `streamText`：把选中的 `ToolDefinition` 包成 AI SDK 工具，`execute` 转给执行环境。
@@ -648,6 +669,7 @@ interface RecoveredRun {
 
 - `completed` 是跑完了；`failed` 是 `stopReason: error` 或 harness 抛错；`cancelled` 是被 `cancel` 或 `signal` 取消（被围栏停下的运行也是 `aborted`，算 `cancelled`）。
 - `owner`：`createOrchestrator({ owner })` 是部署者给的稳定实例名（例如 `yoyo`），写进每个运行的 `ctx.run.started`。`recover()` 只处理 `owner` 与自己相同的断掉的运行（都没配置也算相同），所以两个进程共用一个库时各配一个名字，互不收对方的运行。写 `ctx.run.ended` 时带 `expectSeq`（读到断点之后再读的末尾）：读和写之间会话有了新条目，说明那个运行其实在动，跳过它；就算判错，活着的运行下一次写入会发现自己被结束并停下（围栏）。`recover` 对每个会话只读最后一个生命周期事件（`kinds`、`last: 1`），找到断点的才多读一次末尾。`owner` 配错（两个进程同名，或都不配）就退回只靠围栏兜底。
+- `cancel(runId)` 同时取消这个编排器里以它为 `parent` 的运行（`RunRequest.parent.runId`），一层层往下。
 - 参考实现是进程内队列：每个会话一条队列，一个 harness。
 - yoyo 的 `createYoyoOrchestrator` 是一个应用级的编排器，实现这个协议：定时、让路、收件箱。碎碎念和回复是同一个 harness 跑的两份 `AgentSpec`，导演只剩舞台动作，常驻循环只管进程。
 - 远端编排器（`ctx-remote`）：路径放在 `/orchestrator` 下，和 harness 的 `/runs` 分开：`POST /orchestrator/runs`、`GET /orchestrator/runs/:id`（`?wait=` 长轮询，结束后带 `result`，客户端的 `done` 靠它）、`DELETE /orchestrator/runs/:id`、`POST /orchestrator/recover`、`GET /orchestrator/events`（NDJSON）。

@@ -19,6 +19,7 @@ import {
   type ContextSource,
   type FactsSpec,
   type Entry,
+  type InheritSpec,
   type Fact,
   type Logger,
   type Message,
@@ -309,6 +310,15 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     return after.some((entry) => entry.id === summary.id) ? after : [summary, ...after];
   }
 
+  /** 另一个会话里 `seq` 不超过 `upTo` 的部分。生效的摘要在 `upTo` 之后时它不算，退回读整段。 */
+  async function inherited(spec: InheritSpec): Promise<Entry[]> {
+    const { session, upTo } = spec;
+    if (upTo === undefined) return load(session);
+    let entries = await load(session);
+    if (entries.some((entry) => entry.type === 'summary' && entry.seq > upTo)) entries = await store.list(session);
+    return entries.filter((entry) => entry.seq <= upTo);
+  }
+
   async function view(session: string, viewOptions: ViewOptions = {}): Promise<Projection> {
     const chosen = projectionNamed(viewOptions.projection);
     return project(await load(session), { ...chosen, window: windowOf(chosen, viewOptions.window) });
@@ -356,10 +366,19 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
       (request.tools?.length ? estimateTextTokens(JSON.stringify(request.tools)) : 0) +
       sized(request.input) +
       sized(request.prompt);
-    const projected = project(await load(request.session), {
+    const own = project(await load(request.session), {
       ...chosen,
       window: windowOf(chosen, request.window, reserve),
     });
+    const projected = request.inherit
+      ? withInherited(
+          project(await inherited(request.inherit), {
+            ...chosen,
+            window: windowOf(chosen, request.window, reserve + own.tokens),
+          }),
+          own,
+        )
+      : own;
     const call = assemble({
       projection: projected,
       facts: collected,
@@ -585,4 +604,16 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
   }
 
   return { store, build, view, facts, compact, compactDetailed, recompact };
+}
+
+/** 父会话的投影接在本会话的前面：消息、token、丢弃和截短的条数相加，生效的摘要取本会话的。 */
+function withInherited(parent: Projection, own: Projection): Projection {
+  return {
+    messages: [...parent.messages, ...own.messages],
+    items: [...parent.items, ...own.items],
+    tokens: parent.tokens + own.tokens,
+    dropped: parent.dropped + own.dropped,
+    truncated: parent.truncated + own.truncated,
+    ...(own.summary ? { summary: own.summary } : {}),
+  };
 }

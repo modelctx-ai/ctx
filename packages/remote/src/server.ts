@@ -10,6 +10,7 @@ import {
   CTX_EVENTS,
   DEFAULT_MEMORY_SCOPE,
   isConflict,
+  runParentProblem,
   silentLogger,
   type Entry,
   type EntryType,
@@ -395,6 +396,8 @@ function runRequestOf(body: unknown, policy: AgentPolicy): WireRunRequest {
     }
   }
   if (body['runId'] !== undefined && typeof body['runId'] !== 'string') fail(400, 'RunRequest.runId must be a string');
+  const parent = runParentProblem(body['parent']);
+  if (parent !== undefined) fail(400, parent);
   return body as unknown as WireRunRequest;
 }
 

@@ -1431,6 +1431,14 @@ export function describeHarnessContract(
       assert.equal((started?.['agent'] as Record<string, unknown> | undefined)?.['version'], 'contract@1');
     });
 
+    test('RunRequest.parent 原样记进 ctx.run.started：子会话知道自己是谁派的', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      const parent = { session: 'parent', runId: 'r-parent', toolCallId: 'call-1' };
+      await harness.run({ session: 's', agent, input: '子任务', parent });
+      const [started] = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+      assert.deepEqual(started?.['parent'], parent);
+    });
+
     test('inputKey：失败后用同一个键重试，输入只记一次', async () => {
       const { harness, store, agent } = await factory({
         script: [
