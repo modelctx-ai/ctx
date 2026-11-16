@@ -256,7 +256,7 @@ builder 的 `view`、`build` 经 `projectSession` 读会话：有窗口时不把
 
 ## 调用
 
-`createContextBuilder({ store, projection, projections, sources, sourceTimeoutMs, logger, factsPlacement, model, models, now })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
+`createContextBuilder({ store, projection, projections, sources, sourceTimeoutMs, logger, factsPlacement, model, models, now, calibrate })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
 
 1. 收集事实（`facts: false` 跳过；`FactsSpec.sources` 只用指定的来源）。投影名先认：不认识就以 `not_found` 失败，不回退，也不先去收事实。
 2. 读视图：只读最近一条摘要和它之后的条目，再投影。请求带了 `window` 就整个换掉投影里配的上限（`{}` 是不裁剪），`estimate` 始终用投影里配的。`build` 时 `maxTokens` 先扣掉历史之外已经占掉的部分——指令、事实、工具定义、`input`、`prompt` 的估算——剩下的才是历史的预算，所以它管的是整次调用；`view` 没有这些，不扣。
@@ -264,7 +264,9 @@ builder 的 `view`、`build` 经 `projectSession` 读会话：有窗口时不把
 4. 投影里的 `system` 消息（摘要、事件规则或 `message` 钩子渲染成的，以及存成消息条目的）不放进 `messages`，文字按顺序接在指令最后，同样用空行隔开。
 5. 消息：视图 + `input`（这一轮用户说的话）+ `prompt`（最后一条临时用户消息；可以是函数，拿到事实）。
 6. 工具：`build` 收候选的 `ToolDefinition[]`，给出工具名单；`context.prepare` 的 `tools` 缺省是注册表里全部，`false` 不给，名字列表、`{ names, tags, sources }` 或 `(definition) => boolean` 筛选。
-7. `PreparedCall.tokens`：第 2 步扣掉的那部分加上历史的估算，也就是整次调用的估算。harness 的超窗检查用它（见 [Harness](#harness)）。
+7. `PreparedCall.tokens`：第 2 步扣掉的那部分加上历史的估算，也就是整次调用的估算。harness 的超窗检查用它（见 [Harness](#harness)），也把它记进第一步的 `StepMeta.estimatedInputTokens`。
+
+估算不分词，偏差随文字和服务商而变。builder 拿上一轮的实际用量校准（`calibrate`，缺省开着）：往回最多看 64 条消息，找上一轮第一步的 `meta.step`，`usage.inputTokens` 比 `estimatedInputTokens` 多几倍（样本里已经乘过的 `calibration` 换算回去再比，所以不会来回摆），这一轮 `maxTokens` 就按估算的单位收紧几倍，`PreparedCall.tokens` 乘上它，`PreparedCall.calibration` 记下倍数。只往小里收（估算偏高时不放宽），最多 `MAX_CALIBRATION`（4）倍；投影接了自己的 `window.estimate`（分词器）时不校准。`view` 带 `maxTokens` 时一样校准。样本只有一个、按会话取，同一个会话换了模型时头一轮还是按上一个模型的偏差算。
 
 `instructions` 和 `prompt` 只要有一个是函数，事实就不再自动放进去；投影出的 `system` 消息照样接上。
 

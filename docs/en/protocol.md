@@ -287,7 +287,8 @@ interface PreparedCall {
   tools: readonly string[]; // tool names given to the model this time
   facts: readonly Fact[];
   projection: Projection;
-  tokens?: number; // estimate for the whole call: instructions, facts, tool definitions, messages; the harness's overflow check uses it
+  tokens?: number; // estimate for the whole call: instructions, facts, tool definitions, messages; multiplied by calibration when calibrated; the harness's overflow check uses it
+  calibration?: number; // factor applied when calibrating against the previous run's actual usage (greater than 1); absent otherwise
 }
 interface CompactOptions {
   model?: ModelRef;
@@ -359,7 +360,7 @@ interface Projection {
   - **Checkpoints.** After each segment it appends a `summary` and a `ctx.compacted` (`covers` falls between this segment and the next; a tool call and its result are never split across them). If the model fails, times out or is cut off halfway, what was already compacted stays, and calling again continues from there. So one compaction can leave several summaries; only the last one is in effect.
   - **How it ends.** The `status` of `compactDetailed`: `compacted`, everything that should go into the summary did; `not_needed`, the history is not long enough and the model was not called; `truncated`, a segment's summary was cut off by `maxOutputTokens`, that segment is not written and it stops there; `empty`, the model gave no text, likewise not written; `input_too_long`, it still does not fit after segmenting (the existing summary plus instructions already fill `maxInputTokens`, or the summary model itself reports the context is too long even after halving a segment all the way down). `compact` is its shorthand: it returns the last summary written this time, or `null` when none was. Errors of the model call itself (network, timeout) are thrown as usual.
   - **Entries with `at` in the future.** Events whose `at` is a due time always sort last in the view. They do not count toward "the most recent `keep` entries": those written before the cut go into the summary, those written after stay in the view as usual. Previously their `seq` pinned `covers` before them, and messages written later could never be compacted. `ProjectedMessage.at` is the latest `at` among the entries a message comes from.
-- Token estimation does not tokenize: a CJK character counts 1, 4 ASCII characters count 1, 2 other characters count 1; attachments use `estimateFileTokens(mediaType, data)`: inline text by its characters, base64 by its decoded size (images up to 64 KiB 256, larger 1600; text types bytes divided by 4; anything else 1 per 20 bytes, at least 256), and addresses and provider references, whose size is unknown, 256. For accuracy, plug a tokenizer into `window.estimate`.
+- Token estimation does not tokenize: a CJK character counts 1, 4 ASCII characters count 1, 2 other characters count 1; attachments use `estimateFileTokens(mediaType, data)`: inline text by its characters, base64 by its decoded size (images up to 64 KiB 256, larger 1600; text types bytes divided by 4; anything else 1 per 20 bytes, at least 256), and addresses and provider references, whose size is unknown, 256. For accuracy, plug a tokenizer into `window.estimate`. The harness records the estimate for the first step's request in `StepMeta.estimatedInputTokens`, so comparing it with `usage.inputTokens` shows how far off it was; the reference builder uses that ratio to tighten the next run's `maxTokens` (`PreparedCall.calibration`, only ever tighter), see [the architecture](../architecture.md#调用).
 - `ProjectionOptions` contains functions; it is configuration of an in-process builder and never goes through protocol methods, which only carry the serializable `WindowOptions`.
 - Prompt caching: appending facts to the end of the instructions changes the system prefix every time, so the reference implementation offers to put facts in the final temporary user message instead.
 
@@ -576,6 +577,8 @@ interface StepMeta {
   modelId?: string; // the model identifier in the provider's response
   finishReason?: string;
   usage?: Usage; // this step's usage
+  estimatedInputTokens?: number; // first step only: the estimate for this request (PreparedCall.tokens)
+  calibration?: number; // first step only: the calibration factor applied to that estimate
 }
 interface RunResult {
   runId: string;

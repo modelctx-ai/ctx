@@ -219,6 +219,13 @@ export interface StepMeta {
   /** AI SDK 的 `finishReason`：`stop`、`tool-calls`、`length` 等。 */
   readonly finishReason?: string;
   readonly usage?: Usage;
+  /**
+   * 只有第一步有：这一步请求的估算输入 token（`PreparedCall.tokens`，校准过的话是校准之后的）。和 `usage.inputTokens`
+   * 一比就知道估算偏了多少；参考实现的 builder 拿它校准下一轮的窗口。
+   */
+  readonly estimatedInputTokens?: number;
+  /** 只有第一步有：`estimatedInputTokens` 里乘上的校准倍数（`PreparedCall.calibration`）。没校准时不出现。 */
+  readonly calibration?: number;
 }
 
 /** 条目 `meta.step` 里的 `StepMeta`；不是 harness 写的步骤消息时返回 `undefined`。 */

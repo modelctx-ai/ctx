@@ -176,6 +176,8 @@ interface RunState {
   stepError?: unknown;
   /** 已经写完的步数，也是下一步的序号。 */
   step: number;
+  /** 第一步请求的估算（`PreparedCall.tokens`）和校准倍数，记进第一步的 `StepMeta`。 */
+  estimate?: { readonly tokens: number; readonly calibration?: number };
   /** 这一轮开始的时刻，`budget.maxDurationMs` 从这里算。 */
   readonly startedAt: number;
   /** `budget` 让循环在步骤之间停下了。 */
@@ -327,6 +329,8 @@ function stepMeta(
   },
 ): JsonObject {
   const usage = usageOf(info.usage);
+  // 估算只对第一步的请求成立：之后几步的请求里多了这一轮的工具调用和结果。
+  const estimate = state.step === 0 ? state.estimate : undefined;
   const meta: StepMeta = {
     runId: state.runId,
     step: state.step,
@@ -334,6 +338,8 @@ function stepMeta(
     modelId: info.modelId,
     finishReason: info.finishReason,
     ...(usage ? { usage } : {}),
+    ...(estimate ? { estimatedInputTokens: estimate.tokens } : {}),
+    ...(estimate?.calibration !== undefined ? { calibration: estimate.calibration } : {}),
   };
   return { step: meta as unknown as JsonObject };
 }
@@ -823,6 +829,10 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     if (overflow) prepared = await fit(prepared, building, overflow, state.record, model, signal);
     const hookContext: ModelHookContext = { runId: state.runId, session, step: 0, signal };
     prepared = (await hooks.beforeModel?.(prepared, hookContext)) ?? prepared;
+    state.estimate = {
+      tokens: prepared.tokens ?? estimateCall(prepared, candidates),
+      ...(prepared.calibration !== undefined ? { calibration: prepared.calibration } : {}),
+    };
     // 模型不一定看 abortSignal：已经取消就不调了。
     signal.throwIfAborted();
     const definitions = prepared.tools.flatMap((name) => {

@@ -283,7 +283,8 @@ interface PreparedCall {
   tools: readonly string[]; // 这次给模型的工具名
   facts: readonly Fact[];
   projection: Projection;
-  tokens?: number; // 整次调用的估算：指令、事实、工具定义、消息；harness 的超窗检查用它
+  tokens?: number; // 整次调用的估算：指令、事实、工具定义、消息；校准过的话乘上了 calibration；harness 的超窗检查用它
+  calibration?: number; // 按上一轮的实际用量校准时乘上的倍数（大于 1）；没校准时不出现
 }
 interface CompactOptions {
   model?: ModelRef;
@@ -355,7 +356,7 @@ interface Projection {
   - **检查点。** 每段压完就追加一条 `summary` 和一条 `ctx.compacted`（`covers` 落在这一段和下一段之间；工具调用和它的结果不切到两边）。中途模型出错、超时、被截断，已经压好的留着，再调一次从那里接着压。所以一次压缩可以留下多条摘要，生效的只有最后一条。
   - **收场。** `compactDetailed` 的 `status`：`compacted` 该压的都进了摘要；`not_needed` 历史不够长，没调模型；`truncated` 某一段的摘要被 `maxOutputTokens` 截断，那一段不写、停在那里；`empty` 模型没给出文字，同样不写；`input_too_long` 分段之后还是放不下——已有的摘要加指令就占满了 `maxInputTokens`，或者摘要模型自己报上下文过长、一段减半到底也不行。`compact` 是它的简写：返回这次写下的最后一条摘要，一条都没写就是 `null`。模型调用本身的错误（网络、超时）照常抛出。
   - **`at` 在未来的条目。** 把到期时间当 `at` 的事件一直排在视图的最后。数「最近 `keep` 条」时不算它们：写在切点之前的进摘要，写在切点之后的照常留在视图里。以前它的 `seq` 会把 `covers` 钉在自己前面，之后写的消息永远压不了。`ProjectedMessage.at` 是这条消息来自的条目里最晚的 `at`。
-- token 估算不分词：中日韩文字一个字算 1，ASCII 4 个字符算 1，其余文字 2 个字符算 1；附件按 `estimateFileTokens(mediaType, data)`——内联文字按字数，base64 按解码后的大小（图片 64 KiB 以内 256、更大 1600；文本类按字节数除以 4；其余每 20 字节 1 个、至少 256），地址和服务商引用不知道大小，按 256。要准就在 `window.estimate` 里接分词器。
+- token 估算不分词：中日韩文字一个字算 1，ASCII 4 个字符算 1，其余文字 2 个字符算 1；附件按 `estimateFileTokens(mediaType, data)`——内联文字按字数，base64 按解码后的大小（图片 64 KiB 以内 256、更大 1600；文本类按字节数除以 4；其余每 20 字节 1 个、至少 256），地址和服务商引用不知道大小，按 256。要准就在 `window.estimate` 里接分词器。harness 把第一步请求的估算记进 `StepMeta.estimatedInputTokens`，和 `usage.inputTokens` 一比就知道偏了多少；参考实现的 builder 拿这个比值收紧下一轮的 `maxTokens`（`PreparedCall.calibration`，只往小里收），见[架构](architecture.md#调用)。
 - `ProjectionOptions` 里有函数，是进程内 builder 的配置，不经过协议方法；协议方法里只出现能序列化的 `WindowOptions`。
 - 提示缓存：事实追加在指令末尾会让 system 前缀每次都变，参考实现提供把事实放进最后一条临时用户消息的选项。
 
@@ -572,6 +573,8 @@ interface StepMeta {
   modelId?: string; // 服务商响应里的模型标识
   finishReason?: string;
   usage?: Usage; // 这一步的用量
+  estimatedInputTokens?: number; // 只有第一步有：这次请求的估算（PreparedCall.tokens）
+  calibration?: number; // 只有第一步有：估算里乘上的校准倍数
 }
 interface RunResult {
   runId: string;

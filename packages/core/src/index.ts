@@ -25,6 +25,7 @@ export {
 export {
   createContextBuilder,
   DEFAULT_COMPACT_INPUT_TOKENS,
+  MAX_CALIBRATION,
   type ContextBuilderOptions,
   type FactsPlacement,
   type LocalContextBuilder,

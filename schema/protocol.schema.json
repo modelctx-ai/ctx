@@ -1471,6 +1471,12 @@
         },
         "usage": {
           "$ref": "#/$defs/Usage"
+        },
+        "estimatedInputTokens": {
+          "type": "number"
+        },
+        "calibration": {
+          "type": "number"
         }
       },
       "required": ["runId", "step"],

@@ -612,10 +612,16 @@ export interface PreparedCall {
   readonly facts: readonly Fact[];
   readonly projection: Projection;
   /**
-   * 整次调用的估算 token：指令、事实、工具定义、消息（历史、`input`、`prompt`）合起来，按 builder 自己的估算。
-   * harness 的超窗检查（`OverflowSpec`）用它；builder 不给时 harness 用缺省的估算自己算。
+   * 整次调用的估算 token：指令、事实、工具定义、消息（历史、`input`、`prompt`）合起来，按 builder 自己的估算，
+   * 校准过的话乘上了 `calibration`。harness 的超窗检查（`OverflowSpec`）用它，也把它记进第一步的
+   * `StepMeta.estimatedInputTokens`；builder 不给时 harness 用缺省的估算自己算。
    */
   readonly tokens?: number;
+  /**
+   * builder 按上一轮的实际用量校准过时乘上的倍数（大于 1）：服务商实际计的输入 token 比估算多这么多，窗口的
+   * `maxTokens` 照它收紧过。没校准时不出现。
+   */
+  readonly calibration?: number;
 }
 
 export interface ViewOptions {

@@ -273,7 +273,17 @@ const defs: Record<string, Schema> = {
     obj({ type: literal('run.ended'), runId: str, result: ref('RunResultSummary') }, { seq: int }),
     obj({ type: literal('error'), runId: str, message: str }),
   ),
-  StepMeta: obj({ runId: str, step: int }, { provider: str, modelId: str, finishReason: str, usage: ref('Usage') }),
+  StepMeta: obj(
+    { runId: str, step: int },
+    {
+      provider: str,
+      modelId: str,
+      finishReason: str,
+      usage: ref('Usage'),
+      estimatedInputTokens: num,
+      calibration: num,
+    },
+  ),
   ChildRunResult: obj(
     { child: obj({ session: str, runId: str }), stopReason: ref('StopReason') },
     { text: str, output: any, usage: ref('Usage'), error: obj({ message: str }, { type: str }) },

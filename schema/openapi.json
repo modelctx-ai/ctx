@@ -4024,6 +4024,12 @@
           },
           "usage": {
             "$ref": "#/components/schemas/Usage"
+          },
+          "estimatedInputTokens": {
+            "type": "number"
+          },
+          "calibration": {
+            "type": "number"
           }
         },
         "required": ["runId", "step"],

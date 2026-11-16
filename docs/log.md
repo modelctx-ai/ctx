@@ -4,6 +4,8 @@
 
 ## 2026-11-16
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#35](https://github.com/modelctx-ai/ctx/issues/35)）：`StepMeta` 加 `estimatedInputTokens`、`calibration`，`PreparedCall` 加 `calibration`，token 估算一条写 harness 记下估算、builder 拿实际用量收紧下一轮。[架构](architecture.md)的调用一节写校准怎么找样本、为什么不来回摆、什么时候不校准；[ctx](../packages/core/README.md) 的导出加 `calibrate`、`MAX_CALIBRATION`。
+
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#34](https://github.com/modelctx-ai/ctx/issues/34)）：`ListOptions` 加 `atAfter`；上下文一节写 `projectSession` 怎么只读尾部、为什么结果和读整段一样，`Projection.dropped` 只读了尾部时只数读到的部分。[架构](architecture.md)的投影一节写 builder 的 `view`、`build` 只读尾部，压缩和 `inherit` 照旧读整段；会话存储的 `list` 一行加 `atAfter`。[ctx-sqlite](../packages/sqlite/README.md) 的表结构加两个索引，[ctx-remote](../packages/remote/README.md) 的路径表加 `atAfter`，[ctx-protocol](../packages/protocol/README.md) 的导出加 `projectSession`。
 
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：Harness 一节加「一致性等级」，执行环境一节写反方向的 MCP 服务器，契约测试表跟上。[架构](architecture.md)的工具与 MCP 一节写 `createMcpServer` 的做法；[概念](concepts.md)的术语表加「一致性等级」。[ctx-mcp](../packages/mcp/README.md) 新写「反方向：把执行环境交给 MCP 客户端」，[ctx-protocol](../packages/protocol/README.md) 写等级怎么选，[ctx-remote](../packages/remote/README.md) 写 `--harness-levels`。
