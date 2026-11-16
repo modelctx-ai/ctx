@@ -28,6 +28,7 @@
 
 - 除 `index.md`、`log.md` 以外，每篇开头是 YAML frontmatter：`type`（必填，例如 `Specification`、`Architecture`、`Decision Record`）、`title`（和一级标题一致）、`description`（一句话）、`tags`、`status`（`draft` / `stable` / `deprecated`，对应 ADR 的提案 / 已采纳 / 被取代）。
 - 每个目录一个 `index.md`，只有分组标题和 `- [title](路径) - description` 条目，`title`、`description` 和被链接文档的 frontmatter 一字不差；根目录的 `index.md` 只带 `okf_version` 这一个 frontmatter 键。加、删文档或改 `title`、`description`，同时改所在目录的 `index.md`。
+- 英文译本：`README.en.md` 和 `docs/en/` 里的规范（现在是 [协议层](docs/en/protocol.md)），中文为准。改了 `README.md` 或 `docs/protocol.md`，同一个 PR 改译本并更新它的 `synced` 日期（`README.en.md` 在开头那句里）。`packages/protocol/src/translation.test.ts` 查两边的行内代码（名字、路径、类型）和章节层级一致；中文里新出现带中文的行内代码，在那个文件的 `TRANSLATED_SPANS` 里给出英文写法。架构、ADR、包 README 不译。
 - 链接用相对路径。OKF 推荐的 `/` 开头写法在 GitHub 上会解析到仓库根，不用。
 - `log.md` 按 `## YYYY-MM-DD` 倒序，条目格式见下面「记录」。
 

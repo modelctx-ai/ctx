@@ -4,6 +4,7 @@
 
 ## 2026-11-16
 
+- **新增** 英文译本（[#50](https://github.com/modelctx-ai/ctx/issues/50)）：[`docs/en/protocol.md`](en/protocol.md)（协议层全文，含线上形态）、[`README.en.md`](../README.en.md)，[docs/en/index.md](en/index.md) 和[文档入口](index.md)的「英文」一组。中文为准，译本的 frontmatter 记 `translation_of`、`synced`；`packages/protocol/src/translation.test.ts` 查两边的行内代码和章节层级，规范改了没跟进译本就失败。[README](../README.md) 开头加英文版的链接；[AGENTS.md](../AGENTS.md) 写了同步的规矩。架构和 ADR 先不译。
 - **新增** [ADR 0009](adr/0009-hosted-prerequisites.md)：云托管的前提（[#25](https://github.com/modelctx-ai/ctx/issues/25)）。每会话的执行环境另起 `open`、`close`，不改 `provision`；环境的描述放在 `AgentSpec.environment`；凭证不进执行环境、只给约定；`ctx-remote` 的鉴权扩展点和主体。
 - **更新** [协议层](protocol.md)（#25）：执行环境一节加 `open`、`close`、`ExecutorSessionOptions`、`EnvironmentSpec`，新写「每会话的执行环境」「凭证不进执行环境」两条；`AgentSpec` 加 `environment`；线上形态的路径表加两条执行环境会话的路径，跨路径的规则加「主体」；记忆作用域那条写明配了主体时按 `memoryScopes` 查；契约测试表跟上。
 - **更新** [架构](architecture.md)：函数执行环境一节写 `open`、`close`，新写「每会话的执行环境」（harness 怎么 `open`、`closeExecutorSessions`、`ctx-exec` 的 `sessionCwd`、remote 的两条路径）。[概念](concepts.md)的术语表加「执行环境的会话」「环境描述 `EnvironmentSpec`」「主体 `Principal`」。
