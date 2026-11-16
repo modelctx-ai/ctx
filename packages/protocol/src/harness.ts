@@ -46,6 +46,53 @@ export interface AgentSpec {
   /** 这个 agent 的上下文怎么组装：事实用哪些来源、放哪，用哪套投影。见 `ContextSpec`。 */
   readonly context?: ContextSpec;
   readonly settings?: CallSettings;
+  /** 应用给这份配置的版本标识（例如 `support@3`、一个 git 提交）。原样记进 `ctx.run.started`，回看时知道这一轮跑的是哪一版。 */
+  readonly version?: string;
+  /** 结构化输出：最后的回答按这个 JSON Schema 生成并解析，放在 `RunResult.output`。 */
+  readonly output?: OutputSpec;
+  /** 模型怎么选工具，缺省 `auto`。 */
+  readonly toolChoice?: ToolChoice;
+  /** 按工具名的权限：直接执行、先停下等确认、拒绝。见 `ToolPermissions`。 */
+  readonly permissions?: ToolPermissions;
+  /** 整轮的预算：超了在步骤之间停下，`stopReason` 是 `max_budget`。 */
+  readonly budget?: RunBudget;
+}
+
+/** 结构化输出的 schema。只用 JSON Schema，过得了线。 */
+export interface OutputSpec {
+  readonly schema: JsonObject;
+  /** 给模型看的名字和说明，有的服务商会用。 */
+  readonly name?: string;
+  readonly description?: string;
+}
+
+/** `auto` 模型自己定；`none` 不调工具；`required` 必须调一个；`{ tool }` 必须调这个。 */
+export type ToolChoice = 'auto' | 'none' | 'required' | { readonly tool: string };
+
+/** 一个工具的权限：`allow` 直接执行，`ask` 先停下等确认（走 `requires_action`），`deny` 不执行、模型看到拒绝。 */
+export type ToolPermission = 'allow' | 'ask' | 'deny';
+
+/**
+ * 可序列化的权限策略。`tools` 按工具名，`default` 管没列出的（缺省 `allow`）。`ask` 的调用不执行：这一轮写下调用后以
+ * `requires_action` 结束，应用确认了就让执行方执行（`runPendingTools`），不确认就追加一条错误结果，再不带输入跑一轮。
+ * 和 `Hooks.beforeTool` 叠加：先看权限，`allow` 的再交给钩子。
+ */
+export interface ToolPermissions {
+  readonly default?: ToolPermission;
+  readonly tools?: Readonly<Record<string, ToolPermission>>;
+}
+
+/** 一个工具在这份策略下的权限。 */
+export function toolPermission(permissions: ToolPermissions | undefined, tool: string): ToolPermission {
+  return permissions?.tools?.[tool] ?? permissions?.default ?? 'allow';
+}
+
+/** 整轮的上限。只在步骤之间检查：正在进行的模型调用和工具不会被打断，要硬上限用 `settings.timeoutMs`。 */
+export interface RunBudget {
+  /** 这一轮所有步骤加起来的 `totalTokens`（没有时用输入加输出）。 */
+  readonly maxTotalTokens?: number;
+  /** 从这一轮开始算的墙钟时间。 */
+  readonly maxDurationMs?: number;
 }
 
 /** 模型名的字符串写法：进程内的 `LanguageModel` 记成 `<provider>/<modelId>`。 */
@@ -69,6 +116,11 @@ export function agentSpecToJson(spec: AgentSpec): JsonObject {
   if (spec.maxSteps !== undefined) out['maxSteps'] = spec.maxSteps;
   if (spec.window !== undefined) out['window'] = spec.window;
   if (spec.context !== undefined) out['context'] = spec.context;
+  if (spec.version !== undefined) out['version'] = spec.version;
+  if (spec.output !== undefined) out['output'] = spec.output;
+  if (spec.toolChoice !== undefined) out['toolChoice'] = spec.toolChoice;
+  if (spec.permissions !== undefined) out['permissions'] = spec.permissions;
+  if (spec.budget !== undefined) out['budget'] = spec.budget;
   if (spec.settings !== undefined) {
     const { headers, ...rest } = spec.settings;
     out['settings'] = headers
@@ -98,10 +150,18 @@ export interface RunRequest {
 
 /**
  * 一轮为什么停：`end_turn` 模型自己停下，`max_steps` 到了步数上限，`max_tokens` 输出被 `maxOutputTokens` 截断，
+ * `max_budget` 超了 `AgentSpec.budget`（在步骤之间停下），
  * `requires_action` 留下了要在别处执行的工具调用（`RunResult.pending`），等结果追加进日志后不带输入再跑一轮接着走，
  * `aborted` 被取消，`error` 出错。
  */
-export type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'requires_action' | 'aborted' | 'error';
+export type StopReason =
+  | 'end_turn'
+  | 'max_steps'
+  | 'max_tokens'
+  | 'max_budget'
+  | 'requires_action'
+  | 'aborted'
+  | 'error';
 
 /** token 用量。服务商不给的项就没有，缓存和推理三项是 0 时也不写；各服务商的字段怎么映射过来，没有对真实服务验证。 */
 export interface Usage {
@@ -151,6 +211,8 @@ export interface RunResult {
   readonly recorded: readonly Entry[];
   readonly stopReason: StopReason;
   readonly usage?: Usage;
+  /** 给了 `AgentSpec.output` 时，按那份 schema 解析出来的回答。没能解析（模型没给出合法的 JSON）时这一轮以 `error` 结束。 */
+  readonly output?: JsonValue;
   /** `stopReason` 是 `requires_action` 时，等着别处执行、还没有结果的工具调用。 */
   readonly pending?: readonly ToolCall[];
   /** `stopReason` 是 `error` 时的原因。 */

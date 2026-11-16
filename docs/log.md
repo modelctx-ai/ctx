@@ -4,6 +4,7 @@
 
 ## 2026-11-16
 
+- **更新** [协议层](protocol.md)的 Harness 一节（[#47](https://github.com/modelctx-ai/ctx/issues/47)）：`AgentSpec` 加 `version`、`output`、`toolChoice`、`permissions`、`budget` 和它们的类型，新写一条说明每一项的语义、`invalid_output` 和 `max_budget`，以及不支持的 harness 不能静默忽略；[架构](architecture.md)写参考实现怎么交给 AI SDK；[概念](concepts.md)术语表加「权限策略」「预算」「结构化输出」；[ctx-protocol](../packages/protocol/README.md) 的纯函数表加 `toolPermission`、契约表加一条；[`@modelctx-ai/ctx`](../packages/core/README.md) 加「Agent 配置」一节；[ADR 0008](adr/0008-tool-calls-through-the-log.md) 的实施状态记下 `ask` 复用经日志往返做人工确认。
 - **新增** [ADR 0008](adr/0008-tool-calls-through-the-log.md)：工具调用经日志往返（#21）。等待态是 `StopReason` 的 `requires_action`，结果是带幂等键的 `tool` 消息，走这条路的工具由 harness 的 `external` 名单决定（为什么不按「没有实例」、不在 `ToolDefinition` 上标注），三个待定问题的答案，代价，还没做的两件。[ADR 索引](adr/index.md)跟上。
 - **更新** [协议层](protocol.md)的 Harness 一节加「工具调用经日志往返」，`StopReason`、`RunResult.pending` 跟上；[架构](architecture.md)写 `external`、`runPendingTools` 怎么做；[概念](concepts.md)术语表加「等待外部执行 `requires_action`」。[ctx](../packages/core/README.md) 加「工具在别处执行」一节和导出，[ctx-protocol](../packages/protocol/README.md) 的纯函数表加三项，[ctx-remote](../packages/remote/README.md) 的「长请求和断线」写明长任务走编排器、内网的执行环境怎么接。
 - **新增** [ctx-otel](../packages/otel/README.md)：安装、用法（编排器的事件驱动 `traceSession`）、span 和属性表、导出。[架构](architecture.md)加「追踪」一节，写 span 怎么从条目派生。

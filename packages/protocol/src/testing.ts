@@ -1414,6 +1414,23 @@ export function describeHarnessContract(
       assert.ok(JSON.stringify(tool).includes(text), '工具结果在日志里');
     });
 
+    test('AgentSpec.output：最后的回答按 schema 解析进 RunResult.output；version 原样记进 ctx.run.started', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '{"answer":42}' }] });
+      const result = await harness.run({
+        session: 's',
+        agent: {
+          ...agent,
+          version: 'contract@1',
+          output: { schema: { type: 'object', properties: { answer: { type: 'number' } }, required: ['answer'] } },
+        },
+        input: '答案是多少？',
+      });
+      assert.equal(result.stopReason, 'end_turn');
+      assert.deepEqual(result.output, { answer: 42 });
+      const [started] = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+      assert.equal((started?.['agent'] as Record<string, unknown> | undefined)?.['version'], 'contract@1');
+    });
+
     test('inputKey：失败后用同一个键重试，输入只记一次', async () => {
       const { harness, store, agent } = await factory({
         script: [

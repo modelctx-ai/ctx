@@ -471,6 +471,26 @@ interface AgentSpec {
   window?: WindowOptions;
   context?: ContextSpec; // 这个 agent 的上下文怎么组装
   settings?: CallSettings;
+  version?: string; // 应用给这份配置的版本标识，记进 ctx.run.started
+  output?: OutputSpec; // 结构化输出
+  toolChoice?: ToolChoice; // 缺省 auto
+  permissions?: ToolPermissions; // 按工具名的允许、询问、拒绝
+  budget?: RunBudget; // 整轮的上限，在步骤之间检查
+}
+interface OutputSpec {
+  schema: JsonObject; // JSON Schema
+  name?: string;
+  description?: string;
+}
+type ToolChoice = 'auto' | 'none' | 'required' | { tool: string };
+type ToolPermission = 'allow' | 'ask' | 'deny';
+interface ToolPermissions {
+  default?: ToolPermission; // 缺省 allow
+  tools?: Record<string, ToolPermission>;
+}
+interface RunBudget {
+  maxTotalTokens?: number; // 所有步骤加起来的 totalTokens
+  maxDurationMs?: number; // 从这一轮开始算的墙钟时间
 }
 interface ContextSpec {
   facts?: boolean | FactsSpec; // false 不收事实；缺省收
@@ -500,7 +520,7 @@ interface RunRequest {
   runId?: string; // 不给就生成
   signal?: AbortSignal;
 }
-type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'requires_action' | 'aborted' | 'error';
+type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'max_budget' | 'requires_action' | 'aborted' | 'error';
 interface Usage {
   inputTokens?: number; // 含缓存读到的和写进缓存的
   outputTokens?: number;
@@ -525,6 +545,7 @@ interface RunResult {
   recorded: readonly Entry[];
   stopReason: StopReason;
   usage?: Usage;
+  output?: JsonValue; // 给了 agent.output 时解析出来的回答
   pending?: readonly ToolCall[]; // stopReason 是 requires_action 时，等着别处执行的调用
   error?: ErrorInfo; // stopReason 是 error 时；上游 HTTP 接口出错时带 statusCode 和 responseBody；上下文过长时 type 是 context_overflow
 }
@@ -561,6 +582,13 @@ interface Harness {
 - 一轮里 harness 做的事：`ctx.run.started` → 记输入 → `ContextBuilder.build` →（配了 `context.overflow` 时）超窗检查 → 调模型 → 对每个工具调用：`beforeTool` → 找到绑定的执行环境 → `execute` → `afterTool` → 工具结果回到模型，直到停下 → `ctx.run.ended`。
 - **每一步即时落日志。** 产出不等这一轮结束：模型这一步要调工具时，调用（助手消息）在工具执行之前写下；步骤结束时写这一步剩下的（工具结果，或者没有工具调用时的助手消息）；最后写 `ctx.run.ended`。每次写入都带 `expectSeq`。所以进程在任何时刻崩掉，日志里都有已经做完的步骤，至少有「调用已发出、结果未知」。这一轮半路结束（出错、被取消）时，已经写下的步骤留着；写下了调用、还没等到结果的工具调用先补一条错误结果，再写 `ctx.error` 和 `ctx.run.ended`。
 - 模型出错、被取消也写 `ctx.run.ended`，`run` 照常返回，`stopReason` 和 `error` 说明原因；只有写日志本身失败才 reject。远端调用方因此总拿到同一种形状。
+- **`AgentSpec` 里只能用 JSON 表达的能力**，换一个 harness、过一次 remote 都还在（#47）：
+  - `version`：应用自己的版本标识，原样记进 `ctx.run.started`，回看时知道这一轮跑的是哪一版。
+  - `output`：结构化输出。最后的回答按 `schema` 生成（服务商支持的话约束解码）、解析、按 `checkJsonSchema` 校验，放在 `RunResult.output`；不是 JSON 或不合 schema 时这一轮以 `error` 结束，`error.type` 是 `invalid_output`（`retryable: false`）。只在 `end_turn` 时解析：停在工具调用（`requires_action`、`max_steps`、`max_budget`）的没有回答可解析。
+  - `toolChoice`：`auto`、`none`、`required`，或者 `{ tool }` 点名一个；点名的工具不在这一轮的工具里时 `invalid_request`。没有工具时忽略。
+  - `permissions`：按工具名的 `allow`、`ask`、`deny`（`default` 缺省 `allow`；纯函数 `toolPermission(permissions, name)` 给出一个工具的）。`deny` 的不执行，模型看到拒绝，这一轮继续；`ask` 的和外部执行的工具一样，写下调用后以 `requires_action` 停下，应用确认了就让执行方执行、追加结果，不确认就追加一条错误结果（`toolResultEntry(call, errorOutput(...))`），再不带输入跑一轮。`Hooks.beforeTool` 在 `allow` 之后照常调。
+  - `budget`：`maxTotalTokens`（所有步骤的 `totalTokens` 之和，没有时用输入加输出）、`maxDurationMs`（墙钟）。只在步骤之间检查：超了就不再走下一步，`stopReason` 是 `max_budget`；正在进行的模型调用和工具不会被打断，硬上限用 `settings.timeoutMs`。成本的上限不在这里：价格表是应用的事，用 `meta.step` 的用量自己算。
+  - 这几项的值不对（预算不是正数、权限不是三个值之一、`output.schema` 不是对象）时这一轮以 `invalid_request` 结束。不支持某一项的 harness 不能静默忽略：要么以 `invalid_request` 结束，要么在一致性等级里注明。
 - **工具调用经日志往返（[ADR 0008](adr/0008-tool-calls-through-the-log.md)）。** 绑定到「外部执行环境」的工具（由 harness 的实现配置，参考实现是 `createHarness({ external })`）交给模型，但不在 harness 这一侧执行：模型调用了它们，这一轮写下调用后以 `requires_action` 结束，`pending` 列出这些调用，不占会话。执行方追加结果：`toolResultEntry(call, output)` 是一条 `tool` 消息，带幂等键 `ctx.tool-result:<id>`（`TOOL_RESULT_KEY_PREFIX`），同一次调用只记一条。结果齐了以后，下一轮不带输入接着跑。`pendingToolCalls(entries)` 是纯函数，给出等待中的调用（`PendingToolCall`：`call`、`runId`、带调用的条目的 `seq`）：以 `requires_action` 结束的那一轮留下的，去掉后面已经追加了结果的；之后又有运行以别的原因结束，之前等着的就作废。结果一直不来时由应用决定：照常提交下一轮，投影给缺结果的调用补一条「没有记录到结果」。
 - **超窗兜底（`AgentSpec.context.overflow`，缺省关着）。** `build` 之后 harness 估算整次调用（`PreparedCall.tokens`；builder 不给时用 `estimateTokens`、`estimateTextTokens` 自己算指令、消息和交给模型的工具定义），不超过 `maxTokens` 就照常往下走。超了按 `strategy`：
   1. `compact`（缺省）：调 `ContextBuilder.compact`（参数取 `overflow.compact`，`keep` 至少按 1 算——这一轮刚记下的输入不进摘要），写下了摘要就重新 `build`。摘要模型用 builder 配的；builder 没配时用这一轮的模型，所以配置里不带模型名，远端的调用方不能借它指定任意模型。builder 没有 `compact`、压缩没做成（记一条告警）、压完还超，都接着走下一步。不写日志的运行（`record: false`）跳过这一步：压缩要追加摘要，而它一条都不该写。

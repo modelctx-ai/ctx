@@ -2,6 +2,7 @@ import {
   agentSpecToJson,
   CONTEXT_OVERFLOW,
   CTX_EVENTS,
+  checkJsonSchema,
   CtxError,
   ctxErrorEntry,
   estimateTextTokens,
@@ -15,6 +16,7 @@ import {
   runEndedEntry,
   runStartedEntry,
   silentLogger,
+  toolPermission,
   userEntry,
   type BuildRequest,
   type CompactOptions,
@@ -26,6 +28,8 @@ import {
   type Harness,
   type Hooks,
   type JsonObject,
+  type JsonValue,
+  type RunBudget,
   type Logger,
   type Message,
   type MessageContent,
@@ -48,6 +52,9 @@ import {
 import {
   APICallError,
   generateText,
+  jsonSchema,
+  NoObjectGeneratedError,
+  Output,
   RetryError,
   stepCountIs,
   streamText,
@@ -167,6 +174,10 @@ interface RunState {
   stepError?: unknown;
   /** 已经写完的步数，也是下一步的序号。 */
   step: number;
+  /** 这一轮开始的时刻，`budget.maxDurationMs` 从这里算。 */
+  readonly startedAt: number;
+  /** `budget` 让循环在步骤之间停下了。 */
+  overBudget: boolean;
   /** 每一步写完时日志的末尾 `seq`，流式的 `model.ended` 等它；这一步没写下（不记录、出错）时是 `undefined`。 */
   readonly stepSeqs: Map<number, PromiseWithResolvers<number | undefined>>;
 }
@@ -197,6 +208,65 @@ interface Produced {
   readonly usage: LanguageModelUsage | undefined;
   /** 最后一步里没有结果的工具调用：交给别处执行的。 */
   readonly pending: readonly ToolCall[];
+}
+
+/** `AgentSpec.budget` 的停止条件：在步骤之间看用掉的 token 和时间，超了就停，记下是预算让它停的。 */
+function budgetStop(state: RunState, budget: RunBudget) {
+  return ({ steps }: { readonly steps: ReadonlyArray<{ readonly usage: LanguageModelUsage }> }): boolean => {
+    const used = steps.reduce(
+      (sum, step) => sum + (step.usage.totalTokens ?? (step.usage.inputTokens ?? 0) + (step.usage.outputTokens ?? 0)),
+      0,
+    );
+    const over =
+      (budget.maxTotalTokens !== undefined && used >= budget.maxTotalTokens) ||
+      (budget.maxDurationMs !== undefined && Date.now() - state.startedAt >= budget.maxDurationMs);
+    if (over) state.overBudget = true;
+    return over;
+  };
+}
+
+const PERMISSIONS = new Set(['allow', 'ask', 'deny']);
+
+/** 线上来的 `AgentSpec` 字段：形状不对就当请求不对，不猜。 */
+function checkAgentExtras(agent: RunRequest['agent'], offered: readonly string[]): void {
+  const { budget, permissions, toolChoice, output } = agent;
+  for (const key of ['maxTotalTokens', 'maxDurationMs'] as const) {
+    const value = budget?.[key];
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) {
+      throw new CtxError('invalid_request', `AgentSpec.budget.${key} must be a positive number.`);
+    }
+  }
+  const values = [permissions?.default, ...Object.values(permissions?.tools ?? {})];
+  if (values.some((value) => value !== undefined && !PERMISSIONS.has(value))) {
+    throw new CtxError('invalid_request', 'AgentSpec.permissions values must be "allow", "ask" or "deny".');
+  }
+  if (typeof toolChoice === 'object' && !offered.includes(toolChoice.tool)) {
+    throw new CtxError(
+      'invalid_request',
+      `AgentSpec.toolChoice names tool "${toolChoice.tool}", which is not offered.`,
+    );
+  }
+  if (output !== undefined && (typeof output.schema !== 'object' || output.schema === null)) {
+    throw new CtxError('invalid_request', 'AgentSpec.output.schema must be a JSON Schema object.');
+  }
+}
+
+/** 结构化输出：最后的回答按 `schema` 解析、校验。不合就抛 `invalid_output`。 */
+function parseOutput(text: string, schema: JsonObject): JsonValue {
+  let value: JsonValue;
+  try {
+    value = JSON.parse(text) as JsonValue;
+  } catch {
+    throw new CtxError('invalid_output', 'The final answer is not valid JSON for AgentSpec.output.');
+  }
+  const issues = checkJsonSchema(schema, value);
+  if (issues.length > 0) {
+    throw new CtxError(
+      'invalid_output',
+      `The final answer does not match AgentSpec.output.schema: ${issues.join('; ')}.`,
+    );
+  }
+  return value;
 }
 
 /** 一步的内容里有调用、没有结果的工具调用（服务商执行的不算）。 */
@@ -263,11 +333,15 @@ function stopReasonOf(finishReason: FinishReason, steps: number, maxSteps: numbe
 /**
  * 给 `RunResult.error` 和 `ctx.error` 用：重试错误取最后一次，接口错误标出能不能重试。
  * 服务商说上下文过长的（`isContextOverflowError`）`type` 是 `context_overflow`、`retryable: false`：
- * 原样再发一遍还是放不下，要先压缩或裁剪。
+ * 原样再发一遍还是放不下，要先压缩或裁剪。结构化输出没能解析的是 `invalid_output`。
  */
 export function errorInfo(error: unknown): ErrorInfo {
   const root = RetryError.isInstance(error) ? error.lastError : error;
   const overflow = isContextOverflowError(root);
+  // `generateText` 自己解析 `AgentSpec.output` 时，回答不合就抛它；和 harness 自己解析（流式）的一样叫 `invalid_output`。
+  if (NoObjectGeneratedError.isInstance(root)) {
+    return { message: root.message, type: 'invalid_output', retryable: false };
+  }
   if (APICallError.isInstance(root)) {
     return {
       message: root.message,
@@ -343,6 +417,8 @@ function begin(request: RunRequest): RunState {
     writing: Promise.resolve(),
     step: 0,
     stepSeqs: new Map(),
+    startedAt: Date.now(),
+    overBudget: false,
   };
 }
 
@@ -732,17 +808,33 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       const found = candidates.find((tool) => tool.name === name) ?? tools?.get(name);
       return found ? [found] : [];
     });
-    warnMissingExecutors(definitions);
+    checkAgentExtras(
+      agent,
+      definitions.map((definition) => definition.name),
+    );
+    warnMissingExecutors(
+      definitions.filter((definition) => toolPermission(agent.permissions, definition.name) !== 'ask'),
+    );
+    const { permissions } = agent;
+    // `deny` 的不执行，模型看到拒绝；`ask` 的和外部执行环境的一样不在这里执行，这一轮以 `requires_action` 停下。
+    const runDispatch: typeof dispatch = permissions
+      ? async (call, definition, execution) =>
+          toolPermission(permissions, call.name) === 'deny'
+            ? errorOutput(`Tool call "${call.name}" was denied by the agent's permissions.`)
+            : dispatch(call, definition, execution)
+      : dispatch;
+    const deferred = (definition: ToolDefinition): boolean =>
+      external.has(definition.executor) || toolPermission(permissions, definition.name) === 'ask';
     return {
       model,
       prepared,
       tools: toToolSet(definitions, undefined, {
         session,
         runId: state.runId,
-        dispatch,
+        dispatch: runDispatch,
         validateInput: options.validateToolInput ?? ((definition) => !selfValidated(definition.name)),
         ...(options.maxToolOutputChars !== undefined ? { maxOutputChars: options.maxToolOutputChars } : {}),
-        ...(external.size > 0 ? { external: (definition: ToolDefinition) => external.has(definition.executor) } : {}),
+        ...(external.size > 0 || permissions ? { external: deferred } : {}),
       }),
       toolCount: definitions.length,
       maxSteps: agent.maxSteps ?? (definitions.length > 0 ? 5 : 1),
@@ -845,7 +937,28 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       ...(prepared.instructions ? { instructions: prepared.instructions } : {}),
       messages: toModelMessages(prepared.messages),
       ...(ready.toolCount > 0 ? { tools: ready.tools } : {}),
-      stopWhen: stepCountIs(ready.maxSteps),
+      stopWhen: state.request.agent.budget
+        ? [stepCountIs(ready.maxSteps), budgetStop(state, state.request.agent.budget)]
+        : stepCountIs(ready.maxSteps),
+      ...(state.request.agent.output
+        ? {
+            output: Output.object({
+              schema: jsonSchema(state.request.agent.output.schema as Parameters<typeof jsonSchema>[0]),
+              ...(state.request.agent.output.name !== undefined ? { name: state.request.agent.output.name } : {}),
+              ...(state.request.agent.output.description !== undefined
+                ? { description: state.request.agent.output.description }
+                : {}),
+            }),
+          }
+        : {}),
+      ...(state.request.agent.toolChoice !== undefined && ready.toolCount > 0
+        ? {
+            toolChoice:
+              typeof state.request.agent.toolChoice === 'string'
+                ? state.request.agent.toolChoice
+                : { type: 'tool' as const, toolName: state.request.agent.toolChoice.tool },
+          }
+        : {}),
       ...(settings.temperature !== undefined ? { temperature: settings.temperature } : {}),
       ...(settings.maxOutputTokens !== undefined ? { maxOutputTokens: settings.maxOutputTokens } : {}),
       ...(settings.topP !== undefined ? { topP: settings.topP } : {}),
@@ -890,8 +1003,21 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     if (state.stepError !== undefined) return fail(state, state.stepError, signal);
     const messages = [...produced.messages];
     const { pending } = produced;
-    const stopReason =
-      pending.length > 0 ? 'requires_action' : stopReasonOf(produced.finishReason, produced.steps, ready.maxSteps);
+    const stopReason: StopReason =
+      pending.length > 0
+        ? 'requires_action'
+        : state.overBudget && produced.finishReason === 'tool-calls'
+          ? 'max_budget'
+          : stopReasonOf(produced.finishReason, produced.steps, ready.maxSteps);
+    const spec = state.request.agent.output;
+    let output: JsonValue | undefined;
+    if (spec && stopReason === 'end_turn') {
+      try {
+        output = parseOutput(produced.text, spec.schema);
+      } catch (error) {
+        return fail(state, error, signal);
+      }
+    }
     const usage = usageOf(produced.usage);
     await write(state, [
       ...messages.slice(state.logged).map((message) => messageEntry(message, { source: 'model' })),
@@ -904,6 +1030,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       recorded: state.recorded,
       stopReason,
       ...(usage ? { usage } : {}),
+      ...(output !== undefined ? { output } : {}),
       ...(pending.length > 0 ? { pending } : {}),
     };
   }

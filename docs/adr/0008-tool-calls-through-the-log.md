@@ -58,9 +58,10 @@ harness 和执行环境之间只有同步的请求、响应：`Executor.execute(
 - 协议：`StopReason` 加 `requires_action`；`RunResult.pending`；纯函数 `pendingToolCalls`、`toolResultEntry`、常量 `TOOL_RESULT_KEY_PREFIX`、类型 `PendingToolCall`。
 - 核心包：`createHarness({ external })`，`toToolSet` 的 `external` 选项（这些工具不带 `execute`，AI SDK 遇到它们的调用就停下这一轮）；`runPendingTools`。
 - 还没做：
-  - **人工确认。** 让 `beforeTool` 能返回「先停下等确认」，用 `tool-approval-request` / `tool-approval-response` 两个部件走同一条路。
+  - **人工确认。** `AgentSpec.permissions` 的 `ask`（#47）已经走这条路：调用写下后以 `requires_action` 停下，确认了由执行方执行，不确认就追加错误结果。还没做的是让 `beforeTool` 按输入动态决定「先停下等确认」，以及 `tool-approval-request` / `tool-approval-response` 两个部件。
   - **`ctx-remote` 按执行环境名字领工作的路由。** 现在 worker 要知道去哪些会话找：`sessions()`、`watch`，或者应用告诉它。
 
 ## 决定记录
 
 - 2026-11-16：采纳并实施。
+- 2026-11-16：`AgentSpec.permissions` 的 `ask` 复用这条路做静态的人工确认（#47）。

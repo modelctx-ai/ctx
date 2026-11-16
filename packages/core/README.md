@@ -224,6 +224,26 @@ if (result.stopReason === 'requires_action') {
 
 `runPendingTools` 只执行归这个执行环境的调用（`executor.tools()` 报的名字，或者 `tools`），结果带幂等键，两个 worker 都执行了也只记一条；有副作用的工具自己幂等。结果一直不来时，应用照常提交下一轮就行，等着的调用随之作废。
 
+### Agent 配置：结构化输出、工具选择、权限、预算
+
+`AgentSpec` 里这几项都是 JSON，换 harness、过 `ctx-remote` 都还在：
+
+```ts
+const agent: AgentSpec = {
+  model,
+  version: 'support@3', // 记进 ctx.run.started
+  output: { schema: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] } },
+  toolChoice: 'auto', // 'none'、'required'、{ tool: 'order_lookup' }
+  permissions: { default: 'allow', tools: { refund: 'ask', delete_account: 'deny' } },
+  budget: { maxTotalTokens: 200_000, maxDurationMs: 120_000 },
+};
+const result = await harness.run({ session: 'user:42', agent, input: '订单 42 能退吗？' });
+result.output; // 按 schema 解析过的回答；不合是 stopReason 'error'、error.type 'invalid_output'
+```
+
+- `deny` 的工具不执行，模型看到拒绝；`ask` 的写下调用后以 `requires_action` 停下，和外部执行的工具一样：应用确认了就 `runPendingTools(store, session, { executor })`，不确认就追加 `toolResultEntry(call, errorOutput('用户拒绝了'))`，再不带输入跑一轮。
+- `budget` 只在步骤之间检查，超了 `stopReason` 是 `max_budget`；正在进行的模型调用和工具不会被打断，硬上限用 `settings.timeoutMs`。
+
 ### 崩溃后续跑
 
 harness 每一步都即时写日志：工具调用在执行之前写下，结果在这一步结束时写下。进程在工具执行时被杀掉，日志里有已经做完的步骤和「调用已发出、结果未知」的那一次。下一个进程启动时 `recover()` 给结果未知的调用补一条错误结果，配了 `resume` 的再从日志接着跑：
