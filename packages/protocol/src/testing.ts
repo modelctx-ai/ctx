@@ -877,9 +877,9 @@ export function describeSessionStoreContract(
     test('redact：id、seq、at、key、source 留着，内容换成 ctx.redacted；位置不变，再涂一遍是空操作', async () => {
       const store = await factory({ now: Date.now });
       const written = await store.append('s', [
-        userEntry('银行卡号 6222', { key: 'k1', source: 'user', at: 111, meta: { secret: '6222' } }),
-        assistantEntry('记下了 6222'),
-        eventEntry('pet.whisper', { text: '6222', data: { card: '6222' } }),
+        userEntry('我的卡号机密', { key: 'k1', source: 'user', at: 111, meta: { secret: '卡号机密' } }),
+        assistantEntry('记下了 卡号机密'),
+        eventEntry('pet.whisper', { text: '卡号机密', data: { card: '卡号机密' } }),
         userEntry('别的'),
       ]);
       const [user, assistant, event, keep] = written;
@@ -891,7 +891,10 @@ export function describeSessionStoreContract(
         written.map((entry) => entry.seq),
         '位置不变',
       );
-      assert.ok(!JSON.stringify(left).includes('6222'), '内容、数据、meta 都不在了');
+      assert.ok(
+        !JSON.stringify(left).includes('卡号机密'),
+        '内容、数据、meta 都不在了（标记不会出现在 id 和时间戳里）',
+      );
       assert.deepEqual(left[0], {
         type: 'event',
         kind: CTX_EVENTS.redacted,
@@ -918,7 +921,7 @@ export function describeSessionStoreContract(
       assert.equal(await store.redact('s', [user!.id, assistant!.id]), 0, '已经涂改过的跳过');
       assert.equal((await erasures(store, 's')).length, 1);
       assert.deepEqual(
-        await store.append('s', [userEntry('银行卡号 6222', { key: 'k1' })]),
+        await store.append('s', [userEntry('我的卡号机密', { key: 'k1' })]),
         [],
         'key 还在，重试写不回来',
       );
@@ -927,7 +930,7 @@ export function describeSessionStoreContract(
     test('redact 一条摘要：它不再是摘要；别的会话的 id 涂不到', async () => {
       const store = await factory({ now: Date.now });
       const [first] = await store.append('s', [userEntry('一')]);
-      const [summary] = await store.append('s', [summaryEntry('摘要里有 6222', first!.seq)]);
+      const [summary] = await store.append('s', [summaryEntry('摘要里有 卡号机密', first!.seq)]);
       assert.equal(await store.redact('other', [summary!.id]), 0);
       assert.equal(await store.redact('s', [summary!.id]), 1);
       assert.deepEqual(await store.list('s', { types: ['summary'] }), []);
