@@ -25,6 +25,7 @@ import {
 import { describe, test } from 'vite-plus/test';
 
 import { createMemory, type MemoryOptions } from './memory.ts';
+import { evidenceTerms } from './text.ts';
 import { createMemoryStore } from './store.ts';
 import { textModel } from './test-model.ts';
 
@@ -319,6 +320,57 @@ async function extracted(gate: MemoryOptions['gate']): Promise<string> {
   return JSON.stringify(extraction.requests[0]?.state);
 }
 
+/** 一段对话门控、巩固之后的报告和事实；提取模型按 `facts` 回答。 */
+async function consolidated(facts: string[], said: NewEntry[], consolidate?: MemoryOptions['consolidate']) {
+  const { sessions, store, memory } = setup({
+    decision: createScriptedDecisionModel(KEEP),
+    extraction: createScriptedExtractionModel({ values: { facts, decisions: null, lesson: null } }),
+    gate: { theta: 0.5, auto: false },
+    ...(consolidate ? { consolidate } : {}),
+  });
+  const written = await sessions.append('s', said);
+  await memory.gate('s');
+  const report = await memory.consolidate();
+  return { report, facts: await store.facts.list(), written, memory };
+}
+
+describe('createMemory：证据要在原文里', () => {
+  test('有支撑：证据收窄到说了这句话的那几条，置信度照提取的', async () => {
+    const { report, facts, written } = await consolidated(
+      ['主人住在台北'],
+      [userEntry('今天好热'), assistantEntry('多喝水'), userEntry('我十月搬到台北了')],
+    );
+    assert.equal(report.facts.ungrounded, 0);
+    const [fact] = facts;
+    assert.deepEqual(fact?.sources, [{ session: 's', from: written[2]!.seq, upTo: written[2]!.seq }]);
+  });
+
+  test('没有支撑（模型编的）：证据仍是整段，置信度降到 0.4，缺省不召回', async () => {
+    const { report, facts, memory } = await consolidated(
+      ['主人把密码设成 123'],
+      [userEntry('项目用 PostgreSQL 了'), assistantEntry('好的')],
+    );
+    assert.equal(report.facts.ungrounded, 1);
+    assert.equal(facts[0]?.confidence, 0.4);
+    assert.equal(facts[0]?.sources.length, 1);
+    assert.deepEqual((await memory.recall('密码')).facts, []);
+  });
+
+  test('minEvidenceOverlap: 0 不查', async () => {
+    const { report, facts } = await consolidated(['主人把密码设成 123'], [userEntry('项目用 PostgreSQL 了')], {
+      minEvidenceOverlap: 0,
+    });
+    assert.equal(report.facts.ungrounded, 0);
+    assert.notEqual(facts[0]?.confidence, 0.4);
+  });
+
+  test('evidenceTerms：中文一个字一个，去掉虚字、代词和主语；英文按词', () => {
+    assert.deepEqual(evidenceTerms('主人住在台北', ['主人']), ['住', '台', '北']);
+    assert.deepEqual(evidenceTerms('The user prefers green tea', ['user']), ['prefers', 'green', 'tea']);
+    assert.deepEqual(evidenceTerms('我的 PostgreSQL 版本是 16'), ['postgresql', '版', '本', '16']);
+  });
+});
+
 describe('createMemory：consolidate', () => {
   test('同主题的笔记一起提取；同一句话直接并入（cite + touch），不问模型', async () => {
     const decision = createScriptedDecisionModel(KEEP);
@@ -333,7 +385,7 @@ describe('createMemory：consolidate', () => {
     const report = await memory.consolidate();
     assert.equal(report.notes, 2);
     assert.equal(extraction.requests.length, 1, '同一主题一次提取');
-    assert.deepEqual(report.facts, { added: 0, merged: 1, superseded: 0, archived: 0 });
+    assert.deepEqual(report.facts, { added: 0, merged: 1, superseded: 0, archived: 0, ungrounded: 0 });
     assert.equal(decision.requests.length, asked, '字面相同不问决策模型');
     const [fact] = await store.facts.list();
     assert.equal(fact?.id, old.id);
@@ -400,7 +452,7 @@ describe('createMemory：consolidate', () => {
 
     const plain = await run();
     assert.equal(plain.report.escalated, 0);
-    assert.deepEqual(plain.report.facts, { added: 1, merged: 0, superseded: 0, archived: 0 });
+    assert.deepEqual(plain.report.facts, { added: 1, merged: 0, superseded: 0, archived: 0, ungrounded: 0 });
 
     const garbled = await run(routedModel({ relation: '我觉得是新的吧' }));
     assert.equal(garbled.report.escalated, 1, '问过了就算一次');

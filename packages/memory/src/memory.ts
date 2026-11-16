@@ -46,6 +46,7 @@ import {
   clamp01,
   cosine,
   DAY_MS,
+  evidenceTerms,
   isoDate,
   renderEntries,
   renderEntry,
@@ -120,6 +121,15 @@ export interface MemoryConsolidateOptions {
    * 可以重试的错（`retryable: true`，例如超时、429、5xx）当场再试一次，还不行就留到下次，不记失败次数。
    */
   readonly maxAttempts?: number;
+  /**
+   * 事实要在原文里有支撑：事实的字词（中文一个字一个，去掉虚字、代词和主语）至少有这么大的比例出现在这批原文的
+   * 某一条里，或者几条合起来，缺省 0.5。有支撑的，每条笔记的证据收窄到和事实有共同字词的条目，一条都没有的笔记不当证据；
+   * 没有支撑的（模型编的、从别处推出来的），证据仍是整批，置信度降到不超过
+   * `ungroundedConfidence`，`ConsolidateReport.facts.ungrounded` 记一笔。0 是不查。
+   */
+  readonly minEvidenceOverlap?: number;
+  /** 原文里没有支撑的事实，置信度最多这么高，缺省 0.4：低于召回的缺省门槛 0.5，留着给人看，不会被召回。 */
+  readonly ungroundedConfidence?: number;
 }
 
 export interface MemoryOptions {
@@ -169,6 +179,9 @@ export interface MemoryOptions {
   readonly onDeadLetter?: (notes: readonly Note[], error: unknown) => void;
 }
 
+/** 事实里指代主人的词：查证据时不算（原文里主人说的是「我」）。 */
+const SUBJECT_WORDS = ['主人', '用户', 'user', 'owner'];
+
 /** 参考实现的缺省值。 */
 export const MEMORY_DEFAULTS = {
   theta: 0.6,
@@ -189,6 +202,8 @@ export const MEMORY_DEFAULTS = {
   maxPNull: 0.3,
   consolidateMaxTokens: 6000,
   maxAttempts: 3,
+  minEvidenceOverlap: 0.5,
+  ungroundedConfidence: 0.4,
   coreBudgetTokens: 2000,
 } as const;
 
@@ -379,7 +394,7 @@ interface MutableReport {
   notes: number;
   failed: number;
   dead: number;
-  facts: { added: number; merged: number; superseded: number; archived: number };
+  facts: { added: number; merged: number; superseded: number; archived: number; ungrounded: number };
   procedures: { added: number; confirmed: number };
   escalated: number;
   core: boolean;
@@ -458,6 +473,10 @@ export function createMemory(options: MemoryOptions): Memory {
   const escalateBelow = options.consolidate?.escalateBelow ?? MEMORY_DEFAULTS.escalateBelow;
   const maxAttempts = Math.max(1, countOf(options.consolidate?.maxAttempts, MEMORY_DEFAULTS.maxAttempts));
   const maxPNull = options.consolidate?.maxPNull ?? MEMORY_DEFAULTS.maxPNull;
+  const minEvidenceOverlap = clamp01(options.consolidate?.minEvidenceOverlap ?? MEMORY_DEFAULTS.minEvidenceOverlap);
+  const ungroundedConfidence = clamp01(
+    options.consolidate?.ungroundedConfidence ?? MEMORY_DEFAULTS.ungroundedConfidence,
+  );
   const coreBudget = options.core?.budgetTokens ?? MEMORY_DEFAULTS.coreBudgetTokens;
   const minScore = recallOptions.minScore ?? MEMORY_DEFAULTS.minScore;
   const minConfirmations = recallOptions.confirmations ?? MEMORY_DEFAULTS.confirmations;
@@ -743,20 +762,63 @@ export function createMemory(options: MemoryOptions): Memory {
     readonly topic: string | undefined;
     readonly notes: readonly Note[];
     readonly refs: readonly SourceRef[];
+    /** 每条笔记读到的原文，查事实在哪几条里有支撑。 */
+    readonly groups: readonly { readonly note: Note; readonly entries: readonly Entry[] }[];
     readonly state: string;
     readonly firstAt: number;
     readonly salience: number;
   }
 
+  /**
+   * 事实在这批原文里的支撑：单条覆盖了事实的词的 `minEvidenceOverlap` 以上的条目；没有这样的一条时，几条合起来
+   * 够也算（事实是从几句话里归纳的）。返回按会话收窄的证据，找不到支撑是 `undefined`。
+   */
+  function evidenceFor(text: string, batch: Batch): SourceRef[] | undefined {
+    if (minEvidenceOverlap === 0) return [...batch.refs];
+    const terms = new Set(evidenceTerms(text, [subject, ...SUBJECT_WORDS]));
+    // 全是虚字、主语的事实没有可查的：照整批记。
+    if (terms.size === 0) return [...batch.refs];
+    const groups = batch.groups.map(({ note, entries }) => ({
+      note,
+      hits: entries.flatMap((entry) => {
+        const shared = new Set(evidenceTerms(renderEntry(entry)).filter((term) => terms.has(term)));
+        return shared.size > 0 ? [{ entry, shared }] : [];
+      }),
+    }));
+    const hits = groups.flatMap((group) => group.hits);
+    const best = Math.max(0, ...hits.map((hit) => hit.shared.size));
+    const covered = new Set(hits.flatMap((hit) => [...hit.shared]));
+    if (best / terms.size < minEvidenceOverlap && covered.size / terms.size < minEvidenceOverlap) return undefined;
+    return groups.flatMap(({ note, hits: found }) =>
+      found.length > 0
+        ? [
+            sourceRef(
+              note.session,
+              found.map((hit) => hit.entry),
+            ),
+          ]
+        : [],
+    );
+  }
+
   async function integrate(
     text: string,
     batch: Batch,
-    found: { readonly validFrom: number; readonly confidence: number; readonly dated: boolean },
+    proposed: { readonly validFrom: number; readonly confidence: number; readonly dated: boolean },
     report: MutableReport,
     written: Set<string>,
     now: number,
     signal: AbortSignal | undefined,
   ): Promise<void> {
+    const evidence = evidenceFor(text, batch);
+    if (!evidence) {
+      report.facts.ungrounded += 1;
+      logger.debug?.('memory: a fact has no support in its notes; lowering its confidence.', { text });
+    }
+    const sources = evidence ?? batch.refs;
+    const found = evidence
+      ? proposed
+      : { ...proposed, confidence: Math.min(proposed.confidence, ungroundedConfidence) };
     const candidates = await candidatesFor(text, batch.topic);
     let relation: Relation = 'new';
     let target: MemoryFact | undefined = candidates.find((fact) => normalized(fact.text) === normalized(text));
@@ -795,7 +857,7 @@ export function createMemory(options: MemoryOptions): Memory {
     }
 
     if (relation === 'merge' && target) {
-      await store.facts.cite(target.id, batch.refs);
+      await store.facts.cite(target.id, sources);
       await store.facts.touch([target.id], now);
       written.add(target.id);
       report.facts.merged += 1;
@@ -809,7 +871,7 @@ export function createMemory(options: MemoryOptions): Memory {
       validFrom: found.validFrom,
       confidence: clamp01(found.confidence),
       salience: batch.salience,
-      sources: batch.refs,
+      sources,
     };
     // 将来才成立的变化不关掉现在成立的那条：两条都留着，各带各的起始日期。
     if (relation === 'supersede' && target && found.validFrom > now) {
@@ -900,6 +962,7 @@ export function createMemory(options: MemoryOptions): Memory {
         topic,
         notes: readable.map((item) => item.note),
         refs: readable.map(({ note }) => ({ session: note.session, from: note.from, upTo: note.upTo })),
+        groups: readable.map(({ note, entries }) => ({ note, entries })),
         state: readable.map((item) => renderEntries(item.entries)).join('\n'),
         firstAt: Math.min(...readable.flatMap((item) => item.entries.map((entry) => entry.at))),
         salience: Math.max(...readable.map((item) => item.note.salience)),
@@ -1027,7 +1090,7 @@ export function createMemory(options: MemoryOptions): Memory {
       notes: 0,
       failed: 0,
       dead: 0,
-      facts: { added: 0, merged: 0, superseded: 0, archived: 0 },
+      facts: { added: 0, merged: 0, superseded: 0, archived: 0, ungrounded: 0 },
       procedures: { added: 0, confirmed: 0 },
       escalated: 0,
       core: false,

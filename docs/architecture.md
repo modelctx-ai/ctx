@@ -617,6 +617,8 @@ interface MemoryOptions {
     maxPNull?: number; // 提取字段的 pNull 高于它当作没说，缺省 0.3
     maxTokens?: number; // 一次提取的原文上限，超过就分批，缺省 6000
     maxAttempts?: number; // 一批失败几次进死信，缺省 3
+    minEvidenceOverlap?: number; // 事实的字词在原文里至少出现多少，缺省 0.5，0 不查
+    ungroundedConfidence?: number; // 原文里找不到支撑的事实，置信度最多多高，缺省 0.4
   };
   core?: { budgetTokens?: number }; // 缺省 2000
   embed?: (text: string) => Promise<readonly number[]>; // 召回时再加一路余弦，和存储 search 的分取大的
@@ -707,7 +709,8 @@ sequenceDiagram
   M->>S: core.set
 ```
 
-- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说。起始日期按条给：对话里说了某一条从哪天起成立的，那一条开头写 `[YYYY-MM-DD]`，就是它的 `validFrom`；没写的取这批第一条的 `at`。以前一个 `since` 字段套给整批，一条的日期会被安到别的事实上。证据是这批笔记的区间。
+- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说。起始日期按条给：对话里说了某一条从哪天起成立的，那一条开头写 `[YYYY-MM-DD]`，就是它的 `validFrom`；没写的取这批第一条的 `at`。以前一个 `since` 字段套给整批，一条的日期会被安到别的事实上。
+- 证据：以前证据就是这批笔记的区间，只保证「有区间」，不保证区间里真有这句话。现在每条事实先在原文里找支撑：事实的字词（`evidenceTerms`：中文一个字一个，转述常换掉相邻的字，按两个字切太严；去掉虚字、代词，和「主人」「用户」、`subject` 这些主语，原文里主人说的是「我」），某一条原文覆盖了至少 `consolidate.minEvidenceOverlap`（缺省 0.5），或者几条合起来覆盖到。有支撑的，每条笔记的证据收窄到和事实有共同字词的条目（`sourceRef`），一条都没有的笔记不当证据。没有支撑的，证据仍是整批，置信度降到不超过 `consolidate.ungroundedConfidence`（缺省 0.4，低于召回的缺省门槛 0.5），报告的 `facts.ungrounded` 记一笔：模型编的、从别处推出来的、被注入的话进不了召回，但留在存储里给人看。这是启发式，防的是凭空写进记忆的话，不是证明；「我不吃肉」推出「主人吃素」这种推断也会被降下来，要收的话调低 `minEvidenceOverlap`。
 - 并入：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。措辞相同（空白和句读归一、不分大小写后相等）的直接并入，不调 `decide`；否则有对照的事实放进 `state`，这就是分类问题。置信度低于 `consolidate.escalateBelow`（缺省 0.6）、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是存储的 `supersede`：新的写进去、旧的关掉（`supersededBy` 指向新的），一步完成，不会留下两条都成立的。旧的按新事实自己写的日期关（早于旧事实生效时按今天），没写日期按今天。新事实的日期在将来（「下个月起改用……」）时不取代，两条都留着，各带各的起始日期：协议的有效期只有「关了」和「没关」，关在将来的日期上等于现在就关了。
 - 幂等键：新事实的 `key` 是 `m1:` 加来源区间和归一化文字的 53 位哈希。同一批笔记再处理一次（另一个进程同时在跑、上次半途失败）算出的是同一个键，存储返回已有的那条。
 - 反思是唯一的开放生成，只在 `lesson` 非空且有 `model` 时做：和同主题已有的程序是同一条就 `confirm`，否则 `add`。`add` 时 `confirmations` 是 1，相同的证据 `confirm` 不计数；召回只带 `confirmations ≥ recall.confirmations`（缺省 2）的。

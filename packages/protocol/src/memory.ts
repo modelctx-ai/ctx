@@ -450,6 +450,8 @@ export interface ConsolidateReport {
     readonly merged: number;
     readonly superseded: number;
     readonly archived: number;
+    /** 原文里找不到支撑、置信度被降下来的事实数。参考实现总是给；别的实现可以不给。 */
+    readonly ungrounded?: number;
   };
   readonly procedures: { readonly added: number; readonly confirmed: number };
   /** 升级给 `LanguageModel` 的判断数。 */

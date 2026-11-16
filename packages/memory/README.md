@@ -78,7 +78,7 @@ const slowExtractor = extractionFromLanguageModel(llm);
 | `gate`          | `theta`（缺省 0.6）、`auto`（缺省开）、`entries`（缺省 `{ types: ['message'] }`）、`maxTokens`（一段最多多少估算 token，缺省 4000）                                                                                                                                                                                                  |
 | `recall`        | `k`（缺省 5）、`budgetTokens`（作为来源时的预算，缺省不限）、`minScore`（缺省 0.1）、`minConfidence`（`confidence` 低于它的事实不召回，缺省 0.5）、`archivedWeight`（归档的事实相似度乘多少，缺省 0.5，给 0 不找归档的）、`spacingMs`（来源带出的事实多久记一次 `touch`，缺省一天）、`confirmations`（程序要几次确认才带上，缺省 2） |
 | `decay`         | `d`、`epsilon`、`archiveAt`，缺省 0.5、0.02、0.55（`ACTIVATION_DEFAULTS`）；`minChances`（归档前要错过几次机会，缺省 7，给 0 只看激活度）。见「遗忘」                                                                                                                                                                                |
-| `consolidate`   | `escalateBelow`（缺省 0.6）、`maxPNull`（缺省 0.3）、`maxTokens`（一次提取的原文上限，缺省 6000）、`maxAttempts`（一批失败几次进死信，缺省 3）                                                                                                                                                                                       |
+| `consolidate`   | `escalateBelow`（缺省 0.6）、`maxPNull`（缺省 0.3）、`maxTokens`（一次提取的原文上限，缺省 6000）、`maxAttempts`（一批失败几次进死信，缺省 3）、`minEvidenceOverlap`（事实的字词在原文里至少出现多少，缺省 0.5，0 不查）、`ungroundedConfidence`（原文里找不到支撑的事实置信度最多多高，缺省 0.4）                                   |
 | `core`          | `budgetTokens`，缺省 2000                                                                                                                                                                                                                                                                                                            |
 | `embed`         | 召回时再加一路余弦，和存储 `search` 的分取大的；向量按事实 `id` 缓存在进程里                                                                                                                                                                                                                                                         |
 | `name`          | 执行环境的名字，缺省 `memory`                                                                                                                                                                                                                                                                                                        |
@@ -104,12 +104,13 @@ const slowExtractor = extractionFromLanguageModel(llm);
 
 **`consolidate({ now })`**：
 
-1. 待处理的笔记按主题分组，每组读原文（一个会话读一次），按 `consolidate.maxTokens` 分批，每批一次 `extract`：`facts`、`decisions`（都当事实）、`lesson`。`pNull > maxPNull` 的字段当没说。起始日期按条给：开头写了 `[YYYY-MM-DD]` 的那一条从那天起，没写的取这批第一条的 `at`。证据是这批笔记的区间。
-2. 每条提出的事实：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。字面相同就直接并入；否则一次 `decide` 问关系（`new` / `merge` / `supersede`）和对应哪一条。置信度低于 `escalateBelow`、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`new` 是 `add`；`merge` 是 `cite` + `touch`；`supersede` 是存储的 `supersede`，新的写进去、旧的关掉，一步完成。旧的按新事实自己写的日期关，没写按今天；新事实的日期在将来时不取代，两条都留着。新事实带幂等键（来源区间加文字的哈希），同一批再处理一次不写重复的。
-3. `lesson` 非空且有 `model` 时反思成 `when` / `do`：和同主题已有的程序是同一条就 `confirm`，否则 `add`。没有 `model` 不反思。
-4. 这批笔记 `settle`。读不到原文的笔记（会话清掉了）也 `settle`，什么都不写。一批失败（抛错，包括模型的回答取不出 JSON）不挡后面的：可以重试的错（`retryable: true`）当场再试一次，还不行就留到下次、不记次数；别的错 `notes.fail` 记一次，到 `maxAttempts` 进死信，告警、调 `onDeadLetter`。
-5. 衰减：open 的事实里，`activation < archiveAt` 并且错过了至少 `minChances`（缺省 7）次机会的 `archive`；这一夜刚写、刚并入的不归档。见下面「遗忘」。
-6. `core`：有 `model` 时从 open 事实重写（open 事实和上次重写时一样就不再调模型；输出为空或超预算时回到 `renderCore`），没有时用 `renderCore`。文字和当前版本一样时不写新版本。
+1. 待处理的笔记按主题分组，每组读原文（一个会话读一次），按 `consolidate.maxTokens` 分批，每批一次 `extract`：`facts`、`decisions`（都当事实）、`lesson`。`pNull > maxPNull` 的字段当没说。起始日期按条给：开头写了 `[YYYY-MM-DD]` 的那一条从那天起，没写的取这批第一条的 `at`。
+2. 每条提出的事实先查证据：事实的字词（中文一个字一个，去掉虚字、代词和「主人」这类主语）至少有 `minEvidenceOverlap` 出现在某一条原文里，或者几条合起来。有支撑的，每条笔记的证据收窄到和它有共同字词的条目，一条都没有的笔记不当证据；没有支撑的（模型编的、从别处推出来的、被注入的），证据仍是整批，置信度降到不超过 `ungroundedConfidence`，低于召回的缺省门槛，留着给人看，`report.facts.ungrounded` 记一笔。这是启发式：防的是凭空写进记忆的话，不是证明。
+3. 每条提出的事实：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。字面相同就直接并入；否则一次 `decide` 问关系（`new` / `merge` / `supersede`）和对应哪一条。置信度低于 `escalateBelow`、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`new` 是 `add`；`merge` 是 `cite` + `touch`；`supersede` 是存储的 `supersede`，新的写进去、旧的关掉，一步完成。旧的按新事实自己写的日期关，没写按今天；新事实的日期在将来时不取代，两条都留着。新事实带幂等键（来源区间加文字的哈希），同一批再处理一次不写重复的。
+4. `lesson` 非空且有 `model` 时反思成 `when` / `do`：和同主题已有的程序是同一条就 `confirm`，否则 `add`。没有 `model` 不反思。
+5. 这批笔记 `settle`。读不到原文的笔记（会话清掉了）也 `settle`，什么都不写。一批失败（抛错，包括模型的回答取不出 JSON）不挡后面的：可以重试的错（`retryable: true`）当场再试一次，还不行就留到下次、不记次数；别的错 `notes.fail` 记一次，到 `maxAttempts` 进死信，告警、调 `onDeadLetter`。
+6. 衰减：open 的事实里，`activation < archiveAt` 并且错过了至少 `minChances`（缺省 7）次机会的 `archive`；这一夜刚写、刚并入的不归档。见下面「遗忘」。
+7. `core`：有 `model` 时从 open 事实重写（open 事实和上次重写时一样就不再调模型；输出为空或超预算时回到 `renderCore`），没有时用 `renderCore`。文字和当前版本一样时不写新版本。
 
 报告里 `failed` 数这次失败留着的笔记，`dead` 数进了死信的；`facts.added` 只数 `new`，取代的那条新事实算在 `superseded` 里；`escalated` 数调了几次 `LanguageModel` 做并入判断。整体可重复执行：处理过的笔记不再处理。中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下次重做；重做时同一个键的事实不再写，字面相同的直接并入，同一段证据不会记两次。`consolidate` 排队执行，不并发。
 

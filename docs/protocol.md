@@ -968,7 +968,7 @@ interface ConsolidateReport {
   notes: number; // 这次处理（settle）的
   failed: number; // 这次失败、留着下次再试的（不含进了死信的）
   dead: number; // 这次进了死信的
-  facts: { added: number; merged: number; superseded: number; archived: number };
+  facts: { added: number; merged: number; superseded: number; archived: number; ungrounded?: number }; // ungrounded：原文里找不到支撑、置信度被降下来的
   procedures: { added: number; confirmed: number };
   escalated: number; // 升级给 LanguageModel 的判断数
   core: boolean; // 重写了没有
