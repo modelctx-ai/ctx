@@ -65,6 +65,9 @@ importers:
       '@modelctx-ai/ctx-mcp':
         specifier: workspace:^
         version: link:../packages/mcp
+      '@modelctx-ai/ctx-memory':
+        specifier: workspace:^
+        version: link:../packages/memory
       '@modelctx-ai/ctx-models':
         specifier: workspace:^
         version: link:../packages/models
