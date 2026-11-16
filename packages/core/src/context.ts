@@ -2,6 +2,7 @@ import type {
   AgentSpec,
   CallSettings,
   CompactOptions,
+  CompactResult,
   ContextSource,
   Entry,
   Executor,
@@ -12,6 +13,7 @@ import type {
   Logger,
   MessageContent,
   NewEntry,
+  OverflowSpec,
   PreparedCall,
   Projection,
   ProjectionOptions,
@@ -54,6 +56,11 @@ interface ContextBaseOptions {
   readonly sourceTimeoutMs?: number;
   /** 事实放在指令后面（缺省）还是最后一条临时用户消息里，见 `FactsPlacement`。 */
   readonly factsPlacement?: FactsPlacement;
+  /**
+   * `generate`、`stream` 的超窗兜底，见 `OverflowSpec`：整次调用估算超过 `maxTokens` 时先压缩、再裁剪，
+   * 还放不下就以 `context_overflow` 失败。缺省不检查；每次调用可以单独给。
+   */
+  readonly overflow?: OverflowSpec;
 }
 
 export interface ContextOptions extends ContextBaseOptions {
@@ -112,6 +119,8 @@ export interface GenerateOptions extends PrepareOptions, GenerateSettings {
    * 失败后用同一个键重试，就不会再记一遍。
    */
   readonly inputKey?: string;
+  /** 这一次的超窗兜底，盖过 `createContext({ overflow })`。 */
+  readonly overflow?: OverflowSpec;
 }
 
 export interface GenerateResult {
@@ -160,8 +169,10 @@ export interface Context {
   /** 经 harness 跑一轮。模型出错或被取消时抛出原来的错误（`harness.run` 不抛）。 */
   generate(options?: GenerateOptions): Promise<GenerateResult>;
   stream(options?: StreamOptions): Promise<ContextStream>;
-  /** 把较早的历史压成一条摘要。历史不够长时返回 null。 */
+  /** 把较早的历史压成摘要（太长时分段滚动）。这次没写下摘要时返回 null；要知道为什么，用 `compactDetailed`。 */
   compact(options?: CompactOptions): Promise<SummaryEntry | null>;
+  /** 同 `compact`，返回怎么收场的：`status`、写下的摘要、调了几次模型、压了几条、截短了几条。 */
+  compactDetailed(options?: CompactOptions): Promise<CompactResult>;
 }
 
 function hasExecutor(tools: ToolRegistry | undefined): tools is LocalToolRegistry {
@@ -284,12 +295,14 @@ export function createContext(options: ContextOptions): Context {
     const model = modelFor(call);
     const resolved = await resolve(call);
     const toolNames = tools && call.tools !== false ? tools.select(call.tools ?? true).map((tool) => tool.name) : [];
+    const overflow = call.overflow ?? options.overflow;
     const agent: AgentSpec = {
       model,
       ...(resolved.instructions !== undefined ? { instructions: resolved.instructions } : {}),
       tools: toolNames,
       ...(call.maxSteps !== undefined ? { maxSteps: call.maxSteps } : {}),
       ...(call.window ? { window: call.window } : {}),
+      ...(overflow ? { context: { overflow } } : {}),
       settings: settingsOf(call),
     };
     const run: RunRequest = {
@@ -359,5 +372,6 @@ export function createContext(options: ContextOptions): Context {
     generate,
     stream,
     compact: (compactOptions) => builder.compact(session, compactOptions),
+    compactDetailed: (compactOptions) => builder.compactDetailed(session, compactOptions),
   };
 }

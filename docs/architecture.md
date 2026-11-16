@@ -115,7 +115,8 @@ sequenceDiagram
   H->>Store: append 用户这句（inputKey 作幂等键）
   H->>B: build（会话名、指令、候选工具）
   Note over B: 收集事实（并行，单个超时 2 秒）<br/>从最近一条摘要读起再投影<br/>事实、投影出的 system 消息接到指令后面
-  B-->>H: PreparedCall（指令、消息、工具名）
+  B-->>H: PreparedCall（指令、消息、工具名、估算 token）
+  Note over H: 配了 overflow 又超了：先 compact 再裁剪，重新 build<br/>还放不下就以 context_overflow 结束，不调模型
   H->>SDK: generateText（instructions、messages、tools、stopWhen）
   SDK->>H: 工具调用
   H->>Ex: beforeTool → execute → afterTool
@@ -137,7 +138,8 @@ sequenceDiagram
 | `prepare(options)`               | 组装指令、消息和工具（包成 AI SDK `ToolSet`），不调用模型                           |
 | `generate(options)`              | 经 harness 跑一轮（`generateText`）；模型出错或被取消时抛出原来的错误               |
 | `stream(options)`                | 经 harness 跑一轮（`streamText`），流结束后记录；返回 `{ runId, result, recorded }` |
-| `compact(options)`               | 把较早的历史压成一条摘要                                                            |
+| `compact(options)`               | 把较早的历史压成摘要（太长时分段滚动）；这次没写下摘要时返回 `null`                 |
+| `compactDetailed(options)`       | 同上，返回怎么收场的：`status`、写下的摘要、调了几次模型、压了几条、截短了几条      |
 | `builder`、`executor`、`harness` | 内部的 `ContextBuilder`、函数执行环境和 harness，直接用就是协议的接口               |
 | `session`                        | 会话名                                                                              |
 
@@ -208,7 +210,7 @@ sequenceDiagram
 
 ## 投影
 
-`project(entries, options)` 按顺序做六步：
+`project(entries, options)` 按顺序做六步，要截短时是七步：
 
 1. 按 `(at, seq)` 排序（`compareEntries`）：补写的旧记录排回逻辑上的位置。
 2. 选摘要：`covers` 最大的那条生效，相同时后写（`seq` 大）的生效。`seq` ≤ `covers` 的条目不再出现，摘要之后补写的旧记录（`seq` > `covers`）仍然可见；摘要用 `options.summary` 渲染（缺省是一条用户消息 `Summary of the earlier conversation:\n…`），固定在第一条，不参与裁剪。
@@ -216,6 +218,7 @@ sequenceDiagram
 4. 事件条目：没有规则的 `kind` 跳过，也不打断前后同类事件的合并。`fold: true` 的规则把连续的同类事件合成一组交给 `render(events)`；`render` 返回一条消息、多条消息，或者空（丢掉）。
 5. 配对：工具结果找不到对应的调用（按调用 `id`）就去掉；工具调用没有结果（运行断在中间）就在它后面补一条错误结果 `No result was recorded for this tool call.`，服务商自己执行的调用（`providerExecuted`）不补。
 6. 窗口：开头孤立的工具结果（它的调用已经被摘要盖住或被裁掉）总是丢掉。设了 `maxMessages` 或 `maxTokens` 时，从最旧的消息开始整组丢弃直到不超；带工具调用的助手消息和紧跟的工具结果是一组。裁过之后如果没有摘要、开头又不是用户消息，接着裁到下一条用户消息（后面没有用户消息了就不再裁）。至少留下最后一组，宁可超预算也不交出空上下文。
+7. 截短（只在 `window.truncate` 为 `true`、又给了 `maxTokens` 时）：第 6 步之前先给单条消息封顶——从最新的一组往回看，超过历史预算（`maxTokens` 减去摘要）一半的消息截到一半，累计超过预算就停，更早的反正要丢，不白截；第 6 步之后只剩最后一组还超，从最大的消息接着截，每条最少留 32 个 token，摘要最后才动。截法是 `truncateMessage`（见[协议层](protocol.md#上下文-contextbuilder)）。
 
 这样不管日志里是什么样、窗口裁在哪，交给模型的都是服务商接口收得下的序列。
 
@@ -238,19 +241,20 @@ sequenceDiagram
 | `message`            | 改写或过滤消息条目                                                    |
 | `window.maxMessages` | 最多保留几条消息，摘要不算                                            |
 | `window.maxTokens`   | 估算 token 的预算，摘要计入                                           |
+| `window.truncate`    | 放不下时截短消息，不只是整组丢；缺省不截                              |
 | `window.estimate`    | 换掉缺省的 `estimateTokens`                                           |
 
 不设 `window` 就不裁剪：最近一条摘要之后的历史全部带上。
 
 投影照常输出 `system` 消息（例如摘要渲染成 `system`）；组装调用时 builder 把它们从消息里拿出来，接到指令后面（见[调用](#调用)）。
 
-结果 `Projection`：`messages`；`items`，每条带 `from`、`upTo`（它来自的条目里最小和最大的 `seq`）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`summary` 生效的摘要条目。
+结果 `Projection`：`messages`；`items`，每条带 `from`、`upTo`（它来自的条目里最小和最大的 `seq`）、`at`（来自的条目里最晚的 `at`）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`truncated` 被截短的消息条数；`summary` 生效的摘要条目。
 
 缺省的 token 估算不依赖分词器：中日韩文字一个字约 1 token，ASCII 约 4 个字符 1 token，其余文字（西里尔、阿拉伯、表情……）约 2 个字符 1 token，每条消息另加 4。附件按 `estimateFileTokens`：内联文字按字数，base64 按解码后的大小（图片 64 KiB 以内 256、更大 1600；文本类按字节数除以 4；其余每 20 字节 1 个、至少 256），只有地址或服务商引用、不知道大小的按 256；工具结果里的文件一样算。只用于预算和裁剪，不用于计费。
 
 ## 调用
 
-`createContextBuilder({ store, projection, projections, sources, sourceTimeoutMs, logger, factsPlacement, model })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
+`createContextBuilder({ store, projection, projections, sources, sourceTimeoutMs, logger, factsPlacement, model, models, now })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
 
 1. 收集事实（`facts: false` 跳过；`FactsSpec.sources` 只用指定的来源）。投影名先认：不认识就以 `not_found` 失败，不回退，也不先去收事实。
 2. 读视图：只读最近一条摘要和它之后的条目，再投影。请求带了 `window` 就整个换掉投影里配的上限（`{}` 是不裁剪），`estimate` 始终用投影里配的。`build` 时 `maxTokens` 先扣掉历史之外已经占掉的部分——指令、事实、工具定义、`input`、`prompt` 的估算——剩下的才是历史的预算，所以它管的是整次调用；`view` 没有这些，不扣。
@@ -258,6 +262,7 @@ sequenceDiagram
 4. 投影里的 `system` 消息（摘要、事件规则或 `message` 钩子渲染成的，以及存成消息条目的）不放进 `messages`，文字按顺序接在指令最后，同样用空行隔开。
 5. 消息：视图 + `input`（这一轮用户说的话）+ `prompt`（最后一条临时用户消息；可以是函数，拿到事实）。
 6. 工具：`build` 收候选的 `ToolDefinition[]`，给出工具名单；`context.prepare` 的 `tools` 缺省是注册表里全部，`false` 不给，名字列表、`{ names, tags, sources }` 或 `(definition) => boolean` 筛选。
+7. `PreparedCall.tokens`：第 2 步扣掉的那部分加上历史的估算，也就是整次调用的估算。harness 的超窗检查用它（见 [Harness](#harness)）。
 
 `instructions` 和 `prompt` 只要有一个是函数，事实就不再自动放进去；投影出的 `system` 消息照样接上。
 
@@ -307,13 +312,13 @@ console.log(text);
 
 ### 记录
 
-| 情况       | `record: true`（缺省）                                                                                                   | `record: false`                                            |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------- |
-| 开始、结束 | 先写 `ctx.run.started`（`runId`、`agent`），最后写 `ctx.run.ended`（`runId`、`stopReason`、`usage`）                     | 不写                                                       |
-| `input`    | 调用模型之前写入日志，组装时已经在视图里；`inputKey` 是它的幂等键                                                        | 只放进这一次的消息                                         |
-| 模型产出   | `responseMessages` 全部写入：助手消息、工具调用和工具结果，`source: 'model'`                                             | 不写。从 `result.messages` 拿，由应用决定什么时候 `append` |
-| 模型报错   | `input` 已经在日志里，没有回复；记 `ctx.error` 和 `ctx.run.ended`（`error`）；用同一个 `inputKey` 重试，这句不会再记一遍 | 日志不变                                                   |
-| 没有模型   | `createContext` 直接报错，什么都不写                                                                                     | 直接报错                                                   |
+| 情况       | `record: true`（缺省）                                                                                                                                                                             | `record: false`                                            |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| 开始、结束 | 先写 `ctx.run.started`（`runId`、`agent`），最后写 `ctx.run.ended`（`runId`、`stopReason`、`usage`）                                                                                               | 不写                                                       |
+| `input`    | 调用模型之前写入日志，组装时已经在视图里；`inputKey` 是它的幂等键                                                                                                                                  | 只放进这一次的消息                                         |
+| 模型产出   | `responseMessages` 全部写入：助手消息、工具调用和工具结果，`source: 'model'`                                                                                                                       | 不写。从 `result.messages` 拿，由应用决定什么时候 `append` |
+| 模型报错   | `input` 已经在日志里，没有回复；记 `ctx.error` 和 `ctx.run.ended`（`error`）；带同样的 `input` 重试，这句不会再记一遍（给了 `inputKey` 按键去重，没给的由 harness 认出来，见 [Harness](#harness)） | 日志不变                                                   |
+| 没有模型   | `createContext` 直接报错，什么都不写                                                                                                                                                               | 直接报错                                                   |
 
 - `generate` 返回 `{ runId, stopReason, text, messages, recorded, raw }`：`recorded` 是这次真正写进日志的条目（含 `ctx.run.*`），`raw` 是 `generateText` 的原始结果。
 - `generate` 和 `harness.run` 的差别：模型出错或被取消时，`generate` 为了和 0.1 兼容抛出原来的错误；`harness.run` 不抛，返回 `stopReason: 'error' | 'aborted'` 和 `error`，日志里照样有 `ctx.run.ended`。两者都只在写日志失败时 reject。
@@ -339,17 +344,25 @@ await context.append(eventEntry('whisper', { text }));
 
 ## 压缩
 
-`compact(options)` 把较早的历史压成一条摘要条目，原条目保留：
+`compact(options)` 把较早的历史压成摘要条目，原条目保留；`compactDetailed(options)` 做同一件事，返回 `CompactResult`：
 
 1. 取完整视图（不裁剪）：当前摘要 + 之后的消息。
-2. 最近 `keep`（缺省 12）条原样保留。切点往前挪，保留的部分不以工具结果开头。
-3. 切点之前没有消息，或者不到 `minimum`（缺省 8）条，就不压缩、不调模型，返回 `null`。
-4. 把旧摘要和切点之前的消息转成纯文本记录（图片、文件只写占位，例如 `[image image/png]`，不带数据），用 `instructions`（缺省是内置的压缩指令）、`temperature: 0`、`maxOutputTokens`（缺省 1024）调一次模型。`model` 缺省用上下文的模型。
-5. 摘要被 `maxOutputTokens` 截断（`finishReason` 是 `length`）时不写，告警并返回 `null`；否则在同一批里追加一条 `summary`（`covers` 是被保留的消息里最小的 `from` 减 1，即日志顺序上的切点；输入是投影里 `upTo` ≤ `covers` 的消息，补写的旧记录 `seq` 在切点之后，不进这次摘要，压缩后仍然可见。`fold` 合并的事件组里混进补写的旧记录时，组的 `from` ≤ `covers` < `upTo`，整组进摘要会重复，所以 `covers` 退到这一组的 `from` 减 1，整组留在视图里；退到不再有横跨的组为止，退到 0 就返回 `null`）和一条 `ctx.compacted`（`covers`、`summaryId`）。
+2. 最近 `keep`（缺省 12）条原样保留。切点往前挪，保留的部分不以工具结果开头。`at` 还在未来的消息（把到期时间当 `at` 的提醒；「现在」是 `createContextBuilder({ now })`，缺省 `Date.now`）一直排在视图的最后，数「最近 `keep` 条」时不算它们：它们的 `seq` 很小，算进去会把切点钉在自己前面，之后写的消息永远压不了。
+3. 切点之前没有消息，或者不到 `minimum`（缺省 8）条，就不压缩、不调模型：`status` 是 `not_needed`。
+4. 定 `covers`：被保留的消息里最小的 `from` 减 1，即日志顺序上的切点。进摘要的是投影里 `upTo` ≤ `covers` 的消息：补写的旧记录 `seq` 在切点之后，不进这次摘要，压缩后仍然可见；写在切点之前的未来条目进摘要，写在切点之后的照常留在视图里。`fold` 合并的事件组里混进补写的旧记录时，组的 `from` ≤ `covers` < `upTo`，整组进摘要会重复，所以 `covers` 退到这一组的 `from` 减 1，整组留在视图里；退到不再有横跨的组为止，退到没有可压的就是 `not_needed`。
+5. 把消息转成纯文本记录，一条消息几行：`角色: 文字`、`角色 called 工具(输入)`、`工具 returned 结果`。图片、文件只写占位（例如 `[image image/png]`），不带数据；工具调用的输入和工具结果各自最多留约 1000 个估算 token（预算小时是一段预算的四分之一），留头尾、中间写明省略了多少字符。
+6. 分段滚动：一次交给摘要模型的输入——压缩指令（`instructions`，缺省是内置的）、到目前为止的摘要、这一段记录——估算不超过 `maxInputTokens`（缺省 `DEFAULT_COMPACT_INPUT_TOKENS`，24000）。放不下就分段，每段用 `temperature: 0`、`maxOutputTokens`（缺省 1024）调一次模型，得到的摘要带进下一段。单条消息的记录就超过一段的预算时截短它（`truncateText`），不然永远过不去。短历史只有一段，输入和不分段时一样。`model` 缺省用上下文的模型。
+7. 检查点：每段压完，在同一批里追加一条 `summary`（`covers` 是下一段第一条消息之前）和一条 `ctx.compacted`（`covers`、`summaryId`）。这个位置落不了检查点时（下一段以工具结果开头，或者补写的旧记录让投影顺序和 `seq` 顺序在这里对不上），摘要先带在内存里，到下一个能落的位置再写；最后一段总是写。
+8. 中途停下的三种情况都不写那一段，已经落的检查点留着：摘要被 `maxOutputTokens` 截断（`finishReason` 是 `length`，记一条告警，`status` 是 `truncated`）；模型没给出文字（`empty`）；已有的摘要加指令就占满了 `maxInputTokens`、留给记录的不到 200 个估算 token（`input_too_long`，这时不调模型）。摘要模型自己报上下文过长（`isContextOverflowError`，上限配得比它的窗口大，或者估算偏小）时，这一段的预算减半再试，减到放不下也是 `input_too_long`。
+9. `timeoutMs` 管整次压缩：每次调模型只给剩下的时间，用完了抛 `timeout`（`CtxError`，`retryable: true`）。模型出错、超时照常抛出；这两种情况已经落的检查点同样留着，再调一次从那里接着压。
 
-新摘要已经包含旧摘要，所以只有最新的一条生效；之后 `view()` 从它读起。什么时候压缩由应用决定（例如定时、超过阈值），ctx 不自动压缩。
+`CompactResult` 是 `{ status, summary?, calls, compacted, remaining, shortened }`：`summary` 是这次写下的最后一条摘要，`calls` 是调模型的次数，`compacted`、`remaining` 是进了摘要和没进去的消息条数，`shortened` 是进摘要之前被截短的消息条数。`compact()` 返回 `summary ?? null`：没写下摘要的几种情况它分不开，要分开用 `compactDetailed()`。
+
+新摘要已经包含旧摘要，所以只有 `covers` 最大的那一条生效；之后 `view()` 从它读起。什么时候压缩缺省由应用决定（例如定时、超过阈值）；给 agent 配了 `context.overflow` 时，harness 在上下文超过上限的那一轮先压缩一次（见 [Harness](#harness)）。
 
 窗口和压缩的区别：窗口只影响这一次交给模型的内容，什么都不写；压缩写下一个检查点，以后每次投影都从它开始，被压缩的原条目仍在日志里，要删由应用调 [`pruneSession`](#删除和保留期)。
+
+`recompactLossy`（旧摘要的补救，见[协议层](protocol.md#消息格式和版本)）走同一套分段，但中途不落检查点：它的新摘要和旧摘要 `covers` 相同，写一半的会取代旧的，所以全部并完才写。
 
 ## 上下文来源
 
@@ -450,13 +463,15 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
 `createHarness({ store, context, tools?, executors?, models?, hooks?, logger?, source? })` 实现协议的 `run` 和 `stream`，基于 `generateText` / `streamText`：
 
 1. 写 `ctx.run.started`（`runId`、`agentSpecToJson(agent)`）。
-2. 记输入（`inputKey` 作幂等键；`source` 给了就记成它）。
+2. 记输入（`inputKey` 作幂等键；`source` 给了就记成它）。没给 `inputKey` 时先认重试：开始这一轮时读到的最后一个生命周期事件是停在 `error` 或 `aborted` 的 `ctx.run.ended`，就读日志末尾的 64 条，从后往前跳过 `ctx.*` 事件和摘要，碰到的第一条如果是内容相同的用户消息（而且没被跳过的摘要盖住），这句就不再记。上一轮成功时不多读。
 3. `agent.model` 是字符串时经 `models(name)` 造模型，没给 `models` 就以 `error` 结束。
-4. `tools.select(agent.tools)` 得到候选工具，`context.build(...)` 得到 `PreparedCall`，再交给 `beforeModel`（之后的每个工具步骤也会再调一次）。
+4. `tools.select(agent.tools)` 得到候选工具，`context.build(...)` 得到 `PreparedCall`。`agent.context.overflow` 配了、`PreparedCall.tokens` 又超过它的 `maxTokens` 时，按协议的三步走（见[协议层](protocol.md#harness)）：压缩（builder 抛 `no_model` 时带上这一轮的模型再调一次；失败只告警）→ 带 `truncate` 的窗口重新 `build` → 还超就抛 `context_overflow`。然后才交给 `beforeModel`（之后的每个工具步骤也会再调一次）；钩子换掉的调用不再检查。
 5. 调模型。每个工具调用：按定义的 `inputSchema` 查输入（`checkJsonSchema`；不合就不往下走，模型看到 `Invalid input for tool …` 和具体哪里不对，这一轮继续；`addTool` 加的工具不在这里查，函数执行环境按它原来的 zod 校验，注册表的 `validatesInput(name)` 告诉 harness 是哪些）→ `beforeTool`（可以拒绝或改写输入；拒绝时模型看到 `not allowed: <原因>`，这一轮继续）→ 按定义的 `executor` 找执行环境 `execute` → `afterTool`（可以改写结果）→ 结果超过 `maxToolOutputChars`（缺省 20 万字符）时截断并注明（`limitToolOutput`）。找不到执行环境、执行环境本身抛错也变成给模型看的错误。`validateToolInput: false` 关掉输入检查，`true` 连 `addTool` 的也查，`maxToolOutputChars: 0` 关掉截断。
 6. 记产出（`source: 'model'`）和 `ctx.run.ended`（`stopReason`、`usage`），同一批写。
 
 `stopReason`：模型自己停下是 `end_turn`；步数用完还想调工具是 `max_steps`；被 `maxOutputTokens` 截断是 `max_tokens`；`signal` 中止是 `aborted`；其他错误是 `error`，另记一条 `ctx.error`。出错和取消都照常返回 `RunResult` 并写 `ctx.run.ended`，只有写日志失败才 reject。`record: false` 一条都不写。
+
+`error.type`（`errorInfo(error)` 给出，重试错误取最后一次）：接口错误是 `api_call`，带 `statusCode`、`responseBody` 和 AI SDK 判断的 `retryable`；`CtxError` 是它自己的 `type`（`session_busy`、`not_found`、`unsupported_part`……）；上下文过长是 `context_overflow`、`retryable: false`，来源有两个——超窗检查自己抛的，和 `isContextOverflowError(error)` 认出来的服务商错误。后者 AI SDK 没有专门的类型，只能看状态码和文字：已经标成 `context_overflow` 的、HTTP 413、消息或响应正文里有常见写法的（`context_length_exceeded`、`maximum context length`、`prompt is too long`、`exceeds the context window`、`input is too long`、`input token count … exceeds`、`maximum prompt length`、`too many tokens`、`reduce the length of the messages`、`request_too_large` 等）算，401、403、404、429 一律不算（「too many tokens per minute」是限流）。这张表是按各家文档和常见报错整理的，**没有对真实服务验证**；认不出来的照旧是 `api_call`，应用可以自己再判断 `responseBody`。Anthropic 在输出途中撞到窗口上限时回的是 `stop_reason: model_context_window_exceeded`，AI SDK 把它归成 `length`，这里就是 `max_tokens`，不是错误。
 
 `executors` 可以是数组（按各自的 `name`）或 `{ 名字: 执行环境 }`；`tools` 是 `createToolRegistry()` 建的注册表时，它自带的函数执行环境自动加进来。
 
@@ -807,6 +822,7 @@ sequenceDiagram
 ## 错误和日志
 
 - `describeError(error, { secrets, max })` 给日志和界面用：重试错误取最后一次；接口错误带 `status` 和截短的响应正文 `detail`；`secrets` 里的密钥换成 `***`，空白合并，截到 `max`（缺省 180）字。
+- `isContextOverflowError(error)` 判断一个错误是不是「上下文超过了模型的窗口」，harness 和 `compact` 都用它；认法和「没有对真实服务验证」的说明见 [Harness](#harness)。
 - `redact(text, secrets)` 单独做去密钥。
 - 框架只通过 `Logger { warn, debug? }` 出声，缺省静默（`silentLogger`）。`createContext`、`createMcpHub` 都接受 `logger`。
 
@@ -817,6 +833,7 @@ sequenceDiagram
 | 会话存储               | `SessionStore`                   | 实现七个方法（`watch` 可选），跑 `describeSessionStoreContract`                                          |
 | 执行环境               | `Executor`                       | `execute` 出错返回 `{ type: 'error' }`，跑 `describeExecutorContract`                                    |
 | Harness、编排器        | `Harness`、`Orchestrator`        | 跑 `describeHarnessContract`、`describeOrchestratorContract`；模型用 `createScriptedModel(script)`       |
+| 上下文                 | `ContextBuilder`                 | 实现 `build`、`view`（`compact`、`compactDetailed` 可选），跑 `describeContextBuilderContract`           |
 | 钩子                   | `Hooks`                          | `createHarness({ hooks: { beforeModel, beforeTool, afterTool } })`                                       |
 | 模型服务商             | `ModelFactory`                   | `createModelRegistry().register(name, factory)`；或者直接给 `createContext` 任何 AI SDK `LanguageModel`  |
 | 事件渲染               | `EventRule`                      | `projection.events[kind]`                                                                                |

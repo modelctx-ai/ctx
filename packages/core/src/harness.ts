@@ -1,17 +1,23 @@
 import {
   agentSpecToJson,
+  CONTEXT_OVERFLOW,
   CTX_EVENTS,
   CtxError,
   ctxErrorEntry,
+  estimateTextTokens,
+  estimateTokens,
   headSeq,
   isConflict,
   isErased,
+  isFrameworkKind,
   errorOutput,
   messageEntry,
   runEndedEntry,
   runStartedEntry,
   silentLogger,
   userEntry,
+  type BuildRequest,
+  type CompactOptions,
   type ContextBuilder,
   type Entry,
   type ErasedData,
@@ -21,8 +27,10 @@ import {
   type Hooks,
   type Logger,
   type Message,
+  type MessageContent,
   type ModelHookContext,
   type NewEntry,
+  type OverflowSpec,
   type PreparedCall,
   type RunEvent,
   type RunRequest,
@@ -49,6 +57,7 @@ import {
 } from 'ai';
 
 import { isEmptyContent, resolveModel } from './builder.ts';
+import { isContextOverflowError } from './errors.ts';
 import { fromModelMessages, toModelMessages } from './messages.ts';
 import {
   dispatchTo,
@@ -131,6 +140,8 @@ interface RunState {
   started?: number;
   /** 写日志失败过：这时 run 要 reject，不能当成模型出错。 */
   logFailed: boolean;
+  /** 会话里上一轮以 `error` 或 `aborted` 结束：这一轮可能是它的重试，记输入之前先看它留下的输入（见 `repeatsFailedInput`）。 */
+  afterFailure: boolean;
 }
 
 interface Setup {
@@ -165,19 +176,25 @@ function stopReasonOf(finishReason: FinishReason, steps: number, maxSteps: numbe
   return 'end_turn';
 }
 
-/** 给 `RunResult.error` 和 `ctx.error` 用：重试错误取最后一次，接口错误标出能不能重试。 */
+/**
+ * 给 `RunResult.error` 和 `ctx.error` 用：重试错误取最后一次，接口错误标出能不能重试。
+ * 服务商说上下文过长的（`isContextOverflowError`）`type` 是 `context_overflow`、`retryable: false`：
+ * 原样再发一遍还是放不下，要先压缩或裁剪。
+ */
 export function errorInfo(error: unknown): ErrorInfo {
   const root = RetryError.isInstance(error) ? error.lastError : error;
+  const overflow = isContextOverflowError(root);
   if (APICallError.isInstance(root)) {
     return {
       message: root.message,
-      type: 'api_call',
-      retryable: root.isRetryable,
+      type: overflow ? CONTEXT_OVERFLOW : 'api_call',
+      retryable: overflow ? false : root.isRetryable,
       ...(root.statusCode !== undefined ? { statusCode: root.statusCode } : {}),
       ...(root.responseBody !== undefined ? { responseBody: root.responseBody } : {}),
     };
   }
   if (root instanceof Error) {
+    if (overflow) return { message: root.message, type: CONTEXT_OVERFLOW, retryable: false };
     const retryable = (root as { retryable?: unknown }).retryable;
     return {
       message: root.message,
@@ -187,6 +204,28 @@ export function errorInfo(error: unknown): ErrorInfo {
   }
   return { message: String(root) };
 }
+
+/** builder 没给 `PreparedCall.tokens` 时，harness 用缺省的估算自己算整次调用：指令、消息、交给模型的工具定义。 */
+function estimateCall(call: PreparedCall, tools: readonly ToolDefinition[]): number {
+  const names = new Set(call.tools);
+  const offered = tools.filter((tool) => names.has(tool.name));
+  return (
+    estimateTextTokens(call.instructions ?? '') +
+    call.messages.reduce((sum, message) => sum + estimateTokens(message), 0) +
+    (offered.length > 0 ? estimateTextTokens(JSON.stringify(offered)) : 0)
+  );
+}
+
+/** 会话里最后一个生命周期事件是 `ctx.run.ended`，而且停在 `error` 或 `aborted`：上一轮失败了，没有产出。 */
+function endedInFailure(lifecycle: readonly Entry[]): boolean {
+  const last = lifecycle.at(-1);
+  if (last?.type !== 'event' || last.kind !== CTX_EVENTS.runEnded) return false;
+  const stopReason = (last.data as { stopReason?: unknown } | undefined)?.stopReason;
+  return stopReason === 'error' || stopReason === 'aborted';
+}
+
+/** 认重试时最多往回读这么多条；失败的那句输入之后写得比这多，就不认了，输入照常记。 */
+const RETRY_SCAN = 64;
 
 function hasExecutor(tools: ToolRegistry | undefined): tools is ToolRegistry & { readonly executor: Executor } {
   const candidate = (tools as { executor?: unknown } | undefined)?.executor;
@@ -213,6 +252,7 @@ function begin(request: RunRequest): RunState {
     recorded: [],
     head: undefined,
     logFailed: false,
+    afterFailure: false,
   };
 }
 
@@ -367,8 +407,13 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     try {
       for (let conflicts = 0; ; conflicts += 1) {
         const head = await headSeq(store, session);
-        const [last] = await store.list(session, { kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded], last: 1 });
+        const lifecycle = await store.list(session, {
+          kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded],
+          last: 1,
+        });
+        const last = lifecycle.at(-1);
         if (last?.type === 'event' && last.kind === CTX_EVENTS.runStarted) return false;
+        state.afterFailure = endedInFailure(lifecycle);
         try {
           await append(state, [started], head);
           state.started = state.recorded.at(-1)?.seq;
@@ -383,17 +428,125 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     }
   }
 
+  /**
+   * 这一轮的输入是不是上一轮失败时留下的那句。上一轮以 `error` 或 `aborted` 结束、没有产出，它（或者更早失败的一轮）
+   * 记下的输入还在日志里；这一轮带着一模一样的输入来，就是重试：不再记一遍，不然每失败一次历史就长一条
+   * （上下文过长时越重试越长）。只在那句输入之后没有别的内容时才认：它后面只有框架事件（`ctx.*`）和没盖住它的摘要。
+   * 给了 `inputKey` 的不走这里，由存储按键去重。
+   */
+  async function repeatsFailedInput(state: RunState, input: MessageContent): Promise<boolean> {
+    if (!state.afterFailure) return false;
+    const tail = await store.list(state.request.session, { last: RETRY_SCAN });
+    let covered = 0;
+    // 从末尾往回找最后一条不是框架写的条目：失败的轮次只留下 `ctx.*` 事件，连着失败几轮也一样跳过去。
+    for (const entry of tail.toReversed()) {
+      if (entry.type === 'event' && isFrameworkKind(entry.kind)) continue;
+      if (entry.type === 'summary') {
+        covered = Math.max(covered, entry.covers);
+        continue;
+      }
+      return (
+        entry.type === 'message' &&
+        entry.message.role === 'user' &&
+        entry.seq > covered &&
+        JSON.stringify(entry.message.content) === JSON.stringify(input)
+      );
+    }
+    return false;
+  }
+
+  /** 压缩一次，返回有没有写下摘要。builder 自己没配摘要模型（`no_model`）时用这一轮的模型。 */
+  async function compactFor(
+    session: string,
+    spec: OverflowSpec,
+    model: LanguageModel,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const compactOptions: CompactOptions = {
+      ...spec.compact,
+      // 至少留一条：这一轮刚记下的输入不能进摘要，模型要原样看到它。
+      ...(spec.compact?.keep !== undefined ? { keep: Math.max(1, spec.compact.keep) } : {}),
+      signal,
+    };
+    try {
+      return (await context.compact!(session, compactOptions)) !== null;
+    } catch (error) {
+      if ((error as { type?: unknown } | null)?.type !== 'no_model') throw error;
+      return (await context.compact!(session, { ...compactOptions, model })) !== null;
+    }
+  }
+
+  /**
+   * 超窗兜底（`AgentSpec.context.overflow`）：估算整次调用，超过 `maxTokens` 就先压缩、再裁剪（按 `strategy`），
+   * 每一步之后重新 `build`。都做完还超，抛 `context_overflow`，这一轮不调模型。
+   * 不写日志的运行（`record` 是 false）不压缩：压缩要追加摘要，而它一条都不该写。
+   */
+  async function fit(
+    first: PreparedCall,
+    request: BuildRequest,
+    spec: OverflowSpec,
+    record: boolean,
+    model: LanguageModel,
+    signal: AbortSignal,
+  ): Promise<PreparedCall> {
+    const limit = spec.maxTokens;
+    const strategy = spec.strategy ?? 'compact';
+    // 配置可能是从线上来的 JSON：不是数、不认识的策略都当请求不对，不猜。
+    if (typeof limit !== 'number' || !Number.isFinite(limit) || limit <= 0) {
+      throw new CtxError('invalid_request', 'AgentSpec.context.overflow.maxTokens must be a positive number.');
+    }
+    if (strategy !== 'compact' && strategy !== 'trim' && strategy !== 'error') {
+      throw new CtxError(
+        'invalid_request',
+        'AgentSpec.context.overflow.strategy must be "compact", "trim" or "error".',
+      );
+    }
+    const sizeOf = (call: PreparedCall): number => call.tokens ?? estimateCall(call, request.tools ?? []);
+    let prepared = first;
+    const before = sizeOf(prepared);
+    if (before <= limit) return prepared;
+    if (strategy === 'compact' && record && context.compact) {
+      try {
+        if (await compactFor(request.session, spec, model, signal)) prepared = await context.build(request);
+      } catch (error) {
+        if (signal.aborted) throw error;
+        // 压缩没做成（摘要模型出错、超时）不拦这一轮：接着裁剪。
+        logger.warn('compaction failed while the context is over its limit; trimming instead', {
+          error: errorInfo(error).message,
+        });
+      }
+    }
+    if (strategy !== 'error' && sizeOf(prepared) > limit) {
+      const maxTokens = Math.min(request.window?.maxTokens ?? Infinity, limit);
+      prepared = await context.build({ ...request, window: { ...request.window, maxTokens, truncate: true } });
+    }
+    const after = sizeOf(prepared);
+    logger.debug?.('context over its limit', { limit, before, after, strategy });
+    if (after > limit) {
+      throw new CtxError(
+        CONTEXT_OVERFLOW,
+        `The prepared call is estimated at ${after} tokens, over the limit of ${limit}` +
+          (strategy === 'error' ? '.' : ' even after compaction and trimming.'),
+        { retryable: false },
+      );
+    }
+    return prepared;
+  }
+
   async function setup(state: RunState, extras: RunExtras, signal: AbortSignal): Promise<Setup> {
     const { request } = state;
     const { agent, session } = request;
     const input = isEmptyContent(request.input) ? undefined : request.input;
     if (state.record && input !== undefined) {
       const source = options.source !== undefined ? { source: options.source } : {};
-      await write(state, [userEntry(input, { ...source, ...(request.inputKey ? { key: request.inputKey } : {}) })]);
+      const repeated = request.inputKey === undefined && (await repeatsFailedInput(state, input));
+      if (!repeated) {
+        await write(state, [userEntry(input, { ...source, ...(request.inputKey ? { key: request.inputKey } : {}) })]);
+      }
     }
     const model = resolveModel(agent.model, options.models);
     const candidates = tools ? tools.select(agent.tools ?? true) : [];
-    let prepared = await context.build({
+    const building: BuildRequest = {
       session,
       ...(!state.record && input !== undefined ? { input } : {}),
       ...(agent.instructions !== undefined ? { instructions: agent.instructions } : {}),
@@ -410,7 +563,10 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
             : {}),
       ...(agent.context?.projection !== undefined ? { projection: agent.context.projection } : {}),
       signal,
-    });
+    };
+    let prepared = await context.build(building);
+    const overflow = agent.context?.overflow;
+    if (overflow) prepared = await fit(prepared, building, overflow, state.record, model, signal);
     const hookContext: ModelHookContext = { runId: state.runId, session, step: 0, signal };
     prepared = (await hooks.beforeModel?.(prepared, hookContext)) ?? prepared;
     // 模型不一定看 abortSignal：已经取消就不调了。
