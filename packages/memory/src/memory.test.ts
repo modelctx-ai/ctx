@@ -298,7 +298,7 @@ describe('createMemory：gate', () => {
 
 const PG = '主人的项目改用 PostgreSQL';
 const EXTRACT_PG: ExtractionScript = {
-  values: { facts: [PG], decisions: null, since: null, lesson: null },
+  values: { facts: [PG], decisions: null, lesson: null },
 };
 
 /** 一段带事件的对话门控、提取之后，提取模型看到的 state。 */
@@ -459,29 +459,30 @@ describe('createMemory：consolidate', () => {
     assert.deepEqual(await store.procedures.list(), []);
   });
 
-  test('pNull > 0.3 当没说；since 有值时是 validFrom，没有时取这段第一条的 at', async () => {
+  test('pNull > 0.3 当没说；起始日期按条给：开头写了 [YYYY-MM-DD] 的是 validFrom，没写的取这段第一条的 at', async () => {
     const at = NOW - 3 * DAY;
     const extraction = {
       name: 'x',
       async extract() {
         return {
-          facts: { value: ['主人住在台北'], pNull: 0.1, confidence: 0.8 },
+          facts: { value: ['[2026-10-01] 主人住在台北', '主人养了一只猫'], pNull: 0.1, confidence: 0.8 },
           decisions: { value: ['编出来的决定'], pNull: 0.5, confidence: 0.9 },
-          since: { value: '2026-10-01', pNull: 0.2, confidence: 0.9 },
           lesson: { value: null, pNull: 0.9, confidence: 0.9 },
         };
       },
     };
     const { sessions, store, memory } = setup({ decision: createScriptedDecisionModel(KEEP), extraction });
-    await sessions.append('s', [userEntry('我搬到台北了，记住', { at })]);
+    await sessions.append('s', [userEntry('我十月一号搬到台北了，还养了猫，记住', { at })]);
     await memory.gate('s');
     const report = await memory.consolidate();
-    assert.equal(report.facts.added, 1);
+    assert.equal(report.facts.added, 2);
     assert.equal(report.facts.archived, 0, '这一夜刚写的不归档');
-    const [fact] = await store.facts.list();
-    assert.equal(fact?.text, '主人住在台北');
-    assert.equal(fact?.validFrom, Date.parse('2026-10-01'));
-    assert.equal(fact?.confidence, 0.8);
+    const facts = await store.facts.list();
+    const taipei = facts.find((fact) => fact.text === '主人住在台北');
+    assert.equal(taipei?.validFrom, Date.parse('2026-10-01'));
+    assert.equal(taipei?.confidence, 0.8);
+    assert.ok(taipei?.key, '带幂等键');
+    assert.equal(facts.find((fact) => fact.text === '主人养了一只猫')?.validFrom, at, '一条的日期不套给别的');
   });
 
   test('衰减：激活度低于 archiveAt 还不够，还要错过 minChances 次机会；没人用记忆的日子不算', async () => {
@@ -1022,5 +1023,240 @@ describe('createMemory：几个用户共用一份存储', () => {
       ['s'],
     );
     assert.ok(warnings.some((warning) => warning.includes('does not own')));
+  });
+});
+
+/** 原文里有「坏」字的那批抛 `error`，别的提取出原文本身。 */
+function flakyExtraction(error: () => unknown) {
+  const calls: string[] = [];
+  return {
+    calls,
+    name: 'flaky',
+    async extract(request: { state: JsonValue }) {
+      const state = typeof request.state === 'string' ? request.state : JSON.stringify(request.state);
+      calls.push(state);
+      if (state.includes('坏')) throw error();
+      const text = state.includes('台北') ? '主人住在台北' : '主人养了猫';
+      return {
+        facts: { value: [text], pNull: 0.05, confidence: 0.9 },
+        decisions: { value: null, pNull: 0.9, confidence: 0.9 },
+        lesson: { value: null, pNull: 0.9, confidence: 0.9 },
+      };
+    },
+  };
+}
+
+/** 同一个会话两段，各成一条待处理的笔记；`maxTokens: 1` 让每条自成一批。 */
+async function twoNotes(options: Partial<MemoryOptions>) {
+  const context = setup({ decision: createScriptedDecisionModel(KEEP), consolidate: { maxTokens: 1 }, ...options });
+  await context.sessions.append('s', [userEntry('这段输出总是坏的')]);
+  await context.memory.gate('s');
+  await context.sessions.append('s', [userEntry('我住在台北')]);
+  await context.memory.gate('s');
+  return context;
+}
+
+describe('createMemory：失败和死信', () => {
+  test('一批失败不挡后面的：失败的笔记记次数留着，到 maxAttempts 进死信，告警并调 onDeadLetter；retry 放回去', async () => {
+    const extraction = flakyExtraction(() => new Error('模型的回答取不出 JSON'));
+    const dead: string[][] = [];
+    const { store, memory, warnings } = await twoNotes({
+      extraction,
+      consolidate: { maxTokens: 1, maxAttempts: 2 },
+      onDeadLetter: (notes) => dead.push(notes.map((note) => note.id)),
+    });
+
+    const first = await memory.consolidate();
+    assert.equal(first.notes, 1, '后面那批照常处理');
+    assert.equal(first.failed, 1);
+    assert.equal(first.dead, 0);
+    assert.deepEqual(
+      (await store.facts.list()).map((fact) => fact.text),
+      ['主人住在台北'],
+    );
+    const [bad] = await store.notes.list({ pending: true });
+    assert.equal(bad?.attempts, 1);
+    assert.equal(bad?.error, '模型的回答取不出 JSON');
+
+    const second = await memory.consolidate();
+    assert.equal(second.notes, 0);
+    assert.equal(second.dead, 1);
+    assert.deepEqual(await store.notes.list({ pending: true }), [], '死信不再处理');
+    assert.deepEqual(dead, [[bad?.id]]);
+    assert.ok(warnings.some((message) => message.includes('dead letter')));
+    const calls = extraction.calls.length;
+    assert.equal((await memory.consolidate()).failed, 0);
+    assert.equal(extraction.calls.length, calls, '死信不再调模型');
+
+    assert.equal(await store.notes.retry([bad?.id]), 1);
+    assert.equal((await store.notes.list({ pending: true }))[0]?.id, bad?.id);
+  });
+
+  test('可以重试的错（retryable）当场再试一次，还不行就留到下次，不记失败次数', async () => {
+    const extraction = flakyExtraction(() => Object.assign(new Error('429'), { retryable: true }));
+    const { store, memory } = await twoNotes({ extraction });
+    const report = await memory.consolidate();
+    assert.equal(report.failed, 1);
+    assert.equal(report.dead, 0);
+    assert.equal(extraction.calls.filter((state) => state.includes('坏')).length, 2, '当场再试了一次');
+    const [left] = await store.notes.list({ pending: true });
+    assert.equal(left?.attempts, undefined, '不记次数');
+  });
+
+  test('提取的回答整个不是 JSON（被截断）：笔记不标成处理过，记一次失败', async () => {
+    const model = textModel(() => '{"facts": {"value": ["主人住在台');
+    const { sessions, store, memory } = setup({ decision: createScriptedDecisionModel(KEEP), model });
+    await sessions.append('s', [userEntry('我搬到台北了')]);
+    await memory.gate('s');
+    const report = await memory.consolidate();
+    assert.equal(report.notes, 0);
+    assert.equal(report.failed, 1);
+    const [note] = await store.notes.list({ pending: true });
+    assert.equal(note?.attempts, 1);
+    assert.match(note?.error ?? '', /not a JSON object/);
+  });
+
+  test('门控的决策模型失败：这一段用启发式打分，head 照样前进，告警', async () => {
+    const decision = {
+      name: 'down',
+      async decide(): Promise<Record<string, DecisionAnswer>> {
+        throw new Error('服务不可用');
+      },
+    };
+    const { sessions, store, memory, warnings } = setup({ decision });
+    await sessions.append('s', [userEntry('记住：我以后都用 PostgreSQL，不用 MySQL 了')]);
+    const notes = await memory.gate('s');
+    assert.equal(notes.length, 1);
+    assert.equal(await store.notes.head('s'), 1);
+    assert.ok(warnings.some((message) => message.includes('heuristic')));
+  });
+});
+
+describe('createMemory：取代和幂等', () => {
+  const SUPERSEDE: DecisionScript = {
+    ...KEEP,
+    answers: {
+      relation: choice('supersede', ['new', 'merge', 'supersede'], 0.95),
+      target: choice('c1', ['c1'], 0.95),
+    },
+  };
+
+  async function superseding(text: string) {
+    const extraction = createScriptedExtractionModel({ values: { facts: [text], decisions: null, lesson: null } });
+    const context = setup({ decision: createScriptedDecisionModel(SUPERSEDE), extraction });
+    const old = await seed(context.store, context.sessions, '主人的项目用 MySQL', {
+      topic: 'work',
+      validFrom: NOW - 10 * DAY,
+    });
+    await context.sessions.append('s', [userEntry('项目要换数据库')]);
+    await context.memory.gate('s');
+    return { ...context, old, report: await context.memory.consolidate() };
+  }
+
+  test('取代：新的写进去、旧的关掉，一步完成；没写日期的按今天关', async () => {
+    const { store, old, report } = await superseding('主人的项目改用 PostgreSQL');
+    assert.equal(report.facts.superseded, 1);
+    const closed = (await store.facts.list()).find((fact) => fact.id === old.id);
+    assert.equal(closed?.validTo, NOW);
+    assert.ok(closed?.supersededBy);
+  });
+
+  test('取代：将来才成立的变化不关掉现在成立的那条，两条都留着', async () => {
+    const { store, old, report } = await superseding('[2026-12-01] 主人的项目改用 PostgreSQL');
+    assert.equal(report.facts.superseded, 0);
+    assert.equal(report.facts.added, 1);
+    const open = await store.facts.list({ open: true });
+    assert.deepEqual(open.map((fact) => fact.id).includes(old.id), true, '旧的还成立');
+    assert.equal(open.find((fact) => fact.id !== old.id)?.validFrom, Date.parse('2026-12-01'));
+  });
+
+  test('两个进程同时处理同一批笔记：事实只写一条（幂等键），笔记只有一份', async () => {
+    const sessions = sessionLog();
+    const store = createMemoryStore();
+    const make = () =>
+      createMemory({
+        store,
+        sessions,
+        now: () => NOW,
+        decision: createScriptedDecisionModel(KEEP),
+        extraction: createScriptedExtractionModel(EXTRACT_PG),
+      });
+    const [a, b] = [make(), make()];
+    await sessions.append('s', [userEntry('项目用 PostgreSQL 了')]);
+    await Promise.all([a.gate('s'), b.gate('s')]);
+    assert.equal((await store.notes.list()).length, 1);
+    await Promise.all([a.consolidate(), b.consolidate()]);
+    assert.deepEqual(
+      (await store.facts.list()).map((fact) => fact.text),
+      [PG],
+    );
+  });
+});
+
+async function remembered() {
+  const model = routedModel({ core: '主人住在杭州，喜欢乌龙茶，项目用 PostgreSQL' });
+  const context = setup({ model, decision: createScriptedDecisionModel(KEEP) });
+  const { store, sessions } = context;
+  const tea = await seed(store, sessions, '主人喜欢喝乌龙茶');
+  const city = await seed(store, sessions, '主人住在杭州');
+  const [other] = await sessions.append('t', [userEntry('项目用 PostgreSQL')]);
+  const pg = await store.facts.add({
+    subject: 'user',
+    text: '主人的项目用 PostgreSQL',
+    validFrom: NOW,
+    confidence: 0.9,
+    salience: 0.6,
+    sources: [{ session: 't', from: other!.seq, upTo: other!.seq }],
+  });
+  const rule = await store.procedures.add({
+    when: '部署前',
+    do: '先跑测试',
+    evidence: [{ session: 's', from: 1, upTo: 1 }],
+    at: NOW,
+  });
+  await context.memory.gate('s');
+  await context.memory.consolidate();
+  assert.equal((await store.core.get())?.text, '主人住在杭州，喜欢乌龙茶，项目用 PostgreSQL');
+  return { ...context, tea, city, pg, rule };
+}
+
+describe('createMemory：forget', () => {
+  test('删事实：画像的历史全部清掉，从剩下的事实按缺省写法重新渲染，不经模型', async () => {
+    const { store, memory: mem, tea, city, pg } = await remembered();
+    const calls = (await store.core.history()).length;
+    assert.ok(calls >= 1);
+    const report = await mem.forget({ facts: [tea.id] });
+    assert.deepEqual(report, { notes: 0, facts: 1, procedures: 0, core: calls });
+    const core = await store.core.get();
+    assert.ok(core && !core.text.includes('乌龙茶'), '删掉的不在画像里');
+    assert.ok(core.text.includes('杭州') && core.text.includes('PostgreSQL'));
+    assert.equal((await store.core.history()).length, 1, '旧版本都没了');
+    assert.deepEqual((await store.facts.list()).map((fact) => fact.id).toSorted(), [city.id, pg.id].toSorted());
+  });
+
+  test('删一个会话：它的笔记、证据里有它的事实和程序；别的会话的留着', async () => {
+    const { store, memory: mem, pg } = await remembered();
+    assert.ok((await store.notes.list({ session: 's' })).length > 0);
+    const report = await mem.forget({ session: 's' });
+    assert.equal(report.facts, 2);
+    assert.equal(report.procedures, 1);
+    assert.ok(report.notes > 0);
+    assert.deepEqual(await store.notes.list({ session: 's' }), []);
+    assert.deepEqual(
+      (await store.facts.list()).map((fact) => fact.id),
+      [pg.id],
+    );
+    assert.deepEqual(await store.procedures.list(), []);
+    assert.equal((await store.core.get())?.text, '主人的项目用 PostgreSQL');
+  });
+
+  test('all：这份记忆的全部；没有剩下的事实时画像是空的', async () => {
+    const { store, memory: mem } = await remembered();
+    const report = await mem.forget({ all: true });
+    assert.equal(report.facts, 3);
+    assert.equal(report.procedures, 1);
+    assert.deepEqual(await store.facts.list(), []);
+    assert.deepEqual(await store.notes.list(), []);
+    assert.equal(await store.core.get(), null);
   });
 });

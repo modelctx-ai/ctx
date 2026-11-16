@@ -735,15 +735,29 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
         return (await call<{ notes: Note[] }>('POST', '/notes', { body: { notes } })).notes;
       },
       async list(query = {}) {
-        const { session, pending, limit } = query;
+        const { session, pending, failed, since, limit } = query;
         return (
           await call<{ notes: Note[] }>('GET', '/notes', {
-            query: { session, pending: flag(pending), limit: count(limit) },
+            query: { session, pending: flag(pending), failed: flag(failed), since: count(since), limit: count(limit) },
           })
         ).notes;
       },
       async settle(ids, at) {
         return (await call<{ settled: number }>('POST', '/notes/settle', { body: { ids, at } })).settled;
+      },
+      async fail(ids, at, failOptions) {
+        const { error, maxAttempts } = failOptions;
+        return (await call<{ notes: Note[] }>('POST', '/notes/fail', { body: { ids, at, error, maxAttempts } })).notes;
+      },
+      async retry(ids) {
+        return (await call<{ retried: number }>('POST', '/notes/retry', { body: { ids } })).retried;
+      },
+      async forget(session) {
+        return (
+          await call<{ forgotten: number }>('POST', '/notes/forget', {
+            body: session === undefined ? {} : { session },
+          })
+        ).forgotten;
       },
       async head(session) {
         return (await call<{ head: number }>('GET', '/notes/head', { query: { session } })).head;
@@ -752,6 +766,10 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
     facts: {
       async add(fact) {
         return (await call<{ fact: MemoryFact }>('POST', '/facts', { body: { fact } })).fact;
+      },
+      async supersede(id, fact, at) {
+        return (await call<{ fact: MemoryFact }>('POST', `/facts/${segment(id)}/supersede`, { body: { fact, at } }))
+          .fact;
       },
       async close(id, at, closeOptions) {
         const supersededBy = closeOptions?.supersededBy;
@@ -770,6 +788,9 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
       },
       async restore(ids) {
         return (await call<{ restored: number }>('POST', '/facts/restore', { body: { ids } })).restored;
+      },
+      async reopen(ids) {
+        return (await call<{ reopened: number }>('POST', '/facts/reopen', { body: { ids } })).reopened;
       },
       async forget(ids) {
         return (await call<{ forgotten: number }>('POST', '/facts/forget', { body: { ids } })).forgotten;
@@ -798,6 +819,9 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
       async retire(id, at) {
         await call('POST', `/procedures/${segment(id)}/retire`, { body: { at } });
       },
+      async forget(ids) {
+        return (await call<{ forgotten: number }>('POST', '/procedures/forget', { body: { ids } })).forgotten;
+      },
       async list(query = {}) {
         const { topic, active } = query;
         return (
@@ -820,6 +844,9 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
             query: { last: count(historyOptions.last) },
           })
         ).versions;
+      },
+      async clear() {
+        return (await call<{ cleared: number }>('DELETE', '/core')).cleared;
       },
     },
   };

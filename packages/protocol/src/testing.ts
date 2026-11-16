@@ -2623,6 +2623,166 @@ export function describeMemoryStoreContract(
       await store.core.set('一', 4);
       assert.deepEqual(await store.core.get(), { text: '一', at: 4 }, '回滚就是把旧文字再 set 一次');
     });
+
+    test('notes：同一个会话、同样区间的笔记只写一次，add 返回已有的那条；同一批里重复的也一样', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const draft = { session: 's', from: 1, upTo: 3, at: 10, salience: 0.8 };
+      const [first] = await store.notes.add([draft]);
+      const again = await store.notes.add([
+        { ...draft, at: 11, salience: 0.2 },
+        { ...draft, from: 2 },
+        { ...draft, from: 2, at: 12 },
+      ]);
+      assert.ok(first);
+      assert.equal(again[0]?.id, first.id);
+      assert.equal(again[0]?.salience, 0.8, '已有的不改');
+      assert.equal(again[1]?.id, again[2]?.id);
+      assert.deepEqual(ids(await store.notes.list()), [first.id, again[1]!.id]);
+      const [other] = await store.notes.add([{ ...draft, session: 't' }]);
+      assert.notEqual(other?.id, first.id, '别的会话的同一个区间是另一条');
+      const [scoped] = await store.scope('user:alice').notes.add([draft]);
+      assert.notEqual(scoped?.id, first.id, '别的作用域的是另一条');
+    });
+
+    test('notes：fail 记失败次数和原因，到 maxAttempts 进死信；死信不算待处理，retry 放回去；list 的 failed、since', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const [a, b, done] = await store.notes.add([
+        { session: 's', from: 1, upTo: 1, at: 10, salience: 0.8 },
+        { session: 's', from: 2, upTo: 2, at: 20, salience: 0.8 },
+        { session: 's', from: 3, upTo: 3, at: 30, salience: 0.8, settledAt: 30 },
+      ]);
+      assert.ok(a && b && done);
+      const once = await store.notes.fail([a.id, b.id, done.id, 'missing'], 40, { error: '坏的 JSON', maxAttempts: 2 });
+      assert.deepEqual(ids(once), [a.id, b.id], '处理过的、认不得的跳过');
+      assert.equal(once[0]?.attempts, 1);
+      assert.equal(once[0]?.error, '坏的 JSON');
+      assert.equal(once[0]?.failedAt, undefined);
+      assert.deepEqual(ids(await store.notes.list({ pending: true })), [a.id, b.id], '失败一次还是待处理');
+
+      const twice = await store.notes.fail([a.id], 50, { error: '还是坏的', maxAttempts: 2 });
+      assert.equal(twice[0]?.attempts, 2);
+      assert.equal(twice[0]?.error, '还是坏的');
+      assert.equal(twice[0]?.failedAt, 50, '到上限进死信');
+      assert.deepEqual(ids(await store.notes.list({ pending: true })), [b.id], '死信不算待处理');
+      assert.deepEqual(ids(await store.notes.list({ failed: true })), [a.id]);
+      assert.deepEqual(ids(await store.notes.list({ failed: false })), [b.id, done.id]);
+      assert.deepEqual(ids(await store.notes.list({ pending: false })), [done.id], '死信也不算处理过');
+      assert.deepEqual(await store.notes.fail([a.id], 60, { error: 'x', maxAttempts: 2 }), [], '死信不再记');
+      assert.equal(await store.notes.settle([a.id], 60), 0, '死信不能直接标成处理过');
+      assert.equal(await store.notes.head('s'), 3, 'head 含死信');
+
+      assert.equal(await store.notes.retry([a.id, b.id, 'missing']), 1, '只有死信放得回去');
+      const [back] = (await store.notes.list()).filter((note) => note.id === a.id);
+      assert.equal(back?.failedAt, undefined);
+      assert.equal(back?.attempts, undefined);
+      assert.equal(back?.error, undefined);
+      assert.deepEqual(ids(await store.notes.list({ pending: true })), [a.id, b.id]);
+      assert.deepEqual(ids(await store.notes.list({ since: 20 })), [b.id, done.id]);
+      assert.equal((await store.scope('user:bob').notes.fail([b.id], 70, { error: 'x', maxAttempts: 1 })).length, 0);
+    });
+
+    test('notes：forget 删掉一个会话的笔记（head 回到 0），不给会话删掉全部；别的作用域不动', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const alice = store.scope('user:alice');
+      const draft = { from: 1, upTo: 3, at: 10, salience: 0.8 };
+      await store.notes.add([
+        { ...draft, session: 's' },
+        { ...draft, session: 's', from: 4, upTo: 5 },
+        { ...draft, session: 't' },
+      ]);
+      await alice.notes.add([{ ...draft, session: 's' }]);
+      assert.equal(await store.notes.forget('s'), 2);
+      assert.equal(await store.notes.head('s'), 0);
+      assert.deepEqual(
+        (await store.notes.list()).map((note) => note.session),
+        ['t'],
+      );
+      assert.equal(await store.notes.forget('s'), 0);
+      assert.equal(await store.notes.forget(), 1);
+      assert.deepEqual(await store.notes.list(), []);
+      assert.equal((await alice.notes.list()).length, 1, '别的作用域的还在');
+    });
+
+    test('facts：key 一个作用域里不重复，add 遇到已有的键返回已有的那条、什么都不写', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const first = await store.facts.add(newFact('主人住在杭州', { key: 'k1' }));
+      assert.equal(first.key, 'k1');
+      const again = await store.facts.add(newFact('主人住在上海', { key: 'k1' }));
+      assert.deepEqual(again, first);
+      assert.deepEqual(ids(await store.facts.list()), [first.id]);
+      const other = await store.scope('user:alice').facts.add(newFact('主人住在上海', { key: 'k1' }));
+      assert.notEqual(other.id, first.id, '别的作用域的同一个键是另一条');
+      const plain = [await store.facts.add(newFact('没有键')), await store.facts.add(newFact('没有键'))];
+      assert.notEqual(plain[0]!.id, plain[1]!.id, '没有键的不去重');
+      assert.equal((await store.facts.list()).length, 3);
+    });
+
+    test('facts：supersede 原子地加新关旧；认不得的 id 什么都不写；键已经有了什么都不改；已经关闭的只写新的', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const old = await store.facts.add(newFact('主人住在杭州'));
+      const added = await store.facts.supersede(old.id, newFact('主人住在上海', { key: 'move' }), 50);
+      assert.equal(added.text, '主人住在上海');
+      const closed = await factById(store, old.id);
+      assert.equal(closed?.validTo, 50);
+      assert.equal(closed?.supersededBy, added.id);
+      assert.equal((await factById(store, added.id))?.validTo, undefined);
+
+      await assert.rejects(store.facts.supersede('missing', newFact('不该写'), 60), hasType('not_found'));
+      assert.deepEqual(
+        (await store.facts.list()).map((fact) => fact.text).toSorted(),
+        ['主人住在上海', '主人住在杭州'],
+        '认不得的 id：新的也没写',
+      );
+      await assert.rejects(
+        store.facts.supersede(added.id, newFact('没有证据', { sources: [] }), 60),
+        hasType('invalid_request'),
+      );
+
+      const repeated = await store.facts.supersede(added.id, newFact('主人住在上海', { key: 'move' }), 70);
+      assert.equal(repeated.id, added.id, '同一个键：返回已有的');
+      assert.equal((await factById(store, added.id))?.validTo, undefined, '什么都不改：没有把自己关掉');
+
+      const again = await store.facts.supersede(old.id, newFact('主人住在北京'), 80);
+      assert.equal((await factById(store, old.id))?.validTo, 50, '已经关闭的不改');
+      assert.equal((await factById(store, old.id))?.supersededBy, added.id);
+      assert.equal((await factById(store, again.id))?.text, '主人住在北京');
+      await assert.rejects(
+        store.scope('user:bob').facts.supersede(added.id, newFact('别的作用域'), 90),
+        hasType('not_found'),
+      );
+    });
+
+    test('facts：reopen 撤销关闭，清掉 validTo 和 supersededBy，返回真正重新打开的条数', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const old = await store.facts.add(newFact('主人住在杭州'));
+      const added = await store.facts.supersede(old.id, newFact('主人住在上海'), 50);
+      assert.equal(await store.facts.reopen([old.id, added.id, 'missing']), 1);
+      const reopened = await factById(store, old.id);
+      assert.equal(reopened?.validTo, undefined);
+      assert.equal(reopened?.supersededBy, undefined);
+      assert.deepEqual(ids(await store.facts.list({ open: true })).toSorted(), [old.id, added.id].toSorted());
+      assert.equal((await searchIds(store, { text: '杭州' }))[0], old.id, '回到 open 的搜索里');
+      assert.equal(await store.facts.reopen([old.id]), 0);
+      assert.equal(await store.scope('user:bob').facts.reopen([old.id]), 0);
+    });
+
+    test('procedures：forget 真删，返回删掉的条数；core：clear 删掉全部版本，get 回到 null', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.procedures.add({ when: '部署前', do: '先跑测试', evidence: [ref(1)], at: 1 });
+      const b = await store.procedures.add({ when: '发版后', do: '看监控', evidence: [ref(2)], at: 2 });
+      assert.equal(await store.scope('user:bob').procedures.forget([a.id]), 0);
+      assert.equal(await store.procedures.forget([a.id, a.id, 'missing']), 1);
+      assert.deepEqual(ids(await store.procedures.list()), [b.id]);
+
+      await store.core.set('一', 1);
+      await store.core.set('二', 2);
+      await store.scope('user:bob').core.set('bob', 3);
+      assert.equal(await store.core.clear(), 2);
+      assert.equal(await store.core.get(), null);
+      assert.deepEqual(await store.core.history(), []);
+      assert.equal(await store.core.clear(), 0);
+      assert.equal((await store.scope('user:bob').core.get())?.text, 'bob', '别的作用域的不动');
+    });
   });
 }
 

@@ -140,3 +140,12 @@ ACT-R 的基础激活 `A = ln Σ (Δt_i + ε)^(−d) + s`：每次召回是一�
   这次没做、仍然留着的：事实没有写入时间，提取出的 `since` 很早的事实从写入的第二夜起仍然按 `validFrom` 算（上面待办的第三条）；检索是字面的，同义词、单个汉字的词（「茶」对「乌龙茶」）靠 `embed`。
 
 - 2026-11-15：提取和证据读日志时用和门控一样的筛选（`gate.entries`，缺省只有消息）。原先 `consolidate` 按区间读原文不带筛选，区间里的事件、摘要也进了提取，等于绕过了「工具输出不进事实」这条防线。
+- 2026-11-16：夜里处理的失败、取代的原子性、多进程和删除（[#43](https://github.com/modelctx-ai/ctx/issues/43)、[#36](https://github.com/modelctx-ai/ctx/issues/36) 的记忆一半）。上面的决定 3、4 和 2026-10-27 的修订 10 按下面的读：
+  1. **失败不是「什么都没说」**（修订 10「读不到原文的笔记直接 settle」以外的失败）：以前提取的回答解析失败时笔记照样 `settle`，这段的记忆永久丢了；一批持续失败时整个 `consolidate` 都过不去。现在按批隔离，失败的笔记 `notes.fail` 记次数和原因，到上限（缺省 3）进死信，不再算待处理，`notes.retry` 放回去；可以重试的错当场再试一次、不记次数。LM 装成的决策、提取模型整个回答取不出 JSON 时 reject（`invalid_response`），不再返回一份全是「不确定」的答案，门控失败时那一段退回启发式。没有选「失败就留着待处理、下次再试」：一段总让模型出错的内容会每夜都试、都失败，谁也看不见。
+  2. **结构化输出**：两个 LM 适配器按问题、字段生成 JSON Schema，经 `Output.object` 要结构化输出；服务商不支持时退回从文字里宽松地取。协议不变：`DecisionModel`、`ExtractionModel` 还是 JSON 进、JSON 出。
+  3. **加新关旧是一个方法**（修订决定 4「变了就 `close` 旧的、`add` 新的」）：`facts.supersede(id, fact, at)` 原子地做两步；分开做时 `close` 失败会留下两条都成立的事实。另加 `facts.reopen`，关错了改得回来。起始日期按条给：以前一个 `since` 套给整批事实，将来的日期还会把现在成立的事实提前关掉；现在新事实的日期在将来时不取代，两条都留着。
+  4. **幂等**：同一段日志只有一条笔记（`notes.add` 按会话和区间去重），事实带可选的 `key`，一个作用域里唯一。参考实现用来源区间加文字算键。排队只在进程里，这是两个进程同时门控、同时整理不写出重复的办法。没有选「存储上的锁」：远端存储上没有好用的锁，幂等对重试也一样管用。
+  5. **删除级联**（[ADR 0007](0007-deletion-and-retention.md) 没有覆盖的记忆一半）：门面加 `forget({ facts?, procedures?, session?, all? })`；存储加 `notes.forget`、`procedures.forget`、`core.clear`。删了事实时画像的历史整个清掉，从剩下的事实按缺省写法重写一版，不经模型：重写要把「上一版画像」喂回去，删掉的内容会回来。会话日志仍然不归记忆删（决定 2），应用自己清。
+  6. **System One 的请求有超时**：`SystemOneSpec.timeoutMs`（缺省 30 秒），超时是可以重试的 `timeout`。
+
+  2026-10-27 的待办里「`NoteQuery` 没有时间过滤」做了（`NoteQuery.since`）。破坏面：自己实现 `MemoryStore` 的要加七个方法（`notes.fail`、`retry`、`forget`，`facts.supersede`、`reopen`，`procedures.forget`，`core.clear`）和 `key`、同一段笔记去重的语义；自己实现 `Memory` 的要加 `forget`；构造 `ConsolidateReport` 的要加 `failed`、`dead`。SQLite 的记忆结构升到 4。

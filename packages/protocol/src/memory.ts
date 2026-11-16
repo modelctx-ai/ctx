@@ -31,21 +31,31 @@ export interface Note {
   readonly kind?: string;
   /** 应用定义的主题名。 */
   readonly topic?: string;
-  /** 夜里处理过的时刻；没有就是待处理。 */
+  /** 夜里处理过的时刻；没有、也没进死信（`failedAt`）就是待处理。 */
   readonly settledAt?: number;
+  /** 处理失败过几次（`fail` 记）；没失败过没有这一项。 */
+  readonly attempts?: number;
+  /** 最后一次失败的原因，写给人看。 */
+  readonly error?: string;
+  /** 失败次数到了上限、进死信的时刻。死信不算待处理，`retry` 放回去。 */
+  readonly failedAt?: number;
 }
 
 /**
  * 写入的笔记：`id` 由存储生成。`settledAt` 可以直接给：门控没过的那段也写一条已处理的笔记（`settledAt` 等于 `at`），
- * 这样 `head` 照样前进，同一段日志不会被再打一次分，打过的分也留作阈值的分布。
+ * 这样 `head` 照样前进，同一段日志不会被再打一次分，打过的分也留作阈值的分布。失败的记录只能由 `fail` 写。
  */
-export type NewNote = Omit<Note, 'id'>;
+export type NewNote = Omit<Note, 'id' | 'attempts' | 'error' | 'failedAt'>;
 
 /** `notes.list` 的筛选。结果按写入顺序。 */
 export interface NoteQuery {
   readonly session?: string;
-  /** `true` 只要待处理的（没有 `settledAt`），`false` 只要处理过的；不给不限。 */
+  /** `true` 只要待处理的（没有 `settledAt`、也没进死信），`false` 只要处理过的（有 `settledAt`）；不给不限。 */
   readonly pending?: boolean;
+  /** `true` 只要死信（有 `failedAt`），`false` 不要死信；不给不限。 */
+  readonly failed?: boolean;
+  /** 只要 `at` 不早于它的。 */
+  readonly since?: number;
   /** 最多返回多少条（最早写入的那些）。小数向下取整，不是正数时返回空；不给就不限。 */
   readonly limit?: number;
 }
@@ -53,6 +63,11 @@ export interface NoteQuery {
 /** 记忆里的事实：一句能独立成立的话，带有效期、证据和召回记录。文字写入后不改。 */
 export interface MemoryFact {
   readonly id: string;
+  /**
+   * 幂等键：一个作用域里不重复，`add`、`supersede` 遇到已有的键返回已有的那条、什么都不写。几个进程夜里处理同一批笔记时
+   * 不会写出重复的事实。参考实现用来源区间加文字算。
+   */
+  readonly key?: string;
   /** `user`、`project:agent`……应用定义。 */
   readonly subject: string;
   readonly predicate?: string;
@@ -124,6 +139,14 @@ export interface SearchQuery {
   readonly archived?: boolean;
 }
 
+/** `notes.fail` 的选项。 */
+export interface FailNoteOptions {
+  /** 失败的原因，记进 `Note.error`。 */
+  readonly error: string;
+  /** 失败几次进死信：这次记完 `attempts` 不小于它时写 `failedAt`。 */
+  readonly maxAttempts: number;
+}
+
 /** `facts.close` 的选项。 */
 export interface CloseFactOptions {
   /** 取代它的事实的 `id`，必须已经存在：先 `add` 新的，再 `close` 旧的。 */
@@ -187,7 +210,9 @@ export function checkMemoryScope(scope: unknown): asserts scope is string {
 /**
  * 记忆的存储：笔记、事实、程序、画像四个集合。全部只收发 JSON，可以放到进程边界另一侧；身份是字符串，由存储生成。
  * 时刻都由调用方给（毫秒），存储不看钟。错误用 `CtxError`：参数不合法是 `invalid_request`（例如没有证据、
- * `from > upTo`），认不得的 `id` 是 `not_found`；批量方法（`settle`、`touch`、`archive`、`restore`、`forget`）跳过认不得的 `id`，不报错。
+ * `from > upTo`），认不得的 `id` 是 `not_found`；批量方法（`settle`、`fail`、`retry`、`touch`、`archive`、`restore`、
+ * `reopen`、`forget`）跳过认不得的 `id`，不报错。每个方法单独是原子的：`supersede` 的「加新关旧」要么都成，要么都不成。
+ * 几个进程共用一份存储时，同一段日志的笔记（`notes.add` 按区间）和同一个键的事实（`key`）只写一次。
  * 记忆只读会话日志，存储从不写它。
  *
  * 一份存储按作用域分开（`scope`）：一个用户、租户或项目一个作用域，名字由应用定。四个集合都在作用域里面，
@@ -202,17 +227,37 @@ export interface MemoryStore {
    */
   scope(scope: string): MemoryStore;
   readonly notes: {
-    /** 按输入顺序返回写入的笔记（带 `id`）。区间不合法时整批不写，抛 `invalid_request`。 */
+    /**
+     * 按输入顺序返回写入的笔记（带 `id`）。区间不合法时整批不写，抛 `invalid_request`。同一个会话、同样的 `from` 和 `upTo`
+     * 已经有笔记时不再写，返回已有的那条：两个进程同时门控同一段日志只留一条。
+     */
     add(notes: readonly NewNote[]): Promise<Note[]>;
     list(query?: NoteQuery): Promise<Note[]>;
-    /** 把待处理的标成处理过（`settledAt = at`），返回这次真正标上的条数；已经处理过的不改。可重复调。 */
+    /** 把待处理的标成处理过（`settledAt = at`），返回这次真正标上的条数；已经处理过的、死信不改。可重复调。 */
     settle(ids: readonly string[], at: number): Promise<number>;
-    /** 这个会话的笔记（含处理过的）覆盖到的最大 `seq`；没有就是 0。`gate` 从它之后读。 */
+    /**
+     * 记一次处理失败：待处理的笔记 `attempts` 加 1、`error` 换成这次的；加完不小于 `maxAttempts` 时 `failedAt = at`，进死信。
+     * 返回这次改了的笔记。处理过的、已经是死信的不改。
+     */
+    fail(ids: readonly string[], at: number, options: FailNoteOptions): Promise<Note[]>;
+    /** 死信放回待处理：清掉 `failedAt`、`attempts`、`error`，返回放回的条数。不是死信的不改。 */
+    retry(ids: readonly string[]): Promise<number>;
+    /**
+     * 删掉这个会话的笔记，不给会话就删掉作用域里全部的笔记；返回删掉的条数。删完 `head` 回到 0：会话日志还在的话，
+     * 下次 `gate` 从头读。
+     */
+    forget(session?: string): Promise<number>;
+    /** 这个会话的笔记（含处理过的、死信）覆盖到的最大 `seq`；没有就是 0。`gate` 从它之后读。 */
     head(session: string): Promise<number>;
   };
   readonly facts: {
-    /** 没有证据或证据区间不合法时不写，抛 `invalid_request`。 */
+    /** 没有证据或证据区间不合法时不写，抛 `invalid_request`。`key` 已经有了时不写，返回已有的那条。 */
     add(fact: NewMemoryFact): Promise<MemoryFact>;
+    /**
+     * 原子的「加新关旧」：写入 `fact`，再把 `id` 那条 `close(id, at, { supersededBy: 新的 })`，返回新写的。`id` 认不得时
+     * 抛 `not_found`，什么都不写；`id` 已经关闭时只写新的。`fact.key` 已经有了时返回已有的那条，什么都不改。
+     */
+    supersede(id: string, fact: NewMemoryFact, at: number): Promise<MemoryFact>;
     /**
      * 关闭有效期：`validTo = at`，给了 `supersededBy` 一并记下。事实的文字永不改写：变了就 `add` 新的、`close` 旧的。
      * 已经关闭的不改（第二次 `close` 什么都不做）。`id` 或 `supersededBy` 认不得时抛 `not_found`。
@@ -229,6 +274,8 @@ export interface MemoryStore {
     archive(ids: readonly string[], at: number): Promise<number>;
     /** 恢复归档的事实（清掉 `archivedAt`），返回这次真正恢复的条数；没归档的不改。有效期不动：关闭的恢复了还是关闭的。 */
     restore(ids: readonly string[]): Promise<number>;
+    /** 撤销关闭：清掉 `validTo` 和 `supersededBy`，返回这次真正重新打开的条数；没关闭的不改。关错了的改回来用它。 */
+    reopen(ids: readonly string[]): Promise<number>;
     /** 真删除，连同别的事实里指向它的 `supersededBy` 一起清掉，返回删掉的条数。主人的权利。 */
     forget(ids: readonly string[]): Promise<number>;
     list(query?: FactQuery): Promise<MemoryFact[]>;
@@ -246,6 +293,8 @@ export interface MemoryStore {
     confirm(id: string, evidence: readonly SourceRef[]): Promise<Procedure>;
     /** `retiredAt = at`；已经退役的不改。`id` 认不得抛 `not_found`。 */
     retire(id: string, at: number): Promise<void>;
+    /** 真删除，返回删掉的条数。 */
+    forget(ids: readonly string[]): Promise<number>;
     list(query?: ProcedureQuery): Promise<Procedure[]>;
   };
   readonly core: {
@@ -255,6 +304,8 @@ export interface MemoryStore {
     set(text: string, at: number): Promise<void>;
     /** 历史版本，按写入顺序。 */
     history(options?: CoreHistoryOptions): Promise<CoreVersion[]>;
+    /** 删掉全部版本（真删除，`get` 回到 null），返回删掉的个数。事实删了以后画像里还留着的，用它清。 */
+    clear(): Promise<number>;
   };
 }
 
@@ -390,6 +441,10 @@ export interface ConsolidateOptions {
 export interface ConsolidateReport {
   /** 这次处理（`settle`）的笔记数。 */
   readonly notes: number;
+  /** 这次处理失败、留着下次再试的笔记数（不含进了死信的）。 */
+  readonly failed: number;
+  /** 这次失败次数到了上限、进死信的笔记数。 */
+  readonly dead: number;
   readonly facts: {
     readonly added: number;
     readonly merged: number;
@@ -412,11 +467,35 @@ export interface MemorySourceOptions {
   readonly k?: number;
 }
 
+/**
+ * `Memory.forget` 要删什么，几项可以一起给。删的都是真删除；画像从剩下的事实重新渲染（不经模型，
+ * 删掉的内容不会被「上一版画像」带回来），历史版本一起清掉。
+ */
+export interface ForgetRequest {
+  /** 这些事实。 */
+  readonly facts?: readonly string[];
+  /** 这些程序。 */
+  readonly procedures?: readonly string[];
+  /** 这个会话留下的：它的笔记，证据里有它的事实和程序（证据还指向别的会话的也删）。 */
+  readonly session?: string;
+  /** 这份记忆（它的作用域）里的全部：笔记、事实、程序、画像。 */
+  readonly all?: boolean;
+  readonly signal?: AbortSignal;
+}
+
+export interface ForgetReport {
+  readonly notes: number;
+  readonly facts: number;
+  readonly procedures: number;
+  /** 删掉的画像版本数（不含重新渲染后写的那一版）。 */
+  readonly core: number;
+}
+
 /** 记忆作为工具时的工具名。输入 `{ query: string, since_days?: number }`。 */
 export const MEMORY_RECALL_TOOL = 'recall';
 
 /**
- * 记忆的门面：五个操作，参考实现是 `@modelctx-ai/ctx-memory` 的 `createMemory(options)`。它本身是一个 `Executor`
+ * 记忆的门面：五个操作加删除，参考实现是 `@modelctx-ai/ctx-memory` 的 `createMemory(options)`。它本身是一个 `Executor`
  * （名字缺省 `memory`），`tools()` 报出 `recall` 工具。只读会话日志，从不写它；只有 `consolidate` 改写事实、程序和 `core`。
  */
 export interface Memory extends Executor {
@@ -430,8 +509,13 @@ export interface Memory extends Executor {
    * 归档的事实也找（相似度打折），被召回的那些恢复成没归档的；`confidence` 低于 `minConfidence` 的不召回。
    */
   recall(query: string, options?: RecallOptions): Promise<Recalled>;
-  /** 夜里：处理待处理的笔记，衰减归档，重写 `core`。整体可重复执行：处理过的笔记不再处理。 */
+  /**
+   * 夜里：处理待处理的笔记，衰减归档，重写 `core`。整体可重复执行：处理过的笔记不再处理。按批隔离：一批失败不挡后面的，
+   * 失败的笔记留着（`notes.fail`），失败次数到上限进死信。
+   */
   consolidate(options?: ConsolidateOptions): Promise<ConsolidateReport>;
+  /** 删除（`ForgetRequest`）。和 `consolidate` 排同一个队，不会和夜里的处理交错。 */
+  forget(request: ForgetRequest): Promise<ForgetReport>;
   /**
    * 作为来源：`core` 加按 `query` 召回的事实，渲染成文字；什么都没有时返回空。来源每一轮都会被调，
    * 所以它带出的事实不是每次都记 `touch`：实现要限制频率（参考实现是同一条事实一天记一次），不然被带出的事实

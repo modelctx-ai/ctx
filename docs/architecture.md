@@ -585,17 +585,19 @@ interface MemoryOptions {
     escalateBelow?: number; // 并入判断的 confidence 低于它、又有 model 时升级，缺省 0.6
     maxPNull?: number; // 提取字段的 pNull 高于它当作没说，缺省 0.3
     maxTokens?: number; // 一次提取的原文上限，超过就分批，缺省 6000
+    maxAttempts?: number; // 一批失败几次进死信，缺省 3
   };
   core?: { budgetTokens?: number }; // 缺省 2000
   embed?: (text: string) => Promise<readonly number[]>; // 召回时再加一路余弦，和存储 search 的分取大的
   name?: string; // 执行环境的名字，缺省 memory
   now?: () => number; // 缺省 Date.now
   logger?: Logger;
+  onDeadLetter?: (notes: readonly Note[], error: unknown) => void; // 笔记进了死信时调
 }
 function createMemory(options: MemoryOptions): Memory;
 ```
 
-参考实现在同一会话上的 `gate` 排队执行，`consolidate` 整体排队执行，不并发。
+参考实现在同一会话上的 `gate` 排队执行，`consolidate` 和 `forget` 排同一个队，不并发。排队只在进程里；几个进程共用一份存储时靠存储的幂等（同一段只有一条笔记、同一个 `key` 只有一条事实）不写出重复的。
 
 `ctx-memory` 的 `createMemoryStore` 造的是内存 `MemoryStore`，和核心包 `@modelctx-ai/ctx` 的会话存储 `createMemoryStore`（造 `SessionStore`）同名；两个一起用时改名导入，例如 `import { createMemoryStore as createSessionStore } from '@modelctx-ai/ctx'`。
 
@@ -621,6 +623,7 @@ if (salience >= theta) await store.notes.add([{ session, from, upTo, at: now, sa
 
 - 一次调用四个问题，一次前向。只打分、只写笔记，不提取。新条目超过 `gate.maxTokens`（缺省 4000 估算 token）时拆成几段，各问一次、各写一条笔记。渲染成文字时 `tool` 角色的消息不进来；只剩没有文字的条目时写一条 0 分的已处理笔记。
 - 看哪些条目由应用定（`gate.entries`）：缺省只看消息，事件按 `kinds` 挑。
+- 决策模型失败（服务不可用、回答取不出 JSON）时这一段改用启发式打分，告警一次：不给一个假的 0.5 分让它悄悄过不了阈值，也不让一段日志一直卡住这个会话的门控。
 - 阈值：`gate.auto` 开着（缺省）时取最近 7 天笔记的 `salience`，按 `theta` 算待处理的占比；落在 10–25% 就用 `theta`，否则取分位让占比落到最近的边界。最近 7 天的笔记少于 20 条时用 `theta`（缺省 0.6）。`auto: false` 固定用 `theta`。
 - 启发式退路 `createHeuristicDecisionModel`：惊讶（1 − 与已有事实的最大相似度，乘信息量）、强调（「记住」「以后」「别再」、改变、偏好）、重复（这段里用户反复说的、最近几段里说过的）、情绪（报错、失败、纠正）四项加权，权重 `HEURISTIC_WEIGHTS` 是 0.3、0.4、0.1、0.2。只认这四个问题，别的问题返回均匀分布。`createMemory` 没给 `decision` 时用它：「惊讶」接 `store.facts.search`，「重复」看这个进程最近 7 天门控过的段落（存在进程里，重启后从空开始）。够用就不上模型。
 
@@ -653,50 +656,61 @@ sequenceDiagram
   M->>S: notes.list({ pending: true })
   loop 每个主题
     M->>L: list(from..upTo) 读原文
-    M->>X: extract：facts、since、decisions、lesson
+    M->>X: extract：facts、decisions、lesson
     loop 每条提出的事实
       M->>S: facts.list({ topic, open: true })
       M->>D: decide：关系是 new / merge / supersede，对应哪条
       alt confidence < 0.6
         M->>LM: 升级：让推理模型判断
       end
-      M->>S: add / cite + touch / add + close
+      M->>S: add / cite + touch / supersede
     end
     opt lesson 非空
       M->>LM: 反思：写成 when / do / evidence
       M->>S: procedures.add 或 confirm
     end
-    M->>S: notes.settle
+    M->>S: notes.settle（这批失败了是 notes.fail）
   end
   M->>S: 衰减：activation < archiveAt 且错过了 minChances 次机会的 facts.archive
   M->>LM: 从 open facts 重写 core（≤ budgetTokens）
   M->>S: core.set
 ```
 
-- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`since`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说；`since` 为空时 `validFrom` 取这批第一条的 `at`。证据是这批笔记的区间。
-- 并入：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。措辞相同（空白和句读归一、不分大小写后相等）的直接并入，不调 `decide`；否则有对照的事实放进 `state`，这就是分类问题。置信度低于 `consolidate.escalateBelow`（缺省 0.6）、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是 `add` 新的、`close` 旧的（`supersededBy` 指向新的）。
+- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说。起始日期按条给：对话里说了某一条从哪天起成立的，那一条开头写 `[YYYY-MM-DD]`，就是它的 `validFrom`；没写的取这批第一条的 `at`。以前一个 `since` 字段套给整批，一条的日期会被安到别的事实上。证据是这批笔记的区间。
+- 并入：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。措辞相同（空白和句读归一、不分大小写后相等）的直接并入，不调 `decide`；否则有对照的事实放进 `state`，这就是分类问题。置信度低于 `consolidate.escalateBelow`（缺省 0.6）、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是存储的 `supersede`：新的写进去、旧的关掉（`supersededBy` 指向新的），一步完成，不会留下两条都成立的。旧的按新事实自己写的日期关（早于旧事实生效时按今天），没写日期按今天。新事实的日期在将来（「下个月起改用……」）时不取代，两条都留着，各带各的起始日期：协议的有效期只有「关了」和「没关」，关在将来的日期上等于现在就关了。
+- 幂等键：新事实的 `key` 是 `m1:` 加来源区间和归一化文字的 53 位哈希。同一批笔记再处理一次（另一个进程同时在跑、上次半途失败）算出的是同一个键，存储返回已有的那条。
 - 反思是唯一的开放生成，只在 `lesson` 非空且有 `model` 时做：和同主题已有的程序是同一条就 `confirm`，否则 `add`。`add` 时 `confirmations` 是 1，相同的证据 `confirm` 不计数；召回只带 `confirmations ≥ recall.confirmations`（缺省 2）的。
+- 按批隔离：每一批（和每一组读原文）单独 `try`，一批失败不挡后面的。可以重试的错（`retryable: true`：超时、429、5xx）当场再试一次，还不行就留着下次，不记次数，报告的 `failed` 数它。别的错（包括模型的回答取不出 JSON、`invalid_response`）`notes.fail` 记一次，次数到 `consolidate.maxAttempts`（缺省 3）进死信，告警并调 `onDeadLetter`；死信不再处理，修好原因后 `store.notes.retry(ids)` 放回去。以前一批持续失败（某段内容总让模型输出坏 JSON）时整个 `consolidate` 都过不去，解析失败的那批又被当成「什么都没说」标掉，记忆悄悄丢了。
 - 读不到原文的笔记（会话清掉了）直接 `settle`，什么都不写。既没有 `extraction` 也没有 `model` 时不处理笔记，笔记保持待处理，只做衰减和 `core` 的缺省渲染，第一次告警一次。
 - 衰减：open 的事实同时满足两条才归档。一是[激活度](protocol.md#激活度-activationretrievability)低于 `decay.archiveAt`。二是错过了至少 `decay.minChances`（缺省 7）次机会：这条事实最后一次活动（`validFrom` 或最后一次被召回，取晚的）之后，记忆有这么多个不同的日子（UTC）召回过别的事实，它一次都没轮上。日子从 open 事实的 `recalls` 里数。只看时间的话，一条 `s = 0.6` 的新事实 1.09 天后就归档，头两天没碰上相关的问题就没了；没人用记忆的日子现在不算，主人离开一个月回来也不会全归档。缺省取 7 是一周的节律：只在周末或每周例会上用得到的事实，七个有召回的日子里轮得到一次。`minChances: 0` 回到只看激活度。`validFrom` 在未来的事实按它离现在多远算（和激活度一样折回过去），所以远期的也会归档，临近的不会。这一轮刚写入或刚并入的事实不在同一轮归档（提取出的 `validFrom` 可能早于今天）。归档不是删除：召回还找得到它（降权），被召回就恢复。没有写入时间这个字段，所以提取出的 `since` 很早的事实，从写入的第二夜起仍然按 `validFrom` 算。
 - `core`：有 `model` 时从 open 事实重写；open 事实的集合和上次重写时一样就不再调模型（这个记录在进程里，重启后第一夜会重写一次）；输出为空或超预算时回到 `renderCore`。没有 `model` 时用 `renderCore`。文字和当前版本相同就不写新版本。
-- 幂等：笔记 `settle` 之后不再处理；中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下一夜重做，重做时措辞相同的事实直接并入，同一段证据不会记两次。白天不受影响。
+- 幂等：笔记 `settle` 之后不再处理；中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下一夜重做，重做时同一个键的事实不再写，措辞相同的直接并入，同一段证据不会记两次。白天不受影响。
 - 报告里 `facts.added` 只数 `new`，取代的那条新事实算在 `superseded` 里；`escalated` 数调了几次 `LanguageModel` 做并入判断。
+- 报告的 `failed`、`dead` 数这次失败留着的和进了死信的笔记。
 - 什么时候跑由编排器定：每天固定时刻、空闲时、待处理笔记够多时。框架不替应用决定。
+
+### 删除 `forget`
+
+- `facts`、`procedures` 按 `id` 删；`session` 删这个会话的笔记（`notes.forget(session)`）、证据里有它的事实和程序；`all` 删这个作用域里的全部。几项可以一起给。
+- 删了事实（或 `all`）时画像整个重来：`core.clear()` 删掉全部版本，再从剩下的 open 事实按 `renderCore` 写一版。不经模型重写：重写要把上一版画像喂回去，删掉的内容又会回来。下一次 `consolidate` 照常用模型重写（记着的「上次重写时的事实集合」清掉了）。
+- 召回用的向量缓存（`embed`）删掉对应的；启发式门控记着的最近几段原文清空。
+- 会话日志不归它删：`forget({ session })` 之后应用自己 `sessions.clear(session)`（或 `truncate`、`remove`）。
 
 ### SQLite 和内存存储
 
-SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，加检索用的 `fact_docs`、`fact_terms`，前缀缺省 `memory_`；结构版本 3 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。
+SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，加检索用的 `fact_docs`、`fact_terms`，前缀缺省 `memory_`；结构版本 4 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。
 
 两个存储的 `search` 是同一套：协议包的 `searchTerms` 切词（字母数字连成的词、中日韩文字相邻两字），`termOverlap` 打分（共同的词数除以较小的那一边），分数相同时共同的词多的在前、再相同按 `id`。同一组事实、同一个查询，两边的命中和分数一样。
 
 - SQLite 是倒排索引。`fact_terms(scope, term, doc)` 一个词一行，主键以 `scope` 开头；`fact_docs(doc, scope, fact_id, terms)` 给每条事实一个短的整数编号（事实的 `id` 是 UUID，每个词都带着它太占地方）并记下它有几个词。`facts.add` 在同一个事务里写索引，`forget` 把它的词删干净；事实的文字不改，别的方法不动索引。查询的词（最多 `MAX_SEARCH_TERMS` 个）当一个 JSON 参数传进去，`json_each` 展开后每个词按主键查一次，按事实数命中了几个，只有命中的事实才读事实表。语句的形状不随词数变，所以上千个词也不会撑破表达式树；CROSS JOIN 固定了连接顺序，库里没有统计信息时规划器自己排会先扫整个作用域。3 万条事实的库里，一个常见词的查询约 7 毫秒，罕见词不到 1 毫秒（以前是全表 `instr`，19–41 毫秒；900 个词的查询约 4 秒）。
 - 没有用 FTS5：它不是每个 Node 自带的 SQLite 都编进去了（这个包的 `engines` 从 22.13 起），自带的 `unicode61` 分词器不切中文，`trigram` 匹配不到两个字的词。自己切词、用普通表，哪个版本都一样。
 - 版本 2 的库打开时升到 3：建两张表，已有的事实（各个作用域的，含关闭、归档的）补进索引，`recalls` 超过 `MAX_FACT_RECALLS` 个的截到最近的那些。
+- 版本 4：`notes` 加 `attempts`、`error`、`failed_at`，`(scope, session, from_seq, up_to)` 上有唯一索引（建之前已有的重复只留最早的一条），`notes.add` 用 `ON CONFLICT DO NOTHING`；`facts` 加 `fact_key`，`(scope, fact_key)` 上有部分唯一索引（没有键的不限）。待处理的部分索引换成也排除死信的 `notes_scope_waiting`。`supersede` 在一个 `BEGIN IMMEDIATE` 里写新的、关旧的。
 - 内存存储每次扫一遍这个作用域的事实，每条事实的词只切一次、按 `id` 记着；给了 `embed` 再和余弦取大的。
 
 ### 模型
 
-`ctx-models` 按配置造 System One 模型：`createDecisionModel(spec, options?)`、`createExtractionModel(spec, options?)`。`SystemOneSpec` 的写法和 `createModel` 的 `ModelSpec` 一致，可以直接写进配置文件；差别是 `provider` 必填、没有缺省，`cloudflare` 另要 `accountId`。第二个参数 `options` 不进配置文件，只有 `fetch`（测试里注入）。决策模型内置 `cloudflare`、`typesafe`；提取模型只内置 `cloudflare`，因为 TypeSafe 的公开 API（OpenAPI 只有 `/v1/systemone`）没有提取接口。别的服务商用 `createDecisionModelRegistry`、`createExtractionModelRegistry` 注册。非 2xx 抛 `SystemOneError`（继承 `CtxError`，带 `statusCode`、`responseBody`，408、429、5xx 可重试）。
+`ctx-models` 按配置造 System One 模型：`createDecisionModel(spec, options?)`、`createExtractionModel(spec, options?)`。`SystemOneSpec` 的写法和 `createModel` 的 `ModelSpec` 一致，可以直接写进配置文件；差别是 `provider` 必填、没有缺省，`cloudflare` 另要 `accountId`。第二个参数 `options` 不进配置文件，只有 `fetch`（测试里注入）。一次请求最多等 `timeoutMs`（缺省 `SYSTEM_ONE_TIMEOUT_MS`，30 秒，连读完正文），超时抛 `CtxError('timeout')`，`retryable: true`。决策模型内置 `cloudflare`、`typesafe`；提取模型只内置 `cloudflare`，因为 TypeSafe 的公开 API（OpenAPI 只有 `/v1/systemone`）没有提取接口。别的服务商用 `createDecisionModelRegistry`、`createExtractionModelRegistry` 注册。非 2xx 抛 `SystemOneError`（继承 `CtxError`，带 `statusCode`、`responseBody`，408、429、5xx 可重试）。
 
 请求、响应的映射依据两家的公开文档写成，**没有对真实服务验证过**；测试用的是假 `fetch`。
 
@@ -740,6 +754,8 @@ const llm = createModel({ provider: 'anthropic', apiKey: process.env.ANTHROPIC_A
 const slowGate = decisionFromLanguageModel(llm);
 const slowExtractor = extractionFromLanguageModel(llm);
 ```
+
+两个适配器要结构化输出：按问题、字段生成 JSON Schema，经 `Output.object` 交给服务商约束解码。服务商不支持（回答不合 JSON 或不合 schema）时退回从文字里宽松地取第一个 JSON 对象。整个回答都取不出 JSON 对象（例如被截断）时 reject，`invalid_response`；以前返回全部「不确定」，门控因此得 0.5 分悄悄过不了阈值，提取被当成「什么都没说」把笔记标掉。
 
 ### 组装
 

@@ -2,6 +2,12 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-11-16
+
+- **更新** [协议层](protocol.md)的记忆一节（[#43](https://github.com/modelctx-ai/ctx/issues/43)、[#36](https://github.com/modelctx-ai/ctx/issues/36)）：`Note` 加 `attempts`、`error`、`failedAt`，`NoteQuery` 加 `failed`、`since`；`MemoryStore` 加 `notes.fail`、`retry`、`forget`，`facts.supersede`、`reopen`，`procedures.forget`，`core.clear`，`MemoryFact.key`；新写「每个方法单独是原子的」「几个进程写同一份存储不重复」「失败和死信」「删除是真删除」四条；决策和提取模型写明拿不到可用的回答时 reject `invalid_response`；门面加 `forget`、`ForgetRequest`、`ForgetReport`，`ConsolidateReport` 加 `failed`、`dead`；远端的路径一句话列全；契约测试表跟上。原因：解析失败时记忆悄悄丢了，一批失败卡住整夜，取代不原子，多进程写重复，删了事实画像里还在。
+- **更新** [架构](architecture.md)的记忆一节：`createMemory` 的选项加 `consolidate.maxAttempts`、`onDeadLetter`；门控失败退回启发式；巩固的提取按条给日期、取代用 `supersede`、将来才成立的不取代、幂等键、按批隔离和死信；新节「删除 `forget`」；SQLite 结构版本 4；LM 适配器的结构化输出；System One 的超时。[记忆](memory.md)的失败模式表加三行，纠错的操作换成 `reopen`、`forget`。[概念](concepts.md)的术语表加「死信」「幂等键」，「记忆里的事实」改成 `supersede`。[ADR 0006](adr/0006-memory.md) 的「决定记录」补 2026-11-16 一条，[ADR 0007](adr/0007-deletion-and-retention.md) 的实施状态写明记忆一半已做。
+- **更新** [ctx-memory](../packages/memory/README.md)：选项加 `consolidate.maxAttempts`、`onDeadLetter`，`gate`、`consolidate` 的说明跟上，新写 `forget` 和一起删日志的写法，LM 适配器改成结构化输出、取不出 JSON 时 reject。[ctx-sqlite](../packages/sqlite/README.md)：记忆的表加新列和唯一索引、结构版本 4 和升级。[ctx-remote](../packages/remote/README.md)：记忆的路径表加七条。[ctx-models](../packages/models/README.md)：`SystemOneSpec.timeoutMs`、`SYSTEM_ONE_TIMEOUT_MS`。[协议包](../packages/protocol/README.md)：`MemoryStore`、`Memory` 的说明跟上。
+
 ## 2026-11-15
 
 - **更新** [协议层](protocol.md)的记忆一节：`SearchQuery.archived`、`facts.restore`、`RecallOptions.minConfidence`；`search` 的底线（切词、最多 256 个词、不因查询长报错）；`recalls` 只留最近 32 个；「激活度」一节改成 `activation`、`retrievability`（上界、未来的时刻、排序公式），纯函数的列表加 `searchTerms`、`termOverlap`、`inSearchScope`；契约测试表跟上。原因：检索和遗忘的规则改了（[#44](https://github.com/modelctx-ai/ctx/issues/44)）。

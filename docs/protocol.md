@@ -611,7 +611,7 @@ interface Orchestrator {
 
 一份存储按**作用域**分开：`store.scope(name)` 是同一份数据上名叫 `name` 的作用域的视图，四个集合都在作用域里面。一个用户、租户或项目一个作用域，名字由应用定（字符串，最长 `MAX_MEMORY_SCOPE_LENGTH` = 256 个字符，原样比较）；不调 `scope` 时用的是缺省的作用域 `DEFAULT_MEMORY_SCOPE`（空串）。
 
-- 一个作用域读不到、搜不到、改不了、删不掉另一个作用域的东西：`list`、`search`、`head`、`core.get`、`core.history` 只看自己的；别的作用域的 `id` 和不存在的 `id` 一样对待（`close`、`cite`、`confirm`、`retire` 抛 `not_found`，`settle`、`touch`、`archive`、`restore`、`forget` 跳过），`supersededBy` 也不能指向别的作用域。实现给 `search` 建的索引也要按作用域分开。
+- 一个作用域读不到、搜不到、改不了、删不掉另一个作用域的东西：`list`、`search`、`head`、`core.get`、`core.history` 只看自己的；别的作用域的 `id` 和不存在的 `id` 一样对待（`close`、`supersede`、`cite`、`confirm`、`retire` 抛 `not_found`，`settle`、`fail`、`retry`、`touch`、`archive`、`restore`、`reopen`、`forget` 跳过），`supersededBy` 也不能指向别的作用域。实现给 `search` 建的索引也要按作用域分开。
 - 名字是绝对的，不嵌套：`store.scope('a').scope('b')` 就是 `store.scope('b')`。从没写过的作用域是空的，不用先建。名字不合法（`checkMemoryScope`）抛 `invalid_request`。
 - `id` 在整份存储里不重复，不只是在一个作用域里。
 - 作用域是隔离，不是鉴权：谁能用哪个作用域由应用决定（远端的 `/memory/*` 只认访问令牌，拿到令牌就能用任何作用域）。
@@ -634,18 +634,24 @@ interface Note {
   salience: number; // 0..1
   kind?: string; // 应用定义：pref、obs、fail、ok…
   topic?: string; // 应用定义的主题名
-  settledAt?: number; // 夜里处理过的时刻；没有就是待处理
+  settledAt?: number; // 夜里处理过的时刻；没有、也没进死信就是待处理
+  attempts?: number; // 处理失败过几次（fail 记）
+  error?: string; // 最后一次失败的原因
+  failedAt?: number; // 失败次数到上限、进死信的时刻
 }
-/** 门控没过的那段也写一条，settledAt 等于 at：head 照样前进，打过的分留作阈值的分布。 */
-type NewNote = Omit<Note, 'id'>;
+/** 门控没过的那段也写一条，settledAt 等于 at：head 照样前进，打过的分留作阈值的分布。失败的记录只能由 fail 写。 */
+type NewNote = Omit<Note, 'id' | 'attempts' | 'error' | 'failedAt'>;
 interface NoteQuery {
   session?: string;
-  pending?: boolean; // true 只要待处理的，false 只要处理过的；缺省不限
+  pending?: boolean; // true 只要待处理的（没处理过、不是死信），false 只要处理过的；缺省不限
+  failed?: boolean; // true 只要死信，false 不要死信；缺省不限
+  since?: number; // 只要 at 不早于它的
   limit?: number; // 最早写入的 N 条
 }
 
 interface MemoryFact {
   id: string;
+  key?: string; // 幂等键，一个作用域里不重复
   subject: string; // "user"、"project:agent"…应用定义
   predicate?: string;
   text: string; // 一句能独立成立的话
@@ -706,16 +712,26 @@ interface MemoryStore {
   /** 同一份数据上另一个作用域的视图；名字是绝对的。 */
   scope(scope: string): MemoryStore;
   notes: {
+    /** 同一个会话、同样的 from 和 upTo 已经有笔记时不再写，返回已有的那条。 */
     add(notes: readonly NewNote[]): Promise<Note[]>;
     list(query?: NoteQuery): Promise<Note[]>; // 按写入顺序
-    /** 返回这次真正标上的条数；处理过的不改。 */
+    /** 返回这次真正标上的条数；处理过的、死信不改。 */
     settle(ids: readonly string[], at: number): Promise<number>;
-    /** 这个会话的笔记（含处理过的）覆盖到的最大 seq；没有就是 0。gate 从它之后读。 */
+    /** 记一次失败：attempts 加 1、记下 error；加完不小于 maxAttempts 时 failedAt = at，进死信。返回改了的笔记。 */
+    fail(ids: readonly string[], at: number, options: { error: string; maxAttempts: number }): Promise<Note[]>;
+    /** 死信放回待处理：清掉 failedAt、attempts、error。 */
+    retry(ids: readonly string[]): Promise<number>;
+    /** 删掉这个会话的笔记，不给会话删掉全部；head 回到 0。 */
+    forget(session?: string): Promise<number>;
+    /** 这个会话的笔记（含处理过的、死信）覆盖到的最大 seq；没有就是 0。gate 从它之后读。 */
     head(session: string): Promise<number>;
   };
   facts: {
+    /** key 已经有了时不写，返回已有的那条。 */
     add(fact: NewMemoryFact): Promise<MemoryFact>;
-    /** 关闭有效期。事实的文字永不改写：变了就 add 新的、close 旧的。已关闭的不改。 */
+    /** 原子的「加新关旧」：写入 fact，把 id 那条 close(id, at, { supersededBy: 新的 })。id 认不得时什么都不写。 */
+    supersede(id: string, fact: NewMemoryFact, at: number): Promise<MemoryFact>;
+    /** 关闭有效期。事实的文字永不改写：变了就 supersede（或 add 新的、close 旧的）。已关闭的不改。 */
     close(id: string, at: number, options?: { supersededBy?: string }): Promise<void>;
     /** 追加证据（并入时用），文字不变；相同的区间跳过。 */
     cite(id: string, sources: readonly SourceRef[]): Promise<MemoryFact>;
@@ -724,6 +740,8 @@ interface MemoryStore {
     archive(ids: readonly string[], at: number): Promise<number>;
     /** 恢复归档的事实（清掉 archivedAt），返回真正恢复的条数；有效期不动。 */
     restore(ids: readonly string[]): Promise<number>;
+    /** 撤销关闭：清掉 validTo 和 supersededBy，返回真正重新打开的条数。关错了的改回来。 */
+    reopen(ids: readonly string[]): Promise<number>;
     /** 真删除，连同指向它的 supersededBy 一起清掉。主人的权利。 */
     forget(ids: readonly string[]): Promise<number>;
     list(query?: FactQuery): Promise<MemoryFact[]>;
@@ -734,6 +752,7 @@ interface MemoryStore {
     /** confirmations 加 1；相同的证据不算又一次确认。 */
     confirm(id: string, evidence: readonly SourceRef[]): Promise<Procedure>;
     retire(id: string, at: number): Promise<void>;
+    forget(ids: readonly string[]): Promise<number>; // 真删除
     list(query?: ProcedureQuery): Promise<Procedure[]>; // 按写入顺序
   };
   core: {
@@ -742,15 +761,21 @@ interface MemoryStore {
     set(text: string, at: number): Promise<void>;
     /** 按写入顺序；last 和 ListOptions.last 一样。 */
     history(options?: { last?: number }): Promise<CoreVersion[]>;
+    /** 删掉全部版本（真删除），get 回到 null。 */
+    clear(): Promise<number>;
   };
 }
 ```
 
-- **事实不 UPDATE。** 变了就 `close` 旧的、`add` 新的，`supersededBy` 连起来。「上个月用的是哪个数据库」永远能查。
+- **事实不 UPDATE。** 变了就 `supersede`：新的写进去、旧的关掉，`supersededBy` 连起来。「上个月用的是哪个数据库」永远能查。关错了用 `reopen` 改回来。
+- **每个方法单独是原子的。** `supersede` 的加新关旧要么都成，要么都不成：分成 `add` 再 `close` 两步时，第二步失败会留下两条都成立的事实。
+- **几个进程写同一份存储不重复。** 同一段日志（会话加 `from`、`upTo`）只有一条笔记，`notes.add` 遇到已有的返回已有的；事实带 `key` 时一个作用域里只有一条，`add`、`supersede` 遇到已有的键返回已有的、什么都不改。两个进程同时门控、同时夜里处理同一批笔记，结果和一个进程一样。
+- **失败和死信。** 处理一批笔记失败时调用方 `fail`：记次数和原因，笔记还是待处理的；次数到了上限进死信（`failedAt`），不再算待处理，`list({ failed: true })` 列出来，修好原因后 `retry` 放回去。这样一段总让模型出错的日志不会每夜重试、也不会被悄悄标成处理过。
 - **证据必填。** `MemoryFact.sources`、`Procedure.evidence` 指向会话日志的 `seq` 区间。没有证据的事实不进存储，这是防编造的第一道闸。
 - **归档不删除，也不是找不回。** `archive` 只是让它退出 `open` 的查询，`forget` 才删。归档的事实 `search` 带 `archived: true` 还搜得到（存储不降权，分数怎么打折由调用方定），`restore` 把它恢复成没归档的。
 - **`recalls` 有上限。** `touch` 只留最近 `MAX_FACT_RECALLS`（32）个时刻，早的丢掉：一条事实不随召回次数无限变长，激活度也就有了上界。
-- **错误。** 参数不合法（没有证据、`from > upTo`）是 `CtxError` 的 `invalid_request`，认不得的 `id` 是 `not_found`；批量方法（`settle`、`touch`、`archive`、`restore`、`forget`）跳过认不得的 `id`。存储不看钟，时刻都由调用方给。
+- **删除是真删除。** `facts.forget`、`procedures.forget`、`notes.forget`、`core.clear` 都删掉行，不留墓碑。画像是事实压出来的文字，删事实时画像里可能还有：门面的 `forget` 把画像的历史一起清掉（见下面的门面）。
+- **错误。** 参数不合法（没有证据、`from > upTo`）是 `CtxError` 的 `invalid_request`，认不得的 `id` 是 `not_found`；批量方法（`settle`、`fail`、`retry`、`touch`、`archive`、`restore`、`reopen`、`forget`）跳过认不得的 `id`。存储不看钟，时刻都由调用方给。
 - **记忆不写会话日志。** 记忆是日志的读者。应用要在日志里留痕（例如「今晚整理了 12 条」）自己追加事件，这是明确的选择。
 - `search` 的实现自定：全文、向量、两者混合。协议约定输入是文字，以及三条底线（契约测试都查）：
   - **有共同的词就命中。** 词按 `searchTerms(text)` 切：先 NFKC 归一、转小写；字母和数字连成的一串是一个词，中日韩文字没有空白分词，每相邻两个字算一个词（落单的一个字自成一个）。所以「我平时喜欢喝什么茶？」找得回「主人喜欢喝乌龙茶」（共同的词是「喜欢」「欢喝」）。英文按整词：`Postgre` 不命中 `PostgreSQL`。
@@ -758,7 +783,7 @@ interface MemoryStore {
   - **多长的查询都不报错。** 实现最多看 `MAX_SEARCH_TERMS`（256）个不同的词：`searchTerms(text, MAX_SEARCH_TERMS)` 在词更多时取开头的一半和结尾的一半。
 - 记忆里的事实叫 `MemoryFact`，和来源取到的事实 `Fact`（`{ source, text }`，只用于一次调用）是两回事：前者持久、有有效期，后者是「现在」。
 - 纯函数：`activation(fact, now, options?)`、`retrievability(fact, now, options?)`（见[激活度](#激活度-activationretrievability)，缺省参数是 `ACTIVATION_DEFAULTS`）、`rankFacts(facts, scores, options?)`（`scores` 是事实 `id` → 相似度，一般取 `FactHit.score`）、`renderCore(facts, budget, { now })` 的缺省写法（按激活度排，`estimateTextTokens` 超过 `budget` 前停下）、`sourceRef(session, entries)`；检索用的 `searchTerms`、`termOverlap`（常量 `MAX_SEARCH_TERMS`）；另有存储实现用的 `checkSourceRef`、`checkEvidence`、`sameSourceRef`、`inSourceRef`、`isOpenFact`、`filterFacts`、`inSearchScope`（`SearchQuery` 的 `topic`、`open`、`archived` 写成的判断）和常量 `MAX_FACT_RECALLS`。
-- 远端记忆存储（`ctx-remote`）：服务端挂 `memory`，路径在 `/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core` 下，作用域用查询参数 `?scope=`（不带就是缺省的）；客户端是 `createRemoteMemoryStore`。决策、提取模型没有线上形态，按名字在各自的进程里造。
+- 远端记忆存储（`ctx-remote`）：服务端挂 `memory`，路径在 `/memory/notes`、`/memory/facts`、`/memory/procedures`、`/memory/core` 下，作用域用查询参数 `?scope=`（不带就是缺省的）；客户端是 `createRemoteMemoryStore`。批量和按 `id` 的方法各一条 `POST`：`/memory/notes/{settle,fail,retry,forget}`、`/memory/facts/{search,touch,archive,restore,reopen,forget}`、`/memory/facts/:id/{close,supersede,cite}`、`/memory/procedures/forget`、`/memory/procedures/:id/{confirm,retire}`；`DELETE /memory/core` 是 `core.clear`。决策、提取模型没有线上形态，按名字在各自的进程里造。
 
 ### 决策和提取模型 `DecisionModel`、`ExtractionModel`
 
@@ -810,6 +835,7 @@ interface ExtractionModel {
 
 - 两个协议都不产出文字，只收输入 token，适合每轮都调。
 - 输出总是合法的，但未必正确：调用方用 `confidence`、`pNull` 决定自动化到哪一步，低于阈值的升级给 `LanguageModel`。
+- 拿不到可用的回答（服务回的不是 JSON、被截断）时 reject，`type` 是 `invalid_response`，不要拿一个「不确定」的答案顶上：调用方分不出那是判断还是故障，提取就会当成「什么都没说」把这段记忆丢掉。个别问题、字段缺了或形状不对时，那一项给低置信度的合法答案。
 - 跨边界时模型用名字字符串，和 `ModelRef` 一样。
 - 没有 System One 服务时有两种退路：启发式实现（不联网，见[架构](architecture.md#模型)），或者用 `LanguageModel` 装成一个决策模型（让它输出 JSON，慢、贵，但接口一样）。
 
@@ -829,8 +855,13 @@ interface Memory extends Executor {
    * 归档的事实也找（相似度打折），被召回的那些恢复成没归档的；confidence 低于 minConfidence 的不召回。
    */
   recall(query: string, options?: RecallOptions): Promise<Recalled>;
-  /** 夜里：处理待处理的笔记，衰减归档，重写 core。整体可重复执行。 */
+  /**
+   * 夜里：处理待处理的笔记，衰减归档，重写 core。整体可重复执行。按批隔离：一批失败不挡后面的，
+   * 失败的笔记 fail，次数到上限进死信。
+   */
   consolidate(options?: ConsolidateOptions): Promise<ConsolidateReport>; // ConsolidateOptions = { now?, signal? }
+  /** 删除；和 consolidate 不交错。 */
+  forget(request: ForgetRequest): Promise<ForgetReport>;
   /**
    * 作为来源：core 加按 query 召回的事实，渲染成文字；什么都没有时返回空。
    * 来源每一轮都跑，它带出的事实不能每次都记 touch：实现要限制频率（参考实现是同一条事实一天记一次）。
@@ -859,13 +890,32 @@ interface Recalled {
   evidence?: readonly Entry[]; // 只在 evidence 时有：证据区间里的条目，按 id 去重，按会话、seq 排
 }
 interface ConsolidateReport {
-  notes: number;
+  notes: number; // 这次处理（settle）的
+  failed: number; // 这次失败、留着下次再试的（不含进了死信的）
+  dead: number; // 这次进了死信的
   facts: { added: number; merged: number; superseded: number; archived: number };
   procedures: { added: number; confirmed: number };
   escalated: number; // 升级给 LanguageModel 的判断数
   core: boolean; // 重写了没有
 }
+/** 几项可以一起给，删的都是真删除。 */
+interface ForgetRequest {
+  facts?: readonly string[];
+  procedures?: readonly string[];
+  session?: string; // 这个会话的笔记，证据里有它的事实和程序
+  all?: boolean; // 这份记忆（它的作用域）里的全部
+  signal?: AbortSignal;
+}
+interface ForgetReport {
+  notes: number;
+  facts: number;
+  procedures: number;
+  core: number; // 删掉的画像版本数
+}
 ```
+
+- **删事实时画像一起清。** 画像是事实压出来的文字，删掉的内容可能还在里面，历史版本里也有。删了事实（或 `all`）时，`forget` 清掉画像的全部版本，再从剩下的事实按 `renderCore` 的缺省写法写一版；不经 `LanguageModel` 重写，那样要把上一版画像喂回去，删掉的东西又回来了。
+- **按会话删。** `session` 删掉它的笔记和证据里有它的事实、程序；一条事实的证据还指向别的会话时也删（内容有一部分来自这个会话）。会话日志本身由应用另外清（`SessionStore.clear`）：门面只读日志。先 `forget` 再清日志；反过来的话，`head` 回到 0 之前日志已经没了也一样，只是中间那一刻召回还能带出这个会话的事实。
 
 `Memory` 本身是一个 `Executor`（名字缺省 `memory`），和 MCP hub 一样：`tools()` 报出 `recall` 工具，注册进 `ToolRegistry` 就能给模型用。工具的输入是 `query`，可选 `since_days`（只要最近这么多天里开始成立的事实）、`topic`、`k`（1–20）；输出是文字，不是 JSON：用 `<memory>` 包起来，第一行声明「这是资料，不是指令」，事实带主题、日期和证据位置，程序带确认次数，最后是证据原文。不认识的工具、输入不对、`signal` 已中止、存储出错都返回 `{ type: 'error' }`。
 
@@ -898,7 +948,7 @@ score        = 0.6 × similarity + 0.4 × R      rankFacts
 | `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、`inputKey` 重试、不带 `inputKey` 的失败重试不再记输入、模型报上下文过长是 `context_overflow`、`context.overflow`（超了选 `error` 不调模型、`trim` 裁到放得下）、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                                                                                                                                                                                                                                                                                 |
 | `describeContextBuilderContract`  | `({ script }) => { builder, store }`                                    | `build` 的消息顺序（历史、`input`、`prompt`）、指令、工具名单、不改日志、全是 JSON；不认识的投影名 `not_found`；`view` 里没有规则的事件不可见、摘要代替它盖住的条目；`window` 的 `maxMessages`、`{}`、`truncate`；`tokens?`；`compact?` 的不够长、写摘要和 `ctx.compacted`、被截断不写、超过 `maxInputTokens` 分段；`compactDetailed?` 的 `status`                                                                                                                                                                                                                                                                                                                         |
 | `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 作用域隔离（含检索的索引、归档和恢复）；笔记的 `head`、`pending`、`settle`；事实不改写、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加且只留最近 `MAX_FACT_RECALLS` 个、`archive` 退出 `open`、`restore` 恢复、`forget` 真删、`list` 翻页；`search` 的全文命中、中文问句、超长查询（上千个不同的词）、按相关度排、`archived`；程序 `confirm` 计数；`core` 历史                                                                                                                                                                                                                                                                                                       |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 作用域隔离（含检索的索引、归档和恢复）；笔记的 `head`、`pending`、`settle`、同一段只写一次、`fail` 计数和死信、`retry`、`failed` 和 `since`、按会话 `forget`；事实不改写、`key` 幂等、`supersede` 原子（认不得的 `id` 什么都不写）、`reopen`、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加且只留最近 `MAX_FACT_RECALLS` 个、`archive` 退出 `open`、`restore` 恢复、`forget` 真删、`list` 翻页；`search` 的全文命中、中文问句、超长查询（上千个不同的词）、按相关度排、`archived`；程序 `confirm` 计数、`forget`；`core` 历史、`clear`                                                                                                                              |
 | `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个、归档的也召回并恢复、`minConfidence`；`source` 连着带出几轮 `recalls` 不跟着涨；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                                                                                                                                               |

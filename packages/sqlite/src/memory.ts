@@ -15,6 +15,7 @@ import {
   type FactHit,
   type MemoryFact,
   type MemoryStore,
+  type NewMemoryFact,
   type Note,
   type Procedure,
   type SourceRef,
@@ -46,10 +47,15 @@ export interface SqliteMemoryStore extends MemoryStore {
  * 2：四张表各加一列 `scope`（作用域，已有的行都在缺省的作用域 `''` 里），索引换成以 `scope` 开头的。
  * 3：加 `fact_docs`、`fact_terms` 两张表，是事实文字的倒排索引（`search` 用）；已有的事实补进索引，
  *    `recalls` 超过 `MAX_FACT_RECALLS` 个的截到最近的那些。
+ * 4：`notes` 加 `attempts`、`error`、`failed_at`（失败和死信），同一个作用域、会话、区间的笔记唯一（已有的重复只留最早的一条）；
+ *    `facts` 加 `fact_key`（幂等键），一个作用域里唯一。待处理的部分索引换成也排除死信的。
  * 同一级的结构可能是之前的提交建的，所以版本号对得上时也要查实际的表、列和索引（见 `memoryRepairs`）。
  */
-const MEMORY_SCHEMA_VERSION = 3;
+const MEMORY_SCHEMA_VERSION = 4;
 const MEMORY_SCHEMA_KEY = 'memory_schema';
+
+/** 待处理的笔记：没处理过、也没进死信。`list({ pending: true })` 和部分索引用同一段文字。 */
+const PENDING_NOTE = 'settled_at IS NULL AND failed_at IS NULL';
 
 /** 仍然成立且没归档（`isOpenFact`）。`list({ open: true })`、`search` 和部分索引 `facts_open` 用同一段文字。 */
 const OPEN_FACT = 'valid_to IS NULL AND archived_at IS NULL';
@@ -62,6 +68,10 @@ const SCOPE_COLUMN = `scope TEXT NOT NULL DEFAULT ''`;
 interface MemoryTable {
   readonly table: string;
   readonly create: string;
+  /** 后来的版本加的列：列名 → `ADD COLUMN` 的定义。老库缺哪列补哪列。 */
+  readonly columns: Record<string, string>;
+  /** 建某个索引之前要先跑的语句（索引名 → 语句），例如唯一索引之前去掉已有的重复。只在缺这个索引时跑。 */
+  readonly before: Record<string, string>;
   readonly indexes: Record<string, string>;
   /** 版本 1 建的、现在不用的索引：迁移时删掉。 */
   readonly obsolete: readonly string[];
@@ -90,16 +100,26 @@ function memoryTables(prefix: string): MemoryTable[] {
         salience REAL NOT NULL,
         kind TEXT,
         topic TEXT,
-        settled_at INTEGER
+        settled_at INTEGER,
+        attempts INTEGER,
+        error TEXT,
+        failed_at INTEGER
       )`,
+      columns: { attempts: 'attempts INTEGER', error: 'error TEXT', failed_at: 'failed_at INTEGER' },
+      before: {
+        // 版本 4 之前同一段可能写过两次：只留最早的那条。
+        [`${notes}_scope_range`]: `DELETE FROM ${notes} WHERE seq NOT IN (SELECT min(seq) FROM ${notes} GROUP BY scope, session, from_seq, up_to)`,
+      },
       indexes: {
         // `head`：max(up_to) 只读索引的一端。
         [`${notes}_scope_head`]: `CREATE INDEX ${notes}_scope_head ON ${notes} (scope, session, up_to)`,
         // `list`：一个作用域里按写入顺序；`pending: true` 走部分索引。
         [`${notes}_scope`]: `CREATE INDEX ${notes}_scope ON ${notes} (scope, seq)`,
-        [`${notes}_scope_pending`]: `CREATE INDEX ${notes}_scope_pending ON ${notes} (scope, seq) WHERE settled_at IS NULL`,
+        [`${notes}_scope_waiting`]: `CREATE INDEX ${notes}_scope_waiting ON ${notes} (scope, seq) WHERE ${PENDING_NOTE}`,
+        // 同一段日志只有一条笔记：几个进程同时 `gate` 也一样。
+        [`${notes}_scope_range`]: `CREATE UNIQUE INDEX ${notes}_scope_range ON ${notes} (scope, session, from_seq, up_to)`,
       },
-      obsolete: [`${notes}_head`, `${notes}_pending`],
+      obsolete: [`${notes}_head`, `${notes}_pending`, `${notes}_scope_pending`],
     },
     {
       table: facts,
@@ -119,9 +139,14 @@ function memoryTables(prefix: string): MemoryTable[] {
         salience REAL NOT NULL,
         sources TEXT NOT NULL,
         recalls TEXT NOT NULL DEFAULT '[]',
-        archived_at INTEGER
+        archived_at INTEGER,
+        fact_key TEXT
       )`,
+      columns: { fact_key: 'fact_key TEXT' },
+      before: {},
       indexes: {
+        // 幂等键一个作用域里唯一；没有键的不限。
+        [`${facts}_scope_key`]: `CREATE UNIQUE INDEX ${facts}_scope_key ON ${facts} (scope, fact_key) WHERE fact_key IS NOT NULL`,
         [`${facts}_scope`]: `CREATE INDEX ${facts}_scope ON ${facts} (scope, id)`,
         [`${facts}_scope_subject`]: `CREATE INDEX ${facts}_scope_subject ON ${facts} (scope, subject, id)`,
         [`${facts}_scope_topic`]: `CREATE INDEX ${facts}_scope_topic ON ${facts} (scope, topic, id)`,
@@ -146,6 +171,8 @@ function memoryTables(prefix: string): MemoryTable[] {
         at INTEGER NOT NULL,
         retired_at INTEGER
       )`,
+      columns: {},
+      before: {},
       indexes: {
         [`${procedures}_scope`]: `CREATE INDEX ${procedures}_scope ON ${procedures} (scope, seq)`,
         [`${procedures}_scope_topic`]: `CREATE INDEX ${procedures}_scope_topic ON ${procedures} (scope, topic, seq)`,
@@ -161,6 +188,8 @@ function memoryTables(prefix: string): MemoryTable[] {
         text TEXT NOT NULL,
         at INTEGER NOT NULL
       )`,
+      columns: {},
+      before: {},
       indexes: {
         [`${core}_scope`]: `CREATE INDEX ${core}_scope ON ${core} (scope, seq)`,
       },
@@ -176,6 +205,8 @@ function memoryTables(prefix: string): MemoryTable[] {
         fact_id TEXT NOT NULL UNIQUE,
         terms INTEGER NOT NULL
       )`,
+      columns: {},
+      before: {},
       indexes: {},
       obsolete: [],
     },
@@ -188,6 +219,8 @@ function memoryTables(prefix: string): MemoryTable[] {
         doc INTEGER NOT NULL,
         PRIMARY KEY (scope, term, doc)
       ) WITHOUT ROWID`,
+      columns: {},
+      before: {},
       indexes: {},
       obsolete: [],
     },
@@ -200,12 +233,19 @@ function memoryTables(prefix: string): MemoryTable[] {
  */
 function memoryRepairs(database: DatabaseSync, prefix: string): string[] {
   const sql: string[] = [];
-  for (const { table, create, indexes, obsolete } of memoryTables(prefix)) {
+  for (const { table, create, columns: added, before, indexes, obsolete } of memoryTables(prefix)) {
     const exists = hasTable(database, table);
     if (!exists) sql.push(create);
     const { columns, indexes: existing } = inspect(database, table);
     if (exists && !columns.has('scope')) sql.push(`ALTER TABLE ${table} ADD COLUMN ${SCOPE_COLUMN}`);
-    for (const [name, statement] of Object.entries(indexes)) if (!existing.has(name)) sql.push(statement);
+    if (exists)
+      for (const [column, definition] of Object.entries(added))
+        if (!columns.has(column)) sql.push(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+    for (const [name, statement] of Object.entries(indexes)) {
+      if (existing.has(name)) continue;
+      if (exists && before[name] !== undefined) sql.push(before[name]);
+      sql.push(statement);
+    }
     for (const name of obsolete) if (existing.has(name)) sql.push(`DROP INDEX ${name}`);
   }
   return sql;
@@ -285,6 +325,9 @@ interface NoteRow {
   kind: string | null;
   topic: string | null;
   settled_at: number | null;
+  attempts: number | null;
+  error: string | null;
+  failed_at: number | null;
 }
 
 interface FactRow {
@@ -301,6 +344,7 @@ interface FactRow {
   sources: string;
   recalls: string;
   archived_at: number | null;
+  fact_key: string | null;
 }
 
 interface ProcedureRow {
@@ -330,12 +374,16 @@ function decodeNote(row: NoteRow): Note {
     ...optional('kind', row.kind),
     ...optional('topic', row.topic),
     ...optional('settledAt', row.settled_at),
+    ...optional('attempts', row.attempts),
+    ...optional('error', row.error),
+    ...optional('failedAt', row.failed_at),
   };
 }
 
 function decodeFact(row: FactRow): MemoryFact {
   return {
     id: row.id,
+    ...optional('key', row.fact_key),
     subject: row.subject,
     ...optional('predicate', row.predicate),
     text: row.text,
@@ -417,7 +465,8 @@ interface HitRow extends FactRow {
 /**
  * 基于 `node:sqlite` 的记忆存储：`notes`、`facts`、`procedures`、`core` 四张表加 `meta`，表名带前缀（缺省 `memory_`），
  * 可以和 `createSqliteStore` 的 `ctx_` 表放在同一个库里。每个写方法在一个 `BEGIN IMMEDIATE` 里做完（库上已有应用的事务时用
- * SAVEPOINT），单个方法是原子的；跨方法的组合（先 `add` 新事实再 `close` 旧的）由调用方负责。
+ * SAVEPOINT），单个方法是原子的：`supersede` 的加新关旧在同一个事务里。笔记的区间、事实的 `fact_key` 有唯一索引，
+ * 几个进程同时写也不重复。
  * `search` 走倒排索引：事实写入时用协议包的 `searchTerms` 切成词（字母数字连成的词、中日韩文字相邻两字）存进
  * `fact_terms`，查询切成同样的词去查，按 `termOverlap` 打分，和内存存储同一套。不用 FTS5：它不是每个 Node 自带的
  * SQLite 都编进去了，自带的分词器也切不了中文。
@@ -438,16 +487,24 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
 
   // 每条语句都带 `scope`：按 `id` 找的也带，别的作用域的 `id` 和不存在的一样。
   const insertNote = database.prepare(
-    `INSERT INTO ${notes} (id, scope, session, from_seq, up_to, at, salience, kind, topic, settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ${notes} (id, scope, session, from_seq, up_to, at, salience, kind, topic, settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT (scope, session, from_seq, up_to) DO NOTHING`,
+  );
+  const selectRange = database.prepare(
+    `SELECT * FROM ${notes} WHERE scope = ? AND session = ? AND from_seq = ? AND up_to = ?`,
   );
   const selectNote = database.prepare(`SELECT * FROM ${notes} WHERE id = ? AND scope = ?`);
   const settleNote = database.prepare(
-    `UPDATE ${notes} SET settled_at = ? WHERE id = ? AND scope = ? AND settled_at IS NULL`,
+    `UPDATE ${notes} SET settled_at = ? WHERE id = ? AND scope = ? AND ${PENDING_NOTE}`,
   );
   const insertFact = database.prepare(
-    `INSERT INTO ${facts} (id, scope, subject, predicate, text, topic, valid_from, confidence, salience, sources) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ${facts} (id, scope, subject, predicate, text, topic, valid_from, confidence, salience, sources, fact_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const selectFact = database.prepare(`SELECT * FROM ${facts} WHERE id = ? AND scope = ?`);
+  const selectKey = database.prepare(`SELECT * FROM ${facts} WHERE scope = ? AND fact_key = ?`);
+  const closeFact = database.prepare(
+    `UPDATE ${facts} SET valid_to = ?, superseded_by = ? WHERE id = ? AND scope = ? AND valid_to IS NULL`,
+  );
   const insertProcedure = database.prepare(
     `INSERT INTO ${procedures} (id, scope, topic, when_text, do_text, evidence, confirmations, at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
   );
@@ -472,6 +529,29 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
       if (!row) throw notFound(factId);
       return decodeFact(row);
     };
+    /** 写一条事实；`key` 已经有了时返回已有的那条。要在写锁里调。 */
+    const writeFact = (draft: NewMemoryFact): MemoryFact => {
+      if (draft.key !== undefined) {
+        const row = selectKey.get(scope, draft.key) as FactRow | undefined;
+        if (row) return decodeFact(row);
+      }
+      const factId = id();
+      insertFact.run(
+        factId,
+        scope,
+        draft.subject,
+        draft.predicate ?? null,
+        draft.text,
+        draft.topic ?? null,
+        draft.validFrom,
+        draft.confidence,
+        draft.salience,
+        encodeRefs(draft.sources),
+        draft.key ?? null,
+      );
+      indexFact(scope, factId, draft.text);
+      return factOf(factId);
+    };
     const procedureOf = (procedureId: string): Procedure => {
       const row = selectProcedure.get(procedureId, scope) as ProcedureRow | undefined;
       if (!row) throw notFound(procedureId);
@@ -485,9 +565,8 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
           for (const draft of drafts) checkSourceRef(draft);
           return write(() =>
             drafts.map((draft) => {
-              const noteId = id();
               insertNote.run(
-                noteId,
+                id(),
                 scope,
                 draft.session,
                 draft.from,
@@ -498,7 +577,8 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
                 draft.topic ?? null,
                 draft.settledAt ?? null,
               );
-              return decodeNote(selectNote.get(noteId, scope) as unknown as NoteRow);
+              // 新写的或者早就有的那条：同一段只有一条。
+              return decodeNote(selectRange.get(scope, draft.session, draft.from, draft.upTo) as unknown as NoteRow);
             }),
           );
         },
@@ -509,7 +589,12 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
             where.push('session = ?');
             params.push(query.session);
           }
-          if (query?.pending !== undefined) where.push(query.pending ? 'settled_at IS NULL' : 'settled_at IS NOT NULL');
+          if (query?.pending !== undefined) where.push(query.pending ? PENDING_NOTE : 'settled_at IS NOT NULL');
+          if (query?.failed !== undefined) where.push(query.failed ? 'failed_at IS NOT NULL' : 'failed_at IS NULL');
+          if (query?.since !== undefined) {
+            where.push('at >= ?');
+            params.push(query.since);
+          }
           const limit = countOf(query?.limit);
           if (limit === 0) return [];
           let sql = `SELECT * FROM ${notes} WHERE ${where.join(' AND ')} ORDER BY seq`;
@@ -526,6 +611,42 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
             return count;
           });
         },
+        async fail(ids, at, failOptions) {
+          const update = database.prepare(
+            `UPDATE ${notes} SET attempts = coalesce(attempts, 0) + 1, error = ?,
+               failed_at = CASE WHEN coalesce(attempts, 0) + 1 >= ? THEN ? ELSE NULL END
+             WHERE id = ? AND scope = ? AND ${PENDING_NOTE}`,
+          );
+          return write(() => {
+            const out: Note[] = [];
+            for (const noteId of new Set(ids)) {
+              if (Number(update.run(failOptions.error, failOptions.maxAttempts, at, noteId, scope).changes) === 0)
+                continue;
+              out.push(decodeNote(selectNote.get(noteId, scope) as unknown as NoteRow));
+            }
+            return out;
+          });
+        },
+        async retry(ids) {
+          const update = database.prepare(
+            `UPDATE ${notes} SET failed_at = NULL, attempts = NULL, error = NULL WHERE id = ? AND scope = ? AND failed_at IS NOT NULL`,
+          );
+          return write(() => {
+            let count = 0;
+            for (const noteId of new Set(ids)) count += Number(update.run(noteId, scope).changes);
+            return count;
+          });
+        },
+        async forget(session) {
+          return write(() =>
+            Number(
+              (session === undefined
+                ? database.prepare(`DELETE FROM ${notes} WHERE scope = ?`).run(scope)
+                : database.prepare(`DELETE FROM ${notes} WHERE scope = ? AND session = ?`).run(scope, session)
+              ).changes,
+            ),
+          );
+        },
         async head(session) {
           const row = database
             .prepare(`SELECT coalesce(max(up_to), 0) AS head FROM ${notes} WHERE scope = ? AND session = ?`)
@@ -536,33 +657,27 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
       facts: {
         async add(draft) {
           checkEvidence(draft.sources);
+          return write(() => writeFact(draft));
+        },
+        async supersede(factId, draft, at) {
+          checkEvidence(draft.sources);
           return write(() => {
-            const factId = id();
-            insertFact.run(
-              factId,
-              scope,
-              draft.subject,
-              draft.predicate ?? null,
-              draft.text,
-              draft.topic ?? null,
-              draft.validFrom,
-              draft.confidence,
-              draft.salience,
-              encodeRefs(draft.sources),
-            );
-            indexFact(scope, factId, draft.text);
-            return factOf(factId);
+            factOf(factId);
+            if (draft.key !== undefined) {
+              const row = selectKey.get(scope, draft.key) as FactRow | undefined;
+              if (row) return decodeFact(row);
+            }
+            const written = writeFact(draft);
+            closeFact.run(at, written.id, factId, scope);
+            return written;
           });
         },
         async close(factId, at, closeOptions) {
           write(() => {
-            const found = factOf(factId);
+            factOf(factId);
             const supersededBy = closeOptions?.supersededBy;
             if (supersededBy !== undefined) factOf(supersededBy);
-            if (found.validTo !== undefined) return;
-            database
-              .prepare(`UPDATE ${facts} SET valid_to = ?, superseded_by = ? WHERE id = ? AND scope = ?`)
-              .run(at, supersededBy ?? null, factId, scope);
+            closeFact.run(at, supersededBy ?? null, factId, scope);
           });
         },
         async cite(factId, sources) {
@@ -607,6 +722,16 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
           return write(() => {
             let count = 0;
             for (const factId of new Set(ids)) count += Number(restore.run(factId, scope).changes);
+            return count;
+          });
+        },
+        async reopen(ids) {
+          const reopen = database.prepare(
+            `UPDATE ${facts} SET valid_to = NULL, superseded_by = NULL WHERE id = ? AND scope = ? AND valid_to IS NOT NULL`,
+          );
+          return write(() => {
+            let count = 0;
+            for (const factId of new Set(ids)) count += Number(reopen.run(factId, scope).changes);
             return count;
           });
         },
@@ -721,6 +846,14 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
               .run(at, procedureId, scope);
           });
         },
+        async forget(ids) {
+          const remove = database.prepare(`DELETE FROM ${procedures} WHERE id = ? AND scope = ?`);
+          return write(() => {
+            let count = 0;
+            for (const procedureId of new Set(ids)) count += Number(remove.run(procedureId, scope).changes);
+            return count;
+          });
+        },
         async list(query) {
           const where: string[] = ['scope = ?'];
           const params: SQLInputValue[] = [scope];
@@ -755,6 +888,9 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
             .prepare(sql)
             .all(...(Number.isFinite(last) ? [scope, last] : [scope])) as unknown as CoreVersion[];
           return rows.map((row) => ({ text: row.text, at: row.at }));
+        },
+        async clear() {
+          return write(() => Number(database.prepare(`DELETE FROM ${core} WHERE scope = ?`).run(scope).changes));
         },
       },
     };

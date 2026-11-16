@@ -30,6 +30,7 @@ import {
   type Memory,
   type MemoryFact,
   type MemoryStore,
+  type NewMemoryFact,
   type Note,
   type Procedure,
   type Recalled,
@@ -487,6 +488,10 @@ function appendRefs(existing: readonly SourceRef[], refs: readonly SourceRef[]):
   return out;
 }
 
+function isPendingNote(note: Note): boolean {
+  return note.settledAt === undefined && note.failedAt === undefined;
+}
+
 function fakeMemoryStore(): MemoryStore {
   const scopes = new Map<string, MemoryStore>();
   const counter = { next: 0 };
@@ -518,32 +523,78 @@ function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: numb
     if (index < 0) throw notFound(id);
     return index;
   };
+  const keyed = (key: string | undefined): MemoryFact | undefined =>
+    key === undefined ? undefined : [...facts.values()].find((found) => found.key === key);
+  const write = (draft: NewMemoryFact): MemoryFact => {
+    const written: MemoryFact = { ...draft, id: newId('f'), recalls: [] };
+    facts.set(written.id, written);
+    return written;
+  };
 
   return {
     scope: scopeOf,
     notes: {
       async add(drafts) {
         for (const draft of drafts) checkSourceRef(draft);
-        const written = drafts.map((draft) => ({ ...draft, id: newId('n') }));
-        notes.push(...written);
-        return written;
+        return drafts.map((draft) => {
+          const same = notes.find(
+            (note) => note.session === draft.session && note.from === draft.from && note.upTo === draft.upTo,
+          );
+          if (same) return same;
+          const written = { ...draft, id: newId('n') };
+          notes.push(written);
+          return written;
+        });
       },
       async list(query) {
         return notes
           .filter(
             (note) =>
               (query?.session === undefined || note.session === query.session) &&
-              (query?.pending === undefined || (note.settledAt === undefined) === query.pending),
+              (query?.pending === undefined || (query.pending ? isPendingNote(note) : note.settledAt !== undefined)) &&
+              (query?.failed === undefined || (note.failedAt !== undefined) === query.failed) &&
+              (query?.since === undefined || note.at >= query.since),
           )
           .slice(0, countOf(query?.limit));
       },
       async settle(ids, at) {
         let count = 0;
         for (const [i, note] of notes.entries()) {
-          if (!ids.includes(note.id) || note.settledAt !== undefined) continue;
+          if (!ids.includes(note.id) || !isPendingNote(note)) continue;
           notes[i] = { ...note, settledAt: at };
           count += 1;
         }
+        return count;
+      },
+      async fail(ids, at, options) {
+        const out: Note[] = [];
+        for (const [i, note] of notes.entries()) {
+          if (!ids.includes(note.id) || !isPendingNote(note)) continue;
+          const attempts = (note.attempts ?? 0) + 1;
+          notes[i] = {
+            ...note,
+            attempts,
+            error: options.error,
+            ...(attempts >= options.maxAttempts ? { failedAt: at } : {}),
+          };
+          out.push(notes[i]);
+        }
+        return out;
+      },
+      async retry(ids) {
+        let count = 0;
+        for (const [i, note] of notes.entries()) {
+          if (!ids.includes(note.id) || note.failedAt === undefined) continue;
+          const { failedAt: _f, attempts: _a, error: _e, ...rest } = note;
+          notes[i] = rest;
+          count += 1;
+        }
+        return count;
+      },
+      async forget(session) {
+        const kept = notes.filter((note) => session !== undefined && note.session !== session);
+        const count = notes.length - kept.length;
+        notes.splice(0, notes.length, ...kept);
         return count;
       },
       async head(session) {
@@ -553,9 +604,27 @@ function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: numb
     facts: {
       async add(draft) {
         checkEvidence(draft.sources);
-        const written: MemoryFact = { ...draft, id: newId('f'), recalls: [] };
-        facts.set(written.id, written);
+        return keyed(draft.key) ?? write(draft);
+      },
+      async supersede(id, draft, at) {
+        checkEvidence(draft.sources);
+        const found = factOf(id);
+        const existing = keyed(draft.key);
+        if (existing) return existing;
+        const written = write(draft);
+        if (found.validTo === undefined) facts.set(id, { ...found, validTo: at, supersededBy: written.id });
         return written;
+      },
+      async reopen(ids) {
+        let count = 0;
+        for (const id of new Set(ids)) {
+          const found = facts.get(id);
+          if (!found || found.validTo === undefined) continue;
+          const { validTo: _to, supersededBy: _by, ...rest } = found;
+          facts.set(id, rest);
+          count += 1;
+        }
+        return count;
       },
       async close(id, at, options) {
         const found = factOf(id);
@@ -652,6 +721,12 @@ function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: numb
         const found = procedures[index]!;
         if (found.retiredAt === undefined) procedures[index] = { ...found, retiredAt: at };
       },
+      async forget(ids) {
+        const kept = procedures.filter((procedure) => !ids.includes(procedure.id));
+        const count = procedures.length - kept.length;
+        procedures.splice(0, procedures.length, ...kept);
+        return count;
+      },
       async list(query) {
         return procedures.filter(
           (procedure) =>
@@ -671,6 +746,9 @@ function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: numb
         if (options?.last === undefined) return [...versions];
         const last = countOf(options.last);
         return last > 0 ? versions.slice(-last) : [];
+      },
+      async clear() {
+        return versions.splice(0).length;
       },
     },
   };
@@ -830,12 +908,40 @@ function fakeMemory(options: {
       if (rewrite) await store.core.set(core, at);
       const result: ConsolidateReport = {
         notes: pending.length,
+        failed: 0,
+        dead: 0,
         facts: report,
         procedures: { added: 0, confirmed: 0 },
         escalated: 0,
         core: rewrite,
       };
       return result;
+    },
+
+    async forget(request) {
+      const facts = new Set(request.facts ?? []);
+      const procedures = new Set(request.procedures ?? []);
+      const fromSession = (refs: readonly SourceRef[]): boolean =>
+        request.all === true || refs.some((ref) => ref.session === request.session);
+      if (request.session !== undefined || request.all === true) {
+        for (const found of await store.facts.list()) if (fromSession(found.sources)) facts.add(found.id);
+        for (const found of await store.procedures.list()) if (fromSession(found.evidence)) procedures.add(found.id);
+      }
+      const notes =
+        request.all === true
+          ? await store.notes.forget()
+          : request.session !== undefined
+            ? await store.notes.forget(request.session)
+            : 0;
+      const report = {
+        notes,
+        facts: await store.facts.forget([...facts]),
+        procedures: await store.procedures.forget([...procedures]),
+        core: await store.core.clear(),
+      };
+      const core = renderCore(await store.facts.list({ open: true }), 2000, { now: now() });
+      if (core) await store.core.set(core, now());
+      return report;
     },
 
     source(sourceOptions) {

@@ -15,6 +15,7 @@ import {
   type FactHit,
   type MemoryFact,
   type MemoryStore,
+  type NewMemoryFact,
   type Note,
   type Procedure,
   type SourceRef,
@@ -40,6 +41,11 @@ function countOf(n: number | undefined): number {
 
 function notFound(id: string): CtxError {
   return new CtxError('not_found', `No memory item "${id}".`);
+}
+
+/** 待处理：没处理过，也没进死信。 */
+function isPending(note: Note): boolean {
+  return note.settledAt === undefined && note.failedAt === undefined;
 }
 
 function appendRefs(existing: readonly SourceRef[], refs: readonly SourceRef[]): SourceRef[] {
@@ -97,6 +103,22 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
     if (!found) throw notFound(id);
     return found;
   };
+  const keyed = (key: string | undefined): MemoryFact | undefined =>
+    key === undefined ? undefined : [...facts.values()].find((fact) => fact.key === key);
+  const write = (draft: NewMemoryFact): MemoryFact => {
+    const written: MemoryFact = {
+      ...draft,
+      sources: draft.sources.map((ref) => ({ ...ref })),
+      id: newId('f'),
+      recalls: [],
+    };
+    facts.set(written.id, written);
+    return written;
+  };
+  const closeFact = (found: MemoryFact, at: number, supersededBy: string | undefined): void => {
+    if (found.validTo !== undefined) return;
+    facts.set(found.id, { ...found, validTo: at, ...(supersededBy !== undefined ? { supersededBy } : {}) });
+  };
   const procedureIndex = (id: string): number => {
     const index = procedures.findIndex((procedure) => procedure.id === id);
     if (index < 0) throw notFound(id);
@@ -118,16 +140,25 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
     notes: {
       async add(drafts) {
         for (const draft of drafts) checkSourceRef(draft);
-        const written = drafts.map((draft): Note => ({ ...draft, id: newId('n') }));
-        notes.push(...written);
-        return written;
+        return drafts.map((draft): Note => {
+          const same = notes.find(
+            (note) => note.session === draft.session && note.from === draft.from && note.upTo === draft.upTo,
+          );
+          if (same) return same;
+          const { attempts: _a, error: _e, failedAt: _f, ...clean } = draft as Note;
+          const written: Note = { ...clean, id: newId('n') };
+          notes.push(written);
+          return written;
+        });
       },
       async list(query) {
         return notes
           .filter(
             (note) =>
               (query?.session === undefined || note.session === query.session) &&
-              (query?.pending === undefined || (note.settledAt === undefined) === query.pending),
+              (query?.pending === undefined || (query.pending ? isPending(note) : note.settledAt !== undefined)) &&
+              (query?.failed === undefined || (note.failedAt !== undefined) === query.failed) &&
+              (query?.since === undefined || note.at >= query.since),
           )
           .slice(0, countOf(query?.limit));
       },
@@ -135,11 +166,45 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
         const wanted = new Set(ids);
         let count = 0;
         for (const [i, note] of notes.entries()) {
-          if (!wanted.has(note.id) || note.settledAt !== undefined) continue;
+          if (!wanted.has(note.id) || !isPending(note)) continue;
           notes[i] = { ...note, settledAt: at };
           count += 1;
         }
         return count;
+      },
+      async fail(ids, at, failOptions) {
+        const wanted = new Set(ids);
+        const out: Note[] = [];
+        for (const [i, note] of notes.entries()) {
+          if (!wanted.has(note.id) || !isPending(note)) continue;
+          const attempts = (note.attempts ?? 0) + 1;
+          const updated: Note = {
+            ...note,
+            attempts,
+            error: failOptions.error,
+            ...(attempts >= failOptions.maxAttempts ? { failedAt: at } : {}),
+          };
+          notes[i] = updated;
+          out.push(updated);
+        }
+        return out;
+      },
+      async retry(ids) {
+        const wanted = new Set(ids);
+        let count = 0;
+        for (const [i, note] of notes.entries()) {
+          if (!wanted.has(note.id) || note.failedAt === undefined) continue;
+          const { failedAt: _f, attempts: _a, error: _e, ...rest } = note;
+          notes[i] = rest;
+          count += 1;
+        }
+        return count;
+      },
+      async forget(session) {
+        const before = notes.length;
+        const kept = notes.filter((note) => session !== undefined && note.session !== session);
+        notes.splice(0, notes.length, ...kept);
+        return before - kept.length;
       },
       async head(session) {
         let head = 0;
@@ -150,24 +215,21 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
     facts: {
       async add(draft) {
         checkEvidence(draft.sources);
-        const written: MemoryFact = {
-          ...draft,
-          sources: draft.sources.map((ref) => ({ ...ref })),
-          id: newId('f'),
-          recalls: [],
-        };
-        facts.set(written.id, written);
+        return keyed(draft.key) ?? write(draft);
+      },
+      async supersede(id, draft, at) {
+        checkEvidence(draft.sources);
+        const found = factOf(id);
+        const existing = keyed(draft.key);
+        if (existing) return existing;
+        const written = write(draft);
+        closeFact(found, at, written.id);
         return written;
       },
       async close(id, at, closeOptions) {
         const found = factOf(id);
         if (closeOptions?.supersededBy !== undefined) factOf(closeOptions.supersededBy);
-        if (found.validTo !== undefined) return;
-        facts.set(id, {
-          ...found,
-          validTo: at,
-          ...(closeOptions?.supersededBy !== undefined ? { supersededBy: closeOptions.supersededBy } : {}),
-        });
+        closeFact(found, at, closeOptions?.supersededBy);
       },
       async cite(id, sources) {
         checkEvidence(sources);
@@ -198,6 +260,17 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
           const found = facts.get(id);
           if (!found || found.archivedAt === undefined) continue;
           const { archivedAt: _gone, ...rest } = found;
+          facts.set(id, rest);
+          count += 1;
+        }
+        return count;
+      },
+      async reopen(ids) {
+        let count = 0;
+        for (const id of new Set(ids)) {
+          const found = facts.get(id);
+          if (!found || found.validTo === undefined) continue;
+          const { validTo: _to, supersededBy: _by, ...rest } = found;
           facts.set(id, rest);
           count += 1;
         }
@@ -272,6 +345,13 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
         const found = procedures[index]!;
         if (found.retiredAt === undefined) procedures[index] = { ...found, retiredAt: at };
       },
+      async forget(ids) {
+        const wanted = new Set(ids);
+        const before = procedures.length;
+        const kept = procedures.filter((procedure) => !wanted.has(procedure.id));
+        procedures.splice(0, procedures.length, ...kept);
+        return before - kept.length;
+      },
       async list(query) {
         return procedures.filter(
           (procedure) =>
@@ -291,6 +371,9 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
         if (historyOptions?.last === undefined) return [...versions];
         const last = countOf(historyOptions.last);
         return last > 0 ? versions.slice(-last) : [];
+      },
+      async clear() {
+        return versions.splice(0).length;
       },
     },
   };

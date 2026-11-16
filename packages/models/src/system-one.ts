@@ -24,7 +24,12 @@ export interface SystemOneSpec extends Omit<ModelSpec, 'provider'> {
   readonly provider: string;
   /** Cloudflare 的账号 ID，`cloudflare` 必填。 */
   readonly accountId?: string;
+  /** 一次请求最多等多久（毫秒），连读完响应正文，缺省 `SYSTEM_ONE_TIMEOUT_MS`（30 秒）。超时抛 `timeout`，可以重试。 */
+  readonly timeoutMs?: number;
 }
+
+/** System One 请求缺省的超时（毫秒）。 */
+export const SYSTEM_ONE_TIMEOUT_MS = 30_000;
 
 /** 不进配置文件的选项。 */
 export interface SystemOneOptions {
@@ -71,6 +76,7 @@ interface Endpoint {
   /** 请求体里的 `model` 选择器。 */
   readonly model: string;
   readonly fetch: typeof fetch;
+  readonly timeoutMs: number;
 }
 
 type Json = Record<string, unknown>;
@@ -105,6 +111,7 @@ function cloudflareEndpoint(spec: SystemOneSpec, options: SystemOneOptions): End
     headers: endpointHeaders(spec),
     model: spec.model,
     fetch: options.fetch ?? globalThis.fetch,
+    timeoutMs: timeoutOf(spec),
   };
 }
 
@@ -119,21 +126,44 @@ function typesafeEndpoint(spec: SystemOneSpec, options: SystemOneOptions): Endpo
     headers: endpointHeaders(spec),
     model: spec.model,
     fetch: options.fetch ?? globalThis.fetch,
+    timeoutMs: timeoutOf(spec),
   };
 }
 
-/** 发请求，非 2xx 抛 `SystemOneError`；Cloudflare 的 `{ result, success }` 外壳拆掉，没有外壳（TypeSafe）原样返回。 */
+function timeoutOf(spec: SystemOneSpec): number {
+  const value = spec.timeoutMs;
+  if (value === undefined) return SYSTEM_ONE_TIMEOUT_MS;
+  if (!(value > 0)) throw new Error('System One `timeoutMs` must be a positive number.');
+  return value;
+}
+
+/**
+ * 发请求，非 2xx 抛 `SystemOneError`；Cloudflare 的 `{ result, success }` 外壳拆掉，没有外壳（TypeSafe）原样返回。
+ * 超过 `timeoutMs`（连读正文）抛 `CtxError('timeout')`，`retryable: true`；调用方的 `signal` 中止时照常 reject 它的原因。
+ */
 async function post(endpoint: Endpoint, body: Json, signal: AbortSignal | undefined): Promise<Json> {
   signal?.throwIfAborted();
+  const timer = AbortSignal.timeout(endpoint.timeoutMs);
+  const combined = signal ? AbortSignal.any([signal, timer]) : timer;
   // 不当方法调：浏览器里 fetch 的 this 不是 window 会报 Illegal invocation。
   const send = endpoint.fetch;
-  const response = await send(endpoint.url, {
-    method: 'POST',
-    headers: endpoint.headers,
-    body: JSON.stringify(body),
-    ...(signal ? { signal } : {}),
-  });
-  const text = await response.text();
+  let response: Response;
+  let text: string;
+  try {
+    response = await send(endpoint.url, {
+      method: 'POST',
+      headers: endpoint.headers,
+      body: JSON.stringify(body),
+      signal: combined,
+    });
+    text = await response.text();
+  } catch (error) {
+    if (timer.aborted && !signal?.aborted)
+      throw new CtxError('timeout', `${endpoint.name}: no response within ${endpoint.timeoutMs}ms.`, {
+        retryable: true,
+      });
+    throw error;
+  }
   if (!response.ok)
     throw new SystemOneError(
       `${endpoint.name}: HTTP ${response.status} ${response.statusText}`.trim(),

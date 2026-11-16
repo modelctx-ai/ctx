@@ -1055,6 +1055,8 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
               const noteQuery = defined({
                 session: textParam(query, 'session'),
                 pending: booleanParam(query, 'pending'),
+                failed: booleanParam(query, 'failed'),
+                since: numberParam(query, 'since'),
                 limit: numberParam(query, 'limit'),
               });
               sendJson(res, 200, { notes: await memoryStore.notes.list(noteQuery) });
@@ -1069,6 +1071,28 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
             only('POST', '/memory/notes/settle');
             const input = await body('{ "ids": string[], "at": number }');
             sendJson(res, 200, { settled: await memoryStore.notes.settle(idsField(input), numberField(input, 'at')) });
+            return;
+          }
+          if (action === 'fail') {
+            only('POST', '/memory/notes/fail');
+            const input = await body('{ "ids": string[], "at": number, "error": string, "maxAttempts": number }');
+            const failed = await memoryStore.notes.fail(idsField(input), numberField(input, 'at'), {
+              error: stringField(input, 'error'),
+              maxAttempts: numberField(input, 'maxAttempts'),
+            });
+            sendJson(res, 200, { notes: failed });
+            return;
+          }
+          if (action === 'retry') {
+            only('POST', '/memory/notes/retry');
+            sendJson(res, 200, { retried: await memoryStore.notes.retry(idsField(await body('{ "ids": string[] }'))) });
+            return;
+          }
+          if (action === 'forget') {
+            only('POST', '/memory/notes/forget');
+            const input = await body('{ "session"?: string }');
+            const session = input['session'] === undefined ? undefined : stringField(input, 'session');
+            sendJson(res, 200, { forgotten: await memoryStore.notes.forget(session) });
             return;
           }
           if (action === 'head') {
@@ -1140,6 +1164,12 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
                 sendJson(res, 200, { restored: await memoryStore.facts.restore(idsField(input)) });
                 return;
               }
+              case 'reopen': {
+                only('POST', '/memory/facts/reopen');
+                const input = await body('{ "ids": string[] }');
+                sendJson(res, 200, { reopened: await memoryStore.facts.reopen(idsField(input)) });
+                return;
+              }
               case 'forget': {
                 only('POST', '/memory/facts/forget');
                 const input = await body('{ "ids": string[] }');
@@ -1158,6 +1188,15 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
             const supersededBy = input['supersededBy'] === undefined ? undefined : stringField(input, 'supersededBy');
             await memoryStore.facts.close(id, at, supersededBy === undefined ? undefined : { supersededBy });
             sendJson(res, 200, {});
+            return;
+          }
+          if (second === 'supersede') {
+            only('POST', '/memory/facts/:id/supersede');
+            const input = await body('{ "fact": NewMemoryFact, "at": number }');
+            const fact = itemField(input, 'fact', 'sources');
+            sendJson(res, 200, {
+              fact: await memoryStore.facts.supersede(id, fact as unknown as NewMemoryFact, numberField(input, 'at')),
+            });
             return;
           }
           if (second === 'cite') {
@@ -1185,6 +1224,13 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
             sendJson(res, 200, { procedure: await memoryStore.procedures.add(procedure as unknown as NewProcedure) });
             return;
           }
+          if (id === 'forget' && action === undefined) {
+            only('POST', '/memory/procedures/forget');
+            sendJson(res, 200, {
+              forgotten: await memoryStore.procedures.forget(idsField(await body('{ "ids": string[] }'))),
+            });
+            return;
+          }
           if (action === 'confirm') {
             only('POST', '/memory/procedures/:id/confirm');
             const evidence = objectsField<SourceRef>(await body('{ "evidence": SourceRef[] }'), 'evidence');
@@ -1207,7 +1253,11 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
               sendJson(res, 200, { core: await memoryStore.core.get() });
               return;
             }
-            if (method !== 'PUT') fail(405, 'use GET or PUT /memory/core');
+            if (method === 'DELETE') {
+              sendJson(res, 200, { cleared: await memoryStore.core.clear() });
+              return;
+            }
+            if (method !== 'PUT') fail(405, 'use GET, PUT or DELETE /memory/core');
             const input = await body('{ "text": string, "at": number }');
             await memoryStore.core.set(stringField(input, 'text'), numberField(input, 'at'));
             sendJson(res, 200, {});

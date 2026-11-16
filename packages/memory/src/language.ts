@@ -10,7 +10,17 @@ import {
   type ExtractionModel,
   type JsonValue,
 } from '@modelctx-ai/ctx-protocol';
-import { generateText, type LanguageModel } from 'ai';
+import { generateText, jsonSchema, NoObjectGeneratedError, Output, type LanguageModel } from 'ai';
+
+/** 给模型的 JSON Schema：本包只用到对象、数组、数、字符串和 null。 */
+interface JsonSchema {
+  readonly type?: 'object' | 'array' | 'number' | 'string' | 'null';
+  readonly properties?: Readonly<Record<string, JsonSchema>>;
+  readonly required?: readonly string[];
+  readonly additionalProperties?: boolean;
+  readonly items?: JsonSchema;
+  readonly anyOf?: readonly JsonSchema[];
+}
 
 import { scoreAnswer } from './heuristic.ts';
 import { clamp01, stripMemoryTags, stripTags } from './text.ts';
@@ -27,7 +37,11 @@ export interface LanguageModelAdapterOptions {
   readonly maxRetries?: number;
 }
 
-/** 调一次模型拿回文字。`ai` 的 `generateText`，和 harness 一样的调用方式；不带工具。 */
+/**
+ * 调一次模型拿回文字。`ai` 的 `generateText`，和 harness 一样的调用方式；不带工具。给了 `schema` 时要结构化输出
+ * （`Output.object`，服务商支持的话按 JSON Schema 约束解码），返回的是那个对象的 JSON；模型的回答不合 JSON 或不合
+ * schema（服务商不支持结构化输出时常见）时返回它的原文，由调用方宽松地解析。
+ */
 export async function complete(
   model: LanguageModel,
   request: {
@@ -36,18 +50,78 @@ export async function complete(
     readonly signal?: AbortSignal | undefined;
     readonly temperature?: number | undefined;
     readonly maxRetries?: number | undefined;
+    readonly schema?: JsonSchema | undefined;
   },
 ): Promise<string> {
   request.signal?.throwIfAborted();
-  const result = await generateText({
+  const base = {
     model,
     instructions: request.instructions,
     prompt: request.prompt,
     temperature: request.temperature ?? 0,
     ...(request.maxRetries !== undefined ? { maxRetries: request.maxRetries } : {}),
     ...(request.signal ? { abortSignal: request.signal } : {}),
-  });
-  return result.text;
+  };
+  if (!request.schema) return (await generateText(base)).text;
+  try {
+    const result = await generateText({ ...base, output: Output.object({ schema: jsonSchema(request.schema) }) });
+    return JSON.stringify(result.output);
+  } catch (error) {
+    if (NoObjectGeneratedError.isInstance(error) && error.text !== undefined) return error.text;
+    throw error;
+  }
+}
+
+/** 模型的回答里取不出 JSON 对象：`invalid_response`。调用方据此不把这次当成「什么都没有」。 */
+function unreadable(what: string, text: string): CtxError {
+  const sample = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+  return new CtxError('invalid_response', `${what}: the model answer is not a JSON object: ${JSON.stringify(sample)}`);
+}
+
+const NUMBER: JsonSchema = { type: 'number' };
+
+/** 决策的输出 schema：每个问题一个键，noul 是数，choice 是选项 → 概率，score 是逐档概率的数组。 */
+function decisionSchema(questions: readonly (readonly [string, DecisionQuestion])[]): JsonSchema {
+  const properties: Record<string, JsonSchema> = {};
+  for (const [key, question] of questions) {
+    if (question.type === 'noul') properties[key] = NUMBER;
+    else if (question.type === 'choice') {
+      const options = Object.keys(question.criteria);
+      properties[key] = {
+        type: 'object',
+        properties: Object.fromEntries(options.map((option) => [option, NUMBER])),
+        required: options,
+        additionalProperties: false,
+      };
+    } else properties[key] = { type: 'array', items: NUMBER };
+  }
+  return { type: 'object', properties, required: Object.keys(properties), additionalProperties: false };
+}
+
+function valueSchema(field: ExtractionField): JsonSchema {
+  switch (field.type) {
+    case 'number':
+    case 'duration':
+      return NUMBER;
+    case 'list':
+      return { type: 'array', items: { type: field.items === 'text' ? 'string' : 'number' } };
+    default:
+      return { type: 'string' };
+  }
+}
+
+/** 提取的输出 schema：每个字段一个 `{ value, pNull, confidence }`，`value` 可以是 null。 */
+function extractionSchema(fields: readonly (readonly [string, ExtractionField])[]): JsonSchema {
+  const properties: Record<string, JsonSchema> = {};
+  for (const [key, field] of fields) {
+    properties[key] = {
+      type: 'object',
+      properties: { value: { anyOf: [valueSchema(field), { type: 'null' }] }, pNull: NUMBER, confidence: NUMBER },
+      required: ['value', 'pNull', 'confidence'],
+      additionalProperties: false,
+    };
+  }
+  return { type: 'object', properties, required: Object.keys(properties), additionalProperties: false };
 }
 
 /** 从模型的回答里取出第一个 JSON 对象：容忍 ``` 围栏和前后的话。取不出来是 undefined。 */
@@ -192,9 +266,10 @@ export function readDecision(question: DecisionQuestion, raw: unknown): Decision
 }
 
 /**
- * 用 `LanguageModel` 装成的决策模型：一次 `generateText`，让模型按题型输出 JSON，再规整成协议的回答。慢、贵，
- * 但任何服务商都能用。某个问题的回答取不出来（不是 JSON、缺键、形状不对）时，那一题返回合法但低置信度的答案：
- * `noul` 0.5、`choice` 均匀分布且 `confidence` 0、`score` 均匀分布。模型调用本身失败时 reject。
+ * 用 `LanguageModel` 装成的决策模型：一次 `generateText`，要结构化输出（按问题生成的 JSON Schema），服务商不支持时
+ * 从文字里宽松地取 JSON，再规整成协议的回答。慢、贵，但任何服务商都能用。某个问题的回答取不出来（缺键、形状不对）时，
+ * 那一题返回合法但低置信度的答案：`noul` 0.5、`choice` 均匀分布且 `confidence` 0、`score` 均匀分布。
+ * 整个回答都不是 JSON 对象（例如被截断）时 reject，`type` 是 `invalid_response`；模型调用本身失败时也 reject。
  */
 export function decisionFromLanguageModel(
   model: LanguageModel,
@@ -223,8 +298,10 @@ export function decisionFromLanguageModel(
         signal: request.signal,
         temperature: options.temperature,
         maxRetries: options.maxRetries,
+        schema: decisionSchema(entries),
       });
-      const parsed = parseJsonObject(text) ?? {};
+      const parsed = parseJsonObject(text);
+      if (!parsed) throw unreadable('decide', text);
       return Object.fromEntries(
         entries.map(([key, question]): [string, DecisionAnswer] => [
           key,
@@ -327,9 +404,11 @@ function isEmptyState(state: JsonValue): boolean {
 }
 
 /**
- * 用 `LanguageModel` 装成的提取模型：一次 `generateText`，让模型输出每个字段的 `{ value, pNull, confidence }`，
- * 再按字段类型规整（数字字符串转成数、`integer` 取整、`decimals` 四舍五入、日期校验）。输入是空的时不调模型，全部没找到。
- * 取不出来或形状不对的字段返回 `{ value: null, pNull: 0.5, confidence: 0 }`。模型调用本身失败时 reject。
+ * 用 `LanguageModel` 装成的提取模型：一次 `generateText`，要结构化输出每个字段的 `{ value, pNull, confidence }`
+ * （服务商不支持时从文字里宽松地取 JSON），再按字段类型规整（数字字符串转成数、`integer` 取整、`decimals` 四舍五入、
+ * 日期校验）。输入是空的时不调模型，全部没找到。缺了或形状不对的字段返回 `{ value: null, pNull: 0.5, confidence: 0 }`。
+ * 整个回答都不是 JSON 对象（例如被截断）时 reject，`type` 是 `invalid_response`：不能当成「什么都没说」。
+ * 模型调用本身失败时也 reject。
  */
 export function extractionFromLanguageModel(
   model: LanguageModel,
@@ -359,13 +438,12 @@ export function extractionFromLanguageModel(
         signal: request.signal,
         temperature: options.temperature,
         maxRetries: options.maxRetries,
+        schema: extractionSchema(entries),
       });
       const parsed = parseJsonObject(text);
+      if (!parsed) throw unreadable('extract', text);
       return Object.fromEntries(
-        entries.map(([key, field]): [string, ExtractionAnswer] => [
-          key,
-          parsed ? readExtraction(field, parsed[key]) : { value: null, pNull: 0.5, confidence: 0 },
-        ]),
+        entries.map(([key, field]): [string, ExtractionAnswer] => [key, readExtraction(field, parsed[key])]),
       );
     },
   };

@@ -78,17 +78,18 @@ const slowExtractor = extractionFromLanguageModel(llm);
 | `gate`          | `theta`（缺省 0.6）、`auto`（缺省开）、`entries`（缺省 `{ types: ['message'] }`）、`maxTokens`（一段最多多少估算 token，缺省 4000）                                                                                                                                                                                                  |
 | `recall`        | `k`（缺省 5）、`budgetTokens`（作为来源时的预算，缺省不限）、`minScore`（缺省 0.1）、`minConfidence`（`confidence` 低于它的事实不召回，缺省 0.5）、`archivedWeight`（归档的事实相似度乘多少，缺省 0.5，给 0 不找归档的）、`spacingMs`（来源带出的事实多久记一次 `touch`，缺省一天）、`confirmations`（程序要几次确认才带上，缺省 2） |
 | `decay`         | `d`、`epsilon`、`archiveAt`，缺省 0.5、0.02、0.55（`ACTIVATION_DEFAULTS`）；`minChances`（归档前要错过几次机会，缺省 7，给 0 只看激活度）。见「遗忘」                                                                                                                                                                                |
-| `consolidate`   | `escalateBelow`（缺省 0.6）、`maxPNull`（缺省 0.3）、`maxTokens`（一次提取的原文上限，缺省 6000）                                                                                                                                                                                                                                    |
+| `consolidate`   | `escalateBelow`（缺省 0.6）、`maxPNull`（缺省 0.3）、`maxTokens`（一次提取的原文上限，缺省 6000）、`maxAttempts`（一批失败几次进死信，缺省 3）                                                                                                                                                                                       |
 | `core`          | `budgetTokens`，缺省 2000                                                                                                                                                                                                                                                                                                            |
 | `embed`         | 召回时再加一路余弦，和存储 `search` 的分取大的；向量按事实 `id` 缓存在进程里                                                                                                                                                                                                                                                         |
 | `name`          | 执行环境的名字，缺省 `memory`                                                                                                                                                                                                                                                                                                        |
 | `now`、`logger` | 时钟（缺省 `Date.now`）、告警                                                                                                                                                                                                                                                                                                        |
+| `onDeadLetter`  | `(notes, error) => void`：笔记进了死信时调，同时 `logger.warn`。放回去用 `store.notes.retry(ids)`                                                                                                                                                                                                                                    |
 
 缺省值都在 `MEMORY_DEFAULTS` 里。
 
-## 五个操作
+## 五个操作和删除
 
-**`gate(session)`**：从 `notes.head(session)` 之后读新条目，渲染成文字（`tool` 角色的消息不进来），一次 `decide` 问 `keep`、`kind`、`topic`、`salience` 四个问题，`salience = 0.6 × keep + 0.4 × score`。不低于阈值的写成待处理的笔记，低于的写成已处理的（`settledAt = at`），`head` 照样前进。超过 `gate.maxTokens` 的一段拆成几段，各问一次。同一会话的 `gate` 排队执行，不会给同一段写两条。
+**`gate(session)`**：从 `notes.head(session)` 之后读新条目，渲染成文字（`tool` 角色的消息不进来），一次 `decide` 问 `keep`、`kind`、`topic`、`salience` 四个问题，`salience = 0.6 × keep + 0.4 × score`。不低于阈值的写成待处理的笔记，低于的写成已处理的（`settledAt = at`），`head` 照样前进。超过 `gate.maxTokens` 的一段拆成几段，各问一次。同一会话的 `gate` 排队执行；存储对同一段只留一条笔记，几个进程同时门控也一样。决策模型失败（服务不可用、回答取不出 JSON）时这一段用启发式打分，告警一次，`head` 照样前进。
 
 阈值：`gate.auto` 开着时，取最近 7 天笔记的 `salience`，按 `theta` 算待处理的占比；落在 10–25% 就用 `theta`，否则取分位让占比落到最近的边界。样本少于 20 条时用 `theta`。`auto: false` 固定用 `theta`。
 
@@ -103,20 +104,27 @@ const slowExtractor = extractionFromLanguageModel(llm);
 
 **`consolidate({ now })`**：
 
-1. 待处理的笔记按主题分组，每组读原文（一个会话读一次），按 `consolidate.maxTokens` 分批，每批一次 `extract`：`facts`、`decisions`（都当事实）、`since`、`lesson`。`pNull > maxPNull` 的字段当没说；`since` 为空时 `validFrom` 取这批第一条的 `at`。证据是这批笔记的区间。
-2. 每条提出的事实：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。字面相同就直接并入；否则一次 `decide` 问关系（`new` / `merge` / `supersede`）和对应哪一条。置信度低于 `escalateBelow`、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`new` 是 `add`；`merge` 是 `cite` + `touch`；`supersede` 是 `add` 新的、`close` 旧的（`supersededBy` 指向新的）。
+1. 待处理的笔记按主题分组，每组读原文（一个会话读一次），按 `consolidate.maxTokens` 分批，每批一次 `extract`：`facts`、`decisions`（都当事实）、`lesson`。`pNull > maxPNull` 的字段当没说。起始日期按条给：开头写了 `[YYYY-MM-DD]` 的那一条从那天起，没写的取这批第一条的 `at`。证据是这批笔记的区间。
+2. 每条提出的事实：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。字面相同就直接并入；否则一次 `decide` 问关系（`new` / `merge` / `supersede`）和对应哪一条。置信度低于 `escalateBelow`、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`new` 是 `add`；`merge` 是 `cite` + `touch`；`supersede` 是存储的 `supersede`，新的写进去、旧的关掉，一步完成。旧的按新事实自己写的日期关，没写按今天；新事实的日期在将来时不取代，两条都留着。新事实带幂等键（来源区间加文字的哈希），同一批再处理一次不写重复的。
 3. `lesson` 非空且有 `model` 时反思成 `when` / `do`：和同主题已有的程序是同一条就 `confirm`，否则 `add`。没有 `model` 不反思。
-4. 这批笔记 `settle`。读不到原文的笔记（会话清掉了）也 `settle`，什么都不写。
+4. 这批笔记 `settle`。读不到原文的笔记（会话清掉了）也 `settle`，什么都不写。一批失败（抛错，包括模型的回答取不出 JSON）不挡后面的：可以重试的错（`retryable: true`）当场再试一次，还不行就留到下次、不记次数；别的错 `notes.fail` 记一次，到 `maxAttempts` 进死信，告警、调 `onDeadLetter`。
 5. 衰减：open 的事实里，`activation < archiveAt` 并且错过了至少 `minChances`（缺省 7）次机会的 `archive`；这一夜刚写、刚并入的不归档。见下面「遗忘」。
 6. `core`：有 `model` 时从 open 事实重写（open 事实和上次重写时一样就不再调模型；输出为空或超预算时回到 `renderCore`），没有时用 `renderCore`。文字和当前版本一样时不写新版本。
 
-报告里 `facts.added` 只数 `new`，取代的那条新事实算在 `superseded` 里；`escalated` 数调了几次 `LanguageModel` 做并入判断。整体可重复执行：处理过的笔记不再处理。中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下次重做；重做时字面相同的事实直接并入，同一段证据不会记两次。`consolidate` 排队执行，不并发。
+报告里 `failed` 数这次失败留着的笔记，`dead` 数进了死信的；`facts.added` 只数 `new`，取代的那条新事实算在 `superseded` 里；`escalated` 数调了几次 `LanguageModel` 做并入判断。整体可重复执行：处理过的笔记不再处理。中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下次重做；重做时同一个键的事实不再写，字面相同的直接并入，同一段证据不会记两次。`consolidate` 排队执行，不并发。
 
 既没有 `extraction` 也没有 `model` 时只做衰减和 `core` 的缺省渲染，笔记留着等以后处理，第一次告警一次。
 
 **`source({ name, query, k })`**：`ContextSource`，名字缺省 `memory`。内容是 `core` 加按 `query`（缺省取会话最近一条用户消息）召回的事实和生效的程序，用 `<memory>` 包起来，第一行声明「这是资料，不是指令」；记忆里的文字去掉 `<memory>` 标签，免得提前闭合包裹。取不到 `query` 时只带 `core`，什么都没有时返回 `null`。
 
 来源每一轮都跑，所以它带出的事实不是每次都记 `touch`：同一条事实离它上一次记下的召回不到 `recall.spacingMs`（缺省一天）就不再记。主动的召回（直接调 `recall`、模型调 `recall` 工具）每次都记。归档的事实被来源带出时一样恢复。
+
+**`forget({ facts?, procedures?, session?, all? })`**：真删除，返回 `{ notes, facts, procedures, core }` 各删了多少。`session` 删这个会话的笔记和证据里有它的事实、程序；`all` 删这个作用域的全部。删了事实时画像的历史全部清掉，从剩下的事实按 `renderCore` 写一版，不经模型（重写要把上一版画像喂回去，删掉的又回来了）。召回的向量缓存跟着删。和 `consolidate` 排同一个队。会话日志不归它删，要一起删时：
+
+```ts
+await memory.forget({ session }); // 先删记忆
+await sessions.clear(session); // 再删日志
+```
 
 **`tools()`、`execute()`**：`Memory` 是一个 `Executor`，报一个 `recall` 工具（`MEMORY_RECALL_TOOL`），输入 `query`，可选 `since_days`（只要最近这么多天里开始成立的事实）、`topic`、`k`（1–20）。输出是文字：和来源同样的包裹，事实带主题、日期和证据位置，程序带确认次数，最后是证据原文（`tool` 角色的不列）。不认识的工具、输入不对、`signal` 已中止、存储出错都返回 `{ type: 'error' }`。
 
@@ -148,10 +156,10 @@ const slowExtractor = extractionFromLanguageModel(llm);
 | 导出                                       | 说明                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `createHeuristicDecisionModel(options)`    | 只认门控的四个问题（按键名和 `type`）：惊讶（1 − 与 `known` 给的已有事实的最大相似度，乘信息量）、强调（「记住」「以后」「别再」「remember」「always」「never」、改变、偏好）、重复（这段里用户反复说的、`recent` 里说过的）、情绪（报错、失败、纠正）加权。`kind` 按信号选，`topic` 按说明的相似度选。别的问题返回均匀分布。`similarity` 可注入，缺省 `textSimilarity` |
-| `decisionFromLanguageModel(model, opts)`   | 一次 `generateText`，按题型要 JSON（`noul` 一个数、`choice` 选项到概率、`score` 逐档概率），规整成协议的回答。取不出来的那一题返回 `noul` 0.5、`choice` 均匀且 `confidence` 0、`score` 均匀                                                                                                                                                                             |
-| `extractionFromLanguageModel(model, opts)` | 一次 `generateText`，要每个字段的 `{ value, pNull, confidence }`，按类型规整（数字字符串转数、`integer` 取整、`decimals` 四舍五入、日期校验）。输入为空时不调模型；取不出来的字段返回 `{ value: null, pNull: 0.5, confidence: 0 }`                                                                                                                                      |
+| `decisionFromLanguageModel(model, opts)`   | 一次 `generateText`，按题型要结构化输出（`noul` 一个数、`choice` 选项到概率、`score` 逐档概率，按问题生成 JSON Schema），规整成协议的回答。缺了或形状不对的那一题返回 `noul` 0.5、`choice` 均匀且 `confidence` 0、`score` 均匀                                                                                                                                          |
+| `extractionFromLanguageModel(model, opts)` | 一次 `generateText`，按字段要结构化输出每个字段的 `{ value, pNull, confidence }`，按类型规整（数字字符串转数、`integer` 取整、`decimals` 四舍五入、日期校验）。输入为空时不调模型；缺了或形状不对的字段返回 `{ value: null, pNull: 0.5, confidence: 0 }`                                                                                                                |
 
-两个 LM 适配器只在回答解析失败时兜底；模型调用本身失败时 reject。
+两个 LM 适配器要结构化输出（AI SDK 的 `Output.object`）；服务商不支持、回答不合 schema 时退回从文字里宽松地取第一个 JSON 对象。整个回答都不是 JSON 对象（例如被截断）时 reject，`type` 是 `invalid_response`：调用方不会把故障当成「什么都没说」。模型调用本身失败时也 reject。
 
 ## 几个用户共用一份存储
 
@@ -178,7 +186,7 @@ function memoryFor(user: string) {
 
 ## 契约测试
 
-通过协议包的 `describeMemoryStoreContract`（内存存储，带和不带 `embed`）、`describeDecisionModelContract`（启发式、LM 装成的，含回答不是 JSON 的情况）、`describeExtractionModelContract`（LM 装成的，同上）、`describeMemoryContract`（`createMemory` + 内存存储）。
+通过协议包的 `describeMemoryStoreContract`（内存存储，带和不带 `embed`）、`describeDecisionModelContract`（启发式、LM 装成的，含回答缺键的情况）、`describeExtractionModelContract`（LM 装成的，同上）、`describeMemoryContract`（`createMemory` + 内存存储）。
 
 ## 导出
 
