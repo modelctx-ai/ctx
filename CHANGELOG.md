@@ -4,6 +4,7 @@
 
 ## 未发布
 
+- **新增** 包 `@modelctx-ai/ctx-otel`（[#46](https://github.com/modelctx-ai/ctx/issues/46) 的追踪部分）：`traceSession(store, session, { tracer, after?, parent? })` 把会话里结束了的运行发成 OpenTelemetry 的 span（`invoke_agent` → 每一步的 `chat` → `execute_tool`），属性按 GenAI 语义约定（`gen_ai.operation.name`、`gen_ai.conversation.id`、`gen_ai.response.model`、`gen_ai.usage.*` 等）；`deriveSpans`（纯函数，条目 → `SpanRecord`）、`emitSpans`。span 全部从日志条目派生，核心包不依赖它；`@opentelemetry/api` 是 peer。没有对真实的追踪后端验证。所有包现在是十个。
 - **新增** 用量和步骤（[#46](https://github.com/modelctx-ai/ctx/issues/46) 的用量和事件流两部分）：`Usage` 加 `cacheReadTokens`、`cacheWriteTokens`、`reasoningTokens`（可选，取 AI SDK 的 `inputTokenDetails`、`outputTokenDetails`，服务商不给或者是 0 就不写；没有对真实服务验证）。每一步的助手消息带 `meta.step`（新类型 `StepMeta`：`runId`、`step`、`provider`、服务商响应里的 `modelId`、`finishReason`、这一步的 `usage`），新导出 `stepMetaOf(entry)` 读它。**行为变化**：服务商报了缓存命中、推理 token 的，`RunResult.usage` 和 `ctx.run.ended` 的 `usage` 多出这几项。
 - **新增** `RunEvent` 和日志对齐：`run.started`、`model.ended`、`run.ended` 带 `seq?`，发出时日志已经写到这个位置（`model.ended` 因此等这一步写进日志才发），流断了从它起 `watch` 或 `list({ after })` 接着读；新事件 `reasoning.delta`（推理内容的增量，不落日志）。对 `RunEvent['type']` 做穷尽 `switch` 的要加一支。
 - **实现** harness 每一步即时落日志（[#20](https://github.com/modelctx-ai/ctx/issues/20)）：模型这一步要在本地执行工具时，助手消息（工具调用）在工具执行之前写下，工具结果在这一步结束时写下，最后写 `ctx.run.ended`；`run` 和 `stream` 都一样，每次写入带 `expectSeq`。以前整轮的产出和 `ctx.run.ended` 一批写，进程在工具执行时崩掉，日志里没有任何调用和结果。**行为变化**：一轮出错或被取消时，已经做完的步骤留在日志里（以前一条产出都不写），写下了调用、没等到结果的工具调用补一条错误结果；这样一轮失败之后不带 `inputKey` 的重试，因为输入后面有了产出，会再记一遍输入。`RunResult.messages`、`recorded` 的内容和顺序不变。

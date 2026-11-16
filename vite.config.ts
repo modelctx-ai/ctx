@@ -3,7 +3,13 @@ import { defaultServerConditions, defineConfig } from 'vite-plus';
 export default defineConfig({
   // 测试跑在 Vitest 的 node 环境（Vite 的 ssr 环境）里；加上源码条件，各包互相引用时读 src/*.ts，
   // 不用先构建 dist/。见 docs/adr/0002-packages.md。
-  ssr: { resolve: { conditions: ['@modelctx-ai/source', ...defaultServerConditions] } },
+  // 不带 `module` 条件：`@opentelemetry/api` 的 `module` 入口是不带扩展名的 ESM，测试时 Node 直接加载它会失败；
+  // Node 自己不认 `module`，用的是 `import` / `require`，和使用方一样。
+  ssr: {
+    resolve: {
+      conditions: ['@modelctx-ai/source', ...defaultServerConditions.filter((condition) => condition !== 'module')],
+    },
+  },
 
   test: {
     include: ['packages/*/src/**/*.test.ts', 'examples/**/*.test.ts', 'live/**/*.test.ts'],

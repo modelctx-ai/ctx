@@ -857,6 +857,10 @@ sequenceDiagram
 | `assistant` 文字、工具调用            | `content` + `tool_calls`（`arguments` 是 JSON 字符串）；只有工具调用时 `content: null`。推理和服务商执行的工具调用丢掉，什么都不剩的消息整条丢掉                                                   |
 | `tool` 工具结果                       | 每个结果一条 `{ role: 'tool', tool_call_id, content }`：文字原样，JSON 序列化，拒绝执行写明原因                                                                                                    |
 
+## 追踪
+
+`@modelctx-ai/ctx-otel` 把结束了的运行换成 OpenTelemetry 的 span，全部从会话日志的条目派生，不在 harness、编排器里插桩，核心包不依赖它。`deriveSpans(entries)` 是纯函数：从 `ctx.run.started` 到同一个 `runId` 的 `ctx.run.ended` 是一棵 `invoke_agent`；中间每条带 `meta.step` 的助手消息是一个 `chat`，从它前一条条目的 `at` 到它自己的 `at`；这条消息里本地执行的每个工具调用是一个 `execute_tool`，结束在带它结果的那条 `tool` 消息，到下一步都没有结果就记成 `ERROR`。没结束的运行不发，`upTo` 停在最后一个结束了的运行的 `ctx.run.ended`。`emitSpans` 用 `startSpan({ startTime })`、`end(at)` 把时间设成条目的 `at`，父子关系经 `trace.setSpan` 传。`traceSession(store, session, { tracer, after })` 是 `list({ after })` 加上这两步。属性见包的 README；消息正文、工具输入输出不进属性。
+
 ## 错误和日志
 
 - `describeError(error, { secrets, max })` 给日志和界面用：重试错误取最后一次；接口错误带 `status` 和截短的响应正文 `detail`；`secrets` 里的密钥换成 `***`，空白合并，截到 `max`（缺省 180）字。

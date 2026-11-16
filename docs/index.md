@@ -28,6 +28,7 @@ okf_version: '0.2'
 - [`@modelctx-ai/ctx-exec`](../packages/exec/README.md) - 实现：本机子进程执行环境
 - [`@modelctx-ai/ctx-remote`](../packages/remote/README.md) - 实现：会话、执行环境、harness、编排、记忆的 HTTP 服务端和客户端
 - [`@modelctx-ai/ctx-gateway`](../packages/gateway/README.md) - 实现：本机 OpenAI 兼容网关
+- [`@modelctx-ai/ctx-otel`](../packages/otel/README.md) - 实现：从会话日志派生 OpenTelemetry 的 span
 
 # 记录
 

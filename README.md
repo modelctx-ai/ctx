@@ -74,6 +74,7 @@ sequenceDiagram
 |      | [`@modelctx-ai/ctx-exec`](packages/exec)                | 本机子进程执行环境                                            |
 |      | [`@modelctx-ai/ctx-remote`](packages/remote)            | 会话、执行环境、harness、编排、记忆的 HTTP 服务端和客户端     |
 |      | [`@modelctx-ai/ctx-gateway`](packages/gateway)          | 本机 OpenAI 兼容网关，把客户端带来的历史换成 ctx 的上下文     |
+|      | [`@modelctx-ai/ctx-otel`](packages/otel)                | 从会话日志派生 OpenTelemetry 的 span                          |
 | 实践 | [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo) | 用这些包组合出来的常驻桌宠导演，见[实践：yoyo](docs/repos.md) |
 
 ## 快速开始
@@ -91,6 +92,7 @@ overrides:
   '@modelctx-ai/ctx-mcp': link:../ctx/packages/mcp
   '@modelctx-ai/ctx-memory': link:../ctx/packages/memory
   '@modelctx-ai/ctx-models': link:../ctx/packages/models
+  '@modelctx-ai/ctx-otel': link:../ctx/packages/otel
   '@modelctx-ai/ctx-protocol': link:../ctx/packages/protocol
   '@modelctx-ai/ctx-remote': link:../ctx/packages/remote
   '@modelctx-ai/ctx-sqlite': link:../ctx/packages/sqlite
