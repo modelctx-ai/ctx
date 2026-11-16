@@ -1391,6 +1391,29 @@ export function describeHarnessContract(
       );
     });
 
+    test('每一步结束就落日志：工具调用之后模型出错，前一步的调用和结果留在日志里', async () => {
+      const text = randomMarker();
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'tool-call', id: 'call-1', input: { text } },
+          { type: 'error', message: 'model exploded' },
+        ],
+      });
+      const result = await harness.run({ session: 's', agent: noRetry(agent), input: '回显一下' });
+      assert.equal(result.stopReason, 'error');
+      const log = await store.list('s');
+      assert.deepEqual(kinds(log), [
+        CTX_EVENTS.runStarted,
+        'user',
+        'assistant',
+        'tool',
+        CTX_EVENTS.error,
+        CTX_EVENTS.runEnded,
+      ]);
+      const tool = log.find((entry) => entry.type === 'message' && entry.message.role === 'tool');
+      assert.ok(JSON.stringify(tool).includes(text), '工具结果在日志里');
+    });
+
     test('inputKey：失败后用同一个键重试，输入只记一次', async () => {
       const { harness, store, agent } = await factory({
         script: [
@@ -1948,6 +1971,39 @@ export function describeOrchestratorContract(
           [['lost', 'error']],
         );
         assert.deepEqual(await orchestrator.recover(), []);
+      });
+    });
+
+    test('recover（有时）：写下了调用、没有结果的工具调用补一条错误结果，再补 ctx.run.ended', async () => {
+      await withOrchestrator(factory, answers(0), async ({ orchestrator, store }) => {
+        if (!orchestrator.recover) return;
+        await store.append('crashed', [
+          lifecycle(CTX_EVENTS.runStarted, 'lost'),
+          userEntry('两件事'),
+          messageEntry({
+            role: 'assistant',
+            content: [
+              { type: 'tool-call', id: 'done', name: 'echo', input: {} },
+              { type: 'tool-call', id: 'hung', name: 'echo', input: {} },
+            ],
+          }),
+          messageEntry({
+            role: 'tool',
+            content: [{ type: 'tool-result', id: 'done', name: 'echo', output: { type: 'text', text: '好了' } }],
+          }),
+        ]);
+        assert.deepEqual(
+          (await orchestrator.recover()).map(({ session, runId }) => ({ session, runId })),
+          [{ session: 'crashed', runId: 'lost' }],
+        );
+        const log = await store.list('crashed');
+        assert.deepEqual(kinds(log).slice(4), ['tool', CTX_EVENTS.runEnded]);
+        const patched = log[4];
+        assert.ok(patched?.type === 'message' && patched.message.role === 'tool');
+        assert.deepEqual(
+          patched.message.content.map((part) => (part.type === 'tool-result' ? [part.id, part.output.type] : [])),
+          [['hung', 'error']],
+        );
       });
     });
 

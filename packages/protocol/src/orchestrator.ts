@@ -23,6 +23,8 @@ export interface OrchestratorEvent {
 export interface RecoveredRun {
   readonly session: string;
   readonly runId: string;
+  /** 续跑时，接着这个会话提交的那一轮的 `runId`；只结束不续跑时没有。 */
+  readonly resumed?: string;
 }
 
 /**
@@ -36,7 +38,10 @@ export interface Orchestrator {
   status(runId: string): Promise<RunStatus | undefined>;
   /** 取消排队中或运行中的一轮，返回是否真的取消了。 */
   cancel(runId: string): Promise<boolean>;
-  /** 崩溃后：给断掉的运行补一条 `ctx.run.ended`（`stopReason: error`）或续跑，由实现决定。 */
+  /**
+   * 崩溃后：给断掉的运行写下了调用、没有结果的工具调用补错误结果，再补一条 `ctx.run.ended`（`stopReason: error`）；
+   * 续不续跑由实现（和它的配置）决定，续跑的在 `RecoveredRun.resumed` 里给出新一轮的 `runId`。
+   */
   recover?(): Promise<RecoveredRun[]>;
   /** 状态变化的事件流，直到 `signal` 中止或 `close`。 */
   events?(options?: { readonly signal?: AbortSignal }): AsyncIterable<OrchestratorEvent>;

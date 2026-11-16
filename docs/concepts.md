@@ -65,6 +65,7 @@ flowchart LR
 | 保留期                        | 应用自己调的清理：`pruneSession` 删掉被摘要盖住的旧历史，按条数或时间留一部分。框架里没有定时器                                                                                                                                                                                                                            |
 | 导出、导入                    | 把一个会话搬到别的存储：`exportSession` 导成 JSON Lines，`importSession` 写进目标存储并把摘要的 `covers` 这类 `seq` 引用换成目标存储的位置；`copySession` 是两步连起来。`seq` 是各个存储自己分配的，不能 `list` 再 `append`                                                                                                |
 | 所有者 `owner`                | 部署者给编排器的稳定实例名，写进 `ctx.run.started`；`recover` 只收同一个 `owner` 的断点                                                                                                                                                                                                                                    |
+| 续跑 `resume`                 | 崩溃后从日志接着跑断掉的一轮：harness 每一步即时落日志、工具调用先写再执行，`recover` 给结果未知的调用补错误结果，编排器配了 `resume` 的在同一个会话上提交一轮不带输入的运行                                                                                                                                               |
 | 上下文配置 `ContextSpec`      | `AgentSpec.context`：按名字选事实的来源、位置和投影，能序列化                                                                                                                                                                                                                                                              |
 | 事实 `Fact`                   | 来源在调用那一刻取到的文字，只用于这一次，不写日志                                                                                                                                                                                                                                                                         |
 | 投影 `Projection`             | 把条目渲染成这一次交给模型的消息                                                                                                                                                                                                                                                                                           |
@@ -108,6 +109,6 @@ ctx 的拆法参考了 Anthropic 公开的工程和研究材料。对应关系�
 1. **只追加。** 会话日志只追加，压缩追加摘要，窗口只影响这一次投影。原条目一直在（[ADR 0003](adr/0003-context-model.md)），直到应用明确删掉它：`clear`、`truncate`、`remove` 真删，`redact` 涂改，都留下擦除记录（`clear` 除外），框架自己从不删（[ADR 0007](adr/0007-deletion-and-retention.md)）。
 2. **协议只收发 JSON。** 除 `AbortSignal` 和进程内的 `LanguageModel`，协议方法的参数和返回都能序列化，所以每个组件都能放到进程边界另一侧（[ADR 0004](adr/0004-protocol-and-implementation.md)）。
 3. **身份是字符串。** 会话、工具、执行环境、运行都用字符串 id 指代，跨边界时不用传对象。
-4. **可丢弃。** harness 和执行环境可以随时崩、随时换；会话日志是唯一的真相，续跑从日志读。
+4. **可丢弃。** harness 和执行环境可以随时崩、随时换；会话日志是唯一的真相，续跑从日志读：每一步都即时写下，工具调用在执行之前写下，`recover` 收尾或续跑。
 5. **框架不替应用做决定。** 什么时候压缩、什么事件给模型看、工具给不给、什么时候跑一轮，都是应用（编排器、`AgentSpec`、投影规则）的事；框架给机制和缺省值。上下文超过模型窗口时的兜底也一样：它是 `AgentSpec.context.overflow` 里的配置，缺省关着。
 6. **先简单。** 进程内的用法（`createContext()`）和三行代码的例子要一直能用；分布式是能力，不是门槛。

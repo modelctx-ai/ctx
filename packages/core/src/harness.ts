@@ -49,6 +49,7 @@ import {
   RetryError,
   stepCountIs,
   streamText,
+  type ContentPart,
   type FinishReason,
   type LanguageModel,
   type LanguageModelUsage,
@@ -142,6 +143,16 @@ interface RunState {
   logFailed: boolean;
   /** 会话里上一轮以 `error` 或 `aborted` 结束：这一轮可能是它的重试，记输入之前先看它留下的输入（见 `repeatsFailedInput`）。 */
   afterFailure: boolean;
+  /** 模型产出（AI SDK 的 `responseMessages`）里已经按步写进日志的条数；`finish` 只补后面的。 */
+  logged: number;
+  /** 这一步的助手消息在工具执行前已经写下：步骤结束时跳过它，只写工具结果。 */
+  early: boolean;
+  /** 已经写下、还没有结果的工具调用（`id` → 工具名）：这一轮半路结束时给它们补错误结果。 */
+  readonly open: Map<string, string>;
+  /** 本轮的写入一个接一个：步骤回调和结束时的写入不交错。 */
+  writing: Promise<void>;
+  /** 步骤回调里写日志失败（或被围栏）：AI SDK 吞掉回调的异常，这里记下，再中止这一轮。 */
+  stepError?: unknown;
 }
 
 interface Setup {
@@ -253,7 +264,68 @@ function begin(request: RunRequest): RunState {
     head: undefined,
     logFailed: false,
     afterFailure: false,
+    logged: 0,
+    early: false,
+    open: new Map(),
+    writing: Promise.resolve(),
   };
+}
+
+/** 工具调用没等到结果这一轮就结束了：补给它的错误结果。 */
+export const INTERRUPTED_TOOL_RESULT = 'The run ended before this tool call returned; its result is unknown.';
+
+/** 给还没有结果的工具调用补一条错误结果的 `tool` 消息。 */
+export function interruptedResults(calls: ReadonlyMap<string, string>): Message {
+  return {
+    role: 'tool',
+    content: [...calls].map(([id, name]) => ({
+      type: 'tool-result',
+      id,
+      name,
+      output: errorOutput(INTERRUPTED_TOOL_RESULT),
+    })),
+  };
+}
+
+/**
+ * 一次模型调用的产出转成助手消息，和 AI SDK 在步骤结束时生成的那条一样（`toResponseMessages`）。
+ * 只在这一步要在本地执行工具时用：工具执行前先把调用写进日志。有服务商执行的工具结果、审批请求这些
+ * 照抄不了的部件时返回 `undefined`，这一步照旧在结束时一起写。
+ */
+function assistantBefore(content: ReadonlyArray<ContentPart<ToolSet>>): ModelMessage | undefined {
+  const parts: Exclude<ModelMessage & { role: 'assistant' }, { content: string }>['content'] = [];
+  for (const part of content) {
+    switch (part.type) {
+      case 'source':
+        break;
+      case 'text':
+        if (part.text.length > 0) parts.push({ type: 'text', text: part.text, providerOptions: part.providerMetadata });
+        break;
+      case 'reasoning':
+        parts.push({ type: 'reasoning', text: part.text, providerOptions: part.providerMetadata });
+        break;
+      case 'custom':
+        parts.push({ type: 'custom', kind: part.kind, providerOptions: part.providerMetadata });
+        break;
+      case 'tool-call':
+        parts.push({
+          type: 'tool-call',
+          toolCallId: part.toolCallId,
+          toolName: part.toolName,
+          input: part.invalid && typeof part.input !== 'object' ? {} : part.input,
+          providerExecuted: part.providerExecuted,
+          providerOptions: part.providerMetadata,
+        });
+        break;
+      case 'tool-result':
+      case 'tool-error':
+        if (part.providerExecuted) return undefined;
+        break;
+      default:
+        return undefined;
+    }
+  }
+  return { role: 'assistant', content: parts };
 }
 
 /**
@@ -348,9 +420,16 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
    * 本轮的写入：带 `expectSeq`（上一次写入返回的末尾）。冲突时先看有没有人给自己的 `runId` 写了 `ended`、
    * 自己的 `started` 还在不在、有没有擦除记录动了自己写的条目：有 `ended`、`started` 没了、或者自己的条目被删被涂改，
    * 就是被围栏了，抛 `Fenced`；都不是只是别人写了应用事件（或者删了更早的历史），用新的末尾重试。
+   * 同一轮的写入排成一队，前一次写完（成功或失败）才写下一次。
    */
-  async function write(state: RunState, entries: readonly NewEntry[]): Promise<void> {
-    if (!state.record || entries.length === 0) return;
+  function write(state: RunState, entries: readonly NewEntry[]): Promise<void> {
+    if (!state.record || entries.length === 0) return state.writing;
+    const turn = state.writing.then(() => writeNow(state, entries));
+    state.writing = turn.catch(() => {});
+    return turn;
+  }
+
+  async function writeNow(state: RunState, entries: readonly NewEntry[]): Promise<void> {
     try {
       for (let conflicts = 0; ; conflicts += 1) {
         try {
@@ -591,12 +670,62 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     };
   }
 
+  /**
+   * 每一步即时落日志：模型这一步要在本地执行工具时，模型调用一结束（工具执行前）先写助手消息，崩溃后日志里至少有
+   * 「调用已发出、结果未知」；步骤结束时写这一步剩下的（工具结果，或者没有工具调用时的助手消息）。
+   * AI SDK 等这两个回调写完才执行工具、才走下一步，但吞掉回调的异常：写失败或被围栏时记进 `stepError`，再中止这一轮。
+   */
+  function stepLogging(state: RunState, abort: (reason: unknown) => void) {
+    const stop = (error: unknown): void => {
+      state.stepError ??= error;
+      abort(error);
+    };
+    return {
+      onLanguageModelCallEnd: async ({ content }: { readonly content: ReadonlyArray<ContentPart<ToolSet>> }) => {
+        if (!state.record || state.stepError !== undefined) return;
+        const calls = content.flatMap((part) =>
+          part.type === 'tool-call' && part.providerExecuted !== true ? [part] : [],
+        );
+        if (calls.length === 0) return;
+        const draft = assistantBefore(content);
+        if (!draft) return;
+        try {
+          // 子集之外的部件在这里抛 `unsupported_part`：这一轮以 `error` 结束，工具不执行。
+          const [message] = fromModelMessages([draft]);
+          await write(state, [messageEntry(message!, { source: 'model' })]);
+          state.early = true;
+          for (const call of calls) state.open.set(call.toolCallId, call.toolName);
+        } catch (error) {
+          stop(error);
+        }
+      },
+      onStepEnd: async ({ response }: { readonly response: { readonly messages: readonly ModelMessage[] } }) => {
+        if (!state.record || state.stepError !== undefined) return;
+        try {
+          const messages = fromModelMessages(response.messages);
+          const rest = state.early && messages[0]?.role === 'assistant' ? messages.slice(1) : messages;
+          await write(
+            state,
+            rest.map((message) => messageEntry(message, { source: 'model' })),
+          );
+          state.logged += messages.length;
+          state.early = false;
+          state.open.clear();
+        } catch (error) {
+          stop(error);
+        }
+      },
+    };
+  }
+
   /** `generateText` 和 `streamText` 共用的参数。 */
-  function callOptions(state: RunState, ready: Setup, signal: AbortSignal) {
+  function callOptions(state: RunState, ready: Setup, controller: ReturnType<typeof linked>) {
+    const { signal } = controller;
     const settings = state.request.agent.settings ?? {};
     const { prepared } = ready;
     const beforeModel = hooks.beforeModel?.bind(hooks);
     return {
+      ...stepLogging(state, (reason) => controller.abort(reason)),
       model: ready.model,
       ...(prepared.instructions ? { instructions: prepared.instructions } : {}),
       messages: toModelMessages(prepared.messages),
@@ -640,12 +769,15 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     };
   }
 
-  async function finish(state: RunState, ready: Setup, produced: Produced): Promise<RunResult> {
+  /** 正常结束：每一步已经写下了，这里补上还没写的产出（一般没有）和 `ctx.run.ended`。 */
+  async function finish(state: RunState, ready: Setup, produced: Produced, signal: AbortSignal): Promise<RunResult> {
+    await state.writing;
+    if (state.stepError !== undefined) return fail(state, state.stepError, signal);
     const messages = [...produced.messages];
     const stopReason = stopReasonOf(produced.finishReason, produced.steps, ready.maxSteps);
     const usage = usageOf(produced.usage);
     await write(state, [
-      ...messages.map((message) => messageEntry(message, { source: 'model' })),
+      ...messages.slice(state.logged).map((message) => messageEntry(message, { source: 'model' })),
       runEndedEntry({ runId: state.runId, stopReason, ...(usage ? { usage } : {}) }, { source: 'harness' }),
     ]);
     return {
@@ -658,14 +790,24 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     };
   }
 
-  /** 出错或取消：照样写 `ctx.run.ended`，返回结果而不是抛。 */
-  async function fail(state: RunState, error: unknown, signal: AbortSignal): Promise<RunResult> {
+  /**
+   * 出错或取消：照样写 `ctx.run.ended`，返回结果而不是抛。已经写下的步骤留在日志里；写下了调用、还没等到结果的工具
+   * 先补一条错误结果（`INTERRUPTED_TOOL_RESULT`）。步骤回调里写日志失败的，以那个错误为准：被围栏就停下，别的抛出去。
+   */
+  async function fail(state: RunState, caught: unknown, signal: AbortSignal): Promise<RunResult> {
+    await state.writing;
+    const error = state.stepError ?? caught;
     if (error instanceof Fenced) return fenced(state);
-    const stopReason: StopReason = signal.aborted ? 'aborted' : 'error';
+    if (state.logFailed) throw error;
+    // 步骤回调转换产出失败（`unsupported_part`）时中止过这一轮，但这不是调用方取消的。
+    const aborted = signal.aborted && state.stepError === undefined;
+    const stopReason: StopReason = aborted ? 'aborted' : 'error';
     const info = errorInfo(error);
     if (stopReason === 'error') logger.debug?.('run failed', { runId: state.runId, error: info.message });
+    const open = state.open.size > 0 ? [messageEntry(interruptedResults(state.open), { source: 'harness' })] : [];
     try {
       await write(state, [
+        ...open,
         ...(stopReason === 'error'
           ? [
               ctxErrorEntry(
@@ -757,19 +899,24 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     if (!(await writeStarted(state))) return { result: busy(state) };
     try {
       const ready = await setup(state, extras, controller.signal);
-      const raw = await generateText(callOptions(state, ready, controller.signal));
-      const result = await finish(state, ready, {
-        text: raw.text,
-        // 子集之外的部件在这里抛 `unsupported_part`，下面的 catch 把这一轮以 `error` 结束。
-        messages: fromModelMessages(raw.responseMessages),
-        finishReason: raw.finishReason,
-        steps: raw.steps.length,
-        usage: raw.usage,
-      });
+      const raw = await generateText(callOptions(state, ready, controller));
+      const result = await finish(
+        state,
+        ready,
+        {
+          text: raw.text,
+          // 子集之外的部件在这里抛 `unsupported_part`，下面的 catch 把这一轮以 `error` 结束。
+          messages: fromModelMessages(raw.responseMessages),
+          finishReason: raw.finishReason,
+          steps: raw.steps.length,
+          usage: raw.usage,
+        },
+        controller.signal,
+      );
       return { result, raw };
     } catch (error) {
-      if (state.logFailed) throw error;
-      return { result: await fail(state, error, controller.signal), cause: error };
+      if (state.logFailed) throw state.stepError ?? error;
+      return { result: await fail(state, error, controller.signal), cause: state.stepError ?? error };
     }
   }
 
@@ -835,7 +982,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       extras.onError ?? ((error: unknown) => logger.warn('stream failed', { error: errorInfo(error).message }));
 
     const result = streamText({
-      ...callOptions(state, ready, controller.signal),
+      ...callOptions(state, ready, controller),
       onError: ({ error }) => {
         failure = error;
         report(error);
@@ -845,18 +992,23 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         try {
           messages = fromModelMessages(event.responseMessages);
         } catch (error) {
-          // 子集之外的部件：这一轮以 `error` 结束，不写半截的产出。
+          // 子集之外的部件：这一轮以 `error` 结束，已经按步写下的留着。
           settle(() => fail(state, error, controller.signal), error);
           return;
         }
         settle(() =>
-          finish(state, ready, {
-            text: event.text,
-            messages,
-            finishReason: event.finishReason,
-            steps: event.steps.length,
-            usage: event.totalUsage,
-          }),
+          finish(
+            state,
+            ready,
+            {
+              text: event.text,
+              messages,
+              finishReason: event.finishReason,
+              steps: event.steps.length,
+              usage: event.totalUsage,
+            },
+            controller.signal,
+          ),
         );
       },
       onAbort: () => {

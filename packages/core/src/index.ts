@@ -36,7 +36,12 @@ export {
   type StreamTextResult,
 } from './harness.ts';
 export { findLossySummaries, recompactLossy, type FindLossyOptions, type LossySummary } from './migrate.ts';
-export { createOrchestrator, type LocalOrchestrator, type OrchestratorOptions } from './orchestrator.ts';
+export {
+  createOrchestrator,
+  type InterruptedRun,
+  type LocalOrchestrator,
+  type OrchestratorOptions,
+} from './orchestrator.ts';
 export { pruneSession, type PruneOptions } from './retention.ts';
 export * from './errors.ts';
 export * from './context.ts';

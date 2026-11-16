@@ -40,6 +40,9 @@
     "@modelctx-ai/ctx-protocol": "workspace:^"
   },
   "devDependencies": {
-    "@modelctx-ai/ctx-protocol": "workspace:^"
+    "@modelctx-ai/ctx": "workspace:^",
+    "@modelctx-ai/ctx-protocol": "workspace:^",
+    "ai": "^7.0.150",
+    "zod": "^4.6.7"
   }
 }

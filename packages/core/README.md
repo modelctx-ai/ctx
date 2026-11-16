@@ -190,7 +190,7 @@ import { createOrchestrator } from '@modelctx-ai/ctx';
 
 const orchestrator = createOrchestrator({ harness, store, owner: 'pet' });
 // 用缺省 record（写日志）的应用：启动时先 recover 再 submit，否则崩溃留下的运行会让该会话一直 session_busy
-await orchestrator.recover?.(); // 给崩溃时断掉的运行补 ctx.run.ended（error）
+await orchestrator.recover?.(); // 给崩溃时断掉的运行补上悬空工具调用的结果和 ctx.run.ended（error）
 const handle = await orchestrator.submit({ session: 'user:42', agent: { model: 'deepseek-chat' }, input: '在吗' });
 await orchestrator.status(handle.runId); // queued / running / completed / failed / cancelled
 await handle.done;
@@ -198,6 +198,49 @@ await orchestrator.close();
 ```
 
 同一会话串行，不同会话并行；`cancel` 取消排队中或运行中的一轮；`events()` 给出状态变化。
+
+### 崩溃后续跑
+
+harness 每一步都即时写日志：工具调用在执行之前写下，结果在这一步结束时写下。进程在工具执行时被杀掉，日志里有已经做完的步骤和「调用已发出、结果未知」的那一次。下一个进程启动时 `recover()` 给结果未知的调用补一条错误结果，配了 `resume` 的再从日志接着跑：
+
+```ts
+import { createContextBuilder, createHarness, createOrchestrator, createToolRegistry, tool } from '@modelctx-ai/ctx';
+import { createModel } from '@modelctx-ai/ctx-models';
+import { createSqliteStore } from '@modelctx-ai/ctx-sqlite';
+import { z } from 'zod';
+
+const store = createSqliteStore({ path: 'ctx.db' }); // 前后两个进程共用这个库
+const tools = createToolRegistry().addTool(
+  'send_mail',
+  tool({
+    description: '发一封邮件',
+    inputSchema: z.object({ to: z.string(), text: z.string() }),
+    // 有副作用的工具自己幂等（例如按收件人和正文去重）：结果未知的那次，模型可能会再调一遍。
+    execute: async ({ to, text }) => sendOnce(to, text),
+  }),
+);
+const harness = createHarness({
+  store,
+  context: createContextBuilder({ store }),
+  tools,
+  models: (name) => createModel({ provider: 'openai-compatible', baseUrl: 'https://api.deepseek.com/v1', model: name }),
+});
+const agents = { mailer: { name: 'mailer', model: 'deepseek-chat', tools: { names: ['send_mail'] } } };
+const orchestrator = createOrchestrator({
+  harness,
+  store,
+  owner: 'mailer',
+  // 日志里记下的 agent 模型只剩名字、请求头打了码：按名字给出完整的 AgentSpec，不认识的只结束不续跑。
+  resume: (run) => (run.agent['name'] === 'mailer' ? agents.mailer : undefined),
+});
+
+for (const run of await orchestrator.recover()) {
+  if (run.resumed) console.log(`会话 ${run.session} 的 ${run.runId} 断在半路，接着跑：${run.resumed}`);
+}
+await orchestrator.submit({ session: 'user:42', agent: agents.mailer, input: '给小王和小李各发一封周报' });
+```
+
+第一封发完、第二封发到一半时进程没了：日志是 `ctx.run.started`、输入、调用一、结果一、调用二。重启后 `recover()` 写下调用二的错误结果（`The run ended before this tool call returned; its result is unknown.`）和 `ctx.run.ended`，再提交一轮不带输入的运行；模型看到第一封已经发了、第二封结果未知，第一封不会再发。不给 `resume` 时只补结果和 `ctx.run.ended`，下一句用户输入来了再接着聊。
 
 ## 导出
 
@@ -210,7 +253,7 @@ await orchestrator.close();
 | `toToolSet(definitions, executors, { session?, runId?, dispatch?, validateInput?, maxOutputChars? })`、`dispatchTo(executors)`、`DEFAULT_MAX_TOOL_OUTPUT_CHARS`           | 定义包成 AI SDK `ToolSet`，`execute` 转给绑定的执行环境。执行前按 `inputSchema` 查输入，不合就不执行、把问题回给模型（`validateInput: false` 关掉，也可以给按定义决定的函数）；结果超过 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`，20 万字符）截断并注明                                                                                                                                                                                                   |
 | `createContextBuilder({ store, projection?, projections?, sources?, sourceTimeoutMs?, logger?, factsPlacement?, model?, models?, now? })`、`DEFAULT_COMPACT_INPUT_TOKENS` | `ContextBuilder`：`build`、`view`、`compact`、`compactDetailed`，另加 `facts(session, signal?, { sources? })`、`recompact`。`compact` 按 `maxInputTokens`（缺省 `DEFAULT_COMPACT_INPUT_TOKENS`，24000 个估算 token）分段滚动摘要，每段落一个检查点；`now` 是压缩用的钟（认 `at` 在未来的条目、算 `timeoutMs`），缺省 `Date.now`                                                                                                                                         |
 | `createHarness({ store, context, tools?, executors?, models?, hooks?, logger?, source?, validateToolInput?, maxToolOutputChars? })`                                       | `Harness`：`run`、`stream`。后两个选项就是 `toToolSet` 的 `validateInput`、`maxOutputChars`                                                                                                                                                                                                                                                                                                                                                                             |
-| `createOrchestrator({ harness, store?, owner?, retainEnded?, logger? })`                                                                                                  | `Orchestrator`：`submit`、`status`、`cancel`、`events`、`close`；给了 `store` 才有 `recover`。结束的运行只留状态，最多 `retainEnded` 个（缺省 1000）                                                                                                                                                                                                                                                                                                                    |
+| `createOrchestrator({ harness, store?, owner?, resume?, retainEnded?, logger? })`                                                                                         | `Orchestrator`：`submit`、`status`、`cancel`、`events`、`close`；给了 `store` 才有 `recover`，它给悬空的工具调用补错误结果、补 `ctx.run.ended`；`resume(run)` 返回 `AgentSpec` 时接着跑（`InterruptedRun`：`session`、`runId`、记下的 `agent`、`interrupted`）。结束的运行只留状态，最多 `retainEnded` 个（缺省 1000）                                                                                                                                                  |
 | `createContext(options)`                                                                                                                                                  | 门面：`append`、`entries`、`view`、`facts`、`prepare`、`generate`、`stream`、`compact`、`compactDetailed`，以及 `builder`、`executor`、`harness`                                                                                                                                                                                                                                                                                                                        |
 | `describeError`、`redact`、`errorInfo`、`isContextOverflowError`                                                                                                          | 给日志和界面用的错误摘要；去密钥；`RunResult.error` 的形状（上下文过长时 `type` 是 `context_overflow`）；判断一个错误是不是服务商说的「上下文过长」（按 HTTP 413 和常见的错误码、消息，没有对真实服务验证）                                                                                                                                                                                                                                                             |
 | `toModelMessages`、`fromModelMessages`（单条是 `toModelMessage`、`fromModelMessage`）、`toUserContent`、`fromUserContent`                                                 | ctx 的 `Message` 和 AI SDK 的 `ModelMessage`、`UserContent` 互转；遇到子集之外的部件抛 `unsupported_part`，harness 把这一轮以 `error` 结束。`createContext()` 仍收 AI SDK 的 `UserContent`，在边界上转                                                                                                                                                                                                                                                                  |

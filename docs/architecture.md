@@ -467,7 +467,8 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
 3. `agent.model` 是字符串时经 `models(name)` 造模型，没给 `models` 就以 `error` 结束。
 4. `tools.select(agent.tools)` 得到候选工具，`context.build(...)` 得到 `PreparedCall`。`agent.context.overflow` 配了、`PreparedCall.tokens` 又超过它的 `maxTokens` 时，按协议的三步走（见[协议层](protocol.md#harness)）：压缩（builder 抛 `no_model` 时带上这一轮的模型再调一次；失败只告警）→ 带 `truncate` 的窗口重新 `build` → 还超就抛 `context_overflow`。然后才交给 `beforeModel`（之后的每个工具步骤也会再调一次）；钩子换掉的调用不再检查。
 5. 调模型。每个工具调用：按定义的 `inputSchema` 查输入（`checkJsonSchema`；不合就不往下走，模型看到 `Invalid input for tool …` 和具体哪里不对，这一轮继续；`addTool` 加的工具不在这里查，函数执行环境按它原来的 zod 校验，注册表的 `validatesInput(name)` 告诉 harness 是哪些）→ `beforeTool`（可以拒绝或改写输入；拒绝时模型看到 `not allowed: <原因>`，这一轮继续）→ 按定义的 `executor` 找执行环境 `execute` → `afterTool`（可以改写结果）→ 结果超过 `maxToolOutputChars`（缺省 20 万字符）时截断并注明（`limitToolOutput`）。找不到执行环境、执行环境本身抛错也变成给模型看的错误。`validateToolInput: false` 关掉输入检查，`true` 连 `addTool` 的也查，`maxToolOutputChars: 0` 关掉截断。
-6. 记产出（`source: 'model'`）和 `ctx.run.ended`（`stopReason`、`usage`），同一批写。
+6. 每一步即时记产出（`source: 'model'`），用 AI SDK 的两个回调：`onLanguageModelCallEnd`（模型调用的结果解析完、工具执行之前）在这一步有要本地执行的工具调用时，照 AI SDK 生成响应消息的规则把这次的内容转成助手消息先写下；`onStepEnd` 写这一步剩下的（工具结果，或者没有工具调用时的助手消息）。AI SDK 等这两个回调写完才执行工具、才走下一步，`generateText` 和 `streamText` 都一样。它吞掉回调里的异常，所以写日志失败或被围栏时 harness 记下错误、中止这一轮，再按那个错误收尾。同一轮的写入排成一队，不交错。有服务商执行的工具结果、审批请求这些照抄不了的部件时，这一步退回在结束时一起写。
+7. `ctx.run.ended`（`stopReason`、`usage`）。中途出错或被取消时，写下了调用、没等到结果的工具调用先补一条错误结果（`The run ended before this tool call returned; its result is unknown.`），再写 `ctx.error` 和 `ctx.run.ended`；已经写下的步骤留着。
 
 `stopReason`：模型自己停下是 `end_turn`；步数用完还想调工具是 `max_steps`；被 `maxOutputTokens` 截断是 `max_tokens`；`signal` 中止是 `aborted`；其他错误是 `error`，另记一条 `ctx.error`。出错和取消都照常返回 `RunResult` 并写 `ctx.run.ended`，只有写日志失败才 reject。`record: false` 一条都不写。
 
@@ -519,14 +520,14 @@ for await (const event of harness.stream({
 
 ## 编排器
 
-`createOrchestrator({ harness, store?, owner?, retainEnded?, logger? })` 是进程内队列：每个会话一条队列，同一会话的运行串行，不同会话并行。
+`createOrchestrator({ harness, store?, owner?, resume?, retainEnded?, logger? })` 是进程内队列：每个会话一条队列，同一会话的运行串行，不同会话并行。
 
 ```ts
 import { createOrchestrator } from '@modelctx-ai/ctx';
 
 // harness、store 接上一段
 const orchestrator = createOrchestrator({ harness, store, owner: 'pet' }); // owner：这个实例的稳定名字
-await orchestrator.recover?.(); // 启动时：先给上次崩溃时断掉的运行补 ctx.run.ended（error），再接新的 submit
+await orchestrator.recover?.(); // 启动时：先收上次崩溃时断掉的运行（给了 resume 的接着跑），再接新的 submit
 
 // 状态变化：run.queued → run.running → run.completed
 void (async () => {
@@ -543,7 +544,8 @@ await orchestrator.close(); // 不再收新运行，等运行中的结束
 
 - 状态：`completed` 跑完；`failed` 是 `stopReason: 'error'` 或 harness 抛错（`done` 跟着 reject）；`cancelled` 是被 `cancel` 或请求的 `signal` 取消。
 - `cancel(runId)`：排队中的直接取消，`done` 给出 `stopReason: 'aborted'` 的空结果，不调 harness；运行中的中止传给 harness 的 `signal`。跑完的或不认识的返回 `false`。
-- `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外），补一条 `ctx.run.ended`（`stopReason: 'error'`，`source: 'orchestrator'`），不续跑。
+- `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外）。找到断点的会话再读一次末尾、一次这一轮 `ctx.run.started` 之后的消息（`types: ['message']`），写下了调用、没有结果的工具调用（服务商执行的不算）补一条错误结果，和 `ctx.run.ended`（`stopReason: 'error'`）一批写，`source: 'orchestrator'`。
+- `resume(run)`：给了才续跑。`run` 带 `session`、`runId`、`ctx.run.started` 里记下的 `agent`（`agentSpecToJson` 的结果：模型只剩名字，请求头打了码，不能原样拿来跑）和补了结果的调用个数 `interrupted`；返回 `AgentSpec` 就在这个会话上 `submit` 一轮不带输入的运行，`RecoveredRun.resumed` 是它的 `runId`；返回 `undefined` 只结束不续跑。续跑的那一轮从日志接着走：做完的工具不再执行，结果未知的那次由模型看到错误结果后自己决定。
 - 结束的运行只留状态给 `status` 查，最多 `retainEnded` 个（缺省 1000），再多就从最早结束的开始忘，忘掉之后 `status` 返回 `undefined`；请求和结果在运行结束时就放手，常驻进程的内存不随运行数增长。留着状态的 `runId` 不能再 `submit`。
 - `owner`：写进每个运行的 `ctx.run.started`；`recover()` 只收 `owner` 相同的断点（都没配置也算相同），两个进程共用一个库时各配一个名字。写 `ctx.run.ended` 时带 `expectSeq`，读和写之间会话有新条目就跳过那个运行。
 - 用缺省 `record`（写日志）的应用，进程崩溃留下的未结束运行会让该会话一直 `session_busy`，所以启动时要先 `recover()` 再 `submit`；`record: false` 的运行不留生命周期事件，没有这个要求。harness 里同一会话最多一个未结束的运行（跨进程也成立；同一个 harness 实例内部先按会话排队，一个接一个，`session_busy` 只出现在跨进程或别的 harness 实例上，`record: false` 不排），每次写入带 `expectSeq`，被 `recover` 结束的运行在下一次写入时发现自己被围栏，以 `aborted` 停下、不再写 `ctx.run.ended`；运行中途会话被 `clear` 也一样（冲突后发现自己的 `ctx.run.started` 不在了），删掉的会话不会被这一轮的收尾写回来。`truncate`、`remove`、`redact` 追加的 `ctx.erased` 让这一轮的下一次写入必然冲突一次，harness 在冲突后把它和生命周期事件一起读（一次 `list`，`kinds` 多一项）：记录动了这一轮自己写的条目（`recorded` 里的 `seq`）就同样停下，动的是更早的历史或别人写的条目就换个末尾接着写。
