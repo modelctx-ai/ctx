@@ -1326,13 +1326,40 @@ function randomMarker(): string {
   return `echo-${Math.random().toString(36).slice(2)}`;
 }
 
+/**
+ * harness 的一致性等级（#23）。前三级是 trace、execute、resume，后两项是和等级正交的能力：
+ *
+ * - `trace`：一轮写进会话日志：生命周期事件、输入、回复、错误、取消、`runId`、`owner`、`parent`，`record: false` 不写，
+ *   流的事件顺序。做到这一级，日志可看，记忆可用，别的组件可以订阅。
+ * - `execute`：工具调用交给 ctx 的 `Executor`，每一步结束就落日志。
+ * - `resume`：一个会话一个未结束的运行（`session_busy`）、输入的幂等（`inputKey`、失败的重试不再记输入），崩溃后能从日志接着跑。
+ * - `context`：用 `ContextBuilder` 组装上下文：`agent.context`（投影名、事实）、`context.overflow`。自己管上下文的 harness 不跑。
+ * - `output`：`AgentSpec.output` 的结构化输出和 `version`。
+ */
+export type HarnessLevel = 'trace' | 'execute' | 'resume' | 'context' | 'output';
+
+export const HARNESS_LEVELS: readonly HarnessLevel[] = ['trace', 'execute', 'resume', 'context', 'output'];
+
+export interface HarnessContractOptions {
+  /** 跑哪几级，缺省全部。参考实现全过；适配器按自己做到的跑，并在文档里写明。 */
+  readonly levels?: readonly HarnessLevel[];
+}
+
 export function describeHarnessContract(
   name: string,
   factory: HarnessFactory,
   { describe, test }: ContractTestApi,
+  options: HarnessContractOptions = {},
 ): void {
+  const levels = new Set(options.levels ?? HARNESS_LEVELS);
+  for (const level of levels) {
+    if (!HARNESS_LEVELS.includes(level)) throw new Error(`Unknown harness level "${level}".`);
+  }
+  const atLevel = (level: HarnessLevel, title: string, fn: () => Promise<void>): void => {
+    if (levels.has(level)) test(`[${level}] ${title}`, fn);
+  };
   describe(`Harness contract: ${name}`, () => {
-    test('一轮：ctx.run.started → 输入 → 回复 → ctx.run.ended，recorded 就是写进日志的', async () => {
+    atLevel('trace', '一轮：ctx.run.started → 输入 → 回复 → ctx.run.ended，recorded 就是写进日志的', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '在的' }] });
       const result = await harness.run({ session: 's', agent, input: '在吗', runId: 'run-1' });
       assert.equal(result.runId, 'run-1');
@@ -1353,7 +1380,7 @@ export function describeHarnessContract(
       assert.ok(roundTrips(eventData(log, CTX_EVENTS.runStarted)), 'ctx.run.started 的 data 能序列化');
     });
 
-    test('不给 runId 时生成一个，两轮不同', async () => {
+    atLevel('trace', '不给 runId 时生成一个，两轮不同', async () => {
       const { harness, agent } = await factory({
         script: [
           { type: 'text', text: '一' },
@@ -1367,7 +1394,7 @@ export function describeHarnessContract(
       assert.notEqual(first.runId, second.runId);
     });
 
-    test('工具调用交给执行环境，结果回到模型，调用和结果都记下', async () => {
+    atLevel('execute', '工具调用交给执行环境，结果回到模型，调用和结果都记下', async () => {
       const text = randomMarker();
       const { harness, store, agent } = await factory({
         script: [
@@ -1391,7 +1418,7 @@ export function describeHarnessContract(
       assert.ok(JSON.stringify(tool).includes(text), '工具结果里有回显的输入');
     });
 
-    test('模型出错：run 照常返回 stopReason error 和 error，日志里有 ctx.run.ended', async () => {
+    atLevel('trace', '模型出错：run 照常返回 stopReason error 和 error，日志里有 ctx.run.ended', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'error', message: 'model exploded' }] });
       const result = await harness.run({ session: 's', agent: noRetry(agent), input: '在吗' });
       assert.equal(result.stopReason, 'error');
@@ -1406,7 +1433,7 @@ export function describeHarnessContract(
       );
     });
 
-    test('每一步结束就落日志：工具调用之后模型出错，前一步的调用和结果留在日志里', async () => {
+    atLevel('execute', '每一步结束就落日志：工具调用之后模型出错，前一步的调用和结果留在日志里', async () => {
       const text = randomMarker();
       const { harness, store, agent } = await factory({
         script: [
@@ -1429,24 +1456,28 @@ export function describeHarnessContract(
       assert.ok(JSON.stringify(tool).includes(text), '工具结果在日志里');
     });
 
-    test('AgentSpec.output：最后的回答按 schema 解析进 RunResult.output；version 原样记进 ctx.run.started', async () => {
-      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '{"answer":42}' }] });
-      const result = await harness.run({
-        session: 's',
-        agent: {
-          ...agent,
-          version: 'contract@1',
-          output: { schema: { type: 'object', properties: { answer: { type: 'number' } }, required: ['answer'] } },
-        },
-        input: '答案是多少？',
-      });
-      assert.equal(result.stopReason, 'end_turn');
-      assert.deepEqual(result.output, { answer: 42 });
-      const [started] = eventData(await store.list('s'), CTX_EVENTS.runStarted);
-      assert.equal((started?.['agent'] as Record<string, unknown> | undefined)?.['version'], 'contract@1');
-    });
+    atLevel(
+      'output',
+      'AgentSpec.output：最后的回答按 schema 解析进 RunResult.output；version 原样记进 ctx.run.started',
+      async () => {
+        const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '{"answer":42}' }] });
+        const result = await harness.run({
+          session: 's',
+          agent: {
+            ...agent,
+            version: 'contract@1',
+            output: { schema: { type: 'object', properties: { answer: { type: 'number' } }, required: ['answer'] } },
+          },
+          input: '答案是多少？',
+        });
+        assert.equal(result.stopReason, 'end_turn');
+        assert.deepEqual(result.output, { answer: 42 });
+        const [started] = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+        assert.equal((started?.['agent'] as Record<string, unknown> | undefined)?.['version'], 'contract@1');
+      },
+    );
 
-    test('RunRequest.parent 原样记进 ctx.run.started：子会话知道自己是谁派的', async () => {
+    atLevel('trace', 'RunRequest.parent 原样记进 ctx.run.started：子会话知道自己是谁派的', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       const parent = { session: 'parent', runId: 'r-parent', toolCallId: 'call-1' };
       await harness.run({ session: 's', agent, input: '子任务', parent });
@@ -1454,7 +1485,7 @@ export function describeHarnessContract(
       assert.deepEqual(started?.['parent'], parent);
     });
 
-    test('inputKey：失败后用同一个键重试，输入只记一次', async () => {
+    atLevel('resume', 'inputKey：失败后用同一个键重试，输入只记一次', async () => {
       const { harness, store, agent } = await factory({
         script: [
           { type: 'error', message: 'network down' },
@@ -1471,7 +1502,7 @@ export function describeHarnessContract(
       assert.ok(!retry.recorded.some((entry) => entry.type === 'message' && entry.message.role === 'user'));
     });
 
-    test('record: false 一条都不写，输入照样交给模型', async () => {
+    atLevel('trace', 'record: false 一条都不写，输入照样交给模型', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       const result = await harness.run({ session: 's', agent, input: '不记', record: false });
       assert.equal(result.text, '好');
@@ -1479,37 +1510,45 @@ export function describeHarnessContract(
       assert.deepEqual(await store.list('s'), []);
     });
 
-    test('会话里有未结束的运行（最后一个生命周期事件是 started）：run 以 session_busy 结束，什么都不写', async () => {
-      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
-      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
-      const before = await store.list('s');
-      const result = await harness.run({ session: 's', agent, input: '在吗' });
-      assert.equal(result.stopReason, 'error');
-      assert.equal(result.error?.type, 'session_busy');
-      assert.equal(result.error?.retryable, true);
-      assert.deepEqual(result.recorded, []);
-      assert.deepEqual(await store.list('s'), before, '一条都没写');
-      // 别的会话不受影响；那个运行结束以后就能接着跑。
-      assert.equal((await harness.run({ session: 't', agent, input: '在吗' })).stopReason, 'end_turn');
-    });
+    atLevel(
+      'resume',
+      '会话里有未结束的运行（最后一个生命周期事件是 started）：run 以 session_busy 结束，什么都不写',
+      async () => {
+        const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+        await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
+        const before = await store.list('s');
+        const result = await harness.run({ session: 's', agent, input: '在吗' });
+        assert.equal(result.stopReason, 'error');
+        assert.equal(result.error?.type, 'session_busy');
+        assert.equal(result.error?.retryable, true);
+        assert.deepEqual(result.recorded, []);
+        assert.deepEqual(await store.list('s'), before, '一条都没写');
+        // 别的会话不受影响；那个运行结束以后就能接着跑。
+        assert.equal((await harness.run({ session: 't', agent, input: '在吗' })).stopReason, 'end_turn');
+      },
+    );
 
-    test('上一轮已经 ended：可以接着跑；record: false 的运行不受未结束的运行影响，也不留生命周期事件', async () => {
-      const { harness, store, agent } = await factory({
-        script: [
-          { type: 'text', text: '一' },
-          { type: 'text', text: '二' },
-        ],
-      });
-      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'old'), lifecycle(CTX_EVENTS.runEnded, 'old')]);
-      assert.equal((await harness.run({ session: 's', agent, input: '1' })).stopReason, 'end_turn');
-      await store.append('t', [lifecycle(CTX_EVENTS.runStarted, 'stuck')]);
-      const quiet = await harness.run({ session: 't', agent, input: '2', record: false });
-      assert.equal(quiet.stopReason, 'end_turn');
-      assert.equal(quiet.text, '二');
-      assert.deepEqual(kinds(await store.list('t')), [CTX_EVENTS.runStarted], '只有原来那一条');
-    });
+    atLevel(
+      'resume',
+      '上一轮已经 ended：可以接着跑；record: false 的运行不受未结束的运行影响，也不留生命周期事件',
+      async () => {
+        const { harness, store, agent } = await factory({
+          script: [
+            { type: 'text', text: '一' },
+            { type: 'text', text: '二' },
+          ],
+        });
+        await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'old'), lifecycle(CTX_EVENTS.runEnded, 'old')]);
+        assert.equal((await harness.run({ session: 's', agent, input: '1' })).stopReason, 'end_turn');
+        await store.append('t', [lifecycle(CTX_EVENTS.runStarted, 'stuck')]);
+        const quiet = await harness.run({ session: 't', agent, input: '2', record: false });
+        assert.equal(quiet.stopReason, 'end_turn');
+        assert.equal(quiet.text, '二');
+        assert.deepEqual(kinds(await store.list('t')), [CTX_EVENTS.runStarted], '只有原来那一条');
+      },
+    );
 
-    test('stream（有时）：会话忙时 run.ended 带 session_busy，不写日志', async () => {
+    atLevel('resume', 'stream（有时）：会话忙时 run.ended 带 session_busy，不写日志', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       if (!harness.stream) return;
       await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
@@ -1520,7 +1559,7 @@ export function describeHarnessContract(
       assert.equal((await store.list('s')).length, 1);
     });
 
-    test('owner 写进 ctx.run.started；不给就没有这个字段', async () => {
+    atLevel('trace', 'owner 写进 ctx.run.started；不给就没有这个字段', async () => {
       const { harness, store, agent } = await factory({
         script: [
           { type: 'text', text: '一' },
@@ -1537,28 +1576,36 @@ export function describeHarnessContract(
       assert.ok(!('owner' in started[1]!));
     });
 
-    test('agent.context 交给 ContextBuilder：不认识的投影名以 not_found 结束，不调模型；facts: false 照常跑', async () => {
-      const { harness, store, agent } = await factory({
-        script: [
-          { type: 'text', text: '好' },
-          { type: 'text', text: '多余' },
-        ],
-      });
-      // 忽略 `context` 的 builder 会静默回到缺省，在这里被暴露。
-      const unknown = await harness.run({
-        session: 's',
-        agent: { ...agent, context: { projection: 'no-such-projection' } },
-        input: '在吗',
-      });
-      assert.equal(unknown.stopReason, 'error');
-      assert.equal(unknown.error?.type, 'not_found');
-      assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
-      const quiet = await harness.run({ session: 't', agent: { ...agent, context: { facts: false } }, input: '在吗' });
-      assert.equal(quiet.stopReason, 'end_turn');
-      assert.equal(quiet.text, '好');
-    });
+    atLevel(
+      'context',
+      'agent.context 交给 ContextBuilder：不认识的投影名以 not_found 结束，不调模型；facts: false 照常跑',
+      async () => {
+        const { harness, store, agent } = await factory({
+          script: [
+            { type: 'text', text: '好' },
+            { type: 'text', text: '多余' },
+          ],
+        });
+        // 忽略 `context` 的 builder 会静默回到缺省，在这里被暴露。
+        const unknown = await harness.run({
+          session: 's',
+          agent: { ...agent, context: { projection: 'no-such-projection' } },
+          input: '在吗',
+        });
+        assert.equal(unknown.stopReason, 'error');
+        assert.equal(unknown.error?.type, 'not_found');
+        assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
+        const quiet = await harness.run({
+          session: 't',
+          agent: { ...agent, context: { facts: false } },
+          input: '在吗',
+        });
+        assert.equal(quiet.stopReason, 'end_turn');
+        assert.equal(quiet.text, '好');
+      },
+    );
 
-    test('agent.context 记进 ctx.run.started 的 agent，能 JSON 往返', async () => {
+    atLevel('context', 'agent.context 记进 ctx.run.started 的 agent，能 JSON 往返', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       const context = {
         facts: { sources: ['clock'], placement: 'prompt', heading: '环境' },
@@ -1570,7 +1617,7 @@ export function describeHarnessContract(
       assert.deepEqual((started?.['agent'] as Record<string, unknown> | undefined)?.['context'], context);
     });
 
-    test('不给 inputKey：上一轮失败留下的输入，带同样的输入重试不再记一遍；换一句照常记', async () => {
+    atLevel('resume', '不给 inputKey：上一轮失败留下的输入，带同样的输入重试不再记一遍；换一句照常记', async () => {
       const { harness, store, agent } = await factory({
         script: [
           { type: 'error', message: 'network down' },
@@ -1594,7 +1641,7 @@ export function describeHarnessContract(
       assert.equal(await users(), 3);
     });
 
-    test('模型报上下文过长：以 error 结束，error.type 是 context_overflow，不可重试', async () => {
+    atLevel('trace', '模型报上下文过长：以 error 结束，error.type 是 context_overflow，不可重试', async () => {
       const { harness, store, agent } = await factory({
         script: [
           {
@@ -1611,21 +1658,25 @@ export function describeHarnessContract(
       assert.equal(eventData(await store.list('s'), CTX_EVENTS.error)[0]?.['type'], 'context_overflow');
     });
 
-    test('agent.context.overflow：超了又选 error 就不调模型，以 context_overflow 结束；没超照常跑', async () => {
-      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
-      const strict = { ...agent, context: { overflow: { maxTokens: 1, strategy: 'error' } } } as const;
-      const over = await harness.run({ session: 's', agent: strict, input: '在吗' });
-      assert.equal(over.stopReason, 'error');
-      assert.equal(over.error?.type, 'context_overflow');
-      assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
-      // 剧本只有一步：上面要是调了模型，这里就没得回了。
-      const roomy = { ...agent, context: { overflow: { maxTokens: 1_000_000, strategy: 'error' } } } as const;
-      const fine = await harness.run({ session: 't', agent: roomy, input: '在吗' });
-      assert.equal(fine.stopReason, 'end_turn');
-      assert.equal(fine.text, '好');
-    });
+    atLevel(
+      'context',
+      'agent.context.overflow：超了又选 error 就不调模型，以 context_overflow 结束；没超照常跑',
+      async () => {
+        const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+        const strict = { ...agent, context: { overflow: { maxTokens: 1, strategy: 'error' } } } as const;
+        const over = await harness.run({ session: 's', agent: strict, input: '在吗' });
+        assert.equal(over.stopReason, 'error');
+        assert.equal(over.error?.type, 'context_overflow');
+        assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
+        // 剧本只有一步：上面要是调了模型，这里就没得回了。
+        const roomy = { ...agent, context: { overflow: { maxTokens: 1_000_000, strategy: 'error' } } } as const;
+        const fine = await harness.run({ session: 't', agent: roomy, input: '在吗' });
+        assert.equal(fine.stopReason, 'end_turn');
+        assert.equal(fine.text, '好');
+      },
+    );
 
-    test('agent.context.overflow：历史超了，裁到放得下再调模型（trim 不写摘要）', async () => {
+    atLevel('context', 'agent.context.overflow：历史超了，裁到放得下再调模型（trim 不写摘要）', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       await store.append('s', dialogue(40, 400));
       const result = await harness.run({
@@ -1638,14 +1689,14 @@ export function describeHarnessContract(
       assert.deepEqual(await store.list('s', { types: ['summary'] }), []);
     });
 
-    test('signal 已中止：返回 stopReason aborted，写 ctx.run.ended', async () => {
+    atLevel('trace', 'signal 已中止：返回 stopReason aborted，写 ctx.run.ended', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '不该说' }] });
       const result = await harness.run({ session: 's', agent, input: '在吗', signal: AbortSignal.abort() });
       assert.equal(result.stopReason, 'aborted');
       assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'aborted');
     });
 
-    test('stream（有时）：run.started 在最前、run.ended 在最后，工具事件在两次模型调用之间', async () => {
+    atLevel('trace', 'stream（有时）：run.started 在最前、run.ended 在最后，工具事件在两次模型调用之间', async () => {
       const text = randomMarker();
       const { harness, store, agent } = await factory({
         script: [
@@ -1677,7 +1728,7 @@ export function describeHarnessContract(
       assert.equal(kinds(await store.list('s')).at(-1), CTX_EVENTS.runEnded);
     });
 
-    test('stream（有时）：模型出错时先给 error 再给 run.ended，不抛', async () => {
+    atLevel('trace', 'stream（有时）：模型出错时先给 error 再给 run.ended，不抛', async () => {
       const { harness, agent } = await factory({ script: [{ type: 'error', message: 'model exploded' }] });
       if (!harness.stream) return;
       const types: string[] = [];

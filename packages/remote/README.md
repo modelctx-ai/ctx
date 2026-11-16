@@ -351,8 +351,8 @@ ctx-conformance --url http://127.0.0.1:8080 --token "$TOKEN" --components sessio
 
 响应是 `ConformanceInstance`：`baseUrl`（相对这个服务的路径）、harness 和编排器用的 `agent`（模型名对着按剧本回答的模型）、执行环境用的 `executor: { name, echo }`（回显工具把输入原样放进结果）。实例只给测试用，不该对外开放。
 
-- 命令是 `@modelctx-ai/ctx-remote` 的 `ctx-conformance`，用 `node:test` 跑，失败时退出码非 0。令牌也可以放在 `CTX_ACCESS_TOKEN` 里；`--components` 缺省全部。
-- 在测试框架里跑：`@modelctx-ai/ctx-remote/conformance` 的 `describeConformance(baseUrl, { components?, accessToken?, … }, { describe, test })`，Vitest、`node:test` 都行。
+- 命令是 `@modelctx-ai/ctx-remote` 的 `ctx-conformance`，用 `node:test` 跑，失败时退出码非 0。令牌也可以放在 `CTX_ACCESS_TOKEN` 里；`--components` 缺省全部；`--harness-levels trace,execute` 只跑 harness 的这几级（`HarnessLevel`，缺省全部）。
+- 在测试框架里跑：`@modelctx-ai/ctx-remote/conformance` 的 `describeConformance(baseUrl, { components?, harnessLevels?, accessToken?, … }, { describe, test })`，Vitest、`node:test` 都行。
 - ctx 自己的服务端怎么进一致性模式：`@modelctx-ai/ctx-remote/server` 的 `createConformanceHandler({ create, accessToken?, maxInstances? })`，`create(setup)` 按请求建好要挂的组件（和 `createRemoteHandler` 的选项一样），另给 `agent`、`executor`。本包的测试用核心包的内存组件实现了 `create`，对它跑全部五个组件的契约。
 - 导出：`/conformance` 有 `describeConformance`、`ConformanceOptions`、`CONFORMANCE_COMPONENTS`、`CONFORMANCE_PATH` 和类型 `ConformanceComponent`、`ConformanceSetup`、`ConformanceInstance`；`/server` 有 `createConformanceHandler`、`ConformanceHandlerOptions`、`ConformanceInstanceOptions`，以及 `openApiDocument()`（`GET /protocol/openapi` 的文档）、`openApiOperations()`（文档里的每条路径和方法）。
 - 上下文、工具目录、模型、记忆的门面不在里面：它们不是线上协议（见[协议层的托管矩阵](../../docs/protocol.md#托管矩阵)）。

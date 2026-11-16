@@ -4,6 +4,7 @@
 
 ## 2026-11-16
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：Harness 一节加「一致性等级」，执行环境一节写反方向的 MCP 服务器，契约测试表跟上。[架构](architecture.md)的工具与 MCP 一节写 `createMcpServer` 的做法；[概念](concepts.md)的术语表加「一致性等级」。[ctx-mcp](../packages/mcp/README.md) 新写「反方向：把执行环境交给 MCP 客户端」，[ctx-protocol](../packages/protocol/README.md) 写等级怎么选，[ctx-remote](../packages/remote/README.md) 写 `--harness-levels`。
 - **新增** 英文译本（[#50](https://github.com/modelctx-ai/ctx/issues/50)）：[`docs/en/protocol.md`](en/protocol.md)（协议层全文，含线上形态）、[`README.en.md`](../README.en.md)，[docs/en/index.md](en/index.md) 和[文档入口](index.md)的「英文」一组。中文为准，译本的 frontmatter 记 `translation_of`、`synced`；`packages/protocol/src/translation.test.ts` 查两边的行内代码和章节层级，规范改了没跟进译本就失败。[README](../README.md) 开头加英文版的链接；[AGENTS.md](../AGENTS.md) 写了同步的规矩。架构和 ADR 先不译。
 - **新增** [ADR 0009](adr/0009-hosted-prerequisites.md)：云托管的前提（[#25](https://github.com/modelctx-ai/ctx/issues/25)）。每会话的执行环境另起 `open`、`close`，不改 `provision`；环境的描述放在 `AgentSpec.environment`；凭证不进执行环境、只给约定；`ctx-remote` 的鉴权扩展点和主体。
 - **更新** [协议层](protocol.md)（#25）：执行环境一节加 `open`、`close`、`ExecutorSessionOptions`、`EnvironmentSpec`，新写「每会话的执行环境」「凭证不进执行环境」两条；`AgentSpec` 加 `environment`；线上形态的路径表加两条执行环境会话的路径，跨路径的规则加「主体」；记忆作用域那条写明配了主体时按 `memoryScopes` 查；契约测试表跟上。

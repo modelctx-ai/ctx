@@ -4,6 +4,8 @@
 
 ## 未发布
 
+- **新增** harness 的一致性等级（[#23](https://github.com/modelctx-ai/ctx/issues/23) 的第一步）：`describeHarnessContract(name, factory, api, { levels? })` 按 `HarnessLevel`（`trace`、`execute`、`resume`、`context`、`output`）分组，常量 `HARNESS_LEVELS`、类型 `HarnessContractOptions`；缺省全跑，用例名前面带等级。`describeConformance` 的 `harnessLevels`、`ctx-conformance --harness-levels`。
+- **新增** `ctx-mcp` 的另一半：`createMcpServer({ executors, tools?, context, onResult?, validateInput? })` 把执行环境包成 MCP 服务器（`initialize`、`ping`、`tools/list`、`tools/call`、取消），传输 `createMcpHttpHandler`（Streamable HTTP，只回 JSON）和 `serveMcpStdio`；`toolOutputToMcp`、`MCP_PROTOCOL_VERSIONS`。不加依赖。
 - **新增** 云托管的三个前提（[#25](https://github.com/modelctx-ai/ctx/issues/25)，[ADR 0009](docs/adr/0009-hosted-prerequisites.md)）。
   - 协议包：`Executor.open?(session, { environment?, signal? })`、`Executor.close?(session)`（每个会话的环境，和管整个执行环境的 `provision`、`dispose` 分开），类型 `ExecutorSessionOptions`、`EnvironmentSpec`（`name`、`image`、`packages`、`network.allow`、`env`、`meta`），`AgentSpec.environment`（记进 `ctx.run.started`，`PROTOCOL_SCHEMA` 跟上）。`describeExecutorContract` 加一条：`open`、`close` 可重复，`close` 之后能再 `open`。
   - 核心包：harness 在一轮里第一次把调用交给某个执行环境之前调它的 `open(session, { environment })`，抛错时交给它的调用都回错误结果；新函数 `closeExecutorSessions(executors, session)`（返回 `{ closed, failed }`）。函数执行环境有 `open`、`close`、`openSessions()`。

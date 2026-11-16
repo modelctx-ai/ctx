@@ -434,6 +434,13 @@ await hub.close();
 - `close()` 断开全部连接、清空状态，并从写过的每个注册表里删掉这些工具。
 - MCP 工具和本地工具一样经 harness 的工具循环，调用和结果作为消息写进日志。
 
+反方向，`createMcpServer` 把 ctx 的执行环境包成 MCP 服务器，给只认 MCP 的进程级 harness 用（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：
+
+- 一个服务器对应一组执行环境和一个 `ExecutionContext`（会话、`runId`）：适配器每起一轮就建一个，调用记到那一轮的会话上。`context` 是函数时每次调用取一次。
+- JSON-RPC 自己写，不依赖 MCP 的 SDK：只有工具这一块（`initialize`、`ping`、`tools/list`、`tools/call`、`notifications/cancelled`），每个请求各自跑，取消按请求 id 中止那次调用的 `signal`。
+- 调用前按 `inputSchema` 查输入（`checkJsonSchema`），结果经 `toolOutputToMcp` 转；执行环境的错误结果和抛错都是 `isError` 的结果。`onResult` 在每次调用之后调，适配器在这里把经 ctx 执行的调用记进日志，抛错只记告警。
+- 传输：`createMcpHttpHandler` 只认 `POST`，回 JSON 不开 SSE 流，`Origin` 和令牌的检查照 `ctx-remote`；`serveMcpStdio` 一行一条。
+
 ## 函数执行环境
 
 `createFunctionExecutor(name = 'local')` 是进程内的 `Executor`：一张 `名字 → (input, context) => ToolOutput` 的表。

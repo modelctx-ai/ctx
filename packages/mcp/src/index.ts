@@ -797,3 +797,16 @@ export function createMcpHub(servers: McpServers, options: McpHubOptions = {}): 
     close,
   };
 }
+
+export {
+  createMcpHttpHandler,
+  createMcpServer,
+  MCP_PROTOCOL_VERSIONS,
+  serveMcpStdio,
+  toolOutputToMcp,
+  type McpCallContext,
+  type McpHttpOptions,
+  type McpServer,
+  type McpServerOptions,
+  type McpStdioOptions,
+} from './server.ts';
