@@ -1044,6 +1044,74 @@ describe('长请求、断线和上限', () => {
     expect(body.result.recorded.map((entry) => entry.seq)).toEqual(ran.recorded.map((entry) => entry.seq));
   });
 
+  test('events：服务重启后自己重连，之后的事件照样收到', async () => {
+    const { store, harness } = localHarness([
+      { type: 'text', text: '一' },
+      { type: 'text', text: '二' },
+    ]);
+    const first = await startRemote({ accessToken, store, orchestrator: createOrchestrator({ harness, store }) });
+    const port = Number(new URL(first.origin).port);
+    const remote = createRemoteOrchestrator({ baseUrl: first.baseUrl, accessToken, ...quick });
+    const completed: string[] = [];
+    const controller = new AbortController();
+    const done = (async () => {
+      for await (const event of remote.events({ signal: controller.signal })) {
+        if (event.type === 'run.completed') completed.push(event.runId);
+      }
+    })();
+    await pause(50);
+    await (
+      await remote.submit({ session: 'a', agent, input: '在吗', runId: 'before' })
+    ).done;
+    await eventually(
+      async () => completed.length,
+      (count) => count === 1,
+    );
+    await first.close();
+    await serve({ store, port, orchestrator: createOrchestrator({ harness, store }) });
+    // 断开那一阵的事件收不到：等它重连上再提交。
+    await pause(400);
+    await (
+      await remote.submit({ session: 'b', agent, input: '在吗', runId: 'after' })
+    ).done;
+    await eventually(
+      async () => completed.length,
+      (count) => count === 2,
+    );
+    controller.abort();
+    await done;
+    expect(completed).toEqual(['before', 'after']);
+  });
+
+  test('经编排器提交、还没结束的运行到了 maxPendingRuns 回 429，结束一个又能提交', async () => {
+    const { store, harness } = localHarness(
+      [
+        { type: 'text', text: '一' },
+        { type: 'text', text: '二' },
+        { type: 'text', text: '三' },
+      ],
+      300,
+    );
+    const server = await serve({ store, orchestrator: createOrchestrator({ harness, store }), maxPendingRuns: 2 });
+    const post = (session: string): Promise<Response> =>
+      fetch(`${server.baseUrl}/orchestrator/runs`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ session, agent, input: '在吗' }),
+      });
+    const remote = createRemoteOrchestrator(client(server));
+    const running = await remote.submit({ session: 'a', agent, input: '在吗' });
+    expect((await post('b')).status).toBe(200);
+    const refused = await post('c');
+    expect(refused.status).toBe(429);
+    expect(await refused.json()).toMatchObject({ error: { type: 'rate_limit_error', retryable: true } });
+    await running.done;
+    await eventually(
+      async () => (await post('c')).status,
+      (code) => code === 200,
+    );
+  });
+
   test('到了并发上限回 429（retryable），放掉以后又能用', async () => {
     const { store, harness } = localHarness(
       [

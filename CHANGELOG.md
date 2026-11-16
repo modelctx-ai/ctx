@@ -4,6 +4,9 @@
 
 ## 未发布
 
+- **新增** `ctx-remote` 服务端选项 `maxPendingRuns`（缺省 1024）：经 `POST /orchestrator/runs` 提交、还没结束的运行到了上限回 429（[#39](https://github.com/modelctx-ai/ctx/issues/39) 剩下的一项）。编排器自己只限同时跑几个，排队的提交以前不限。
+- **实现** `createRemoteOrchestrator` 的 `events()` 断线后按 `retry` 退避重连，和 `watch` 一样；以前一断就抛。断开那一阵的事件收不到（编排器的事件没有位置），要不漏就按 `runId` 查状态。
+
 - **实现** 估算按上一轮的实际用量校准（[#35](https://github.com/modelctx-ai/ctx/issues/35) 剩下的一项）。harness 把第一步请求的估算记进 `StepMeta.estimatedInputTokens`（校准过时另记 `calibration`）。核心包 builder 的新选项 `calibrate`（缺省 `true`）：上一轮第一步服务商实际计的 `usage.inputTokens` 比估算多几倍，这一轮 `maxTokens` 就收紧几倍，`PreparedCall.tokens` 乘上它、`PreparedCall.calibration` 记下倍数（协议包新字段），超窗检查因此也按校准过的数字。只往小里收，最多 `MAX_CALIBRATION`（4）倍；投影接了自己的 `window.estimate` 时不校准。**行为变化**：服务商报的输入 token 比估算多的会话，窗口留下的历史比以前少；不要就传 `calibrate: false`。#35 的另一条（请求的 `window` 按字段合并）没有照做：规范定的是整个换掉、`{}` 表示不裁剪，`estimate` 始终用 builder 的。
 
 - **实现** 长会话的读取有上界（[#34](https://github.com/modelctx-ai/ctx/issues/34) 剩下的两项）。协议包新函数 `projectSession(store, session, options)`：读生效的摘要和它之后的条目再投影，结果和读出来再 `project` 一样；有窗口时只读够用的尾部——按 `seq` 读最后 N 条，用 `atAfter` 补上 `at` 排在这段之后的更早的条目，窗口挤掉了开头可能不完整的那组和至少一个完整的组就停，否则读 4 倍。核心包 builder 的 `view`、`build` 用它：30 万条、没压缩过的 SQLite 会话，`maxMessages: 20` 的 `view` 从读全量（这台机器上 41 秒）降到 3 毫秒。`project` 的窗口裁剪不再是平方复杂度（`shift()` 换成下标）：30 万条、`maxMessages: 20` 从 40 秒降到 0.3 秒。**行为变化**：只读了尾部时 `Projection.dropped` 只数读到的那部分。

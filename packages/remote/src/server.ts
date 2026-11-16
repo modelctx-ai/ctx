@@ -116,6 +116,11 @@ export interface RemoteHandlerOptions {
   readonly maxExecutions?: number;
   /** 同时开着的 `entries/stream` 和 `orchestrator/events` 流的上限，缺省 256；满了回 429。 */
   readonly maxStreams?: number;
+  /**
+   * 经 `POST /orchestrator/runs` 提交、还没结束（排着队的加正在跑的）的运行的上限，缺省 1024；满了回 429。
+   * 编排器自己只限同时跑几个，排队的不限，每个排队的提交都占着请求和结果的内存。
+   */
+  readonly maxPendingRuns?: number;
   readonly logger?: Logger;
 }
 
@@ -716,6 +721,9 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   const maxRuns = options.maxRuns ?? 32;
   const maxExecutions = options.maxExecutions ?? 64;
   const maxStreams = options.maxStreams ?? 256;
+  const maxPendingRuns = options.maxPendingRuns ?? 1024;
+  /** 经这个服务提交、还没结束的运行数。 */
+  let pendingRuns = 0;
   const logger = options.logger ?? silentLogger;
   const hosts = options.allowedHosts ? lowered(options.allowedHosts) : undefined;
   const origins = lowered(options.allowedOrigins ?? []);
@@ -1177,7 +1185,19 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
       if (method !== 'POST') fail(405, 'use POST /orchestrator/runs');
       const { aborted, ...wire } = runRequestOf(await readBody(req, limit), agentPolicy);
       checkRunSessions(who, wire);
-      const handle = await queue.submit({ ...wire, ...(aborted ? { signal: AbortSignal.abort() } : {}) });
+      if (pendingRuns >= maxPendingRuns) busy('unfinished submitted runs', maxPendingRuns);
+      pendingRuns += 1;
+      let handle: Awaited<ReturnType<typeof queue.submit>>;
+      try {
+        handle = await queue.submit({ ...wire, ...(aborted ? { signal: AbortSignal.abort() } : {}) });
+      } catch (error) {
+        pendingRuns -= 1;
+        throw error;
+      }
+      void handle.done.then(
+        () => (pendingRuns -= 1),
+        () => (pendingRuns -= 1),
+      );
       remember(handle.runId, handle.session, handle.done);
       sendJson(res, 200, { runId: handle.runId, session: handle.session });
       return;

@@ -729,18 +729,38 @@ export function createRemoteOrchestrator(options: RemoteOrchestratorOptions): Or
       signal?.addEventListener('abort', stop, { once: true });
       streams.add(controller);
       try {
-        const opening = connection.request('GET', '/orchestrator/events', { signal: controller.signal });
-        connecting.add(opening);
-        let response: Response;
-        try {
-          response = await opening;
-        } finally {
-          connecting.delete(opening);
+        // 连接断了就退避重连，和 `watch` 一样。编排器的事件没有位置，断开那一阵的事件收不到：要不漏就按 `runId` 查状态。
+        for (let failures = 0; ;) {
+          if (controller.signal.aborted) return;
+          let connectedAt: number | undefined;
+          try {
+            const opening = connection.request('GET', '/orchestrator/events', {
+              signal: controller.signal,
+              retry: false,
+            });
+            connecting.add(opening);
+            let response: Response;
+            try {
+              response = await opening;
+            } finally {
+              connecting.delete(opening);
+            }
+            connectedAt = Date.now();
+            for await (const event of lines<OrchestratorEvent>(response)) {
+              failures = 0;
+              yield event;
+            }
+            // 服务端自己结束了这条流。
+            return;
+          } catch (error) {
+            if (isAbort(error, controller.signal)) return;
+            // 连上以后撑了一阵才断的不算连续失败。
+            if (connectedAt !== undefined && Date.now() - connectedAt > connection.maxDelayMs) failures = 0;
+            if (failures >= connection.retries || !transient(error)) throw error;
+            await pause(connection.delay(failures), controller.signal);
+            failures += 1;
+          }
         }
-        yield* lines<OrchestratorEvent>(response);
-      } catch (error) {
-        if (isAbort(error, controller.signal)) return;
-        throw error;
       } finally {
         streams.delete(controller);
         signal?.removeEventListener('abort', stop);
