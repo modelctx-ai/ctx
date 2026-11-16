@@ -468,6 +468,7 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
 4. `tools.select(agent.tools)` 得到候选工具，`context.build(...)` 得到 `PreparedCall`。`agent.context.overflow` 配了、`PreparedCall.tokens` 又超过它的 `maxTokens` 时，按协议的三步走（见[协议层](protocol.md#harness)）：压缩（builder 抛 `no_model` 时带上这一轮的模型再调一次；失败只告警）→ 带 `truncate` 的窗口重新 `build` → 还超就抛 `context_overflow`。然后才交给 `beforeModel`（之后的每个工具步骤也会再调一次）；钩子换掉的调用不再检查。
 5. 调模型。每个工具调用：按定义的 `inputSchema` 查输入（`checkJsonSchema`；不合就不往下走，模型看到 `Invalid input for tool …` 和具体哪里不对，这一轮继续；`addTool` 加的工具不在这里查，函数执行环境按它原来的 zod 校验，注册表的 `validatesInput(name)` 告诉 harness 是哪些）→ `beforeTool`（可以拒绝或改写输入；拒绝时模型看到 `not allowed: <原因>`，这一轮继续）→ 按定义的 `executor` 找执行环境 `execute` → `afterTool`（可以改写结果）→ 结果超过 `maxToolOutputChars`（缺省 20 万字符）时截断并注明（`limitToolOutput`）。找不到执行环境、执行环境本身抛错也变成给模型看的错误。`validateToolInput: false` 关掉输入检查，`true` 连 `addTool` 的也查，`maxToolOutputChars: 0` 关掉截断。
 6. 每一步即时记产出（`source: 'model'`），用 AI SDK 的两个回调：`onLanguageModelCallEnd`（模型调用的结果解析完、工具执行之前）在这一步有要本地执行的工具调用时，照 AI SDK 生成响应消息的规则把这次的内容转成助手消息先写下；`onStepEnd` 写这一步剩下的（工具结果，或者没有工具调用时的助手消息）。AI SDK 等这两个回调写完才执行工具、才走下一步，`generateText` 和 `streamText` 都一样。它吞掉回调里的异常，所以写日志失败或被围栏时 harness 记下错误、中止这一轮，再按那个错误收尾。同一轮的写入排成一队，不交错。有服务商执行的工具结果、审批请求这些照抄不了的部件时，这一步退回在结束时一起写。
+   每一步的助手消息带 `meta.step`（`StepMeta`）：工具执行前写下的那条取模型调用结束时的 `provider`、`modelId`（服务商响应里的）、`finishReason`、用量，步骤结束时写的取 `StepResult` 的同几项。用量的缓存和推理取 AI SDK 的 `inputTokenDetails.cacheReadTokens`、`cacheWriteTokens` 和 `outputTokenDetails.reasoningTokens`。
 7. `ctx.run.ended`（`stopReason`、`usage`）。中途出错或被取消时，写下了调用、没等到结果的工具调用先补一条错误结果（`The run ended before this tool call returned; its result is unknown.`），再写 `ctx.error` 和 `ctx.run.ended`；已经写下的步骤留着。
 
 `stopReason`：模型自己停下是 `end_turn`；步数用完还想调工具是 `max_steps`；被 `maxOutputTokens` 截断是 `max_tokens`；`signal` 中止是 `aborted`；其他错误是 `error`，另记一条 `ctx.error`。出错和取消都照常返回 `RunResult` 并写 `ctx.run.ended`，只有写日志失败才 reject。`record: false` 一条都不写。
@@ -516,7 +517,7 @@ for await (const event of harness.stream({
 }
 ```
 
-`stream` 的事件：`run.started` → 每一步 `model.started`、`text.delta`、`tool.called`、`tool.returned`、`model.ended` → 出错时 `error` → `run.ended`（带去掉 `messages`、`recorded` 的结果）。调用方提前不读时取消模型调用，照样写 `ctx.run.ended`（`aborted`）。
+`stream` 的事件：`run.started` → 每一步 `model.started`、`reasoning.delta`、`text.delta`、`tool.called`、`tool.returned`、`model.ended` → 出错时 `error` → `run.ended`（带去掉 `messages`、`recorded` 的结果）。调用方提前不读时取消模型调用，照样写 `ctx.run.ended`（`aborted`）。`model.ended` 等这一步写进日志再发，带上写到的 `seq`；`run.started`、`run.ended` 带 `ctx.run.started`、`ctx.run.ended` 的 `seq`。
 
 ## 编排器
 

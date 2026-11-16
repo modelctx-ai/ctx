@@ -102,10 +102,42 @@ export interface RunRequest {
  */
 export type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'aborted' | 'error';
 
+/** token 用量。服务商不给的项就没有，缓存和推理三项是 0 时也不写；各服务商的字段怎么映射过来，没有对真实服务验证。 */
 export interface Usage {
+  /** 输入的 token，含缓存读到的和写进缓存的。 */
   readonly inputTokens?: number;
   readonly outputTokens?: number;
   readonly totalTokens?: number;
+  /** 输入里从提示缓存读到的。 */
+  readonly cacheReadTokens?: number;
+  /** 输入里写进提示缓存的。 */
+  readonly cacheWriteTokens?: number;
+  /** 输出里推理用掉的。 */
+  readonly reasoningTokens?: number;
+}
+
+/**
+ * harness 写进每一步助手消息 `meta.step` 的内容：这是哪一轮的第几步，服务商实际用的模型，这一步的用量。
+ * 整轮的合计在 `ctx.run.ended` 的 `usage`。用 `stepMetaOf(entry)` 读。
+ */
+export interface StepMeta {
+  readonly runId: string;
+  /** 从 0 数。 */
+  readonly step: number;
+  readonly provider?: string;
+  /** 服务商在响应里给的模型标识；走了回落、别名解析到具体版本时和请求的不一样。 */
+  readonly modelId?: string;
+  /** AI SDK 的 `finishReason`：`stop`、`tool-calls`、`length` 等。 */
+  readonly finishReason?: string;
+  readonly usage?: Usage;
+}
+
+/** 条目 `meta.step` 里的 `StepMeta`；不是 harness 写的步骤消息时返回 `undefined`。 */
+export function stepMetaOf(entry: Entry): StepMeta | undefined {
+  const step = entry.meta?.['step'];
+  if (typeof step !== 'object' || step === null || Array.isArray(step)) return undefined;
+  const { runId, step: index } = step as Record<string, unknown>;
+  return typeof runId === 'string' && typeof index === 'number' ? (step as unknown as StepMeta) : undefined;
 }
 
 export interface RunResult {
@@ -122,15 +154,32 @@ export interface RunResult {
   readonly error?: ErrorInfo;
 }
 
-/** 流式运行的事件。`text.delta` 不落日志，其余各有对应的日志条目。 */
+/**
+ * 流式运行的事件。`text.delta`、`reasoning.delta` 不落日志，其余各有对应的日志条目。带 `seq` 的三种是和日志对齐的点：
+ * 发出它的时候，日志已经写到这个 `seq`（`run.started` 是 `ctx.run.started`，`model.ended` 是这一步最后一条，
+ * `run.ended` 是 `ctx.run.ended`）。流断了，从最后收到的 `seq` 起 `watch` 或 `list({ after })` 就能接上。
+ * 不写日志（`record: false`）时没有 `seq`。
+ */
 export type RunEvent =
-  | { readonly type: 'run.started'; readonly runId: string; readonly session: string }
+  | { readonly type: 'run.started'; readonly runId: string; readonly session: string; readonly seq?: number }
   | { readonly type: 'model.started'; readonly runId: string; readonly step: number }
   | { readonly type: 'text.delta'; readonly runId: string; readonly text: string }
+  | { readonly type: 'reasoning.delta'; readonly runId: string; readonly text: string }
   | { readonly type: 'tool.called'; readonly runId: string; readonly call: ToolCall }
   | { readonly type: 'tool.returned'; readonly runId: string; readonly callId: string; readonly output: ToolOutput }
-  | { readonly type: 'model.ended'; readonly runId: string; readonly step: number; readonly usage?: Usage }
-  | { readonly type: 'run.ended'; readonly runId: string; readonly result: Omit<RunResult, 'messages' | 'recorded'> }
+  | {
+      readonly type: 'model.ended';
+      readonly runId: string;
+      readonly step: number;
+      readonly usage?: Usage;
+      readonly seq?: number;
+    }
+  | {
+      readonly type: 'run.ended';
+      readonly runId: string;
+      readonly result: Omit<RunResult, 'messages' | 'recorded'>;
+      readonly seq?: number;
+    }
   | { readonly type: 'error'; readonly runId: string; readonly message: string };
 
 export type RunEventType = RunEvent['type'];

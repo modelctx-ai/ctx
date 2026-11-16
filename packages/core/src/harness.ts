@@ -25,6 +25,7 @@ import {
   type Executor,
   type Harness,
   type Hooks,
+  type JsonObject,
   type Logger,
   type Message,
   type MessageContent,
@@ -36,6 +37,7 @@ import {
   type RunRequest,
   type RunResult,
   type SessionStore,
+  type StepMeta,
   type StopReason,
   type ToolCall,
   type ToolDefinition,
@@ -117,6 +119,10 @@ export interface RunOutcome {
 
 export interface StartedStream {
   readonly runId: string;
+  /** 这一轮 `ctx.run.started` 的 `seq`；没写（不记录、会话忙）时没有。 */
+  readonly seq?: number;
+  /** 第 `step` 步写完时日志的末尾 `seq`；这一步没写下时是 `undefined`。只在流里那一步的 `finish-step` 之后等它。 */
+  stepSeq?(step: number): Promise<number | undefined>;
   /** 组装失败时没有流，`done()` 直接给出结果。 */
   readonly result?: StreamTextResult;
   /** 产出写进日志以后给出结果；第一次调用时才开始等（等的时候会让流跑完）。只在写日志失败时 reject。 */
@@ -153,6 +159,20 @@ interface RunState {
   writing: Promise<void>;
   /** 步骤回调里写日志失败（或被围栏）：AI SDK 吞掉回调的异常，这里记下，再中止这一轮。 */
   stepError?: unknown;
+  /** 已经写完的步数，也是下一步的序号。 */
+  step: number;
+  /** 每一步写完时日志的末尾 `seq`，流式的 `model.ended` 等它；这一步没写下（不记录、出错）时是 `undefined`。 */
+  readonly stepSeqs: Map<number, PromiseWithResolvers<number | undefined>>;
+}
+
+/** 第 `index` 步写完时的末尾 `seq`。 */
+function stepSeq(state: RunState, index: number): PromiseWithResolvers<number | undefined> {
+  let entry = state.stepSeqs.get(index);
+  if (!entry) {
+    entry = Promise.withResolvers<number | undefined>();
+    state.stepSeqs.set(index, entry);
+  }
+  return entry;
 }
 
 interface Setup {
@@ -171,13 +191,45 @@ interface Produced {
   readonly usage: LanguageModelUsage | undefined;
 }
 
+/**
+ * AI SDK 的用量转成协议的：缓存和推理取 `inputTokenDetails`、`outputTokenDetails`。这三项是 0 时不写：服务商没给明细时
+ * AI SDK 的适配也常填 0，分不出「没有」和「没给」，不写更省日志，读的人按 0 算。
+ */
 function usageOf(usage: LanguageModelUsage | undefined): Usage | undefined {
   if (!usage) return undefined;
-  const out: { inputTokens?: number; outputTokens?: number; totalTokens?: number } = {};
+  const out: { -readonly [K in keyof Usage]: Usage[K] } = {};
   if (usage.inputTokens !== undefined) out.inputTokens = usage.inputTokens;
   if (usage.outputTokens !== undefined) out.outputTokens = usage.outputTokens;
   if (usage.totalTokens !== undefined) out.totalTokens = usage.totalTokens;
+  const cacheRead = usage.inputTokenDetails?.cacheReadTokens;
+  const cacheWrite = usage.inputTokenDetails?.cacheWriteTokens;
+  const reasoning = usage.outputTokenDetails?.reasoningTokens;
+  if (cacheRead) out.cacheReadTokens = cacheRead;
+  if (cacheWrite) out.cacheWriteTokens = cacheWrite;
+  if (reasoning) out.reasoningTokens = reasoning;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** 一步的 `meta.step`。 */
+function stepMeta(
+  state: RunState,
+  info: {
+    readonly provider: string;
+    readonly modelId: string;
+    readonly finishReason: FinishReason;
+    readonly usage: LanguageModelUsage;
+  },
+): JsonObject {
+  const usage = usageOf(info.usage);
+  const meta: StepMeta = {
+    runId: state.runId,
+    step: state.step,
+    provider: info.provider,
+    modelId: info.modelId,
+    finishReason: info.finishReason,
+    ...(usage ? { usage } : {}),
+  };
+  return { step: meta as unknown as JsonObject };
 }
 
 function stopReasonOf(finishReason: FinishReason, steps: number, maxSteps: number): StopReason {
@@ -268,6 +320,8 @@ function begin(request: RunRequest): RunState {
     early: false,
     open: new Map(),
     writing: Promise.resolve(),
+    step: 0,
+    stepSeqs: new Map(),
   };
 }
 
@@ -681,7 +735,14 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       abort(error);
     };
     return {
-      onLanguageModelCallEnd: async ({ content }: { readonly content: ReadonlyArray<ContentPart<ToolSet>> }) => {
+      onLanguageModelCallEnd: async (event: {
+        readonly content: ReadonlyArray<ContentPart<ToolSet>>;
+        readonly provider: string;
+        readonly modelId: string;
+        readonly finishReason: FinishReason;
+        readonly usage: LanguageModelUsage;
+      }) => {
+        const { content } = event;
         if (!state.record || state.stepError !== undefined) return;
         const calls = content.flatMap((part) =>
           part.type === 'tool-call' && part.providerExecuted !== true ? [part] : [],
@@ -692,26 +753,55 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         try {
           // 子集之外的部件在这里抛 `unsupported_part`：这一轮以 `error` 结束，工具不执行。
           const [message] = fromModelMessages([draft]);
-          await write(state, [messageEntry(message!, { source: 'model' })]);
+          await write(state, [messageEntry(message!, { source: 'model', meta: stepMeta(state, event) })]);
           state.early = true;
           for (const call of calls) state.open.set(call.toolCallId, call.toolName);
         } catch (error) {
           stop(error);
         }
       },
-      onStepEnd: async ({ response }: { readonly response: { readonly messages: readonly ModelMessage[] } }) => {
-        if (!state.record || state.stepError !== undefined) return;
+      onStepEnd: async (step: {
+        readonly model: { readonly provider: string };
+        readonly response: { readonly modelId: string; readonly messages: readonly ModelMessage[] };
+        readonly finishReason: FinishReason;
+        readonly usage: LanguageModelUsage;
+      }) => {
+        const index = state.step;
+        state.step += 1;
+        const done = stepSeq(state, index);
+        if (!state.record || state.stepError !== undefined) return done.resolve(undefined);
         try {
-          const messages = fromModelMessages(response.messages);
-          const rest = state.early && messages[0]?.role === 'assistant' ? messages.slice(1) : messages;
+          const messages = fromModelMessages(step.response.messages);
+          const skip = state.early && messages[0]?.role === 'assistant';
+          const meta = stepMeta(
+            { ...state, step: index },
+            {
+              provider: step.model.provider,
+              modelId: step.response.modelId,
+              finishReason: step.finishReason,
+              usage: step.usage,
+            },
+          );
           await write(
             state,
-            rest.map((message) => messageEntry(message, { source: 'model' })),
+            messages.flatMap((message, at) =>
+              skip && at === 0
+                ? []
+                : [
+                    messageEntry(message, {
+                      source: 'model',
+                      // 这一步的助手消息带上用量；工具执行前已经写下的那条在写的时候带过了。
+                      ...(!skip && at === 0 && message.role === 'assistant' ? { meta } : {}),
+                    }),
+                  ],
+            ),
           );
           state.logged += messages.length;
           state.early = false;
           state.open.clear();
+          done.resolve(state.head);
         } catch (error) {
+          done.resolve(undefined);
           stop(error);
         }
       },
@@ -952,7 +1042,11 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       const outcome = fail(state, error, controller.signal).then((result) => ({ result, cause: error }));
       outcome.catch(() => {});
       void outcome.then(release, release);
-      return { runId: state.runId, done: () => outcome };
+      return {
+        runId: state.runId,
+        ...(state.started !== undefined ? { seq: state.started } : {}),
+        done: () => outcome,
+      };
     }
 
     const finished = Promise.withResolvers<RunOutcome>();
@@ -1020,6 +1114,8 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     let watched = false;
     return {
       runId: state.runId,
+      ...(state.started !== undefined ? { seq: state.started } : {}),
+      stepSeq: (step) => stepSeq(state, step).promise,
       result,
       done() {
         if (!watched) {
@@ -1040,8 +1136,18 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     const started = await startStream({ ...request, signal: controller.signal });
     const { runId } = started;
     let completed = false;
+    // 这一轮落定（包括出错）以后，还没写下的步骤不会再写：等步骤的 `seq` 时以它兜底，不会一直等。
+    const settled = started.done().then(
+      () => undefined,
+      () => undefined,
+    );
     try {
-      yield { type: 'run.started', runId, session: request.session };
+      yield {
+        type: 'run.started',
+        runId,
+        session: request.session,
+        ...(started.seq !== undefined ? { seq: started.seq } : {}),
+      };
       if (started.result) {
         let step = 0;
         try {
@@ -1052,6 +1158,9 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
                 break;
               case 'text-delta':
                 if (part.text) yield { type: 'text.delta', runId, text: part.text };
+                break;
+              case 'reasoning-delta':
+                if (part.text) yield { type: 'reasoning.delta', runId, text: part.text };
                 break;
               case 'tool-call':
                 yield {
@@ -1073,7 +1182,15 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
                 break;
               case 'finish-step': {
                 const usage = usageOf(part.usage);
-                yield { type: 'model.ended', runId, step, ...(usage ? { usage } : {}) };
+                // 等这一步写进日志：事件里的 `seq` 说的是「日志已经写到这里」。
+                const seq = await Promise.race([started.stepSeq?.(step), settled]);
+                yield {
+                  type: 'model.ended',
+                  runId,
+                  step,
+                  ...(usage ? { usage } : {}),
+                  ...(seq !== undefined ? { seq } : {}),
+                };
                 step += 1;
                 break;
               }
@@ -1088,8 +1205,15 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       const { result } = await started.done();
       completed = true;
       if (result.error) yield { type: 'error', runId, message: result.error.message };
-      const { messages: _messages, recorded: _recorded, ...summary } = result;
-      yield { type: 'run.ended', runId, result: summary };
+      const { messages: _messages, recorded, ...summary } = result;
+      const last = recorded.at(-1);
+      const ended =
+        last?.type === 'event' &&
+        last.kind === CTX_EVENTS.runEnded &&
+        (last.data as { runId?: unknown } | undefined)?.runId === runId
+          ? last.seq
+          : undefined;
+      yield { type: 'run.ended', runId, result: summary, ...(ended !== undefined ? { seq: ended } : {}) };
     } finally {
       if (!completed) {
         // 调用方提前不读了：取消模型调用，等 ctx.run.ended 写完。

@@ -502,9 +502,21 @@ interface RunRequest {
 }
 type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'aborted' | 'error';
 interface Usage {
-  inputTokens?: number;
+  inputTokens?: number; // 含缓存读到的和写进缓存的
   outputTokens?: number;
   totalTokens?: number;
+  cacheReadTokens?: number; // 输入里从提示缓存读到的
+  cacheWriteTokens?: number; // 输入里写进提示缓存的
+  reasoningTokens?: number; // 输出里推理用掉的
+}
+interface StepMeta {
+  // harness 写进每一步助手消息的 meta.step
+  runId: string;
+  step: number; // 从 0 数
+  provider?: string;
+  modelId?: string; // 服务商响应里的模型标识
+  finishReason?: string;
+  usage?: Usage; // 这一步的用量
 }
 interface RunResult {
   runId: string;
@@ -516,13 +528,14 @@ interface RunResult {
   error?: ErrorInfo; // stopReason 是 error 时；上游 HTTP 接口出错时带 statusCode 和 responseBody；上下文过长时 type 是 context_overflow
 }
 type RunEvent =
-  | { type: 'run.started'; runId: string; session: string }
+  | { type: 'run.started'; runId: string; session: string; seq?: number }
   | { type: 'model.started'; runId: string; step: number }
   | { type: 'text.delta'; runId: string; text: string }
+  | { type: 'reasoning.delta'; runId: string; text: string }
   | { type: 'tool.called'; runId: string; call: ToolCall }
   | { type: 'tool.returned'; runId: string; callId: string; output: ToolOutput }
-  | { type: 'model.ended'; runId: string; step: number; usage?: Usage }
-  | { type: 'run.ended'; runId: string; result: Omit<RunResult, 'messages' | 'recorded'> }
+  | { type: 'model.ended'; runId: string; step: number; usage?: Usage; seq?: number }
+  | { type: 'run.ended'; runId: string; result: Omit<RunResult, 'messages' | 'recorded'>; seq?: number }
   | { type: 'error'; runId: string; message: string };
 
 type ToolDecision = { allow: true; input?: JsonValue } | { allow: false; reason: string };
@@ -561,7 +574,8 @@ interface Harness {
   4. 进程崩溃留下的未结束运行会让该会话一直 `session_busy`，直到有编排器 `recover` 它。**所以用 `record` 缺省（写日志）的应用，进程启动时要先 `recover()` 再接新的 `submit`。** 不写日志的运行没有这个要求。
   5. 续跑：`recover` 给断掉的运行写下了调用、没有结果的工具调用补一条错误结果（「这一轮在工具返回之前结束了，结果未知」），和 `ctx.run.ended` 一批写；要续跑的，在同一个会话上提交一轮不带新输入的运行，模型从日志里看到已经做完的步骤和那条错误结果，接着往下走。已经有结果的工具不会再执行；结果未知的那次由模型决定要不要重试，有副作用的工具应当自己幂等。
   6. `RunRequest.owner` 写进 `ctx.run.started` 的 `owner`（编排器按自己的 `owner` 填）。
-- `text.delta` 不落日志，像 Managed Agents 的 event delta；其余事件各有对应的日志条目。
+- `text.delta`、`reasoning.delta` 不落日志，像 Managed Agents 的 event delta；其余事件各有对应的日志条目。`run.started`、`model.ended`、`run.ended` 带 `seq`，是流和日志对齐的点：发出它的时候日志已经写到这个 `seq`（`ctx.run.started`、这一步的最后一条、`ctx.run.ended`）。流断了，从最后收到的 `seq` 起 `watch(session, { after })` 或 `list({ after })` 接着读日志，不会漏也不会重；不写日志的运行没有 `seq`。
+- **用量。** `Usage` 的缓存和推理三项是可选的，服务商不给或者是 0 就没有（服务商没给明细时 AI SDK 的适配也常填 0，分不出来）；`inputTokens` 含缓存读到的和写进缓存的，算费用时按各家的价格分开算。整轮的合计在 `RunResult.usage` 和 `ctx.run.ended` 的 `usage`；每一步的在这一步助手消息的 `meta.step`（`StepMeta`，用 `stepMetaOf(entry)` 读），还带服务商响应里的模型标识——请求的是别名、走了回落时看得出实际用了哪个。价格表不在协议里：应用按 `provider`、`modelId` 和这几项自己算。各服务商的用量字段经 AI SDK 映射过来，**没有对真实服务验证**。
 - 纯函数：`modelName(model)` 把进程内模型记成 `<provider>/<modelId>`；`agentSpecToJson(spec)` 是写进 `ctx.run.started` 的可序列化部分。`settings.headers` 只留名字，值换成 `REDACTED_HEADER`（`[redacted]`）：请求头里常有凭证，而日志只追加、读得到会话的人都看得到。
 - `Hooks` 是 harness 实现的构造参数，不在 `RunRequest` 里：它们是函数，不能跨边界。
 - 权限确认是 `beforeTool` 的一种实现：返回 `{ allow: false }` 时工具结果是一条错误，模型会看到原因，这一轮继续。

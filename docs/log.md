@@ -4,6 +4,7 @@
 
 ## 2026-11-16
 
+- **更新** [协议层](protocol.md)的 Harness 一节（[#46](https://github.com/modelctx-ai/ctx/issues/46)）：`Usage` 加缓存读写和推理三项，新写 `StepMeta` 和「用量」一条；`RunEvent` 加 `reasoning.delta` 和三个对齐点的 `seq`。[架构](architecture.md)写每一步的 `meta.step` 取哪些字段、`model.ended` 等写完再发。[概念](concepts.md)术语表加「步骤元数据 `meta.step`」「对齐点 `seq`（流）」。[ctx-protocol](../packages/protocol/README.md) 的纯函数表加 `stepMetaOf`。
 - **更新** [协议层](protocol.md)的 Harness 一节（[#20](https://github.com/modelctx-ai/ctx/issues/20)）：新写「每一步即时落日志」，一个会话一个运行的约定加第 5 条「续跑」；编排器的 `recover` 签名改成 `RecoveredRun[]`，`RecoveredRun` 加 `resumed`；契约测试表跟上。以前写的是整轮结束时一批记产出。
 - **更新** [架构](architecture.md)的 Harness 和编排器两节：每一步怎么用 AI SDK 的 `onLanguageModelCallEnd`、`onStepEnd` 落日志，半路结束时怎么给悬空的调用补结果；`recover` 补结果、`resume` 续跑。
 - **更新** [概念](concepts.md)：术语表加「续跑 `resume`」；「可丢弃」一条写明续跑靠什么。
