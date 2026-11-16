@@ -457,6 +457,16 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
 - `execute` 从不抛：不认识的工具（错误里列出可用的）、`signal` 已中止、函数抛错、`dispose()` 之后都返回 `{ type: 'error', message }`，模型看得到原因。
 - `context` 是协议的 `ExecutionContext`（`session`、`runId`、`signal`）加上这次调用的 `callId`。
 - 注册表的 `addTool` 就是往它的函数执行环境里 `register`。
+- `open(session)`、`close(session)` 只记下开着的会话（`openSessions()`），不做别的：函数在 harness 的进程里，没有要准备的环境。
+
+### 每会话的执行环境
+
+[ADR 0009](adr/0009-hosted-prerequisites.md) 的参考实现：
+
+- harness 每一轮建一张「这一轮已经 `open` 过的执行环境」的表。第一次把调用交给某个执行环境之前调它的 `open(session, { environment: agent.environment, signal })`，同一轮的后续调用复用那次的结果。`open` 抛错时，这一轮交给它的调用都回 `Executor "x" could not prepare session "s" for tool …: 原因`，模型看得到，这一轮照常往下走；没有 `open` 的执行环境不管。外部执行的工具（`external`）不经这一步。
+- `closeExecutorSessions(executors, session)` 依次调各个执行环境的 `close`，没有的跳过，一个失败不挡别的，返回 `{ closed, failed }`。harness 和编排器都不调它：会话什么时候算结束是应用的事。
+- `ctx-exec` 的 `sessionCwd: true`：`cwd` 下 `session-<会话名 sha256 的前 16 位>` 是这个会话的工作目录，`run_command`、固定命令工具和文件工具都以它为根（越界检查也按它），第一次调用或 `open` 时建，`close` 时连同内容删掉。`open` 收到镜像、包、出站白名单，或者 `env` 里要的变量它的 `env` 选项里没有，抛 `invalid_request`。
+- `ctx-remote`：`POST /executors/:name/sessions/:session/open`、`DELETE /executors/:name/sessions/:session` 转给服务端挂的执行环境，客户端的 `open`、`close` 连不上时按 `retry` 重试（两个都可以重复调）。
 
 ## Harness
 
@@ -871,7 +881,7 @@ sequenceDiagram
 - 只转发调用方的 `content-type`、`accept`，加上 `upstream.headers`；有 `upstream.apiKey` 时设 `Authorization: Bearer <apiKey>`。调用方的令牌不会到上游，上游的密钥不会到调用方。
 - 响应的状态码和头原样转回（去掉逐跳头和 `content-encoding`、`content-length`），正文边收边转，SSE 不缓冲。调用方中途断开时取消上游请求，不算出错。
 - 错误正文是 OpenAI 的形状：`{ "error": { "message", "type" } }`，`type` 是 `authentication_error`（401）、`permission_error`（403）或 `gateway_error`。
-- `accessToken` 是空串时抛错；`startGateway` 听在非本机地址上又没有 `accessToken` 时拒绝启动，除非写 `allowUnauthenticated: true`。`ctx-remote` 的 `startRemote` 是同样的规则。
+- `accessToken` 是空串时抛错；`startGateway` 听在非本机地址上又没有 `accessToken` 时拒绝启动，除非写 `allowUnauthenticated: true`。`ctx-remote` 的 `startRemote` 是同样的规则（给了 `authenticate` 也算有鉴权）。
 - 缺省只听 `127.0.0.1`、随机端口。`createGatewayHandler(options)` 返回 `(req, res) => Promise<void>`，可以挂到已有的 HTTP 服务上。
 
 `replaceHistory(history, { keepSystem })` 生成改写函数：保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `toChatMessages(await history())`（去掉其中的 `system`），再接上调用方从最后一句用户话起的尾巴：这句话，以及它之后的工具调用、工具结果和预填的助手话（调用方没有用户话时只留最后一条预填的助手话）。完整历史的最后一条和这句用户话内容相同时这句不重复带：比的是归一后的内容，字符串和分段写法算一样，图片比地址。完整历史里没配对的工具调用和工具结果先去掉。请求的 `messages` 逐条校验，不合的回 400；改写函数抛错回 500、连不上上游回 502，两种的原因都只进 `onError`，不回给调用方。`withContext(context)` 就是 `replaceHistory(async () => (await context.view()).messages)`；`withContext(builder, session)` 直接用一个 `ContextBuilder` 和会话名。

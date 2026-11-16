@@ -1,14 +1,17 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
-import { lstat, mkdir, open, readdir, readlink, realpath, stat, type FileHandle } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, readlink, realpath, rm, stat, type FileHandle } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
+  CtxError,
   errorOutput,
   isValidToolName,
   type Awaitable,
   type ExecutionContext,
   type Executor,
+  type ExecutorSessionOptions,
   type JsonObject,
   type JsonValue,
   type ToolCall,
@@ -44,6 +47,11 @@ export interface ProcessExecutorOptions {
   /** 工作目录，命令在这里跑，文件工具也只能碰它里面的东西。缺省 `process.cwd()`。 */
   readonly cwd?: string;
   /**
+   * 每个会话一个工作目录：`cwd` 下按会话名的哈希建一个子目录（`sessionCwd(session)`），这个会话的命令和文件工具只在里面，
+   * 碰不到别的会话的。`open` 或第一次调用时建，`close` 时连同内容删掉。缺省 `false`：所有会话共用 `cwd`。见 ADR 0009。
+   */
+  readonly sessionCwd?: boolean;
+  /**
    * 额外的环境变量。子进程不继承整份 `process.env`，只带 `PATH`、`HOME`、`LANG`、`TMPDIR` 这类基础变量
    * （见 `INHERITED_ENV`），再叠上这里给的。
    */
@@ -74,6 +82,8 @@ export interface ProcessExecutorOptions {
 /** 本机子进程执行环境。`tools()` 总是有。 */
 export interface ProcessExecutor extends Executor {
   readonly cwd: string;
+  /** 这个会话的工作目录：`sessionCwd` 时是 `cwd` 下的子目录，否则就是 `cwd`。不建目录。 */
+  sessionCwd(session: string): string;
   tools(): Promise<ToolDefinition[]>;
 }
 
@@ -470,7 +480,22 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
   const shellTool = options.runCommand !== false;
   const files = options.files !== false;
   const commands = options.commands ?? {};
+  const perSession = options.sessionCwd === true;
   let disposed = false;
+  /** 工具说明里的工作目录。 */
+  const place = perSession ? `this session's own working directory (a subdirectory of ${root})` : root;
+
+  function sessionDir(session: string): string {
+    if (!perSession) return root;
+    return join(root, `session-${createHash('sha256').update(session).digest('hex').slice(0, 16)}`);
+  }
+
+  /** 这次调用的工作目录；按会话时没有就建。 */
+  async function baseFor(context: ExecutionContext): Promise<string> {
+    const dir = sessionDir(context.session);
+    if (perSession) await mkdir(dir, { recursive: true });
+    return dir;
+  }
 
   for (const tool of Object.keys(commands)) {
     if (!isValidToolName(tool)) throw new Error(`Invalid tool name "${tool}": use [a-zA-Z0-9_-], at most 64 chars.`);
@@ -488,7 +513,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       name: RUN_COMMAND,
       description:
         `Run one shell command (${shell.join(' ')} "<command>") on this machine and return its exit code, stdout and stderr. ` +
-        `It runs in ${root} unless you pass cwd (a path inside that directory), with a minimal environment ` +
+        `It runs in ${place} unless you pass cwd (a path inside that directory), with a minimal environment ` +
         `(PATH, HOME, LANG and a few more; no secrets), no stdin and no TTY, so interactive programs will hang until the timeout. ` +
         `Each of stdout and stderr is cut at ${kib}; the cut is marked with how many bytes were dropped, so filter large output ` +
         `with head, tail or grep. Default timeout ${seconds(timeoutMs)} (max ${seconds(maxTimeoutMs)} via timeoutMs); on timeout the ` +
@@ -502,7 +527,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
             type: 'string',
             description: 'The command line, e.g. "ls -la src" or "npm test 2>&1 | tail -50".',
           },
-          cwd: { type: 'string', description: `Working directory relative to ${root}. Defaults to it.` },
+          cwd: { type: 'string', description: `Working directory relative to ${place}. Defaults to it.` },
           timeoutMs: {
             type: 'number',
             description: `Timeout in milliseconds, at most ${maxTimeoutMs}. Defaults to ${timeoutMs}.`,
@@ -527,7 +552,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       {
         name: READ_FILE,
         description:
-          `Read a UTF-8 text file inside ${root} (path relative to it). Returns the content; files over ${kib} are cut and the ` +
+          `Read a UTF-8 text file inside ${place} (path relative to it). Returns the content; files over ${kib} are cut and the ` +
           `cut is marked` +
           (shellTool ? `, so read large files in parts with run_command (sed -n, head, tail). ` : `. `) +
           `Only regular files: directories, FIFOs and devices are refused, and so are paths outside the directory.`,
@@ -544,7 +569,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       {
         name: WRITE_FILE,
         description:
-          `Write a UTF-8 text file inside ${root} (path relative to it), creating parent directories. Replaces the file ` +
+          `Write a UTF-8 text file inside ${place} (path relative to it), creating parent directories. Replaces the file ` +
           `unless append is true. Returns how many bytes were written. Paths outside the directory are refused.`,
         inputSchema: {
           type: 'object',
@@ -563,7 +588,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       {
         name: LIST_DIR,
         description:
-          `List a directory inside ${root} (path relative to it, default "."): one entry per line, directories end with "/". ` +
+          `List a directory inside ${place} (path relative to it, default "."): one entry per line, directories end with "/". ` +
           `At most ${MAX_LIST_ENTRIES} entries` +
           (shellTool ? `; use run_command with find for deep trees.` : `.`),
         inputSchema: {
@@ -626,13 +651,13 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     }
   }
 
-  async function runCommand(input: JsonValue, context: ExecutionContext): Promise<ToolOutput> {
+  async function runCommand(input: JsonValue, context: ExecutionContext, base: string): Promise<ToolOutput> {
     const command = stringField(input, 'command');
     if (!command?.trim()) return errorOutput('run_command needs a non-empty "command" string, e.g. {"command": "ls"}.');
-    let cwd = root;
+    let cwd = base;
     const requested = stringField(input, 'cwd');
     if (requested !== undefined) {
-      const resolved = await resolveInside(root, requested);
+      const resolved = await resolveInside(base, requested);
       if ('error' in resolved) return resolved.error;
       cwd = resolved.real;
     }
@@ -642,7 +667,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     return runLaunch({ file, args: [...args, command], display: command }, cwd, limitMs, context);
   }
 
-  async function runFixed(spec: CommandTool, tool: string, input: JsonValue, context: ExecutionContext) {
+  async function runFixed(spec: CommandTool, tool: string, input: JsonValue, context: ExecutionContext, base: string) {
     let command: string | readonly string[];
     try {
       command = spec.command(input);
@@ -652,11 +677,11 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     const limitMs = spec.timeoutMs ?? timeoutMs;
     if (typeof command === 'string') {
       const [file, ...args] = shell;
-      return runLaunch({ file, args: [...args, command], display: command }, root, limitMs, context);
+      return runLaunch({ file, args: [...args, command], display: command }, base, limitMs, context);
     }
     const [file, ...args] = command;
     if (!file) return errorOutput(`Tool ${tool} produced an empty command.`);
-    return runLaunch({ file, args, display: command.join(' ') }, root, limitMs, context);
+    return runLaunch({ file, args, display: command.join(' ') }, base, limitMs, context);
   }
 
   /** 过 `allowFile`；被拒绝时返回给模型看的错误。 */
@@ -708,10 +733,10 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     }
   }
 
-  async function readText(input: JsonValue, context: ExecutionContext): Promise<ToolOutput> {
+  async function readText(input: JsonValue, context: ExecutionContext, base: string): Promise<ToolOutput> {
     const path = stringField(input, 'path');
     if (!path) return errorOutput('read_file needs a "path" string relative to the working directory.');
-    const resolved = await resolveInside(root, path);
+    const resolved = await resolveInside(base, path);
     if ('error' in resolved) return resolved.error;
     const denied = await fileDenied(READ_FILE, 'read', path, resolved);
     if (denied) return denied;
@@ -721,20 +746,20 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       return await orAborted(readInside(resolved, path, context.signal, cancelled), context.signal, cancelled);
     } catch (error) {
       if (errorCode(error) === 'ENOENT') {
-        return errorOutput(`File not found: ${path} (in ${root}). Use list_dir to see what is there.`);
+        return errorOutput(`File not found: ${path} (in ${shown(root, base)}). Use list_dir to see what is there.`);
       }
       if (errorCode(error) === 'EISDIR') return errorOutput(`${path} is a directory; use list_dir.`);
       return errorOutput(`Could not read ${path}: ${messageOf(error)}`);
     }
   }
 
-  async function writeText(input: JsonValue): Promise<ToolOutput> {
+  async function writeText(input: JsonValue, base: string): Promise<ToolOutput> {
     const path = stringField(input, 'path');
     const content = stringField(input, 'content');
     if (!path || content === undefined) {
       return errorOutput('write_file needs "path" (relative to the working directory) and "content" strings.');
     }
-    const resolved = await resolveInside(root, path);
+    const resolved = await resolveInside(base, path);
     if ('error' in resolved) return resolved.error;
     const denied = await fileDenied(WRITE_FILE, 'write', path, resolved);
     if (denied) return denied;
@@ -770,9 +795,9 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     }
   }
 
-  async function listDir(input: JsonValue): Promise<ToolOutput> {
+  async function listDir(input: JsonValue, base: string): Promise<ToolOutput> {
     const path = stringField(input, 'path') ?? '.';
-    const resolved = await resolveInside(root, path);
+    const resolved = await resolveInside(base, path);
     if ('error' in resolved) return resolved.error;
     const denied = await fileDenied(LIST_DIR, 'read', path, resolved);
     if (denied) return denied;
@@ -797,7 +822,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       return { type: 'text', text: lines.join('\n') };
     } catch (error) {
       if (errorCode(error) === 'ENOENT') {
-        return errorOutput(`Directory not found: ${path} (in ${root}). List "." to see what is there.`);
+        return errorOutput(`Directory not found: ${path} (in ${shown(root, base)}). List "." to see what is there.`);
       }
       return errorOutput(`Could not list ${path}: ${messageOf(error)}`);
     }
@@ -806,6 +831,7 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
   return {
     name,
     cwd: root,
+    sessionCwd: sessionDir,
     async tools() {
       return definitions.map((definition) => ({ ...definition }));
     },
@@ -813,13 +839,20 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
       if (disposed) return errorOutput(`Executor "${name}" has been disposed; tool "${call.name}" did not run.`);
       if (context.signal?.aborted) return errorOutput(`Aborted before tool "${call.name}" ran.`);
       try {
-        if (call.name === RUN_COMMAND && shellTool) return await runCommand(call.input, context);
+        const known =
+          (call.name === RUN_COMMAND && shellTool) ||
+          Object.hasOwn(commands, call.name) ||
+          (files && [READ_FILE, WRITE_FILE, LIST_DIR].includes(call.name));
+        const base = known ? await baseFor(context) : root;
+        if (call.name === RUN_COMMAND && shellTool) return await runCommand(call.input, context, base);
         const fixed = commands[call.name];
-        if (fixed && Object.hasOwn(commands, call.name)) return await runFixed(fixed, call.name, call.input, context);
+        if (fixed && Object.hasOwn(commands, call.name)) {
+          return await runFixed(fixed, call.name, call.input, context, base);
+        }
         if (files) {
-          if (call.name === READ_FILE) return await readText(call.input, context);
-          if (call.name === WRITE_FILE) return await writeText(call.input);
-          if (call.name === LIST_DIR) return await listDir(call.input);
+          if (call.name === READ_FILE) return await readText(call.input, context, base);
+          if (call.name === WRITE_FILE) return await writeText(call.input, base);
+          if (call.name === LIST_DIR) return await listDir(call.input, base);
         }
       } catch (error) {
         return errorOutput(`Tool "${call.name}" failed: ${messageOf(error)}`);
@@ -837,5 +870,43 @@ export function createProcessExecutor(options: ProcessExecutorOptions = {}): Pro
     async dispose() {
       disposed = true;
     },
+    ...(perSession
+      ? {
+          async open(session: string, sessionOptions?: ExecutorSessionOptions) {
+            unsupported(name, sessionOptions?.environment, env);
+            await mkdir(sessionDir(session), { recursive: true });
+          },
+          async close(session: string) {
+            await rm(sessionDir(session), { recursive: true, force: true });
+          },
+        }
+      : {}),
   };
+}
+
+/** 本机子进程做不到镜像、装包、出站白名单；要的环境变量没配也不行。 */
+function unsupported(
+  name: string,
+  environment: ExecutorSessionOptions['environment'],
+  env: Readonly<Record<string, string | undefined>>,
+): void {
+  if (!environment) return;
+  const asked = [
+    environment.image !== undefined ? `image "${environment.image}"` : undefined,
+    environment.packages !== undefined && Object.keys(environment.packages).length > 0 ? 'packages' : undefined,
+    environment.network?.allow !== undefined ? 'network.allow' : undefined,
+  ].filter((item) => item !== undefined);
+  if (asked.length > 0) {
+    throw new CtxError(
+      'invalid_request',
+      `Executor "${name}" runs local processes and cannot provide ${asked.join(', ')}.`,
+    );
+  }
+  const missing = (environment.env ?? []).filter((key) => env[key] === undefined);
+  if (missing.length > 0) {
+    throw new CtxError(
+      'invalid_request',
+      `Executor "${name}" has no value for environment variable(s) ${missing.join(', ')}; give them in its env option.`,
+    );
+  }
 }

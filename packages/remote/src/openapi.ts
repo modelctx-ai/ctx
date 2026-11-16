@@ -129,6 +129,21 @@ const OPERATIONS: readonly Operation[] = [
   },
   {
     method: 'post',
+    path: '/executors/{name}/sessions/{session}/open',
+    tag: '执行环境',
+    summary: 'open：为一个会话准备好，可以重复调',
+    body: shape({}, { environment: ref('EnvironmentSpec') }),
+    response: empty,
+  },
+  {
+    method: 'delete',
+    path: '/executors/{name}/sessions/{session}',
+    tag: '执行环境',
+    summary: 'close',
+    response: empty,
+  },
+  {
+    method: 'post',
     path: '/executors/{name}/execute',
     tag: '执行环境',
     summary: 'execute：断开即中止；等结果时先发 200 和心跳换行',

@@ -431,6 +431,21 @@ interface Executor {
   execute(call: ToolCall, context: ExecutionContext): Promise<ToolOutput>;
   provision?(): Promise<void>; // 可以重复调
   dispose?(): Promise<void>;
+  /** 为一个会话准备好（起容器、建工作目录）；可以重复调。满足不了 environment 时抛 invalid_request。 */
+  open?(session: string, options?: ExecutorSessionOptions): Promise<void>;
+  close?(session: string): Promise<void>; // 可以重复调，之后还能再 open
+}
+interface ExecutorSessionOptions {
+  environment?: EnvironmentSpec;
+  signal?: AbortSignal;
+}
+interface EnvironmentSpec {
+  name?: string;
+  image?: string; // 镜像或模板
+  packages?: Record<string, string[]>; // 按包管理器：{ pip: ['pandas'] }
+  network?: { allow?: string[] }; // 出站白名单
+  env?: string[]; // 要哪些环境变量的名字，值由部署方给
+  meta?: JsonObject; // 实现自己的配置
 }
 ```
 
@@ -440,7 +455,9 @@ interface Executor {
   - **输出**由执行环境截断或分页，再交给模型：它知道怎么截才有用（命令输出留头尾、文件按行分页）。harness 另兜一层底：一次结果超过上限（参考实现缺省 20 万字符）时截断并注明省略了多少，免得哪个执行环境忘了就把上下文塞满。纯函数 `limitToolOutput(output, maxChars)`：文字和错误信息直接截，`json` 序列化后超了换成截断的文字，`content` 各段合起来算、放不下的内联文件换成一句说明。
 - 和 AI SDK 互转：`toolOutputToAiSdk(output)` 得到工具结果的 `output`（`text`、`json`、`error-text`、`error-json`、`content`），`toolOutputFromAiSdk` 转回来。协议 → AI SDK → 协议不丢信息：只有文字的错误是 `error-text`，带 `retryable` 或 `data` 的是 `error-json` 的 `{ message, retryable?, data? }`；`URL` 规范化会改写法时原串放进 `originalUrl`。反方向：二进制变 base64，已弃用的 `image-data`、`file-url` 等换成 `file`，`execution-denied` 变成错误，任意形状的 `error-json` 整个放进 `data`，`providerOptions` 和 `custom` 分段丢掉。
 - `errorOutput(message, { retryable?, data? })` 构造错误结果。
-- 实现：进程内函数（核心包）、MCP 服务器（`ctx-mcp`）、本机子进程（`ctx-exec`）、HTTP 远端（`ctx-remote`）。
+- **每会话的执行环境（[ADR 0009](adr/0009-hosted-prerequisites.md)）。** `provision`、`dispose` 管整个执行环境，`open`、`close` 管一个会话：每个会话一个容器、一个工作目录。harness 在一轮里第一次把调用交给某个执行环境之前调一次它的 `open(session, { environment: agent.environment })`；`open` 抛错时这一轮交给它的调用都得到错误结果，模型看得到原因，这一轮照常往下走。会话什么时候结束由应用决定，框架不猜：应用调各个执行环境的 `close`（参考实现的 `closeExecutorSessions(executors, session)`）。闲置回收是执行环境自己的策略。`EnvironmentSpec` 满足不了（没有那个镜像、不支持白名单、要的变量没配）时 `open` 抛 `invalid_request`，不静默降级。
+- **凭证不进执行环境。** 凭证不出现在 `ToolCall`、`ExecutionContext`、`AgentSpec` 里，日志里也就没有；`EnvironmentSpec.env` 只有变量的名字。需要凭证的工具放在 harness 这一侧执行（函数执行环境、MCP 服务器），模型生成的代码碰不到；一定要在沙箱里用的，由部署方在出口替换：沙箱里只有占位符，出站代理换成真的。交给子进程的环境变量模型生成的代码读得到。
+- 实现：进程内函数（核心包）、MCP 服务器（`ctx-mcp`）、本机子进程（`ctx-exec`，`sessionCwd` 时每个会话一个工作目录）、HTTP 远端（`ctx-remote`）。
 - 远端执行环境有两种接法：harness 调它（它是服务），或它从 harness 领工作（它是只需出站连接的 worker，像 Managed Agents 的自托管沙箱）。协议相同，`ctx-remote` 先做前者。
 
 ## Harness
@@ -478,6 +495,7 @@ interface AgentSpec {
   toolChoice?: ToolChoice; // 缺省 auto
   permissions?: ToolPermissions; // 按工具名的允许、询问、拒绝
   budget?: RunBudget; // 整轮的上限，在步骤之间检查
+  environment?: EnvironmentSpec; // 交给执行环境的 open，见「执行环境」
 }
 interface OutputSpec {
   schema: JsonObject; // JSON Schema
@@ -602,6 +620,7 @@ interface Harness {
   - `toolChoice`：`auto`、`none`、`required`，或者 `{ tool }` 点名一个；点名的工具不在这一轮的工具里时 `invalid_request`。没有工具时忽略。
   - `permissions`：按工具名的 `allow`、`ask`、`deny`（`default` 缺省 `allow`；纯函数 `toolPermission(permissions, name)` 给出一个工具的）。`deny` 的不执行，模型看到拒绝，这一轮继续；`ask` 的和外部执行的工具一样，写下调用后以 `requires_action` 停下，应用确认了就让执行方执行、追加结果，不确认就追加一条错误结果（`toolResultEntry(call, errorOutput(...))`），再不带输入跑一轮。`Hooks.beforeTool` 在 `allow` 之后照常调。
   - `budget`：`maxTotalTokens`（所有步骤的 `totalTokens` 之和，没有时用输入加输出）、`maxDurationMs`（墙钟）。只在步骤之间检查：超了就不再走下一步，`stopReason` 是 `max_budget`；正在进行的模型调用和工具不会被打断，硬上限用 `settings.timeoutMs`。成本的上限不在这里：价格表是应用的事，用 `meta.step` 的用量自己算。
+  - `environment`：这个 agent 要的执行环境，harness 原样交给执行环境的 `open`（见上面「执行环境」）。记进 `ctx.run.started`。
   - 这几项的值不对（预算不是正数、权限不是三个值之一、`output.schema` 不是对象）时这一轮以 `invalid_request` 结束。不支持某一项的 harness 不能静默忽略：要么以 `invalid_request` 结束，要么在一致性等级里注明。
 - **工具调用经日志往返（[ADR 0008](adr/0008-tool-calls-through-the-log.md)）。** 绑定到「外部执行环境」的工具（由 harness 的实现配置，参考实现是 `createHarness({ external })`）交给模型，但不在 harness 这一侧执行：模型调用了它们，这一轮写下调用后以 `requires_action` 结束，`pending` 列出这些调用，不占会话。执行方追加结果：`toolResultEntry(call, output)` 是一条 `tool` 消息，带幂等键 `ctx.tool-result:<id>`（`TOOL_RESULT_KEY_PREFIX`），同一次调用只记一条。结果齐了以后，下一轮不带输入接着跑。`pendingToolCalls(entries)` 是纯函数，给出等待中的调用（`PendingToolCall`：`call`、`runId`、带调用的条目的 `seq`）：以 `requires_action` 结束的那一轮留下的，去掉后面已经追加了结果的；之后又有运行以别的原因结束，之前等着的就作废。结果一直不来时由应用决定：照常提交下一轮，投影给缺结果的调用补一条「没有记录到结果」。
 - **超窗兜底（`AgentSpec.context.overflow`，缺省关着）。** `build` 之后 harness 估算整次调用（`PreparedCall.tokens`；builder 不给时用 `estimateTokens`、`estimateTextTokens` 自己算指令、消息和交给模型的工具定义），不超过 `maxTokens` 就照常往下走。超了按 `strategy`：
@@ -689,7 +708,7 @@ interface RecoveredRun {
 - 一个作用域读不到、搜不到、改不了、删不掉另一个作用域的东西：`list`、`search`、`head`、`core.get`、`core.history` 只看自己的；别的作用域的 `id` 和不存在的 `id` 一样对待（`close`、`supersede`、`cite`、`confirm`、`retire` 抛 `not_found`，`settle`、`fail`、`retry`、`touch`、`archive`、`restore`、`reopen`、`forget` 跳过），`supersededBy` 也不能指向别的作用域。实现给 `search` 建的索引也要按作用域分开。
 - 名字是绝对的，不嵌套：`store.scope('a').scope('b')` 就是 `store.scope('b')`。从没写过的作用域是空的，不用先建。名字不合法（`checkMemoryScope`）抛 `invalid_request`。
 - `id` 在整份存储里不重复，不只是在一个作用域里。
-- 作用域是隔离，不是鉴权：谁能用哪个作用域由应用决定（远端的 `/memory/*` 只认访问令牌，拿到令牌就能用任何作用域）。
+- 作用域是隔离，不是鉴权：谁能用哪个作用域由应用决定（远端的 `/memory/*` 只配了访问令牌时，拿到令牌就能用任何作用域；配了主体时按它的 `memoryScopes` 查，见「线上形态」）。
 - 证据（`SourceRef`）指向会话日志，会话本身不分作用域：哪个会话归哪个作用域由应用保证，参考实现的 `createMemory` 有 `ownsSession` 可以再挡一道。
 
 ```ts
@@ -1018,7 +1037,7 @@ score        = 0.6 × similarity + 0.4 × R      rankFacts
 | 契约测试                          | 工厂                                                                    | 覆盖                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | --------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `describeSessionStoreContract`    | `({ now }) => SessionStore`                                             | 存进去的是拷贝、会话名（空串、`.`、`..` 每个方法都拒绝，别的名字往返）、排序、同一时刻、去重、一批里有重复时其余照写、并发两批不交错、`after`/`last`/`limit`/`types`/`kinds`、往返、全是 JSON 的消息、`expectSeq`（对得上才写、冲突整批不写、先于去重、并发恰好一个成功）、`clear`、擦除（`truncate`、`remove`、`redact` 的条数和剩下的条目、`ctx.erased` 记录、什么都没动时不留记录、末尾前进和旧 `expectSeq` 冲突、`id`/`key` 让不让出来、和并发 `append` 不交错）、`sessions` 的升序和翻页、导出再导入（另一个存储里 `covers` 指对位置、投影一致、重复导入只有一份、截断的文件接得上、同一个存储里复制、擦除记录的位置）、`watch?` 的读已有、读新写入、读擦除记录、中止 |
-| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `describeExecutorContract`        | `() => { executor, echo }`                                              | 有名字、`tools?()` 列出回显工具并绑定自己、`execute` 回显且能 JSON 往返、未知工具和已中止的 `signal` 返回 `{ type: 'error' }` 不抛、`provision?` 可重复、`open?`、`close?` 可重复且 `close` 之后能再 `open`                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `describeToolRegistryContract`    | `() => ToolRegistry`                                                    | 增查和顺序、名字校验、同名和 `replace`、`remove`/`removeSource`、`select` 与 `selectTools` 一致                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、每一步结束就落日志（工具调用之后模型出错，前一步留在日志里）、`inputKey` 重试、不带 `inputKey` 的失败重试不再记输入、模型报上下文过长是 `context_overflow`、`context.overflow`（超了选 `error` 不调模型、`trim` 裁到放得下）、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响                                                                                                                                                                                                                   |
 | `describeContextBuilderContract`  | `({ script }) => { builder, store }`                                    | `build` 的消息顺序（历史、`input`、`prompt`）、指令、工具名单、不改日志、全是 JSON；不认识的投影名 `not_found`；`view` 里没有规则的事件不可见、摘要代替它盖住的条目；`window` 的 `maxMessages`、`{}`、`truncate`；`tokens?`；`compact?` 的不够长、写摘要和 `ctx.compacted`、被截断不写、超过 `maxInputTokens` 分段；`compactDetailed?` 的 `status`                                                                                                                                                                                                                                                                                                                         |
@@ -1072,6 +1091,8 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 | 执行环境 | （列出名字）      | `GET /executors`                                                   | → `{ executors }`                                                                                                                           |
 |          | `tools`           | `GET /executors/:name/tools`                                       | → `{ tools }`                                                                                                                               |
 |          | `execute`         | `POST /executors/:name/execute`                                    | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止                                                                         |
+|          | `open`            | `POST /executors/:name/sessions/:session/open`                     | `{ environment? }` → `{}`；执行环境没有 `open` 时什么都不做                                                                                 |
+|          | `close`           | `DELETE /executors/:name/sessions/:session`                        | → `{}`                                                                                                                                      |
 | Harness  | `run`             | `POST /runs`                                                       | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`                                                                             |
 |          | `stream`          | `POST /runs?stream=1`                                              | 同上 → NDJSON `RunEvent`；断开即中止                                                                                                        |
 |          | 取消（`signal`）  | `DELETE /runs/:runId`                                              | → `{ cancelled }`                                                                                                                           |
@@ -1088,6 +1109,7 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 几条跨路径的规则：
 
 - 等很久才有结果的两个请求（`POST /runs`、`POST /executors/:name/execute`）会在结果出来之前先发 200 的响应头，隔一段时间写一个换行当心跳，最后才是 JSON 正文（JSON 允许前面有空白）。头发出去之后才出的错改不了状态码，正文是 `{ error, status }`，`status` 是本来该回的状态码。
+- **主体（[ADR 0009](adr/0009-hosted-prerequisites.md)）。** 服务端可以把请求映射到一个主体 `Principal { id, sessionPrefixes?, memoryScopes?, admin? }`（`ctx-remote` 的 `authenticate`，和单一的访问令牌二选一）。认不出是 401。带会话的入口都按 `sessionPrefixes` 查，超出的回 403 `permission_error`：会话的路径、`execute` 的 `context.session`、执行环境会话的 `open` 和 `close`、提交运行时的 `session`、`parent.session` 和 `agent.context.inherit.session`、按 `runId` 取消和查状态时那一轮的会话。`GET /sessions` 只列范围里的，编排器的事件流只发范围里的；`/memory/*` 的作用域按 `memoryScopes` 查；`recover` 横跨所有会话，只有 `admin` 能调。身份怎么来（JWT、mTLS、网关传来的头）是部署方的事。
 - 到了并发上限回 429（`type: rate_limit_error`，`retryable: true`）。
 - 500 的 `message` 只有一句通用的话和一个编号，原文在服务端的日志里；协议错误（`invalid_request`、`not_found`、`conflict`）照旧带着自己的 `type` 和文字。
 - 客户端可以放心重试的：所有 `GET`、带着 `id` 的 `append`（存储按 `id` 去重）、两个取消。提交运行、执行工具、记忆的写入不幂等，不重试。会话的 `clear` 和三个擦除重发一遍不会多删，但第二次回的条数是 0，本包的客户端不自动重试，调用方想重试可以自己重发。

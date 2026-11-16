@@ -13,7 +13,10 @@ import { createRemoteHandler, type RemoteHandler, type RemoteHandlerOptions } fr
 import { parse, stringify } from './wire.ts';
 
 /** `create` 给出的一个实例：挂哪些组件（和 `createRemoteHandler` 的选项一样），以及给一致性测试的 agent、回显工具。 */
-export interface ConformanceInstanceOptions extends Omit<RemoteHandlerOptions, 'basePath' | 'accessToken'> {
+export interface ConformanceInstanceOptions extends Omit<
+  RemoteHandlerOptions,
+  'basePath' | 'accessToken' | 'authenticate'
+> {
   /** harness、编排器的契约用的 agent：模型名对着按 `setup.script` 回答的模型。 */
   readonly agent?: Pick<AgentSpec, 'model'> & Partial<AgentSpec>;
   /** 执行环境的契约用：哪个执行环境、它的回显工具叫什么。 */

@@ -145,6 +145,36 @@ export interface Executor {
   provision?(): Promise<void>;
   /** 释放。之后不再执行。 */
   dispose?(): Promise<void>;
+  /**
+   * 为一个会话准备好（起容器、建工作目录）。可以重复调：已经准备好就什么都不做。harness 在一轮里第一次把调用交给它之前调一次。
+   * 满足不了 `environment`（没有那个镜像、不支持出站白名单）时抛 `invalid_request`，不静默降级。见 ADR 0009。
+   */
+  open?(session: string, options?: ExecutorSessionOptions): Promise<void>;
+  /** 释放这个会话的资源。可以重复调；之后还能再 `open`。会话什么时候结束由应用决定。 */
+  close?(session: string): Promise<void>;
+}
+
+export interface ExecutorSessionOptions {
+  readonly environment?: EnvironmentSpec;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * 执行环境的描述，全是 JSON（`AgentSpec.environment`）。只有几项通用的，各实现按自己能做的解释，做不到就在 `open` 里报错。
+ * 凭证不在这里：`env` 只是要哪些变量的名字，值由部署方给（见 ADR 0009）。
+ */
+export interface EnvironmentSpec {
+  readonly name?: string;
+  /** 镜像或模板，例如容器镜像名。 */
+  readonly image?: string;
+  /** 要装的包，按包管理器：`{ pip: ['pandas'], apt: ['ffmpeg'] }`。 */
+  readonly packages?: Readonly<Record<string, readonly string[]>>;
+  /** 出站网络：`allow` 是允许的主机名，不给是实现的缺省。 */
+  readonly network?: { readonly allow?: readonly string[] };
+  /** 要哪些环境变量的名字。 */
+  readonly env?: readonly string[];
+  /** 实现自己的配置。 */
+  readonly meta?: JsonObject;
 }
 
 // ---- 和 AI SDK 互转 ----

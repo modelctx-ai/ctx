@@ -20,6 +20,8 @@ import {
   type EntryType,
   type ErrorInfo,
   type ExecutionContext,
+  type Awaitable,
+  type EnvironmentSpec,
   type Executor,
   type Harness,
   type ListOptions,
@@ -74,6 +76,11 @@ export interface RemoteHandlerOptions {
    */
   readonly accessToken?: string;
   /**
+   * 鉴权扩展点：把请求映射到主体，返回 `undefined` 回 401。和 `accessToken` 二选一。主体限定能碰的会话前缀和记忆作用域，
+   * 超出的回 403 `permission_error`（见 `Principal`、ADR 0009）。身份怎么来（JWT、mTLS、网关传来的头）由部署方决定。
+   */
+  readonly authenticate?: (request: IncomingMessage) => Awaitable<Principal | undefined>;
+  /**
    * 只接受这些 Host 头（`host:port`，不分大小写），别的回 403，挡 DNS rebinding。`startRemote` 缺省用监听地址，
    * 监听本机时再加 `localhost`、`127.0.0.1`、`[::1]`；`createRemoteHandler` 不知道端口，不给就不查。
    */
@@ -113,6 +120,19 @@ export interface RemoteHandlerOptions {
 }
 
 export type RemoteHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+
+/**
+ * `authenticate` 认出的调用方，全是 JSON。不给的限制是不限：只有 `id` 的主体能碰所有会话和作用域，只是不能 `recover`。
+ */
+export interface Principal {
+  readonly id: string;
+  /** 能碰的会话名前缀，按字面匹配。不给是全部，空数组是一个都不行。 */
+  readonly sessionPrefixes?: readonly string[];
+  /** 能碰的记忆作用域。不给是全部。 */
+  readonly memoryScopes?: readonly string[];
+  /** 能不能做横跨所有会话的事（`POST /orchestrator/recover`）。 */
+  readonly admin?: boolean;
+}
 
 export interface StartRemoteOptions extends RemoteHandlerOptions {
   /** 缺省 `127.0.0.1`。不是本机地址时必须给 `accessToken`，或者写明 `allowUnauthenticated: true`。 */
@@ -244,6 +264,57 @@ async function readBody(req: IncomingMessage, limit: number): Promise<unknown> {
   }
 }
 
+function denied(message: string): never {
+  return fail(403, message, 'permission_error');
+}
+
+/** 主体能不能碰这个会话；没有主体（没配 `authenticate`）时都能。 */
+function canSee(who: Principal | undefined, session: string): boolean {
+  return !who?.sessionPrefixes || who.sessionPrefixes.some((prefix) => session.startsWith(prefix));
+}
+
+function checkSession(who: Principal | undefined, session: string): void {
+  if (!canSee(who, session)) denied(`principal "${who!.id}" may not access session "${session}"`);
+}
+
+function checkScope(who: Principal | undefined, scope: string): void {
+  if (who?.memoryScopes && !who.memoryScopes.includes(scope)) {
+    denied(`principal "${who.id}" may not access memory scope "${scope}"`);
+  }
+}
+
+/** 一轮会碰到的会话：它自己、父运行的会话、继承上下文的会话。 */
+function checkRunSessions(who: Principal | undefined, request: WireRunRequest): void {
+  checkSession(who, request.session);
+  if (request.parent) checkSession(who, request.parent.session);
+  const inherit = request.agent.context?.inherit;
+  if (inherit) checkSession(who, inherit.session);
+}
+
+/**
+ * `GET /sessions` 按主体的前缀收窄：问的前缀落在某个允许的前缀里就照问，允许的前缀落在问的前缀里就换成允许的，
+ * 合起来按名字排序再截 `limit`。
+ */
+async function visibleSessions(
+  store: SessionStore,
+  who: Principal | undefined,
+  asked: SessionsOptions,
+): Promise<string[]> {
+  if (!who?.sessionPrefixes) return store.sessions(asked);
+  const wanted = asked.prefix ?? '';
+  const prefixes = new Set<string>();
+  for (const allowed of who.sessionPrefixes) {
+    if (wanted.startsWith(allowed)) prefixes.add(wanted);
+    else if (allowed.startsWith(wanted)) prefixes.add(allowed);
+  }
+  const found = new Set<string>();
+  for (const prefix of prefixes) {
+    for (const name of await store.sessions({ ...asked, prefix })) found.add(name);
+  }
+  const names = [...found].toSorted();
+  return asked.limit === undefined ? names : names.slice(0, Math.max(0, Math.floor(asked.limit)));
+}
+
 function authorized(req: IncomingMessage, token: string | undefined): boolean {
   if (!token) return true;
   // 认证方案不分大小写（RFC 9110）。
@@ -267,6 +338,15 @@ const LOOPBACK = ['localhost', '127.0.0.1', '::1'];
 
 function isLoopback(host: string): boolean {
   return LOOPBACK.includes(host) || host.startsWith('127.');
+}
+
+/** `accessToken` 和 `authenticate` 二选一：两个都给时不知道该信哪个。 */
+function checkAuthOptions(options: RemoteHandlerOptions): void {
+  if (options.accessToken !== undefined && options.authenticate !== undefined) {
+    throw new Error(
+      'Pass either `accessToken` or `authenticate`, not both: `authenticate` can check the token itself.',
+    );
+  }
 }
 
 /** 给了 `accessToken` 却是空的：当成配置写错，不当成「不要鉴权」。 */
@@ -611,8 +691,9 @@ async function resultFromLog(store: SessionStore, session: string, runId: string
  * 可以挂到已有 HTTP 服务上的处理函数。给了哪些组件就挂哪些路径，其余 404。路径见包说明和 docs/protocol.md「线上形态」。
  */
 export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandler {
-  const { store, harness, orchestrator, memory } = options;
+  const { store, harness, orchestrator, memory, authenticate } = options;
   checkAccessToken(options.accessToken);
+  checkAuthOptions(options);
   const executors = executorTable(options.executors);
   const basePath = normalizePath(options.basePath ?? '');
   const limit = options.maxBodyBytes ?? 4 * 1024 * 1024;
@@ -632,8 +713,11 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   };
 
   /** 正在跑的 harness 运行：`DELETE /runs/:id` 和断开都会中止它。 */
-  const activeRuns = new Map<string, AbortController>();
-  const pendingCancels = new Map<string, ReturnType<typeof setTimeout>>();
+  const activeRuns = new Map<string, { readonly controller: AbortController; readonly session: string }>();
+  const pendingCancels = new Map<
+    string,
+    { readonly timer: ReturnType<typeof setTimeout>; readonly by: Principal | undefined }
+  >();
   /** 经这个服务提交给编排器的运行，留着结果给客户端取。 */
   const submitted = new Map<string, SubmittedRun>();
   /** 其中已经结束的，按结束的先后：超过 `MAX_RETAINED_RESULTS` 时最早的先丢。 */
@@ -723,14 +807,22 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
 
   // ---- 会话 ----
 
-  async function sessions(method: string, rest: string[], url: URL, req: IncomingMessage, res: ServerResponse) {
+  async function sessions(
+    method: string,
+    rest: string[],
+    url: URL,
+    req: IncomingMessage,
+    res: ServerResponse,
+    who: Principal | undefined,
+  ) {
     const sessionStore = need(store, 'a session store');
     const [session, sub, tail, extra] = rest;
     if (session === undefined) {
       if (method !== 'GET') fail(405, 'use GET /sessions');
-      sendJson(res, 200, { sessions: await sessionStore.sessions(sessionsOptionsOf(url.searchParams)) });
+      sendJson(res, 200, { sessions: await visibleSessions(sessionStore, who, sessionsOptionsOf(url.searchParams)) });
       return;
     }
+    checkSession(who, session);
     if (sub === undefined) {
       if (method !== 'DELETE') fail(405, 'use DELETE /sessions/:session');
       sendJson(res, 200, { deleted: await sessionStore.clear(session) });
@@ -832,7 +924,14 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
 
   // ---- 执行环境 ----
 
-  async function executorRoutes(method: string, rest: string[], url: URL, req: IncomingMessage, res: ServerResponse) {
+  async function executorRoutes(
+    method: string,
+    rest: string[],
+    url: URL,
+    req: IncomingMessage,
+    res: ServerResponse,
+    who: Principal | undefined,
+  ) {
     if (executors.size === 0) fail(404, 'this server does not serve executors');
     const [name, action, extra] = rest;
     if (name === undefined) {
@@ -842,6 +941,27 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     }
     const executor = executors.get(name);
     if (!executor) fail(404, `no executor named "${name}"; available: ${[...executors.keys()].join(', ')}`);
+    if (action === 'sessions') {
+      // 每会话的生命周期（ADR 0009）：执行环境没有 `open`、`close` 时什么都不做。
+      const [, , session, verb, more] = rest;
+      if (session === undefined || more !== undefined) fail(404, `not found: ${url.pathname}`);
+      checkSession(who, session);
+      if (verb === 'open') {
+        if (method !== 'POST') fail(405, 'use POST /executors/:name/sessions/:session/open');
+        const body = await readBody(req, limit);
+        const environment = isObject(body) ? body['environment'] : undefined;
+        if (environment !== undefined && !isObject(environment))
+          fail(400, 'environment must be an EnvironmentSpec object');
+        await executor.open?.(session, environment ? { environment: environment as unknown as EnvironmentSpec } : {});
+        sendJson(res, 200, {});
+        return;
+      }
+      if (verb !== undefined) fail(404, `not found: ${url.pathname}`);
+      if (method !== 'DELETE') fail(405, 'use DELETE /executors/:name/sessions/:session');
+      await executor.close?.(session);
+      sendJson(res, 200, {});
+      return;
+    }
     if (extra !== undefined) fail(404, `not found: ${url.pathname}`);
     if (action === 'tools') {
       if (method !== 'GET') fail(405, 'use GET /executors/:name/tools');
@@ -857,6 +977,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
       fail(400, 'request body must be { "call": { "id", "name", "input" }, "context": { "session", "runId"? } }');
     }
     if (!isObject(context) || typeof context['session'] !== 'string') fail(400, 'context.session must be a string');
+    checkSession(who, context['session']);
     if (executions >= maxExecutions) busy('tool executions', maxExecutions);
     const controller = new AbortController();
     res.on('close', () => {
@@ -882,55 +1003,64 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
 
   // ---- Harness ----
 
-  function cancelLater(runId: string): void {
+  function cancelLater(runId: string, by: Principal | undefined): void {
     if (pendingCancels.size >= MAX_PENDING_CANCELS) {
       const [oldest] = pendingCancels.keys();
       if (oldest !== undefined) {
-        clearTimeout(pendingCancels.get(oldest));
+        clearTimeout(pendingCancels.get(oldest)?.timer);
         pendingCancels.delete(oldest);
       }
     }
     const timer = setTimeout(() => pendingCancels.delete(runId), PENDING_CANCEL_MS);
     timer.unref?.();
-    pendingCancels.set(runId, timer);
+    pendingCancels.set(runId, { timer, by });
   }
 
-  function takePendingCancel(runId: string): boolean {
-    const timer = pendingCancels.get(runId);
-    if (timer === undefined) return false;
-    clearTimeout(timer);
+  function takePendingCancel(runId: string, session: string): boolean {
+    const pending = pendingCancels.get(runId);
+    if (pending === undefined) return false;
+    clearTimeout(pending.timer);
     pendingCancels.delete(runId);
-    return true;
+    return canSee(pending.by, session);
   }
 
-  async function runs(method: string, rest: string[], url: URL, req: IncomingMessage, res: ServerResponse) {
+  async function runs(
+    method: string,
+    rest: string[],
+    url: URL,
+    req: IncomingMessage,
+    res: ServerResponse,
+    who: Principal | undefined,
+  ) {
     const runner = need(harness, 'a harness');
     const [runId, extra] = rest;
     if (runId !== undefined) {
       if (extra !== undefined) fail(404, `not found: ${url.pathname}`);
       if (method !== 'DELETE') fail(405, 'use DELETE /runs/:runId');
       const active = activeRuns.get(runId);
-      if (active && !active.signal.aborted) {
-        active.abort(new Error('Run cancelled.'));
+      if (active) checkSession(who, active.session);
+      if (active && !active.controller.signal.aborted) {
+        active.controller.abort(new Error('Run cancelled.'));
         sendJson(res, 200, { cancelled: true });
         return;
       }
-      // 请求可能还在路上：记下来，它到了就以已中止开始。
-      if (!active) cancelLater(runId);
+      // 请求可能还在路上：记下来，它到了就以已中止开始（只在那一轮的会话也是这个主体能碰的时候）。
+      if (!active) cancelLater(runId, who);
       sendJson(res, 200, { cancelled: false });
       return;
     }
     if (method !== 'POST') fail(405, 'use POST /runs');
     const { aborted, ...wire } = runRequestOf(await readBody(req, limit), agentPolicy);
+    checkRunSessions(who, wire);
     const id = wire.runId ?? crypto.randomUUID();
     if (activeRuns.has(id)) fail(409, `run "${id}" is already running`);
     if (activeRuns.size >= maxRuns) busy('runs', maxRuns);
     const controller = new AbortController();
-    activeRuns.set(id, controller);
+    activeRuns.set(id, { controller, session: wire.session });
     res.on('close', () => {
       if (!res.writableFinished) controller.abort(new Error('Client disconnected.'));
     });
-    if (aborted || takePendingCancel(id)) controller.abort(new Error('Run cancelled before it started.'));
+    if (aborted || takePendingCancel(id, wire.session)) controller.abort(new Error('Run cancelled before it started.'));
     const request: RunRequest = { ...wire, runId: id, signal: controller.signal };
     try {
       if (url.searchParams.get('stream') === '1') await streamRun(runner, request, res);
@@ -994,6 +1124,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     url: URL,
     req: IncomingMessage,
     res: ServerResponse,
+    who: Principal | undefined,
   ) {
     const queue = need(orchestrator, 'an orchestrator');
     const [resource, runId, extra] = rest;
@@ -1008,7 +1139,9 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
       const first = iterator.next();
       const write = startStream(res, heartbeatMs);
       try {
-        for (let next = await first; !next.done; next = await iterator.next()) await write(next.value);
+        for (let next = await first; !next.done; next = await iterator.next()) {
+          if (canSee(who, next.value.session)) await write(next.value);
+        }
       } catch (error) {
         if (!controller.signal.aborted) {
           await write({ error: publicError(error, 'remote orchestrator events failed').info });
@@ -1022,6 +1155,8 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     if (resource === 'recover' && runId === undefined) {
       if (method !== 'POST') fail(405, 'use POST /orchestrator/recover');
       if (!queue.recover) fail(404, 'this orchestrator does not support recover');
+      if (who && who.admin !== true)
+        denied(`principal "${who.id}" may not recover: it spans every session (needs admin)`);
       sendJson(res, 200, { recovered: await queue.recover() });
       return;
     }
@@ -1029,20 +1164,28 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     if (runId === undefined) {
       if (method !== 'POST') fail(405, 'use POST /orchestrator/runs');
       const { aborted, ...wire } = runRequestOf(await readBody(req, limit), agentPolicy);
+      checkRunSessions(who, wire);
       const handle = await queue.submit({ ...wire, ...(aborted ? { signal: AbortSignal.abort() } : {}) });
       remember(handle.runId, handle.session, handle.done);
       sendJson(res, 200, { runId: handle.runId, session: handle.session });
       return;
     }
+    const record = submitted.get(runId);
+    // 限定了会话的主体：这一轮的会话要知道而且在范围里。不经这个服务提交的（或者结果已经丢了的）不知道会话，
+    // 只能按 `?session=` 从日志里找；找不到就当没有。
+    const scoped = who?.sessionPrefixes !== undefined;
+    if (record) checkSession(who, record.session);
     if (method === 'DELETE') {
+      if (scoped && !record) fail(404, `no run "${runId}" this caller may cancel`, 'not_found_error');
       sendJson(res, 200, { cancelled: await queue.cancel(runId) });
       return;
     }
     if (method !== 'GET') fail(405, 'use GET or DELETE /orchestrator/runs/:runId');
-    let status = await queue.status(runId);
-    const record = submitted.get(runId);
+    const askedSession = url.searchParams.get('session') ?? undefined;
+    if (askedSession !== undefined) checkSession(who, askedSession);
+    let status = scoped && !record ? undefined : await queue.status(runId);
     // 结果不在内存里了（过了保留期，或者服务重启过）：调用方给了会话名、这里又挂着存储，就从日志还原。
-    const session = record?.session ?? url.searchParams.get('session') ?? undefined;
+    const session = record?.session ?? askedSession;
     const logged = async (): Promise<RunResult | undefined> =>
       store && session !== undefined && !record?.result && !record?.error
         ? resultFromLog(store, session, runId)
@@ -1076,11 +1219,20 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
 
   // ---- 记忆 ----
 
-  async function memoryRoutes(method: string, rest: string[], url: URL, req: IncomingMessage, res: ServerResponse) {
+  async function memoryRoutes(
+    method: string,
+    rest: string[],
+    url: URL,
+    req: IncomingMessage,
+    res: ServerResponse,
+    who: Principal | undefined,
+  ) {
     const [collection, ...tail] = rest;
     const query = url.searchParams;
     // 作用域从查询参数来（不带就是缺省的那个）；名字不合法由存储报 `invalid_request`。
-    const memoryStore = scopedMemory(memory, query.get('scope') ?? DEFAULT_MEMORY_SCOPE);
+    const scope = query.get('scope') ?? DEFAULT_MEMORY_SCOPE;
+    checkScope(who, scope);
+    const memoryStore = scopedMemory(memory, scope);
     const body = async (shape: string): Promise<Record<string, unknown>> =>
       bodyObject(await readBody(req, limit), shape);
     const only = (expected: string, route: string): void => {
@@ -1344,6 +1496,18 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
       return;
     }
     const method = req.method ?? 'GET';
+    let who: Principal | undefined;
+    if (authenticate) {
+      try {
+        who = await authenticate(req);
+      } catch (error) {
+        logger.warn('remote authenticate threw', { error: messageOf(error) });
+      }
+      if (!who) {
+        sendError(res, 401, { message: 'unauthorized', type: 'authentication_error' });
+        return;
+      }
+    }
     try {
       const segments = url.pathname
         .slice(basePath.length)
@@ -1362,19 +1526,19 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
           protocolRoutes(method, rest, url, res);
           break;
         case 'sessions':
-          await sessions(method, rest, url, req, res);
+          await sessions(method, rest, url, req, res, who);
           break;
         case 'executors':
-          await executorRoutes(method, rest, url, req, res);
+          await executorRoutes(method, rest, url, req, res, who);
           break;
         case 'runs':
-          await runs(method, rest, url, req, res);
+          await runs(method, rest, url, req, res, who);
           break;
         case 'orchestrator':
-          await orchestratorRoutes(method, rest, url, req, res);
+          await orchestratorRoutes(method, rest, url, req, res, who);
           break;
         case 'memory':
-          await memoryRoutes(method, rest, url, req, res);
+          await memoryRoutes(method, rest, url, req, res, who);
           break;
         default:
           fail(404, `not found: ${url.pathname}`);
@@ -1393,10 +1557,11 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
 export async function startRemote(options: StartRemoteOptions): Promise<RemoteServer> {
   const host = options.host ?? '127.0.0.1';
   checkAccessToken(options.accessToken);
-  if (!isLoopback(host) && !options.accessToken && options.allowUnauthenticated !== true) {
+  checkAuthOptions(options);
+  if (!isLoopback(host) && !options.accessToken && !options.authenticate && options.allowUnauthenticated !== true) {
     throw new Error(
-      `Refusing to listen on ${host} without \`accessToken\`: anyone who can reach it could read sessions and run tools. ` +
-        'Pass `accessToken`, or `allowUnauthenticated: true` if something in front of it authenticates.',
+      `Refusing to listen on ${host} without \`accessToken\` or \`authenticate\`: anyone who can reach it could read sessions and run tools. ` +
+        'Pass one of them, or `allowUnauthenticated: true` if something in front of it authenticates.',
     );
   }
   const basePath = normalizePath(options.basePath ?? '');

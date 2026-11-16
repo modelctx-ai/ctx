@@ -3,7 +3,7 @@ import type { LanguageModel } from 'ai';
 import type { Message, MessageContent } from './message.ts';
 import type { ContextSpec, PreparedCall, WindowOptions } from './context.ts';
 import { CTX_EVENTS, messageEntry, type Entry, type EntryOptions, type NewMessageEntry } from './session.ts';
-import type { ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
+import type { EnvironmentSpec, ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
 import type { Awaitable, ErrorInfo, JsonObject, JsonValue } from './types.ts';
 
 /**
@@ -56,6 +56,8 @@ export interface AgentSpec {
   readonly permissions?: ToolPermissions;
   /** 整轮的预算：超了在步骤之间停下，`stopReason` 是 `max_budget`。 */
   readonly budget?: RunBudget;
+  /** 这个 agent 的工具在什么样的执行环境里跑：harness 交给执行环境的 `open`。见 `EnvironmentSpec`。 */
+  readonly environment?: EnvironmentSpec;
 }
 
 /** 结构化输出的 schema。只用 JSON Schema，过得了线。 */
@@ -121,6 +123,7 @@ export function agentSpecToJson(spec: AgentSpec): JsonObject {
   if (spec.toolChoice !== undefined) out['toolChoice'] = spec.toolChoice;
   if (spec.permissions !== undefined) out['permissions'] = spec.permissions;
   if (spec.budget !== undefined) out['budget'] = spec.budget;
+  if (spec.environment !== undefined) out['environment'] = spec.environment;
   if (spec.settings !== undefined) {
     const { headers, ...rest } = spec.settings;
     out['settings'] = headers

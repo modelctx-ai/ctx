@@ -90,7 +90,8 @@ createServer((req, res) => {
 | `allowedModels`        | 不限                       | `/runs` 和 `/orchestrator/runs` 只收这些模型名，别的 400。模型名是调用方写的、密钥是服务端的，对外的服务该列出来                                                         |
 | `allowedSettings`      | `DEFAULT_ALLOWED_SETTINGS` | 调用方的 `agent.settings` 里收哪些键，别的 400。缺省是采样参数、`maxRetries`、`timeoutMs`，不含 `headers` 和 `providerOptions`（它们会原样进服务端发给模型服务商的请求） |
 | `accessToken`          | —                          | 要求 `Authorization: Bearer <token>`，常量时间比较；方案名不分大小写。空串（或全是空白）抛错                                                                             |
-| `allowUnauthenticated` | `false`                    | 只有 `startRemote` 看它：`host` 不是本机地址又没有 `accessToken` 时拒绝启动，除非写 `true`                                                                               |
+| `authenticate`         | —                          | `(request) => Principal \| undefined`（可以是 `Promise`）：把请求映射到主体，`undefined` 回 401。和 `accessToken` 二选一，两个都给时抛错。见「主体」                     |
+| `allowUnauthenticated` | `false`                    | 只有 `startRemote` 看它：`host` 不是本机地址又没有 `accessToken` 或 `authenticate` 时拒绝启动，除非写 `true`                                                             |
 | `allowedHosts`         | 监听地址                   | 只接受这些 `Host`（`host:port`），挡 DNS rebinding。`startRemote` 监听本机时认 `localhost`、`127.0.0.1`、`[::1]`；`createRemoteHandler` 不给就不查                       |
 | `allowedOrigins`       | 无                         | 带 `Origin` 的请求只放行这些来源；缺省浏览器网页发来的请求一律 403                                                                                                       |
 | `maxBodyBytes`         | 4 MiB                      | 请求体上限，超过 413                                                                                                                                                     |
@@ -139,7 +140,7 @@ await orchestrator.close(); // 只关这个客户端
 | 工厂                                                                                         | 行为                                                                                                                                                                                                                                                                                                                                                                                                  |
 | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `createRemoteSessionStore({ baseUrl, accessToken?, fetch?, headers?, retry?, unreadable? })` | `SessionStore`。`watch` 读 NDJSON 流，连接断了按最后读到的 `seq` 重连，`signal` 中止后迭代正常结束；服务端的存储没有 `watch` 时由服务端轮询。`list` 自己翻页。`append` 发出前给没有 `id` 的条目补上，响应丢了重试不会记两遍。`clear`、`truncate`、`remove`、`redact` 原样转给服务端的存储，不自动重试。`unreadable` 见下                                                                              |
-| `createRemoteExecutor({ …, name })`                                                          | `Executor`：`tools()`、`execute()`。连不上返回 `{ type: 'error', retryable: true }`，服务端拒绝（4xx/5xx）返回错误结果（5xx 和 429 可重试），都不抛；`signal` 中止时断开请求，服务端的执行跟着中止。`execute` 不自动重试：工具可能已经跑了                                                                                                                                                            |
+| `createRemoteExecutor({ …, name })`                                                          | `Executor`：`tools()`、`execute()`、`open()`、`close()`。连不上返回 `{ type: 'error', retryable: true }`，服务端拒绝（4xx/5xx）返回错误结果（5xx 和 429 可重试），都不抛；`signal` 中止时断开请求，服务端的执行跟着中止。`execute` 不自动重试：工具可能已经跑了                                                                                                                                       |
 | `createRemoteHarness(…)`                                                                     | `Harness`：`run`、`stream`。`agent.model` 不是字符串就抛。`signal` 中止时发 `DELETE /runs/:runId`，`run` 照常返回 `stopReason: aborted`；`stream` 提前不读就断开连接，服务端同样中止并写 `ctx.run.ended`                                                                                                                                                                                              |
 | `createRemoteOrchestrator({ …, waitMs? })`                                                   | `Orchestrator`：`submit`、`status`、`cancel`、`recover`、`events`、`close`。`done` 用长轮询 `GET /orchestrator/runs/:id?wait=&session=` 实现（每次最多等 `waitMs`，缺省 25 秒），连不上时按 `retry` 重试，服务重启后结果从会话日志还原（服务端要挂着 `store`）；`close` 只关这个客户端：不再提交、结束它的事件流、等它提交的运行结束。`events` 断了不重连（事件没有位置可以续接），要不漏就看会话日志 |
 
@@ -252,6 +253,8 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 | 执行环境 | （列出）         | `GET /executors`                                                         | —                                                  | `{ executors: string[] }`                                         |
 |          | `tools`          | `GET /executors/:name/tools`                                             | —                                                  | `{ tools: ToolDefinition[] }`                                     |
 |          | `execute`        | `POST /executors/:name/execute`                                          | `{ call: ToolCall, context: { session, runId? } }` | `{ output: ToolOutput }`                                          |
+|          | `open`           | `POST /executors/:name/sessions/:session/open`                           | `{ environment?: EnvironmentSpec }`                | `{}`；执行环境没有 `open` 时什么都不做                            |
+|          | `close`          | `DELETE /executors/:name/sessions/:session`                              | —                                                  | `{}`                                                              |
 | Harness  | `run`            | `POST /runs`                                                             | `RunRequest` 去掉 `signal`，可加 `aborted: true`   | `RunResult`                                                       |
 |          | `stream`         | `POST /runs?stream=1`                                                    | 同上                                               | NDJSON，每行一个 `RunEvent`                                       |
 |          | （`signal`）     | `DELETE /runs/:runId`                                                    | —                                                  | `{ cancelled: boolean }`                                          |
@@ -289,6 +292,38 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 - 错误正文统一 `{ error: { message, type } }`，`type` 是 `invalid_request_error`、`authentication_error`、`permission_error`、`not_found_error`、`method_not_allowed`、`conflict_error`、`request_too_large`、`rate_limit_error`、`server_error`、`harness_error` 之一；会话的 `append` 冲突是 `conflict`，`/memory/*` 转发的协议错误是 `invalid_request`、`not_found`、`conflict`（见「记忆」）。
 
 服务端不替组件做隔离：挂一个 `ctx-exec` 执行环境就是把这台机器上的命令行交给持有 token 的人。要隔离，把执行环境的服务端放进容器。
+
+### 主体
+
+一个 `accessToken` 只分得出「能进」和「不能进」。多个租户共用一个服务时给 `authenticate`：把请求映射到一个主体，主体限定能碰的会话和记忆作用域（[ADR 0009](https://github.com/modelctx-ai/ctx/blob/main/docs/adr/0009-hosted-prerequisites.md)）。身份怎么来（JWT、mTLS、网关传来的头）由你决定：
+
+```ts
+import { startRemote, type Principal } from '@modelctx-ai/ctx-remote/server';
+
+const server = await startRemote({
+  host: '0.0.0.0',
+  store,
+  harness,
+  executors: [box],
+  memory,
+  authenticate: async (request): Promise<Principal | undefined> => {
+    const tenant = await verify(request.headers.authorization); // 你的令牌校验
+    if (!tenant) return undefined; // 401
+    return { id: tenant, sessionPrefixes: [`${tenant}/`], memoryScopes: [tenant] };
+  },
+});
+```
+
+`Principal` 是 `{ id, sessionPrefixes?, memoryScopes?, admin? }`，不给的限制是不限。超出范围的回 403 `permission_error`：
+
+- 带会话的入口按 `sessionPrefixes` 查（按字面的前缀）：`/sessions/:session/…`、`execute` 的 `context.session`、`/executors/:name/sessions/:session`、`POST /runs` 和 `POST /orchestrator/runs` 的 `session`、`parent.session`、`agent.context.inherit.session`，`DELETE /runs/:runId` 那一轮的会话。
+- 编排器的 `status`、`cancel` 按 `runId` 找到经这个服务提交的那一轮的会话再查；限定了会话的主体碰不到不是经这个服务提交的运行（`status` 只能带 `session=` 从会话日志里还原自己的）。
+- `GET /sessions` 只列范围里的；`GET /orchestrator/events` 只发范围里的。
+- `/memory/*` 的 `scope` 按 `memoryScopes` 查。
+- `POST /orchestrator/recover` 横跨所有会话，只有 `admin: true` 能调。
+- `authenticate` 抛错按认不出算（401），原文进 `logger`。
+
+租户隔离靠会话名的前缀：给每个租户的会话名加上前缀（`tenant-a/…`）。前缀之外的东西（同一个执行环境实例、同一个模型密钥）不隔离，要隔离就每个租户一套服务；执行环境按会话分开用 `ctx-exec` 的 `sessionCwd` 或者每会话一个容器的执行环境。
 
 ## 之后
 

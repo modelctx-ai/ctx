@@ -30,6 +30,8 @@ export interface FunctionExecutor extends Executor {
   has(name: string): boolean;
   /** 注册过的定义，`executor` 已经填成这个执行环境的名字。 */
   definition(name: string): ToolDefinition | undefined;
+  /** `open` 过、还没 `close` 的会话，按打开的先后。函数执行环境的 `open`、`close` 只记这个，不做别的。 */
+  openSessions(): string[];
 }
 
 function messageOf(error: unknown): string {
@@ -42,6 +44,7 @@ function messageOf(error: unknown): string {
  */
 export function createFunctionExecutor(name = 'local'): FunctionExecutor {
   const table = new Map<string, { definition: ToolDefinition; fn: ToolFunction }>();
+  const sessions = new Set<string>();
   let disposed = false;
 
   const executor: FunctionExecutor = {
@@ -80,6 +83,13 @@ export function createFunctionExecutor(name = 'local'): FunctionExecutor {
     async dispose() {
       disposed = true;
     },
+    async open(session) {
+      sessions.add(session);
+    },
+    async close(session) {
+      sessions.delete(session);
+    },
+    openSessions: () => [...sessions],
   };
   return executor;
 }

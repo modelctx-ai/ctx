@@ -10,6 +10,7 @@ export {
   type ToolFunctionContext,
 } from './executor.ts';
 export {
+  closeExecutorSessions,
   createToolRegistry,
   DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   dispatchTo,

@@ -1151,6 +1151,21 @@ export function describeExecutorContract(
         assert.notEqual(output.type, 'error');
       });
     });
+
+    test('open、close（有时）按会话：都可以重复调，close 之后还能再 open，open 过的会话照常执行', async () => {
+      await withExecutor(factory, async ({ executor, echo }) => {
+        if (!executor.open || !executor.close) return;
+        const session = 'contract-session';
+        await executor.open(session);
+        await executor.open(session);
+        const output = await executor.execute({ id: 'c5', name: echo, input: { text: 'in session' } }, { session });
+        assert.notEqual(output.type, 'error');
+        await executor.close(session);
+        await executor.close(session);
+        await executor.open(session);
+        await executor.close(session);
+      });
+    });
   });
 }
 

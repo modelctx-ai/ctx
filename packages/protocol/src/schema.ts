@@ -217,6 +217,18 @@ const defs: Record<string, Schema> = {
       toolChoice: anyOf({ enum: ['auto', 'none', 'required'] }, obj({ tool: str })),
       permissions: obj({}, { default: ref('ToolPermission'), tools: recordOf(ref('ToolPermission')) }),
       budget: obj({}, { maxTotalTokens: num, maxDurationMs: num }),
+      environment: ref('EnvironmentSpec'),
+    },
+  ),
+  EnvironmentSpec: obj(
+    {},
+    {
+      name: str,
+      image: str,
+      packages: recordOf(arrayOf(str)),
+      network: obj({}, { allow: arrayOf(str) }),
+      env: arrayOf(str),
+      meta: { type: 'object' },
     },
   ),
   ToolPermission: { enum: ['allow', 'ask', 'deny'] },

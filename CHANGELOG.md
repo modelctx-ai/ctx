@@ -4,6 +4,11 @@
 
 ## 未发布
 
+- **新增** 云托管的三个前提（[#25](https://github.com/modelctx-ai/ctx/issues/25)，[ADR 0009](docs/adr/0009-hosted-prerequisites.md)）。
+  - 协议包：`Executor.open?(session, { environment?, signal? })`、`Executor.close?(session)`（每个会话的环境，和管整个执行环境的 `provision`、`dispose` 分开），类型 `ExecutorSessionOptions`、`EnvironmentSpec`（`name`、`image`、`packages`、`network.allow`、`env`、`meta`），`AgentSpec.environment`（记进 `ctx.run.started`，`PROTOCOL_SCHEMA` 跟上）。`describeExecutorContract` 加一条：`open`、`close` 可重复，`close` 之后能再 `open`。
+  - 核心包：harness 在一轮里第一次把调用交给某个执行环境之前调它的 `open(session, { environment })`，抛错时交给它的调用都回错误结果；新函数 `closeExecutorSessions(executors, session)`（返回 `{ closed, failed }`）。函数执行环境有 `open`、`close`、`openSessions()`。
+  - `ctx-exec`：选项 `sessionCwd`，每个会话一个工作目录（`cwd` 下按会话名的哈希），`close` 时删掉；`ProcessExecutor.sessionCwd(session)`。`open` 收到做不到的环境（镜像、包、出站白名单、没配的变量）抛 `invalid_request`。
+  - `ctx-remote`：路径 `POST /executors/:name/sessions/:session/open`、`DELETE /executors/:name/sessions/:session`，远端执行环境有 `open`、`close`；服务端选项 `authenticate(request) → Principal | undefined`（和 `accessToken` 二选一）和类型 `Principal`（`id`、`sessionPrefixes?`、`memoryScopes?`、`admin?`）：带会话的入口按前缀查，超出的 403 `permission_error`，`GET /sessions` 和编排器的事件只给范围里的，`recover` 要 `admin`。`startRemote` 听在非本机地址上时有 `authenticate` 也能启动。
 - **修复** 记忆的证据只保证「有区间」，不保证区间里真有这句话（[#42](https://github.com/modelctx-ai/ctx/issues/42)）。`consolidate` 先在原文里给每条事实找支撑（`consolidate.minEvidenceOverlap`，缺省 0.5）：有支撑的，每条笔记的证据收窄到说了这句话的条目；没有的置信度降到不超过 `consolidate.ungroundedConfidence`（缺省 0.4，低于召回门槛），`ConsolidateReport.facts.ungrounded`（可选）记一笔。已有的事实不变。
 - **新增** 语言无关的线上规范（[#22](https://github.com/modelctx-ai/ctx/issues/22)）。协议包：`PROTOCOL_VERSION`（`0.3`）、`ProtocolInfo`、`ProtocolComponents`、`checkProtocolInfo`；线上形状的 JSON Schema `PROTOCOL_SCHEMA`（`PROTOCOL_SCHEMA_ID`）和 `resolveSchemaRefs`，副本在仓库根 `schema/`。`ctx-remote`：服务端加 `GET /protocol`（版本和挂了的组件）、`GET /protocol/schema`、`GET /protocol/openapi`（`openApiDocument`、`openApiOperations`）；客户端第一次请求前握手，版本不同、服务端没有这个入口都抛 `unsupported_version`（`checkProtocol: false` 关掉）。**不兼容**：0.3 的客户端连不上没有 `GET /protocol` 的服务端（例如 0.2），两边一起升。一致性测试：`/conformance` 子路径的 `describeConformance`、`/server` 的 `createConformanceHandler`（一致性模式的入口 `POST /conformance/instances`），命令 `ctx-conformance --url <地址>`。
 - **修复** `ctx-remote` 的测试「`agent.settings` 缺省不收 headers」偶尔失败：随机的 `runId` 里可能有被查的字符串。

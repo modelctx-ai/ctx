@@ -17,6 +17,7 @@ import {
   type Entry,
   type ErrorInfo,
   type ExecutionContext,
+  type ExecutorSessionOptions,
   type Executor,
   type FactHit,
   type Harness,
@@ -281,6 +282,12 @@ function messageOf(error: unknown): string {
 
 // ---- 会话 ----
 
+/** 放进一段路径的会话名：`.`、`..`、空串发出去之前就拒绝。 */
+function checkedSession(session: string): string {
+  checkSessionName(session);
+  return session;
+}
+
 function entriesPath(session: string): string {
   // `.`、`..`、空串放不进一段路径，发出去之前就拒绝。
   checkSessionName(session);
@@ -470,6 +477,8 @@ export interface RemoteExecutorOptions extends RemoteClientOptions {
  */
 export function createRemoteExecutor(options: RemoteExecutorOptions): Executor & {
   tools(): Promise<ToolDefinition[]>;
+  open(session: string, options?: ExecutorSessionOptions): Promise<void>;
+  close(session: string): Promise<void>;
 } {
   const connection = connect(options);
   const { name } = options;
@@ -479,6 +488,17 @@ export function createRemoteExecutor(options: RemoteExecutorOptions): Executor &
     async tools() {
       const body = await connection.json<{ tools: ToolDefinition[] }>('GET', `${base}/tools`);
       return body.tools.map((tool) => ({ ...tool, executor: name }));
+    },
+    // 会话的准备和释放（ADR 0009）：出错照常抛，harness 把它变成这个执行环境的错误结果。准备可以重复，所以重试。
+    async open(session, sessionOptions = {}) {
+      await connection.json('POST', `${base}/sessions/${segment(checkedSession(session))}/open`, {
+        body: sessionOptions.environment ? { environment: sessionOptions.environment } : {},
+        retry: true,
+        ...(sessionOptions.signal ? { signal: sessionOptions.signal } : {}),
+      });
+    },
+    async close(session) {
+      await connection.json('DELETE', `${base}/sessions/${segment(checkedSession(session))}`, { retry: true });
     },
     async execute(call: ToolCall, context: ExecutionContext): Promise<ToolOutput> {
       const { signal } = context;

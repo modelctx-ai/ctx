@@ -844,6 +844,29 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
             ? errorOutput(`Tool call "${call.name}" was denied by the agent's permissions.`)
             : dispatch(call, definition, execution)
       : dispatch;
+    // 一轮里第一次交给某个执行环境之前 `open` 这个会话（ADR 0009）；打不开时这个执行环境的调用都回错误，模型看得到原因。
+    const opened = new Map<string, Promise<void>>();
+    const environment = agent.environment;
+    const openFor = (definition: ToolDefinition): Promise<void> | undefined => {
+      const executor = executors.get(definition.executor);
+      if (!executor?.open) return undefined;
+      let opening = opened.get(definition.executor);
+      if (!opening) {
+        opening = executor.open(session, { ...(environment ? { environment } : {}), signal });
+        opened.set(definition.executor, opening);
+      }
+      return opening;
+    };
+    const sessionDispatch: typeof dispatch = async (call, definition, execution) => {
+      try {
+        await openFor(definition);
+      } catch (error) {
+        return errorOutput(
+          `Executor "${definition.executor}" could not prepare session "${session}" for tool "${call.name}": ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return runDispatch(call, definition, execution);
+    };
     const deferred = (definition: ToolDefinition): boolean =>
       external.has(definition.executor) || toolPermission(permissions, definition.name) === 'ask';
     return {
@@ -852,7 +875,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       tools: toToolSet(definitions, undefined, {
         session,
         runId: state.runId,
-        dispatch: runDispatch,
+        dispatch: sessionDispatch,
         validateInput: options.validateToolInput ?? ((definition) => !selfValidated(definition.name)),
         ...(options.maxToolOutputChars !== undefined ? { maxOutputChars: options.maxToolOutputChars } : {}),
         ...(external.size > 0 || permissions ? { external: deferred } : {}),

@@ -300,3 +300,23 @@ export function createToolRegistry(options: ToolRegistryOptions = {}): LocalTool
   };
   return registry;
 }
+
+/**
+ * 会话结束了：让每个执行环境释放这个会话（`close`，没有就跳过）。一个失败不挡别的，失败的列在 `failed` 里。
+ * 什么时候算会话结束由应用决定（ADR 0009）。
+ */
+export async function closeExecutorSessions(
+  executors: Executors,
+  session: string,
+): Promise<{ readonly closed: string[]; readonly failed: { readonly executor: string; readonly error: unknown }[] }> {
+  const entries = [...executorMap(executors)].filter(([, executor]) => typeof executor.close === 'function');
+  const settled = await Promise.allSettled(entries.map(([, executor]) => executor.close!(session)));
+  const closed: string[] = [];
+  const failed: { executor: string; error: unknown }[] = [];
+  settled.forEach((result, index) => {
+    const name = entries[index]![0];
+    if (result.status === 'fulfilled') closed.push(name);
+    else failed.push({ executor: name, error: result.reason });
+  });
+  return { closed, failed };
+}

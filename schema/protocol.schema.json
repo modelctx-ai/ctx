@@ -1109,9 +1109,54 @@
             }
           },
           "additionalProperties": false
+        },
+        "environment": {
+          "$ref": "#/$defs/EnvironmentSpec"
         }
       },
       "required": ["model"],
+      "additionalProperties": false
+    },
+    "EnvironmentSpec": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "packages": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "network": {
+          "type": "object",
+          "properties": {
+            "allow": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "meta": {
+          "type": "object"
+        }
+      },
       "additionalProperties": false
     },
     "ToolPermission": {
