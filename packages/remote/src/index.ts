@@ -4,11 +4,13 @@
  */
 import {
   checkMemoryScope,
+  checkProtocolInfo,
   checkSessionName,
   CtxError,
   DEFAULT_MEMORY_SCOPE,
   ENTRY_VERSION,
   errorOutput,
+  PROTOCOL_VERSION,
   unreadableEntry,
   type AppendOptions,
   type CoreVersion,
@@ -65,6 +67,11 @@ export interface RemoteClientOptions {
   readonly fetch?: typeof fetch;
   /** 连不上、连接中途断了、服务端回 429/502/503/504 时怎么重试。只用在重试了也不会多做一遍的请求上。 */
   readonly retry?: RetryOptions;
+  /**
+   * 第一次请求之前读 `GET /protocol`，协议版本不同、对方的条目格式比这一端新就以 `unsupported_version` 失败，
+   * 不去猜对方的形状。缺省查；`false` 不查（例如对面是只实现了部分路径的服务）。每个客户端只查一次。
+   */
+  readonly checkProtocol?: boolean;
 }
 
 /**
@@ -107,6 +114,8 @@ const TRANSIENT_STATUS: readonly number[] = [429, 502, 503, 504];
 /** 暂时性的错：连不上、连接断了（`fetch` 抛的不是 `RemoteError`），或者上面那几个状态码。 */
 function transient(error: unknown): boolean {
   if (isRemoteError(error)) return TRANSIENT_STATUS.includes(error.status);
+  // 协议层认得的错误（握手时的版本不对）重试也不会变。
+  if (error instanceof CtxError) return false;
   return !(error instanceof Error && error.name === 'AbortError');
 }
 
@@ -170,7 +179,37 @@ function connect(options: RemoteClientOptions): Connection {
     }
   }
 
+  /** 握手：第一次请求前读一次 `GET /protocol`。失败了下次再试，不把一次连不上记成版本不对。 */
+  let handshake: Promise<void> | undefined;
+  function ensureProtocol(signal: AbortSignal | undefined): Promise<void> {
+    if (options.checkProtocol === false) return Promise.resolve();
+    handshake ??= retrying('GET', signal ? { signal } : {}, async () => {
+      let response: Response;
+      try {
+        response = await send('GET', '/protocol', signal ? { signal } : {});
+      } catch (error) {
+        if (isRemoteError(error) && error.status === 404) {
+          throw new CtxError(
+            'unsupported_version',
+            `${baseUrl} has no GET /protocol: the server predates ctx protocol ${PROTOCOL_VERSION}, or is not a ctx server.`,
+          );
+        }
+        throw error;
+      }
+      checkProtocolInfo(parse(await response.text()));
+    }).catch((error: unknown) => {
+      if (!(error instanceof CtxError)) handshake = undefined;
+      throw error;
+    });
+    return handshake;
+  }
+
   async function once(method: string, path: string, init: RequestInit = {}): Promise<Response> {
+    await ensureProtocol(init.signal);
+    return send(method, path, init);
+  }
+
+  async function send(method: string, path: string, init: RequestInit = {}): Promise<Response> {
     const headers: Record<string, string> = { accept: 'application/json, application/x-ndjson', ...options.headers };
     if (options.accessToken) headers['authorization'] = `Bearer ${options.accessToken}`;
     if (init.body !== undefined) headers['content-type'] = 'application/json; charset=utf-8';

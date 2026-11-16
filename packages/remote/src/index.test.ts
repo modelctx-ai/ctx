@@ -18,7 +18,9 @@ import { createMemoryStore as createInMemoryMemoryStore } from '@modelctx-ai/ctx
 import {
   CTX_EVENTS,
   CtxError,
+  ENTRY_VERSION,
   eventEntry,
+  PROTOCOL_VERSION,
   userEntry,
   type Entry,
   type Harness,
@@ -316,12 +318,12 @@ describe('远程 harness', () => {
       allowedModels: [agent.model],
       allowedSettings: [...DEFAULT_ALLOWED_SETTINGS, 'headers'],
     });
-    const result = await post({ headers: { 'x-trace': 'abc' } }, createRemoteHarness(client(allowed)));
+    const result = await post({ headers: { 'x-trace': 'trace-secret-value' } }, createRemoteHarness(client(allowed)));
     expect(result.stopReason).toBe('end_turn');
     const started = (await open.store.list('s')).find(
       (entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.runStarted,
     );
-    expect(JSON.stringify(started)).not.toContain('abc');
+    expect(JSON.stringify(started)).not.toContain('trace-secret-value');
     expect(JSON.stringify(started)).toContain('"x-trace":"[redacted]"');
   });
 
@@ -381,6 +383,62 @@ describe('远程 harness', () => {
 function guardedServer(): Promise<RemoteServer> {
   return serve({ store: createMemoryStore(), maxBodyBytes: 1_024 });
 }
+
+/** 替 `GET /protocol` 回话的 `fetch`：`body` 是 `undefined` 时回 404，别的请求照常发。 */
+function answering(body: unknown): typeof fetch {
+  return (input, init) => {
+    if (new URL(urlOf(input)).pathname.endsWith('/protocol')) {
+      return Promise.resolve(
+        body === undefined
+          ? new Response(JSON.stringify({ error: { message: 'not found', type: 'not_found' } }), { status: 404 })
+          : new Response(JSON.stringify(body), { status: 200 }),
+      );
+    }
+    return fetch(input, init);
+  };
+}
+
+describe('版本和能力：GET /protocol', () => {
+  test('列出版本、条目格式和挂了的组件', async () => {
+    const executor = createFunctionExecutor('box');
+    const store = createMemoryStore();
+    const harness = createHarness({ store, context: createContextBuilder({ store }) });
+    const server = await serve({
+      store,
+      executors: [executor],
+      harness,
+      orchestrator: createOrchestrator({ harness, store }),
+    });
+    const response = await fetch(`${server.baseUrl}/protocol`, { headers: { authorization: `Bearer ${accessToken}` } });
+    expect(await response.json()).toEqual({
+      protocol: PROTOCOL_VERSION,
+      entryVersion: ENTRY_VERSION,
+      components: {
+        sessions: { watch: true },
+        executors: { names: ['box'] },
+        harness: { stream: true },
+        orchestrator: { recover: true, events: true },
+      },
+    });
+  });
+
+  test('客户端第一次请求前握手：版本不同、没有这个入口都是 unsupported_version，checkProtocol: false 不查', async () => {
+    const server = await serve({ store: createMemoryStore() });
+    const old = createRemoteSessionStore({ ...client(server), fetch: answering(undefined) });
+    await expect(old.list('s')).rejects.toMatchObject({ type: 'unsupported_version' });
+    const future = createRemoteSessionStore({
+      ...client(server),
+      fetch: answering({ protocol: '9.9', entryVersion: 1, components: {} }),
+    });
+    await expect(future.list('s')).rejects.toMatchObject({ type: 'unsupported_version' });
+    const unchecked = createRemoteSessionStore({
+      ...client(server),
+      fetch: answering(undefined),
+      checkProtocol: false,
+    });
+    expect(await unchecked.list('s')).toEqual([]);
+  });
+});
 
 describe('会话的条目分页', () => {
   test('服务端一次最多回 maxListEntries 条并带 more；客户端的 list 自己接着读，结果不变', async () => {
@@ -450,12 +508,13 @@ describe('会话的擦除', () => {
     expect(await spying.remove('a/b', [written[1]!.id, 'missing'])).toBe(1);
     expect(await spying.redact('a/b', [written[2]!.id])).toBe(1);
     expect(calls).toEqual([
+      'GET /protocol ',
       `POST /sessions/a%2Fb/entries/truncate {"upTo":${written[0]!.seq}}`,
       `POST /sessions/a%2Fb/entries/remove {"ids":["${written[1]!.id}","missing"]}`,
       `POST /sessions/a%2Fb/entries/redact {"ids":["${written[2]!.id}"]}`,
     ]);
     expect(await spying.truncate('a/b', Number.NaN)).toBe(0);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(4);
     const kinds = (await remote.list('a/b')).map((entry) => (entry.type === 'event' ? entry.kind : entry.type));
     expect(kinds).toEqual([CTX_EVENTS.redacted, 'message', CTX_EVENTS.erased, CTX_EVENTS.erased, CTX_EVENTS.erased]);
     expect(await remote.list('a/b')).toEqual(await memory.list('a/b'));

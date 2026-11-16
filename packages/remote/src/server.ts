@@ -9,7 +9,11 @@ import type { AddressInfo } from 'node:net';
 import {
   CTX_EVENTS,
   DEFAULT_MEMORY_SCOPE,
+  ENTRY_VERSION,
   isConflict,
+  PROTOCOL_SCHEMA,
+  PROTOCOL_VERSION,
+  type ProtocolInfo,
   runParentProblem,
   silentLogger,
   type Entry,
@@ -39,6 +43,7 @@ import {
   type Usage,
 } from '@modelctx-ai/ctx-protocol';
 
+import { openApiDocument } from './openapi.ts';
 import { parse, stringify, type WireRunRequest } from './wire.ts';
 
 export interface RemoteHandlerOptions {
@@ -646,6 +651,39 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
     const ref = crypto.randomUUID().slice(0, 8);
     logger.warn(where, { ref, error: messageOf(error) });
     return { status: 500, info: { message: `internal error (ref ${ref}); see the server log`, type } };
+  }
+
+  /** `GET /protocol`：版本，和挂了哪些组件、可选方法有没有。 */
+  function protocolInfo(): ProtocolInfo {
+    return {
+      protocol: PROTOCOL_VERSION,
+      entryVersion: ENTRY_VERSION,
+      components: {
+        // 存储没有 `watch` 时服务端轮询 `list`，所以线上总有 `entries/stream`。
+        ...(store ? { sessions: { watch: true } } : {}),
+        ...(executors.size > 0 ? { executors: { names: [...executors.keys()] } } : {}),
+        ...(harness ? { harness: { stream: typeof harness.stream === 'function' } } : {}),
+        ...(orchestrator
+          ? {
+              orchestrator: {
+                recover: typeof orchestrator.recover === 'function',
+                events: typeof orchestrator.events === 'function',
+              },
+            }
+          : {}),
+        ...(memory ? { memory: {} } : {}),
+      },
+    };
+  }
+
+  /** `GET /protocol`、`GET /protocol/schema`、`GET /protocol/openapi`：只读，不改任何状态。 */
+  function protocolRoutes(method: string, rest: string[], url: URL, res: ServerResponse): void {
+    const [doc, extra] = rest;
+    if (extra !== undefined || (doc !== undefined && doc !== 'schema' && doc !== 'openapi')) notFoundPath(url);
+    if (method !== 'GET') fail(405, `use GET ${url.pathname}`);
+    if (doc === undefined) sendJson(res, 200, protocolInfo());
+    else if (doc === 'schema') sendJson(res, 200, PROTOCOL_SCHEMA);
+    else sendJson(res, 200, openApiDocument());
   }
 
   /** 占一个流的名额，响应关闭时放掉。 */
@@ -1320,6 +1358,9 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
         });
       const [group, ...rest] = segments;
       switch (group) {
+        case 'protocol':
+          protocolRoutes(method, rest, url, res);
+          break;
         case 'sessions':
           await sessions(method, rest, url, req, res);
           break;
@@ -1386,3 +1427,9 @@ export async function startRemote(options: StartRemoteOptions): Promise<RemoteSe
 }
 
 export { isRemoteError, type ErrorBody, type RemoteError, type WireRunRequest } from './wire.ts';
+export {
+  createConformanceHandler,
+  type ConformanceHandlerOptions,
+  type ConformanceInstanceOptions,
+} from './conformance-server.ts';
+export { openApiDocument, openApiOperations } from './openapi.ts';

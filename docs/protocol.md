@@ -25,6 +25,8 @@ status: stable
 | 取消         | 需要取消的方法收 `signal?: AbortSignal`                                                                                                                                                                              |
 | 错误         | 抛 `Error`；跨边界时是 `{ error: ErrorInfo }`，`ErrorInfo` 是 `{ message, type?, retryable?, statusCode?, responseBody? }`；`type` 是机器可读的类别（`not_found`、`conflict`、`session_busy`、`context_overflow`……） |
 | 契约测试     | `@modelctx-ai/ctx-protocol/testing` 的 `describeXContract(name, factory, { describe, test })`，实现跑它（见[契约测试](#契约测试)）                                                                                   |
+| 版本         | 线上协议的版本是 `PROTOCOL_VERSION`（当前 `0.3`，和包的 minor 版本一起走）；客户端连上先读 `GET /protocol`，版本不同直接报错                                                                                         |
+| 语言无关     | 线上形状有 JSON Schema（`PROTOCOL_SCHEMA`），路径有 OpenAPI；别的语言的实现对着一个地址跑同一套契约测试（`ctx-conformance`）                                                                                         |
 
 ## 会话 `SessionStore`
 
@@ -1032,6 +1034,8 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 
 每个组件三种形态。「进程内」是 `@modelctx-ai/ctx` 和各适配包；「本机另一进程 / 远端」靠 `ctx-remote` 的 HTTP 服务端和客户端，或者别人按协议实现的服务。
 
+不是每个组件都有线上协议。能跨进程、有线上形态和一致性测试的是会话、执行环境、harness、编排、记忆存储。上下文、工具目录、模型不是线上协议：`ContextBuilder` 的行为大半在投影规则这些函数里，没有一致性测试，跟着 harness 走；工具目录是同步的进程内对象，远端执行环境用 `tools()` 报定义；模型直接用 AI SDK 的 `LanguageModel`，跨边界只传名字。这不是缺陷：它们本来就和 harness 在同一个进程里。
+
 | 组件           | 进程内                                                            | 另一进程 / 远端                                                                              | 第三方托管                                                           |
 | -------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
 | 会话           | 内存、SQLite                                                      | `ctx-remote`：服务端挂 `store` / `createRemoteSessionStore`（含 `watch`）                    | 实现 `SessionStore` 的任何存储服务                                   |
@@ -1051,6 +1055,9 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 ## 线上形态
 
 `ctx-remote` 用 HTTP 承载协议。JSON 请求和响应，流式用 NDJSON（每行一个值，出错时最后一行是 `{ error }`；空行是心跳，读的一方跳过）；错误正文是 `{ error: ErrorInfo }`，客户端转成带 `status` 的 `Error`。鉴权用 `Authorization: Bearer <token>`，缺省只听本机，Host 只认监听地址，带 `Origin` 的请求缺省 403。消息本身就是 JSON，线上不做编码（0.3 起；0.2 的客户端和服务端不能混用）。路径按组件分组，可以整体挂在一个前缀下：
+
+- **版本和能力发现。** `GET /protocol` 回 `ProtocolInfo`：`protocol`（`PROTOCOL_VERSION`）、`entryVersion`（`ENTRY_VERSION`）、`components`（挂了的组件和可选方法：`sessions: { watch }`、`executors: { names }`、`harness: { stream }`、`orchestrator: { recover, events }`、`memory: {}`）。客户端第一次请求之前读它（`checkProtocolInfo`）：版本不同、对方的条目格式比这一端新、没有这个入口，都以 `unsupported_version` 失败，不去猜对方的形状。
+- **形状和路径的规范。** `GET /protocol/schema` 是线上形状的 JSON Schema（2020-12），`$defs` 的名字和 TypeScript 的类型名一样，只描述过线的形状（`AgentSpec.model` 只能是名字，`RunRequest` 没有 `signal`），对象不收没列出的键；`GET /protocol/openapi` 是 OpenAPI 3.1，每条路径一项，引用同一批形状。两份的副本在仓库根的 [`schema/`](../schema)。手写，不从类型生成；一致靠测试：副本和代码一致，线上的真实值（会话、harness、流、编排器、执行环境、记忆、发现）都合 schema，OpenAPI 列出的每条路径服务端都认。
 
 | 组件     | 方法              | 路径                                                               | 请求体 → 响应                                                                                                                               |
 | -------- | ----------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1084,6 +1091,8 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 - 到了并发上限回 429（`type: rate_limit_error`，`retryable: true`）。
 - 500 的 `message` 只有一句通用的话和一个编号，原文在服务端的日志里；协议错误（`invalid_request`、`not_found`、`conflict`）照旧带着自己的 `type` 和文字。
 - 客户端可以放心重试的：所有 `GET`、带着 `id` 的 `append`（存储按 `id` 去重）、两个取消。提交运行、执行工具、记忆的写入不幂等，不重试。会话的 `clear` 和三个擦除重发一遍不会多删，但第二次回的条数是 0，本包的客户端不自动重试，调用方想重试可以自己重发。
+
+**对一个地址跑一致性测试。** 被测的服务以一致性模式运行，多一个入口 `POST /conformance/instances`：请求体是 `ConformanceSetup`（`components`、模型剧本 `script`、模型的延迟 `delayMs`、存储的钟 `clock`），回一个新的隔离实例（`baseUrl` 是相对路径，另给契约用的 `agent` 和 `executor: { name, echo }`）。`ctx-conformance --url <地址>`（`@modelctx-ai/ctx-remote`）给每个用例建一个实例，用客户端跑会话、执行环境、harness、编排器、记忆存储的契约测试。任何语言写的服务端，提供这个入口、实现了线上形态，就能这样验证；剧本的语义见 [`packages/remote`](../packages/remote/README.md#对一个地址跑一致性测试)。
 
 编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 

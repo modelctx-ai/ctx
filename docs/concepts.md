@@ -8,7 +8,7 @@ status: stable
 
 # 概念
 
-ctx 是面向 agent 原生程序的上下文与运行框架。它把一个 agent 拆成七个组件，每个组件一个协议；组件之间只通过协议交互，任何一个都可以单独替换、单独托管。本仓库给每个协议一份参考实现，[yoyo](https://github.com/modelctx-ai/yoyo) 是把它们组合成业务的实践。
+ctx 是面向 agent 原生程序的上下文与运行框架。它把一个 agent 拆成七个组件，每个组件一个协议；组件之间只通过协议交互，任何一个都可以单独替换。其中会话、执行环境、harness、编排和记忆存储有线上形态，能单独托管、用别的语言实现（[托管矩阵](protocol.md#托管矩阵)）；上下文、工具目录、模型是进程内的，跟着 harness 走。本仓库给每个协议一份参考实现，[yoyo](https://github.com/modelctx-ai/yoyo) 是把它们组合成业务的实践。
 
 ## 七个组件
 
@@ -65,6 +65,8 @@ flowchart LR
 | 保留期                         | 应用自己调的清理：`pruneSession` 删掉被摘要盖住的旧历史，按条数或时间留一部分。框架里没有定时器                                                                                                                                                                                                                            |
 | 导出、导入                     | 把一个会话搬到别的存储：`exportSession` 导成 JSON Lines，`importSession` 写进目标存储并把摘要的 `covers` 这类 `seq` 引用换成目标存储的位置；`copySession` 是两步连起来。`seq` 是各个存储自己分配的，不能 `list` 再 `append`                                                                                                |
 | 所有者 `owner`                 | 部署者给编排器的稳定实例名，写进 `ctx.run.started`；`recover` 只收同一个 `owner` 的断点                                                                                                                                                                                                                                    |
+| 协议版本 `PROTOCOL_VERSION`    | 线上协议的版本，和包的 minor 版本一起走；客户端连上先读 `GET /protocol`（`ProtocolInfo`：版本、条目格式、挂了的组件），不同就报错                                                                                                                                                                                          |
+| 一致性模式                     | 被测服务多一个 `POST /conformance/instances`，每个用例一个隔离的实例；`ctx-conformance` 对这个地址跑契约测试，别的语言的实现也这样验证                                                                                                                                                                                     |
 | 父运行、子运行 `parent`        | 一个 agent 经工具调用派另一个 agent 在子会话上跑一轮：子会话的 `ctx.run.started` 记 `parent`，父会话的工具结果是 `ChildRunResult`，取消沿着链往下传                                                                                                                                                                        |
 | 继承上下文 `inherit`           | `AgentSpec.context.inherit`：把另一个会话（一般是父会话）到某个 `seq` 的投影接在本会话的历史前面，只读不写                                                                                                                                                                                                                 |
 | 权限策略 `permissions`         | `AgentSpec` 里按工具名的 `allow`、`ask`、`deny`：能序列化，过得了线；`ask` 走 `requires_action`                                                                                                                                                                                                                            |

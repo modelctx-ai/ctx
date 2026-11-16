@@ -143,7 +143,9 @@ await orchestrator.close(); // 只关这个客户端
 | `createRemoteHarness(…)`                                                                     | `Harness`：`run`、`stream`。`agent.model` 不是字符串就抛。`signal` 中止时发 `DELETE /runs/:runId`，`run` 照常返回 `stopReason: aborted`；`stream` 提前不读就断开连接，服务端同样中止并写 `ctx.run.ended`                                                                                                                                                                                              |
 | `createRemoteOrchestrator({ …, waitMs? })`                                                   | `Orchestrator`：`submit`、`status`、`cancel`、`recover`、`events`、`close`。`done` 用长轮询 `GET /orchestrator/runs/:id?wait=&session=` 实现（每次最多等 `waitMs`，缺省 25 秒），连不上时按 `retry` 重试，服务重启后结果从会话日志还原（服务端要挂着 `store`）；`close` 只关这个客户端：不再提交、结束它的事件流、等它提交的运行结束。`events` 断了不重连（事件没有位置可以续接），要不漏就看会话日志 |
 
-选项的类型是 `RemoteClientOptions`（`baseUrl`、`accessToken?`、`headers?`、`fetch?`、`retry?: RetryOptions`），会话存储是 `RemoteSessionStoreOptions`（多一个 `unreadable?`），记忆存储是 `RemoteMemoryStoreOptions`（多一个 `scope?`），执行环境是 `RemoteExecutorOptions`（多一个 `name`），编排器是 `RemoteOrchestratorOptions`（多一个 `waitMs?`）。
+选项的类型是 `RemoteClientOptions`（`baseUrl`、`accessToken?`、`headers?`、`fetch?`、`retry?: RetryOptions`、`checkProtocol?`），会话存储是 `RemoteSessionStoreOptions`（多一个 `unreadable?`），记忆存储是 `RemoteMemoryStoreOptions`（多一个 `scope?`），执行环境是 `RemoteExecutorOptions`（多一个 `name`），编排器是 `RemoteOrchestratorOptions`（多一个 `waitMs?`）。
+
+客户端第一次请求之前读一次 `GET /protocol`（`checkProtocolInfo`）：协议版本和这一端的 `PROTOCOL_VERSION` 不同、对方写的条目格式比这一端新，或者服务端没有这个入口（0.3 之前的版本、不是 ctx 的服务），都抛 `unsupported_version`，不发后面的请求。连不上不算版本不对，下一次请求再握手。对面是只实现了部分路径的服务时给 `checkProtocol: false`。
 
 服务端返回的 `{ error }` 变成抛出的 `RemoteError`：一个 `Error`，带 `status`（HTTP 状态码）、`type`、`retryable?`、`statusCode?`、`responseBody?`（后两个是上游接口的状态码和响应正文，服务端有才带；`status` 仍是本次 HTTP 响应的）；`isRemoteError(error)` 判断。NDJSON 流中途出错时最后一行是 `{ error }`，客户端同样抛出。
 
@@ -236,6 +238,9 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 
 | 组件     | 协议方法         | HTTP                                                                     | 请求体                                             | 响应                                                              |
 | -------- | ---------------- | ------------------------------------------------------------------------ | -------------------------------------------------- | ----------------------------------------------------------------- |
+| 发现     | （握手）         | `GET /protocol`                                                          | —                                                  | `ProtocolInfo`：`{ protocol, entryVersion, components }`          |
+|          | （JSON Schema）  | `GET /protocol/schema`                                                   | —                                                  | `PROTOCOL_SCHEMA`                                                 |
+|          | （OpenAPI）      | `GET /protocol/openapi`                                                  | —                                                  | `openApiDocument()`                                               |
 | 会话     | `append`         | `POST /sessions/:session/entries`                                        | `{ entries: NewEntry[], expectSeq? }`              | `{ entries: Entry[] }`                                            |
 |          | `list`           | `GET /sessions/:session/entries?after=&last=&limit=&types=a,b&kinds=x,y` | —                                                  | `{ entries: Entry[], more?: true }`，一次最多 `maxListEntries` 条 |
 |          | `watch`          | `GET /sessions/:session/entries/stream?after=`                           | —                                                  | NDJSON，每行一个 `Entry`                                          |
@@ -256,7 +261,9 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 |          | `recover`        | `POST /orchestrator/recover`                                             | —                                                  | `{ recovered: RecoveredRun[] }`                                   |
 |          | `events`         | `GET /orchestrator/events`                                               | —                                                  | NDJSON，每行一个 `OrchestratorEvent`                              |
 
-- 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），线上不做编码，`JSON.stringify`、`JSON.parse` 直接用。0.2 的编码（带 `\u0000ctx` 标记的对象）删掉了，所以客户端和服务端要一起升到 0.3。条目带 `v`，客户端读到比自己认识的更高的版本时抛 `unsupported_version`（或者按 `unreadable: 'placeholder'` 换成占位条目）。
+- `GET /protocol` 的 `components` 只列挂了的组件：`sessions: { watch }`（服务端在存储没有 `watch` 时轮询，所以总是 `true`）、`executors: { names }`、`harness: { stream }`、`orchestrator: { recover, events }`、`memory: {}`。它和另外两个文档都要鉴权，不改任何状态。
+- 形状的规范是 `GET /protocol/schema`（JSON Schema 2020-12，`$defs` 的名字和类型名一样），路径的规范是 `GET /protocol/openapi`（OpenAPI 3.1，引用同一批形状）。仓库根的 [`schema/`](../../schema) 有两份的副本；测试保证副本和代码一致、线上的真实值都合 schema、OpenAPI 列出的每条路径服务端都认。
+- 消息是 ctx 的 JSON 格式（二进制是 base64 字符串），线上不做编码，`JSON.stringify`、`JSON.parse` 直接用。0.2 的编码（带 `\u0000ctx` 标记的对象）删掉了，所以客户端和服务端要一起升到 0.3；0.3 起两边先握手，版本不同直接报错。条目带 `v`，客户端读到比自己认识的更高的版本时抛 `unsupported_version`（或者按 `unreadable: 'placeholder'` 换成占位条目）。
 - NDJSON 流里的空行是心跳，跳过。`POST /runs` 和 `POST /executors/:name/execute` 的 JSON 正文前面可能有换行（也是心跳）；这时状态码已经是 200，之后才出的错写成 `{ error, status }`，`status` 是本来该回的状态码。
 - `list` 的响应带 `more: true` 时后面还有：用最后一条的 `seq` 当 `after` 接着读。`last` 是从末尾数的，只读一页。
 - `append` 带 `expectSeq` 而前提不满足时，服务端回 409（`{ error: { type: 'conflict', retryable: true } }`），客户端转成协议的 `conflict`（`CtxError`，`isConflict(error)` 认得），调用方不必认识 HTTP。
@@ -290,6 +297,31 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 
 两者都是传输方式的变化，协议不变：客户端拿到的仍是同样的 `Executor`、`Harness`，契约测试照样跑。
 
+## 对一个地址跑一致性测试
+
+别的语言写的服务端，按线上形态实现了哪几个组件，就能对着它跑同一套契约测试：
+
+```bash
+ctx-conformance --url http://127.0.0.1:8080 --token "$TOKEN" --components sessions,harness
+```
+
+被测的服务要以一致性模式运行，多提供一个入口 `POST /conformance/instances`：每个用例请求一次，拿到一个新的隔离实例，实例的路径挂在 `/conformance/instances/<id>` 下，形态和正常的服务一样。请求体是 `ConformanceSetup`：
+
+| 字段         | 意思                                                                                                                                                                 |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `components` | 这个用例要哪几个组件：`sessions`、`executors`、`harness`、`orchestrator`、`memory`                                                                                   |
+| `script`     | harness、编排器的模型剧本：第 n 次调用模型回第 n 步。`text` 是回答（带 `truncated` 时 `finishReason` 是 `length`），`tool-call` 调用回显工具，`error` 是模型调用失败 |
+| `delayMs`    | 模型每一步先等这么久。编排器的契约要在第一轮还在跑时提交、取消第二轮                                                                                                 |
+| `clock`      | 存储的钟：`{ at, step }` 第 n 次读是 `at + n × step`；`real` 是真实时间                                                                                              |
+
+响应是 `ConformanceInstance`：`baseUrl`（相对这个服务的路径）、harness 和编排器用的 `agent`（模型名对着按剧本回答的模型）、执行环境用的 `executor: { name, echo }`（回显工具把输入原样放进结果）。实例只给测试用，不该对外开放。
+
+- 命令是 `@modelctx-ai/ctx-remote` 的 `ctx-conformance`，用 `node:test` 跑，失败时退出码非 0。令牌也可以放在 `CTX_ACCESS_TOKEN` 里；`--components` 缺省全部。
+- 在测试框架里跑：`@modelctx-ai/ctx-remote/conformance` 的 `describeConformance(baseUrl, { components?, accessToken?, … }, { describe, test })`，Vitest、`node:test` 都行。
+- ctx 自己的服务端怎么进一致性模式：`@modelctx-ai/ctx-remote/server` 的 `createConformanceHandler({ create, accessToken?, maxInstances? })`，`create(setup)` 按请求建好要挂的组件（和 `createRemoteHandler` 的选项一样），另给 `agent`、`executor`。本包的测试用核心包的内存组件实现了 `create`，对它跑全部五个组件的契约。
+- 导出：`/conformance` 有 `describeConformance`、`ConformanceOptions`、`CONFORMANCE_COMPONENTS`、`CONFORMANCE_PATH` 和类型 `ConformanceComponent`、`ConformanceSetup`、`ConformanceInstance`；`/server` 有 `createConformanceHandler`、`ConformanceHandlerOptions`、`ConformanceInstanceOptions`，以及 `openApiDocument()`（`GET /protocol/openapi` 的文档）、`openApiOperations()`（文档里的每条路径和方法）。
+- 上下文、工具目录、模型、记忆的门面不在里面：它们不是线上协议（见[协议层的托管矩阵](../../docs/protocol.md#托管矩阵)）。
+
 ## 测试
 
-客户端一侧跑协议包的契约测试，服务端挂核心包、`ctx-exec` 的实现：`describeSessionStoreContract`（服务端的存储有 `watch` 和没有 `watch` 两种）、`describeExecutorContract`（函数执行环境和子进程执行环境）、`describeHarnessContract`、`describeOrchestratorContract`、`describeMemoryStoreContract`（服务端挂 `ctx-memory` 的内存存储）全部通过。另有一例端到端：会话存储、子进程执行环境、harness 各在一个 `startRemote` 里，harness 经客户端用另外两个，按剧本调用 `run_command` 跑 `echo hello`，日志里有工具结果。
+客户端一侧跑协议包的契约测试，服务端挂核心包、`ctx-exec` 的实现：`describeSessionStoreContract`（服务端的存储有 `watch` 和没有 `watch` 两种）、`describeExecutorContract`（函数执行环境和子进程执行环境）、`describeHarnessContract`、`describeOrchestratorContract`、`describeMemoryStoreContract`（服务端挂 `ctx-memory` 的内存存储）全部通过。另有一例端到端：会话存储、子进程执行环境、harness 各在一个 `startRemote` 里，harness 经客户端用另外两个，按剧本调用 `run_command` 跑 `echo hello`，日志里有工具结果。`describeConformance` 对一致性模式的参考服务（`createConformanceHandler` 加核心包的内存组件）再跑一遍五个组件的契约，走的是别的语言的服务端会走的那条路。`schema.test.ts` 查 `schema/` 下的副本和代码一致、线上的真实值合 schema、OpenAPI 的每条路径服务端都认。
