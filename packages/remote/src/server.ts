@@ -511,9 +511,21 @@ function sessionsOptionsOf(query: URLSearchParams): SessionsOptions {
 }
 
 function listOptionsOf(query: URLSearchParams): ListOptions {
-  const options: { after?: number; last?: number; limit?: number; types?: EntryType[]; kinds?: string[] } = {};
+  const options: {
+    after?: number;
+    last?: number;
+    limit?: number;
+    types?: EntryType[];
+    kinds?: string[];
+    atAfter?: number;
+  } = {};
   const after = afterParam(query);
   if (after !== undefined) options.after = after;
+  const atAfter = query.get('atAfter');
+  if (atAfter !== null) {
+    options.atAfter = Number(atAfter);
+    if (atAfter === '' || Number.isNaN(options.atAfter)) fail(400, 'atAfter must be a number (an at)');
+  }
   const last = query.get('last');
   if (last !== null) options.last = Number(last);
   const limit = query.get('limit');

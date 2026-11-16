@@ -69,6 +69,7 @@ interface ListOptions {
   limit?: number; // 过滤之后 seq 最小的 N 条；和 after 配合向前翻页；和 last 同时给时先取 last
   types?: readonly EntryType[];
   kinds?: readonly string[]; // 只要事件，且 kind 在其中；与 types 取交集；空列表什么都不匹配
+  atAfter?: number; // 只要 at 大于它的（不含）；NaN 不过滤
 }
 interface SessionsOptions {
   prefix?: string; // 字面前缀，不是通配符
@@ -106,6 +107,7 @@ interface SessionStore {
 - `sessions` 只列有内容的会话，按名字升序（码点序，也就是 UTF-8 字节序）。翻页：`after` 给上一页最后一个名字，`prefix` 按字面匹配，`limit` 限条数。
 - `limit` 用来翻页：`list({ after, limit })` 读一页，下一页的 `after` 是这一页最后一条的 `seq`，读到不满一页为止。长会话不必一次读进内存；`ctx-sqlite` 的 `watch` 和 `ctx-remote` 的服务端都这样一页一页读。
 - `kinds` 只返回事件，消息和摘要没有 `kind`；和 `types` 取交集，`types` 里没有 `event` 就什么都不返回；`last` 在过滤之后取，所以 `{ kinds: [a, b], last: 1 }` 是这些事件里最后写的一条。
+- `atAfter` 按 `at` 筛，结果仍按 `seq` 升序；和别的条件取交集，`last`、`limit` 在过滤之后取。只读尾部的一方靠它找写得早、`at` 却排在尾部之后的条目（把到期时间当 `at` 的提醒），见 `projectSession`。
 - 生效的摘要是 `covers` 最大的那条；`covers` 相同时 `seq` 大的（后写的）生效。
 - 事件 `kind` 用 `{domain}.{action}`。框架保留 `ctx.` 前缀，常量是 `CTX_EVENTS`：
 
@@ -336,14 +338,15 @@ interface Projection {
   messages: Message[];
   items: readonly ProjectedMessage[]; // 每条带 from、upTo、at、pinned、tokens
   tokens: number;
-  dropped: number; // 被窗口丢掉的消息条数
+  dropped: number; // 被窗口丢掉的消息条数；projectSession 只读了尾部时只数读到的部分
   truncated: number; // 因为 window.truncate 被截短的消息条数
   summary?: SummaryEntry;
 }
 ```
 
 - 参考实现 = 投影规则（事件渲染、摘要渲染、消息改写、窗口）+ 来源 + 压缩，就是今天 `createContext` 里的 `prepare`、`view`、`compact`。
-- 投影、来源收集、token 估算和截短是纯函数，放在协议包：`project(entries, options)`、`latestSummary`、`defaultSummaryMessage`、`collectFacts(sources, { session, timeoutMs?, onError? })`、`renderFacts`、`defineSource`、`estimateTokens`、`estimateTextTokens`、`estimateFileTokens`、`truncateText`、`truncateMessage`。语义见[架构](architecture.md#投影)。
+- 投影、来源收集、token 估算和截短是纯函数，放在协议包：`project(entries, options)`、`projectSession(store, session, options)`、`latestSummary`、`defaultSummaryMessage`、`collectFacts(sources, { session, timeoutMs?, onError? })`、`renderFacts`、`defineSource`、`estimateTokens`、`estimateTextTokens`、`estimateFileTokens`、`truncateText`、`truncateMessage`。语义见[架构](architecture.md#投影)。
+- 长会话不必整段读出来：`projectSession` 读生效的摘要和它之后的条目再投影，结果和读出来再 `project` 一样，但有窗口时只读够用的尾部。按 `seq` 读最后 N 条（`last`），用 `atAfter` 补上写得更早、`at` 却排在这 N 条之后的条目，这样读到的是投影顺序里完整的一段尾巴；窗口把开头可能不完整的那组（同类事件合成的一组被切开，或者工具结果的调用在更前面）和后面至少一个完整的组都挤掉了，就说明更早的部分不会再进窗口，否则读 4 倍那么多再来。没有窗口（或者是 `{}`）时读整段。参考实现的 `view`、`build` 用它。
 - 投影的输出是模型接口收得下的消息序列，不管日志里是什么样、窗口裁在哪：工具结果找不到对应的调用（调用被裁掉了、或者本来就没有）就去掉；工具调用没有结果（运行断在中间）就补一条错误结果（`No result was recorded for this tool call.`），服务商自己执行的调用（`providerExecuted`）除外；窗口裁剪之后，开头不留孤立的工具结果，没有摘要时也不以助手消息开头（接着裁到下一条用户消息）。
 - 窗口的两处配置：请求里的 `window`（`BuildRequest`、`ViewOptions`、`AgentSpec`）给了就**整个换掉** builder 配置的上限，`{}` 表示不裁剪；`estimate` 是函数、过不了线，始终用 builder 的。`build` 的 `maxTokens` 管的是整次调用：指令、事实、工具定义、`input`、`prompt` 的估算先从里面扣掉，剩下的才是历史的预算；`view` 没有这些，`maxTokens` 就是历史的预算。
 - `window.truncate`：缺省窗口只会整组地丢，至少留下最后一组，哪怕它自己就超预算（一条 25 万 token 的工具结果、一段粘贴进来的长文）。给了 `truncate: true`（要同时有 `maxTokens`）就再多做两步：先给单条消息封顶，超过历史预算一半的截到一半，免得它把别的历史全挤掉；丢到只剩最后一组还超，从最大的消息接着截，直到放得下。截短用 `truncateMessage(message, maxTokens, estimate?)`：文字留头尾、中间写明省略了多少字符（`truncateText(text, maxTokens, estimate?)`），工具结果先把内联的文件换成一句说明、再把内容写成文字截短（错误结果只截信息、去掉 `data`），消息里内联的文件换成说明；推理、工具调用的输入、服务商自定义内容不动（截了签名对不上、调用不再合法），所以结果仍可能超。截短只发生在这一次投影里，日志不变；`Projection.truncated` 是被截短的条数。

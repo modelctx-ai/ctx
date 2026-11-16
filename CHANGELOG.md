@@ -4,6 +4,11 @@
 
 ## 未发布
 
+- **实现** 长会话的读取有上界（[#34](https://github.com/modelctx-ai/ctx/issues/34) 剩下的两项）。协议包新函数 `projectSession(store, session, options)`：读生效的摘要和它之后的条目再投影，结果和读出来再 `project` 一样；有窗口时只读够用的尾部——按 `seq` 读最后 N 条，用 `atAfter` 补上 `at` 排在这段之后的更早的条目，窗口挤掉了开头可能不完整的那组和至少一个完整的组就停，否则读 4 倍。核心包 builder 的 `view`、`build` 用它：30 万条、没压缩过的 SQLite 会话，`maxMessages: 20` 的 `view` 从读全量（这台机器上 41 秒）降到 3 毫秒。`project` 的窗口裁剪不再是平方复杂度（`shift()` 换成下标）：30 万条、`maxMessages: 20` 从 40 秒降到 0.3 秒。**行为变化**：只读了尾部时 `Projection.dropped` 只数读到的那部分。
+- **新增** `ListOptions.atAfter`：只要 `at` 大于它的条目，仍按 `seq` 返回，`NaN` 不过滤。内存存储（`filterEntries`）、`ctx-sqlite`、`ctx-remote`（`?atAfter=`，OpenAPI 跟上）都实现，`describeSessionStoreContract` 加一例。**不兼容**：自己实现 `SessionStore` 的要认它。
+- **新增** `ctx-sqlite` 的索引 `(session, type, seq)`（读摘要不扫整个会话）和 `(session, at)`（`atAfter`）。打开已有的库时补上，不升结构版本，旧版本照样打得开。
+- **修复** `ctx-remote` 客户端的 `list({ last })`：`last` 比服务端一页（`maxListEntries`）多时只回了第一页，而且是最后 N 条里最早的那一段。现在接着读完。
+
 - **新增** harness 的一致性等级（[#23](https://github.com/modelctx-ai/ctx/issues/23) 的第一步）：`describeHarnessContract(name, factory, api, { levels? })` 按 `HarnessLevel`（`trace`、`execute`、`resume`、`context`、`output`）分组，常量 `HARNESS_LEVELS`、类型 `HarnessContractOptions`；缺省全跑，用例名前面带等级。`describeConformance` 的 `harnessLevels`、`ctx-conformance --harness-levels`。
 - **新增** `ctx-mcp` 的另一半：`createMcpServer({ executors, tools?, context, onResult?, validateInput? })` 把执行环境包成 MCP 服务器（`initialize`、`ping`、`tools/list`、`tools/call`、取消），传输 `createMcpHttpHandler`（Streamable HTTP，只回 JSON）和 `serveMcpStdio`；`toolOutputToMcp`、`MCP_PROTOCOL_VERSIONS`。不加依赖。
 - **新增** 云托管的三个前提（[#25](https://github.com/modelctx-ai/ctx/issues/25)，[ADR 0009](docs/adr/0009-hosted-prerequisites.md)）。

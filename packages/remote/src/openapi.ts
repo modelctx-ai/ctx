@@ -68,7 +68,7 @@ const OPERATIONS: readonly Operation[] = [
     path: '/sessions/{session}/entries',
     tag: '会话',
     summary: 'list：一次最多一页，more 时用最后一条的 seq 当 after 接着读',
-    query: ['after', 'last', 'limit', 'types', 'kinds'],
+    query: ['after', 'last', 'limit', 'types', 'kinds', 'atAfter'],
     response: shape({ entries: arrayOf(ref('Entry')) }, { more: bool }),
   },
   {

@@ -334,13 +334,19 @@ export function createRemoteSessionStore(options: RemoteSessionStoreOptions): Se
   };
 
   async function list(session: string, listOptions: ListOptions = {}): Promise<Entry[]> {
-    const { last, limit, types, kinds } = listOptions;
+    const { limit, types, kinds, atAfter } = listOptions;
     // kinds 用逗号分隔，带逗号的 kind 过不了线；与其静默拆成两个，不如直接报错。
     if (kinds?.some((kind) => kind.includes(','))) throw new Error('An entry kind cannot contain a comma.');
     const wanted = limit === undefined ? undefined : Number.isFinite(limit) ? Math.floor(limit) : 0;
     if (wanted !== undefined && wanted <= 0) return [];
+    const lastN =
+      listOptions.last === undefined ? undefined : Number.isFinite(listOptions.last) ? Math.floor(listOptions.last) : 0;
+    if (lastN !== undefined && lastN <= 0) return [];
     // 服务端一次只回一页（`more: true` 表示后面还有）：接着用 `after` 读，直到读完或够了 `limit`。
+    // 带 `last` 时第一页是最后 N 条里最早的那一段；它们是按 `seq` 的一段后缀，所以后面几页不带 `last`、
+    // 只从这一页的末尾接着读。其间又写进来的会多出来，最后只留最后 N 条。
     const out: Entry[] = [];
+    let last = lastN;
     for (let after = listOptions.after; ;) {
       const body = await connection.json<{ entries: Entry[]; more?: boolean }>('GET', entriesPath(session), {
         query: {
@@ -349,13 +355,15 @@ export function createRemoteSessionStore(options: RemoteSessionStoreOptions): Se
           limit: wanted !== undefined ? String(wanted - out.length) : undefined,
           types: types ? types.join(',') : undefined,
           kinds: kinds ? kinds.join(',') : undefined,
+          atAfter: atAfter !== undefined && !Number.isNaN(atAfter) ? String(atAfter) : undefined,
         },
       });
       out.push(...body.entries.map(checked));
       const tail = body.entries.at(-1);
-      // `last` 是从末尾数的，翻页会改变它的意思：只读服务端给的这一页。
-      if (!body.more || tail === undefined || last !== undefined) return out;
+      if (!body.more || tail === undefined)
+        return lastN !== undefined && wanted === undefined ? out.slice(-lastN) : out;
       after = tail.seq;
+      last = undefined;
     }
   }
 

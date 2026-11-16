@@ -4,6 +4,8 @@
 
 ## 2026-11-16
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#34](https://github.com/modelctx-ai/ctx/issues/34)）：`ListOptions` 加 `atAfter`；上下文一节写 `projectSession` 怎么只读尾部、为什么结果和读整段一样，`Projection.dropped` 只读了尾部时只数读到的部分。[架构](architecture.md)的投影一节写 builder 的 `view`、`build` 只读尾部，压缩和 `inherit` 照旧读整段；会话存储的 `list` 一行加 `atAfter`。[ctx-sqlite](../packages/sqlite/README.md) 的表结构加两个索引，[ctx-remote](../packages/remote/README.md) 的路径表加 `atAfter`，[ctx-protocol](../packages/protocol/README.md) 的导出加 `projectSession`。
+
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：Harness 一节加「一致性等级」，执行环境一节写反方向的 MCP 服务器，契约测试表跟上。[架构](architecture.md)的工具与 MCP 一节写 `createMcpServer` 的做法；[概念](concepts.md)的术语表加「一致性等级」。[ctx-mcp](../packages/mcp/README.md) 新写「反方向：把执行环境交给 MCP 客户端」，[ctx-protocol](../packages/protocol/README.md) 写等级怎么选，[ctx-remote](../packages/remote/README.md) 写 `--harness-levels`。
 - **新增** 英文译本（[#50](https://github.com/modelctx-ai/ctx/issues/50)）：[`docs/en/protocol.md`](en/protocol.md)（协议层全文，含线上形态）、[`README.en.md`](../README.en.md)，[docs/en/index.md](en/index.md) 和[文档入口](index.md)的「英文」一组。中文为准，译本的 frontmatter 记 `translation_of`、`synced`；`packages/protocol/src/translation.test.ts` 查两边的行内代码和章节层级，规范改了没跟进译本就失败。[README](../README.md) 开头加英文版的链接；[AGENTS.md](../AGENTS.md) 写了同步的规矩。架构和 ADR 先不译。
 - **新增** [ADR 0009](adr/0009-hosted-prerequisites.md)：云托管的前提（[#25](https://github.com/modelctx-ai/ctx/issues/25)）。每会话的执行环境另起 `open`、`close`，不改 `provision`；环境的描述放在 `AgentSpec.environment`；凭证不进执行环境、只给约定；`ctx-remote` 的鉴权扩展点和主体。

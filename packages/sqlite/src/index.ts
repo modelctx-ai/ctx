@@ -185,6 +185,10 @@ function repairs(database: DatabaseSync, table: string): string[] {
     sql.push(`ALTER TABLE ${table} ADD COLUMN kind TEXT GENERATED ALWAYS AS (json_extract(body, '$.kind')) VIRTUAL`);
   }
   if (!indexes.has(`${table}_kind`)) sql.push(`CREATE INDEX ${table}_kind ON ${table} (session, kind, seq)`);
+  // 读摘要（`list({ types: ['summary'] })`，每次组装上下文都读）不扫整个会话。
+  if (!indexes.has(`${table}_type`)) sql.push(`CREATE INDEX ${table}_type ON ${table} (session, type, seq)`);
+  // `list({ atAfter })`：只读尾部的投影用它找 `at` 排在尾部之后的旧条目。
+  if (!indexes.has(`${table}_at`)) sql.push(`CREATE INDEX ${table}_at ON ${table} (session, at)`);
   return sql;
 }
 
@@ -341,9 +345,16 @@ export function createSqliteStore(options: SqliteStoreOptions): SqliteSessionSto
       checkSessionName(session);
       const where = ['session = ?'];
       const params: SQLInputValue[] = [session];
+      // 和内存存储一样，`atAfter` 是 `NaN` 时不过滤（直接绑进去的话 `at > NaN` 一行都不匹配）。
+      const byAt = listOptions.atAfter !== undefined && !Number.isNaN(listOptions.atAfter);
       if (listOptions.after !== undefined) {
-        where.push('seq > ?');
+        // 同时按 `at` 筛时让 (session, at) 索引挑行：`+seq` 不走 (session, seq) 索引，免得从 `after` 起一行行扫过去。
+        where.push(byAt ? '+seq > ?' : 'seq > ?');
         params.push(listOptions.after);
+      }
+      if (byAt) {
+        where.push('at > ?');
+        params.push(listOptions.atAfter);
       }
       if (listOptions.types) {
         if (listOptions.types.length === 0) return [];

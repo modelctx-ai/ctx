@@ -8,6 +8,7 @@ import {
   estimateTokens,
   latestSummary,
   project,
+  projectSession,
   renderFacts,
   summaryEntry,
   textOf,
@@ -321,7 +322,8 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
 
   async function view(session: string, viewOptions: ViewOptions = {}): Promise<Projection> {
     const chosen = projectionNamed(viewOptions.projection);
-    return project(await load(session), { ...chosen, window: windowOf(chosen, viewOptions.window) });
+    // 有窗口时只读够用的尾部，长会话不必整段读出来；结果和读整段一样。
+    return projectSession(store, session, { ...chosen, window: windowOf(chosen, viewOptions.window) });
   }
 
   /** 不裁剪的整段视图：压缩要看到全部，builder 配的窗口不能挡着。 */
@@ -366,7 +368,7 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
       (request.tools?.length ? estimateTextTokens(JSON.stringify(request.tools)) : 0) +
       sized(request.input) +
       sized(request.prompt);
-    const own = project(await load(request.session), {
+    const own = await projectSession(store, request.session, {
       ...chosen,
       window: windowOf(chosen, request.window, reserve),
     });

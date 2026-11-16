@@ -493,6 +493,27 @@ export function describeSessionStoreContract(
       assert.equal((await store.list('s', { types: ['event'] })).length, 5, '不给 kinds 时不过滤');
     });
 
+    test('atAfter 只要 at 更晚的（不含等于），仍按 seq 返回；和 after、types、last、limit 一起用；NaN 不过滤', async () => {
+      const store = await factory({ now: Date.now });
+      const written = await store.append('s', [
+        userEntry('提醒', { at: 9_000 }),
+        userEntry('一', { at: 100 }),
+        eventEntry('pet.whisper', { text: '二', at: 200 }),
+        userEntry('三', { at: 300 }),
+        userEntry('四', { at: 300 }),
+      ]);
+      await store.append('other', [userEntry('别的会话', { at: 9_999 })]);
+      assert.deepEqual(texts(await store.list('s', { atAfter: 200 })), ['提醒', '三', '四'], '按 seq，不按 at');
+      assert.deepEqual(texts(await store.list('s', { atAfter: 200, after: written[0]!.seq })), ['三', '四']);
+      assert.deepEqual(texts(await store.list('s', { atAfter: 100, types: ['event'] })), ['二']);
+      assert.deepEqual(texts(await store.list('s', { atAfter: 100, limit: 2 })), ['提醒', '二'], '过滤之后取最早的');
+      assert.deepEqual(texts(await store.list('s', { atAfter: 100, last: 1 })), ['四'], '过滤之后取最后的');
+      assert.deepEqual(await store.list('s', { atAfter: 9_000 }), []);
+      assert.equal((await store.list('s', { atAfter: Number.NaN })).length, 5, 'NaN 不过滤');
+      assert.equal((await store.list('s', { atAfter: Number.NEGATIVE_INFINITY })).length, 5);
+      assert.deepEqual(await store.list('s', { atAfter: Number.POSITIVE_INFINITY }), []);
+    });
+
     test('kinds 只看事件自己的 kind：消息正文和事件数据里的 kind 字样不算', async () => {
       const store = await factory({ now: Date.now });
       await store.append('s', [

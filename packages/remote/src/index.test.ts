@@ -445,7 +445,7 @@ describe('会话的条目分页', () => {
     const store = createMemoryStore();
     await store.append(
       's',
-      Array.from({ length: 10 }, (_, i) => userEntry(String(i + 1))),
+      Array.from({ length: 10 }, (_, i) => userEntry(String(i + 1), { at: i + 1 })),
     );
     const server = await serve({ store, maxListEntries: 3 });
     const raw = await fetch(`${server.baseUrl}/sessions/s/entries`, {
@@ -461,6 +461,11 @@ describe('会话的条目分页', () => {
     expect(await texts({ after: 4, limit: 5 })).toEqual(['5', '6', '7', '8', '9']);
     expect(await texts({ limit: 2 })).toEqual(['1', '2']);
     expect(await texts({ last: 2 })).toEqual(['9', '10']);
+    // `last` 比一页多：以前只回服务端的第一页（最后 7 条里最早的 3 条）。
+    expect(await texts({ last: 7 })).toEqual(['4', '5', '6', '7', '8', '9', '10']);
+    expect(await texts({ last: 7, limit: 5 })).toEqual(['4', '5', '6', '7', '8']);
+    expect(await texts({ last: 99 })).toHaveLength(10);
+    expect(await texts({ atAfter: 7 })).toEqual(['8', '9', '10']);
   });
 
   test('没有 watch 的存储：轮询一页一页读，长会话也读得完', async () => {

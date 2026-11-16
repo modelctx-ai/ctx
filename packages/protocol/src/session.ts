@@ -79,6 +79,11 @@ export interface ListOptions {
    * 空列表什么都不匹配。`last` 在过滤之后取。
    */
   readonly kinds?: readonly string[];
+  /**
+   * 只要 `at` 大于它的条目（不含）。和别的条件取交集，`last`、`limit` 在过滤之后取；`NaN` 不过滤。
+   * 投影按 `at` 排：只读尾部的一方用它找写得早、`at` 却排在尾部之后的条目（把到期时间当 `at` 的提醒）。
+   */
+  readonly atAfter?: number;
 }
 
 /** `append` 的写入前提。 */
@@ -219,6 +224,7 @@ export function compareEntries(a: Pick<Entry, 'at' | 'seq'>, b: Pick<Entry, 'at'
 export function filterEntries(entries: readonly Entry[], options: ListOptions | undefined): Entry[] {
   let out = entries.filter((entry) => {
     if (options?.after !== undefined && entry.seq <= options.after) return false;
+    if (options?.atAfter !== undefined && entry.at <= options.atAfter) return false;
     if (options?.types && !options.types.includes(entry.type)) return false;
     if (options?.kinds && (entry.type !== 'event' || !options.kinds.includes(entry.kind))) return false;
     return true;

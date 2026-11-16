@@ -73,6 +73,7 @@ interface ListOptions {
   limit?: number; // the N entries with the smallest seq after filtering; pages forward with after; when given with last, last applies first
   types?: readonly EntryType[];
   kinds?: readonly string[]; // events only, whose kind is in the list; intersected with types; an empty list matches nothing
+  atAfter?: number; // only entries whose at is greater (exclusive); NaN does not filter
 }
 interface SessionsOptions {
   prefix?: string; // literal prefix, not a wildcard
@@ -110,6 +111,7 @@ interface SessionStore {
 - `sessions` lists only sessions with content, ascending by name (code point order, which is UTF-8 byte order). Paging: `after` is the last name of the previous page, `prefix` matches literally, `limit` caps the count.
 - `limit` is for paging: `list({ after, limit })` reads one page, the next page's `after` is the `seq` of this page's last entry, and you stop at a short page. A long session never has to be read into memory at once; `ctx-sqlite`'s `watch` and the `ctx-remote` server both read page by page.
 - `kinds` returns only events, since messages and summaries have no `kind`; it is intersected with `types`, so nothing comes back when `types` lacks `event`; `last` applies after filtering, so `{ kinds: [a, b], last: 1 }` is the last of those events written.
+- `atAfter` filters by `at`; the result is still in ascending `seq`. It is intersected with the other conditions, and `last` and `limit` apply after filtering. A reader that only reads the tail uses it to find entries written earlier whose `at` sorts after the tail (reminders that use their due time as `at`); see `projectSession`.
 - The summary in effect is the one with the largest `covers`; on equal `covers` the one with the larger `seq` (written later) wins.
 - Event `kind` is `{domain}.{action}`. The framework reserves the `ctx.` prefix; the constants are `CTX_EVENTS`:
 
@@ -340,14 +342,15 @@ interface Projection {
   messages: Message[];
   items: readonly ProjectedMessage[]; // each with from, upTo, at, pinned, tokens
   tokens: number;
-  dropped: number; // messages dropped by the window
+  dropped: number; // messages dropped by the window; when projectSession read only the tail, it counts only the part it read
   truncated: number; // messages shortened because of window.truncate
   summary?: SummaryEntry;
 }
 ```
 
 - The reference implementation = projection rules (event rendering, summary rendering, message rewriting, window) + sources + compaction, which is what `prepare`, `view` and `compact` in `createContext` do today.
-- Projection, source collection, token estimation and shortening are pure functions in the protocol package: `project(entries, options)`, `latestSummary`, `defaultSummaryMessage`, `collectFacts(sources, { session, timeoutMs?, onError? })`, `renderFacts`, `defineSource`, `estimateTokens`, `estimateTextTokens`, `estimateFileTokens`, `truncateText`, `truncateMessage`. Their semantics are in [the architecture](../architecture.md#投影).
+- Projection, source collection, token estimation and shortening are pure functions in the protocol package: `project(entries, options)`, `projectSession(store, session, options)`, `latestSummary`, `defaultSummaryMessage`, `collectFacts(sources, { session, timeoutMs?, onError? })`, `renderFacts`, `defineSource`, `estimateTokens`, `estimateTextTokens`, `estimateFileTokens`, `truncateText`, `truncateMessage`. Their semantics are in [the architecture](../architecture.md#投影).
+- Long sessions need not be read whole: `projectSession` reads the effective summary and the entries after it, then projects them, with the same result as reading them and calling `project`, but with a window it reads only as much of the tail as it needs. It reads the last N entries by `seq` (`last`) and uses `atAfter` to add entries written earlier whose `at` sorts after those N, so what it read is a complete tail in projection order. When the window pushed out the possibly incomplete first group (a fold of same-kind events cut in two, or tool results whose call is further back) and at least one complete group after it, nothing earlier can enter the window; otherwise it reads four times as many and tries again. Without a window (or with `{}`) it reads everything. The reference implementation's `view` and `build` use it.
 - A projection's output is a message sequence a model API accepts, whatever the log looks like and wherever the window cuts: a tool result without its call (the call was cut, or never existed) is dropped; a tool call without a result (the run broke off) gets an error result (`No result was recorded for this tool call.`), except calls the provider executed itself (`providerExecuted`); after the window cuts, no orphaned tool result is left at the start, and without a summary it does not start with an assistant message either (it cuts on to the next user message).
 - The window is configured in two places: a `window` in the request (`BuildRequest`, `ViewOptions`, `AgentSpec`) **replaces** the builder's limits entirely when given, and `{}` means no cutting; `estimate` is a function that cannot cross the wire, so the builder's is always used. In `build`, `maxTokens` covers the whole call: the estimates of instructions, facts, tool definitions, `input` and `prompt` are taken out first and what is left is the budget for history; `view` has none of those, so there `maxTokens` is the history budget.
 - `window.truncate`: by default the window only drops whole groups and always keeps the last group, even when it alone is over budget (a 250k-token tool result, a long pasted text). With `truncate: true` (which needs `maxTokens` as well) it does two more things: first it caps single messages, shortening any message over half the history budget to half, so it does not push out all other history; then if only the last group is left and it is still over, it keeps shortening from the largest message until it fits. Shortening uses `truncateMessage(message, maxTokens, estimate?)`: text keeps its head and tail with a note in the middle on how many characters were left out (`truncateText(text, maxTokens, estimate?)`), a tool result first replaces inline files with a note and then is written as text and shortened (an error result shortens only the message and drops `data`), and inline files in a message are replaced with a note; reasoning, tool-call inputs and provider-defined content are left alone (cutting them breaks signatures or makes the call invalid), so the result may still be over. Shortening happens only in this projection and the log is unchanged; `Projection.truncated` is how many messages were shortened.
