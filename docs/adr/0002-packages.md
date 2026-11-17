@@ -16,18 +16,19 @@ status: stable
 
 先按层拆：协议一个包，实现若干包（[ADR 0004](0004-protocol-and-implementation.md)）。实现包再按依赖和运行环境拆，不按概念拆：所有应用都要的、和运行环境无关的放进核心包；带额外依赖或只能在 Node 上跑的各成一个适配包，用不到就不装。
 
-| 包                          | 内容                                                                                            | 单独成包的原因                                                                                          |
-| --------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `@modelctx-ai/ctx-protocol` | 九个协议的接口、JSON 形状、纯函数、`/testing` 契约测试                                          | 实现别的存储、执行环境或 harness 时只装它，不带进任何实现和 `ai` 的运行时                               |
-| `@modelctx-ai/ctx`          | 内存存储、投影和来源、工具注册表、函数执行环境、AI SDK harness、进程内编排器、`createContext()` | 进程内的参考实现，每个应用都要；只依赖协议包和 `ai`                                                     |
-| `@modelctx-ai/ctx-sqlite`   | `node:sqlite` 的会话存储和记忆存储                                                              | 只能在 Node ≥22.13 上跑；自带存储的应用用不到                                                           |
-| `@modelctx-ai/ctx-models`   | 按配置建模型，含 System One 的决策、提取模型                                                    | 带进服务商 SDK（`@ai-sdk/openai-compatible`、`@ai-sdk/anthropic`）；自己传 `LanguageModel` 的应用用不到 |
-| `@modelctx-ai/ctx-memory`   | 记忆的参考实现 `createMemory`、内存记忆存储、启发式和 `LanguageModel` 装成的决策、提取模型      | 不用记忆的应用用不到；要 `ai` 的 `generateText`                                                         |
-| `@modelctx-ai/ctx-mcp`      | MCP 服务器作为执行环境                                                                          | 带进 `@ai-sdk/mcp`，要起子进程                                                                          |
-| `@modelctx-ai/ctx-exec`     | 本机子进程执行环境                                                                              | 要 `node:child_process`；不跑命令的应用用不到                                                           |
-| `@modelctx-ai/ctx-remote`   | 会话存储、执行环境、harness、编排器、记忆存储的 HTTP 服务端和客户端                             | 服务端要 `node:http`；进程内用法用不到                                                                  |
-| `@modelctx-ai/ctx-gateway`  | OpenAI 兼容网关                                                                                 | 本机 HTTP 服务；只有要接 OpenAI 协议客户端的应用才用                                                    |
-| `@modelctx-ai/ctx-otel`     | 从会话日志派生 OpenTelemetry 的 span                                                            | 带进 `@opentelemetry/api`；不接追踪后端的应用用不到                                                     |
+| 包                             | 内容                                                                                            | 单独成包的原因                                                                                          |
+| ------------------------------ | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `@modelctx-ai/ctx-protocol`    | 九个协议的接口、JSON 形状、纯函数、`/testing` 契约测试                                          | 实现别的存储、执行环境或 harness 时只装它，不带进任何实现和 `ai` 的运行时                               |
+| `@modelctx-ai/ctx`             | 内存存储、投影和来源、工具注册表、函数执行环境、AI SDK harness、进程内编排器、`createContext()` | 进程内的参考实现，每个应用都要；只依赖协议包和 `ai`                                                     |
+| `@modelctx-ai/ctx-sqlite`      | `node:sqlite` 的会话存储和记忆存储                                                              | 只能在 Node ≥22.13 上跑；自带存储的应用用不到                                                           |
+| `@modelctx-ai/ctx-models`      | 按配置建模型，含 System One 的决策、提取模型                                                    | 带进服务商 SDK（`@ai-sdk/openai-compatible`、`@ai-sdk/anthropic`）；自己传 `LanguageModel` 的应用用不到 |
+| `@modelctx-ai/ctx-memory`      | 记忆的参考实现 `createMemory`、内存记忆存储、启发式和 `LanguageModel` 装成的决策、提取模型      | 不用记忆的应用用不到；要 `ai` 的 `generateText`                                                         |
+| `@modelctx-ai/ctx-mcp`         | MCP 服务器作为执行环境                                                                          | 带进 `@ai-sdk/mcp`，要起子进程                                                                          |
+| `@modelctx-ai/ctx-exec`        | 本机子进程执行环境                                                                              | 要 `node:child_process`；不跑命令的应用用不到                                                           |
+| `@modelctx-ai/ctx-remote`      | 会话存储、执行环境、harness、编排器、记忆存储的 HTTP 服务端和客户端                             | 服务端要 `node:http`；进程内用法用不到                                                                  |
+| `@modelctx-ai/ctx-gateway`     | OpenAI 兼容网关                                                                                 | 本机 HTTP 服务；只有要接 OpenAI 协议客户端的应用才用                                                    |
+| `@modelctx-ai/ctx-otel`        | 从会话日志派生 OpenTelemetry 的 span                                                            | 带进 `@opentelemetry/api`；不接追踪后端的应用用不到                                                     |
+| `@modelctx-ai/ctx-claude-code` | 把 Claude Code 接成 harness                                                                     | 要起 `claude` 子进程和本机 HTTP；不用 Claude Code 的应用用不到                                          |
 
 没选一个包加子路径（`@modelctx-ai/ctx/sqlite`）：适配器的依赖要么所有人都装上，要么变成可选的 peer 让使用方自己补；各部分对 Node 版本的要求也不一样。
 
@@ -40,20 +41,21 @@ status: stable
 
 ## 依赖关系
 
-| 包                          | `dependencies`                                   | `peerDependencies`                   |
-| --------------------------- | ------------------------------------------------ | ------------------------------------ |
-| `@modelctx-ai/ctx-protocol` | —                                                | `ai`（只用类型）                     |
-| `@modelctx-ai/ctx`          | `ai`                                             | `ctx-protocol`、`zod`                |
-| `@modelctx-ai/ctx-sqlite`   | —                                                | `ctx-protocol`                       |
-| `@modelctx-ai/ctx-models`   | `@ai-sdk/openai-compatible`、`@ai-sdk/anthropic` | `ctx-protocol`、`ai`                 |
-| `@modelctx-ai/ctx-memory`   | —                                                | `ctx-protocol`、`ai`                 |
-| `@modelctx-ai/ctx-mcp`      | `@ai-sdk/mcp`                                    | `ctx-protocol`                       |
-| `@modelctx-ai/ctx-exec`     | —                                                | `ctx-protocol`                       |
-| `@modelctx-ai/ctx-remote`   | —                                                | `ctx-protocol`                       |
-| `@modelctx-ai/ctx-gateway`  | —                                                | `ctx-protocol`                       |
-| `@modelctx-ai/ctx-otel`     | —                                                | `ctx-protocol`、`@opentelemetry/api` |
+| 包                             | `dependencies`                                   | `peerDependencies`                   |
+| ------------------------------ | ------------------------------------------------ | ------------------------------------ |
+| `@modelctx-ai/ctx-protocol`    | —                                                | `ai`（只用类型）                     |
+| `@modelctx-ai/ctx`             | `ai`                                             | `ctx-protocol`、`zod`                |
+| `@modelctx-ai/ctx-sqlite`      | —                                                | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-models`      | `@ai-sdk/openai-compatible`、`@ai-sdk/anthropic` | `ctx-protocol`、`ai`                 |
+| `@modelctx-ai/ctx-memory`      | —                                                | `ctx-protocol`、`ai`                 |
+| `@modelctx-ai/ctx-mcp`         | `@ai-sdk/mcp`                                    | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-exec`        | —                                                | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-remote`      | —                                                | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-gateway`     | —                                                | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-otel`        | —                                                | `ctx-protocol`、`@opentelemetry/api` |
+| `@modelctx-ai/ctx-claude-code` | —                                                | `ctx-protocol`、`ctx-mcp`            |
 
-依赖只朝一个方向：协议 ← 实现 ← 实践。实现包把协议包当 peer：应用里只有一份协议包，`SessionStore`、`Executor`、`Harness` 这些类型来自同一份。实现包之间不互相依赖；测试里需要一个会话存储时把 `@modelctx-ai/ctx` 列进 `devDependencies`。ctx-models、ctx-memory 把协议包和 `ai` 都当 peer：返回的 `LanguageModel`、`DecisionModel`、`ExtractionModel` 和应用用的是同一份 AI SDK、同一份协议包。仓库里对协议包的 peer 写成 `workspace:^`，同时列进 `devDependencies` 供测试和构建使用。
+依赖只朝一个方向：协议 ← 实现 ← 实践。实现包把协议包当 peer：应用里只有一份协议包，`SessionStore`、`Executor`、`Harness` 这些类型来自同一份。实现包之间不互相依赖（例外是 `ctx-claude-code` 把 `ctx-mcp` 当 peer，见 [ADR 0010](0010-external-harness-adapters.md)）；测试里需要一个会话存储时把 `@modelctx-ai/ctx` 列进 `devDependencies`。ctx-models、ctx-memory 把协议包和 `ai` 都当 peer：返回的 `LanguageModel`、`DecisionModel`、`ExtractionModel` 和应用用的是同一份 AI SDK、同一份协议包。仓库里对协议包的 peer 写成 `workspace:^`，同时列进 `devDependencies` 供测试和构建使用。
 
 ## 源码条件
 
@@ -137,3 +139,4 @@ Trusted publishing 只能给已经存在的包配置，所以第一次要先把�
 - 2026-11-15：暂不引入 changesets。`CHANGELOG.md` 继续手写（「未发布」一节），发版时由 `scripts/release.mjs version` 统一改版本号和落版本标题。九个包、版本一起升、一个人维护，changesets 的每 PR 一份变更说明换不来什么；包多到要分组、或者有了外部贡献者再议。
 - 2026-11-15：加预发布通道。带 `-` 的版本发到 npm 的 `next`，不动 `latest`，tag 不要求在 `main` 上。
 - 2026-11-16：加第十个包 `@modelctx-ai/ctx-otel`（[#46](https://github.com/modelctx-ai/ctx/issues/46)）：OpenTelemetry 的适配带进 `@opentelemetry/api`，按「带额外依赖的各成一个适配包」单独成包，不进核心包。它只依赖协议包，`@opentelemetry/api` 是 peer：应用里只有一份 OpenTelemetry API，全局的 tracer provider 才对得上。正文里「现在九个」按十个读；占位版本也要给它发。
+- 2026-11-17：加第十一个包 `@modelctx-ai/ctx-claude-code`（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：要起子进程和本机 HTTP，按「只能在 Node 上跑的各成一个适配包」单独成包。它把 `ctx-mcp` 当 peer，是「实现包之间不互相依赖」的第一个例外：MCP 服务器那一半（`createMcpServer`）只在 `ctx-mcp` 里有一份，理由见 [ADR 0010](0010-external-harness-adapters.md)。正文里的「十个」按十一个读；占位版本也要给它发。

@@ -111,15 +111,15 @@ interface SessionStore {
 - 生效的摘要是 `covers` 最大的那条；`covers` 相同时 `seq` 大的（后写的）生效。
 - 事件 `kind` 用 `{domain}.{action}`。框架保留 `ctx.` 前缀，常量是 `CTX_EVENTS`：
 
-| `kind`            | 谁写          | `data`                                                                                    |
-| ----------------- | ------------- | ----------------------------------------------------------------------------------------- |
-| `ctx.run.started` | harness       | `RunStartedData`：`{ runId, agent, owner?, parent? }`，`agent` 是 `agentSpecToJson(spec)` |
-| `ctx.run.ended`   | harness       | `RunEndedData`：`{ runId, stopReason, usage? }`                                           |
-| `ctx.compacted`   | 上下文        | `CompactedData`：`{ covers, summaryId }`                                                  |
-| `ctx.error`       | harness、编排 | `CtxErrorData`：`{ runId?, message, type? }`                                              |
-| `ctx.unreadable`  | （不写入）    | `UnreadableData`：`{ v?, type?, error: { type, message } }`，见下面                       |
-| `ctx.erased`      | 存储          | `ErasedData`：`{ op, upTo?, seqs?, count }`，见[擦除](#擦除)                              |
-| `ctx.redacted`    | 存储          | `RedactedData`：`{ type?, role? }`，被涂改的条目留下的占位                                |
+| `kind`            | 谁写          | `data`                                                                                                                                                                             |
+| ----------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ctx.run.started` | harness       | `RunStartedData`：`{ runId, agent, owner?, parent?, harness? }`，`agent` 是 `agentSpecToJson(spec)`，`harness` 是外部 harness 的身份 `HarnessInfo`：`{ name, version?, session? }` |
+| `ctx.run.ended`   | harness       | `RunEndedData`：`{ runId, stopReason, usage? }`                                                                                                                                    |
+| `ctx.compacted`   | 上下文        | `CompactedData`：`{ covers, summaryId }`                                                                                                                                           |
+| `ctx.error`       | harness、编排 | `CtxErrorData`：`{ runId?, message, type? }`                                                                                                                                       |
+| `ctx.unreadable`  | （不写入）    | `UnreadableData`：`{ v?, type?, error: { type, message } }`，见下面                                                                                                                |
+| `ctx.erased`      | 存储          | `ErasedData`：`{ op, upTo?, seqs?, count }`，见[擦除](#擦除)                                                                                                                       |
+| `ctx.redacted`    | 存储          | `RedactedData`：`{ type?, role? }`，被涂改的条目留下的占位                                                                                                                         |
 
 这些事件缺省对模型不可见，和应用事件一样由投影规则决定要不要渲染。
 
@@ -634,7 +634,7 @@ interface Harness {
   2. 裁剪（`compact` 的下一步，或者 `strategy: 'trim'` 直接到这里）：带着 `window: { ...agent.window, maxTokens, truncate: true }` 重新 `build`，从最旧的消息丢起，单条消息超预算时截短。什么都不写。
   3. 还超（指令、工具定义、`input` 本身就放不下），或者 `strategy: 'error'`：这一轮不调模型，以 `stopReason: 'error'`、`error.type: 'context_overflow'`（`retryable: false`）结束，照常写 `ctx.error` 和 `ctx.run.ended`。
      配置全是 JSON，随 `agent.context` 过线、记进 `ctx.run.started`；`maxTokens` 不是正数、`strategy` 不认识时这一轮以 `invalid_request` 结束。检查只在第一次调模型之前做：工具步骤里长出来的上下文靠工具结果的长度上限和下面的错误映射兜着。
-- **上下文过长的错误。** 服务商拒绝一次调用、说上下文超过了模型的窗口时，harness 把它映射成 `stopReason: 'error'`、`error.type: 'context_overflow'`、`retryable: false`（`ctx.error` 的 `type` 同样），`statusCode`、`responseBody` 照旧带着。不另加 `StopReason`：它和 `session_busy`、`not_found` 一样是「这一轮没跑成」的一种，已有的 `stopReason === 'error'` 分支（编排器的 `failed`、远端的状态码）都不用改，要区分的看 `error.type`。纯函数 `isContextOverflow(error)` 只看 `type`，`CtxError`、`ErrorInfo`、远端客户端转出来的错误都认；常量 `CONTEXT_OVERFLOW`。AI SDK 没有专门的错误类型，参考实现按 HTTP 413 和各服务商常见的错误码、消息认（见[架构](architecture.md#harness)），**各服务商的错误形状没有对真实服务验证**；认不出来的照旧是 `api_call`。应用看到 `context_overflow` 之后的下一步：`compactDetailed` 压缩再重试，或者给 agent 配上 `context.overflow`。
+- **上下文过长的错误。** 服务商拒绝一次调用、说上下文超过了模型的窗口时，harness 把它映射成 `stopReason: 'error'`、`error.type: 'context_overflow'`、`retryable: false`（`ctx.error` 的 `type` 同样），`statusCode`、`responseBody` 照旧带着。不另加 `StopReason`：它和 `session_busy`、`not_found` 一样是「这一轮没跑成」的一种，已有的 `stopReason === 'error'` 分支（编排器的 `failed`、远端的状态码）都不用改，要区分的看 `error.type`。纯函数 `isContextOverflow(error)` 只看 `type`，`CtxError`、`ErrorInfo`、远端客户端转出来的错误都认；常量 `CONTEXT_OVERFLOW`。`isContextOverflowText(text, status?)` 认上游的原始报错：HTTP 413 算，401、403、404、429 不算，其余看文字里有没有各服务商常见的错误码和消息。AI SDK 没有专门的错误类型，参考实现拿接口错误的消息和响应正文交给它（见[架构](architecture.md#harness)），外部 harness 的适配器拿程序转出来的报错交给它，**各服务商的错误形状没有对真实服务验证**；认不出来的照旧是 `api_call`。应用看到 `context_overflow` 之后的下一步：`compactDetailed` 压缩再重试，或者给 agent 配上 `context.overflow`。
 - **失败的重试不让历史变长。** 输入在调模型之前就写进日志，这一轮失败了它也留着。重试有两种认法：给了 `inputKey` 的由存储按键去重；没给的，harness 看上一轮是不是以 `error` 或 `aborted` 结束、日志里最后一条不是框架写的条目是不是同样内容的用户消息（它后面只有 `ctx.*` 事件和没盖住它的摘要），是就不再记一遍，`recorded` 里也没有它。上一轮成功了、换了一句话、两轮之间应用写过别的条目，都照常记。以前不带 `inputKey` 的重试每失败一次历史就长一条，上下文过长时越重试越长。
 - **一个会话最多一个未结束的运行，跨进程也成立**（只对 `record` 不为 `false` 的运行；`record: false` 的运行不碰日志，不占会话，不会遇到 `session_busy`，也不会被 `recover` 看到）：
   1. 开始：读最后一个生命周期事件（`list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`）。是 `started` 就说明有未结束的运行，`run` 以 `ErrorInfo.type: 'session_busy'`（`retryable: true`）结束，不写任何东西；否则带 `expectSeq` 追加 `ctx.run.started`，冲突就重读重判。
@@ -662,6 +662,7 @@ interface Harness {
   - `context`：用 `ContextBuilder` 组装上下文（`agent.context` 的投影名和事实、`context.overflow`）。自己管上下文的 harness 不跑这一项。
   - `output`：`AgentSpec.output` 的结构化输出和 `version`。
     参考实现全过；`ctx-conformance --harness-levels` 对一个地址按等级跑。
+- **外部 harness 的身份。** 适配器在 `ctx.run.started` 写 `harness`（`HarnessInfo`）：`name`（`claude-code`）、`version`、它自己的会话 `session`。自己存对话的程序把 ctx 的一个会话对到它的一个会话上，下一轮从最近一次记下的 `session` 接着跑；它记录里的位置这类只有适配器用的东西放条目的 `meta`。参考实现不写。已有的适配器：`ctx-claude-code`（`trace`、`execute`、`resume`、`output`），做法和取舍见 [ADR 0010](adr/0010-external-harness-adapters.md)。
 - `Hooks` 是 harness 实现的构造参数，不在 `RunRequest` 里：它们是函数，不能跨边界。
 - 权限确认是 `beforeTool` 的一种实现：返回 `{ allow: false }` 时工具结果是一条错误，模型会看到原因，这一轮继续。
 - 参考实现基于 AI SDK 的 `generateText` / `streamText`：把选中的 `ToolDefinition` 包成 AI SDK 工具，`execute` 转给执行环境。

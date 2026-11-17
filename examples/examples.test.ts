@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 
 import { describe, test } from 'vite-plus/test';
 
+import { claudeCodeInstalled, main as claudeCode } from './claude-code.ts';
 import { main as memory } from './memory.ts';
 import { main as moveSession } from './move-session.ts';
 import { main as remoteSplit } from './remote-split.ts';
@@ -10,6 +11,12 @@ import { main as twoProcesses } from './two-processes.ts';
 
 // 每个例子用剧本模型跑一遍：例子和代码脱节了，这里先红。
 function quiet(): void {}
+
+// claude-code.ts 要装 Claude Code：没装就跳过，`CTX_TEST_CLAUDE_CODE=required`（CI 的 Claude Code 作业）时没装就失败。
+const hasClaudeCode = claudeCodeInstalled();
+if (!hasClaudeCode && process.env['CTX_TEST_CLAUDE_CODE'] === 'required') {
+  throw new Error('CTX_TEST_CLAUDE_CODE=required but Claude Code is not installed.');
+}
 
 describe('examples', () => {
   test('single-process：SQLite 加一个模型，带工具', async () => {
@@ -43,4 +50,19 @@ describe('examples', () => {
     assert.deepEqual(sqliteView, memoryView);
     assert.deepEqual(remoteView, memoryView);
   });
+
+  test.skipIf(!hasClaudeCode)(
+    'claude-code：Claude Code 跑循环，ctx 的工具经 MCP 回到 ctx，第二轮续接它自己的会话',
+    { timeout: 120_000 },
+    async () => {
+      const result = await claudeCode(quiet);
+      assert.ok(result);
+      assert.match(result.answers[0]!, /带把伞/);
+      assert.match(result.answers[1]!, /不用带伞/);
+      assert.equal(result.sessions.length, 2);
+      assert.ok(result.sessions[0]);
+      assert.equal(result.sessions[1], result.sessions[0]);
+      assert.deepEqual(result.toolSources, ['local', 'local']);
+    },
+  );
 });

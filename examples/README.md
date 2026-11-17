@@ -2,13 +2,14 @@
 
 每个例子对应一种部署或一件值得示范的事，都是一个能直接跑的文件。不设环境变量时模型按剧本回答（协议包的剧本模型），不用联网、不用密钥；CI 里跑的就是这一种（`examples.test.ts`，以及构建之后的 `pnpm examples`）。
 
-| 文件                                     | 部署                                          | 看什么                                                                                                        |
-| ---------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| [`single-process.ts`](single-process.ts) | 单进程：SQLite 加一个模型，带工具             | `createSqliteStore`、`createToolRegistry().addTool`、`createHarness`、`createOrchestrator`                    |
-| [`remote-split.ts`](remote-split.ts)     | 拆开：存储一个进程，执行环境一个进程，经 HTTP | `startRemote`、`createRemoteSessionStore`、`createRemoteExecutor`；harness 一侧只认协议                       |
-| [`two-processes.ts`](two-processes.ts)   | 记录开着，两个进程共用一个库                  | 一个会话最多一个未结束的运行（`session_busy`）、`owner`、`recover` 收走自己断掉的运行                         |
-| [`memory.ts`](memory.ts)                 | 记忆接进上下文                                | `createMemory` 的 `gate`、`consolidate`、`source()`、`recall` 工具，按用户的作用域（`scope`）                 |
-| [`move-session.ts`](move-session.ts)     | 搬会话：内存 → 文件 → SQLite → 远端           | `exportSession`、`importSession`、`copySession`：`seq` 重新分配之后摘要的 `covers` 仍然指对，三边的上下文一样 |
+| 文件                                     | 部署                                          | 看什么                                                                                                                           |
+| ---------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| [`single-process.ts`](single-process.ts) | 单进程：SQLite 加一个模型，带工具             | `createSqliteStore`、`createToolRegistry().addTool`、`createHarness`、`createOrchestrator`                                       |
+| [`remote-split.ts`](remote-split.ts)     | 拆开：存储一个进程，执行环境一个进程，经 HTTP | `startRemote`、`createRemoteSessionStore`、`createRemoteExecutor`；harness 一侧只认协议                                          |
+| [`two-processes.ts`](two-processes.ts)   | 记录开着，两个进程共用一个库                  | 一个会话最多一个未结束的运行（`session_busy`）、`owner`、`recover` 收走自己断掉的运行                                            |
+| [`memory.ts`](memory.ts)                 | 记忆接进上下文                                | `createMemory` 的 `gate`、`consolidate`、`source()`、`recall` 工具，按用户的作用域（`scope`）                                    |
+| [`move-session.ts`](move-session.ts)     | 搬会话：内存 → 文件 → SQLite → 远端           | `exportSession`、`importSession`、`copySession`：`seq` 重新分配之后摘要的 `covers` 仍然指对，三边的上下文一样                    |
+| [`claude-code.ts`](claude-code.ts)       | 外部 harness：Claude Code 跑循环              | `createClaudeCodeHarness`：ctx 的工具经 MCP 回到 ctx 的执行环境，轨迹实时进日志，第二轮续接它自己的会话（`HarnessInfo.session`） |
 
 ## 怎么跑
 
@@ -27,6 +28,12 @@ CTX_EXAMPLE_BASE_URL=https://api.deepseek.com/v1 CTX_EXAMPLE_API_KEY=… CTX_EXA
 ```
 
 真的模型怎么回答、调不调工具由它自己定，输出和剧本的不一样是正常的。没有对真实服务验证：CI 只跑剧本模型。
+
+`claude-code.ts` 要装 Claude Code（`claude` 在 `PATH` 上，或 `CTX_CLAUDE_CODE_COMMAND` 指过去），没装就跳过。缺省模型是本机的假 Anthropic 接口（`@modelctx-ai/ctx-claude-code/testing`），Claude Code 的设置和会话放在临时目录，不读本机的设置和凭证；CI 的 Claude Code 作业装固定版本跑它。用真的模型，走本机 Claude Code 自己的登录和设置（没有对真实服务验证）：
+
+```sh
+CTX_EXAMPLE_CLAUDE_MODEL=sonnet node examples/claude-code.ts
+```
 
 `remote-split.ts` 可以真的拆成三个进程：
 

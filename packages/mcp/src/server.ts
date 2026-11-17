@@ -7,7 +7,9 @@ import { timingSafeEqual } from 'node:crypto';
 
 import {
   checkJsonSchema,
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   errorOutput,
+  limitToolOutput,
   silentLogger,
   type Awaitable,
   type ExecutionContext,
@@ -40,6 +42,11 @@ export interface McpServerOptions {
   readonly instructions?: string;
   /** 执行前按 `inputSchema` 查输入（`checkJsonSchema`），缺省查：调用方不经过 harness。 */
   readonly validateInput?: boolean;
+  /**
+   * 一次结果最多多少字符，超过的截断并注明（`limitToolOutput`），缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`；0 或 Infinity 不限。
+   * 和输入检查一样是 harness 那一层的兜底：调用方不经过 harness。`onResult` 收到的是截过的。
+   */
+  readonly maxOutputChars?: number;
   /** 每次调用结束以后调，适配器用它把经 ctx 执行的调用记进日志。抛错只记告警，不影响结果。 */
   readonly onResult?: (call: ToolCall, output: ToolOutput, context: McpCallContext) => Awaitable<void>;
   readonly logger?: Logger;
@@ -149,6 +156,7 @@ export function createMcpServer(options: McpServerOptions): McpServer {
   const executors = executorTable(options.executors);
   const logger = options.logger ?? silentLogger;
   const validate = options.validateInput !== false;
+  const maxOutputChars = options.maxOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
   const running = new Map<RequestId, AbortController>();
 
   async function definitions(): Promise<ToolDefinition[]> {
@@ -197,7 +205,10 @@ export function createMcpServer(options: McpServerOptions): McpServer {
       if (signal?.aborted) abort();
       running.set(id, controller);
       try {
-        output = await executor.execute(toolCall, { ...context, signal: controller.signal });
+        output = limitToolOutput(
+          await executor.execute(toolCall, { ...context, signal: controller.signal }),
+          maxOutputChars,
+        );
       } catch (error) {
         output = errorOutput(`Executor "${executor.name}" failed: ${messageOf(error)}`);
       } finally {

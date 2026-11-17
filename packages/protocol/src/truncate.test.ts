@@ -6,7 +6,7 @@ import { project } from './context.ts';
 import type { Message } from './message.ts';
 import { assistantEntry, eventEntry, messageEntry, userEntry, type Entry, type NewEntry } from './session.ts';
 import { estimateTextTokens, estimateTokens, truncateMessage, truncateText } from './tokens.ts';
-import { CONTEXT_OVERFLOW, CtxError, isContextOverflow } from './types.ts';
+import { CONTEXT_OVERFLOW, CtxError, isContextOverflow, isContextOverflowText } from './types.ts';
 import { ENTRY_VERSION } from './version.ts';
 
 /** 照存储的样子补上 id、session、seq、at：协议包里没有存储实现。 */
@@ -287,5 +287,24 @@ describe('isContextOverflow', () => {
     assert.equal(isContextOverflow(new CtxError('conflict', '别的')), false);
     assert.equal(isContextOverflow(new Error('prompt is too long')), false);
     assert.equal(isContextOverflow(undefined), false);
+  });
+});
+
+describe('isContextOverflowText', () => {
+  test('各家的写法认得出；413 算，401、403、404、429 不算；别的错误不算', () => {
+    for (const text of [
+      "This model's maximum context length is 8192 tokens. However, your messages resulted in 9000 tokens.",
+      'prompt is too long: 210000 tokens > 200000 maximum',
+      'API Error: 400 {"error":{"code":"context_length_exceeded"}}',
+      'The input token count (1200000) exceeds the maximum number of tokens allowed (1048576).',
+      'Input is too long for requested model.',
+    ]) {
+      assert.equal(isContextOverflowText(text), true, text);
+    }
+    assert.equal(isContextOverflowText('Request Entity Too Large', 413), true);
+    assert.equal(isContextOverflowText('too many tokens per minute', 429), false, '限流不是超窗');
+    assert.equal(isContextOverflowText('prompt is too long', 401), false);
+    assert.equal(isContextOverflowText('API Error: 500 network down', 500), false);
+    assert.equal(isContextOverflowText(''), false);
   });
 });

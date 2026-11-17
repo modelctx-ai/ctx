@@ -115,11 +115,11 @@ await serveMcpStdio(server);
 ```
 
 - 只做工具：`initialize`、`ping`、`tools/list`、`tools/call` 和客户端的 `notifications/cancelled`（中止那次调用）。不依赖 MCP 的 SDK。协议版本认 `MCP_PROTOCOL_VERSIONS`（`2025-06-18`、`2025-03-26`、`2024-11-05`），客户端要的不在里面就回最新的。
-- 工具：`tools` 给了就交出这些定义，不给就是各执行环境 `tools()` 报的全部，同名的留第一个。调用前按 `inputSchema` 查输入（`validateInput: false` 关掉）：MCP 客户端不经过 harness 的那一层。
+- 工具：`tools` 给了就交出这些定义，不给就是各执行环境 `tools()` 报的全部，同名的留第一个。调用前按 `inputSchema` 查输入（`validateInput: false` 关掉），结果超过 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`，20 万字符；0 不限）时截断并注明省略了多少（`limitToolOutput`），`onResult` 收到的是截过的：MCP 客户端不经过 harness 的那一层。
 - 结果按 `toolOutputToMcp` 转：文字是 `text`；`json` 是它的 JSON 文字，值是对象时另放进 `structuredContent`；图片、音频是它们自己的块，别的内联文件是嵌入的资源，地址是 `resource_link`；`{ type: 'error' }` 是 `isError: true` 的结果（`retryable`、`data` 跟在信息后面），不是 JSON-RPC 错误，模型看得到。执行环境抛错也是这样。
 - `createMcpHttpHandler(server, { path?, accessToken?, allowedOrigins?, maxBodyBytes? })`：只认 `POST <path>`（缺省 `/mcp`），请求回 `application/json`，通知回 202；`GET`、`DELETE` 回 405（不开服务器发起的流，不建会话）。带 `Origin` 的请求缺省 403，给了 `accessToken` 要 `Authorization: Bearer`。客户端断开时那次调用中止。
 - `serveMcpStdio(server, { input?, output? })`：缺省 `process.stdin`、`process.stdout`，输入结束时 resolve，正在跑的调用中止。请求不排队，慢的调用不挡 `ping` 和取消。日志别写 stdout。
-- 用本包的 hub（`@ai-sdk/mcp` 的客户端）验证过 HTTP 和 stdio 两种传输；Claude Code、pi 这些真实的客户端没有验证。
+- 用本包的 hub（`@ai-sdk/mcp` 的客户端）验证过 HTTP 和 stdio 两种传输；Claude Code 2.1.326 经 Streamable HTTP 验证过（2026-11-17，[`@modelctx-ai/ctx-claude-code`](../claude-code/README.md) 的测试：`initialize`、`tools/list`、`tools/call`，它还会试一次 `GET`，405 不影响）。pi 没有验证。
 
 ## 导出
 
