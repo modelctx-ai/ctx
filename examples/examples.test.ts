@@ -5,6 +5,7 @@ import { describe, test } from 'vite-plus/test';
 import { claudeCodeInstalled, main as claudeCode } from './claude-code.ts';
 import { main as memory } from './memory.ts';
 import { main as moveSession } from './move-session.ts';
+import { main as pydanticAI, uvInstalled } from './pydantic-ai.ts';
 import { main as remoteSplit } from './remote-split.ts';
 import { main as singleProcess } from './single-process.ts';
 import { main as twoProcesses } from './two-processes.ts';
@@ -16,6 +17,12 @@ function quiet(): void {}
 const hasClaudeCode = claudeCodeInstalled();
 if (!hasClaudeCode && process.env['CTX_TEST_CLAUDE_CODE'] === 'required') {
   throw new Error('CTX_TEST_CLAUDE_CODE=required but Claude Code is not installed.');
+}
+
+// pydantic-ai.ts 要装 uv：没装就跳过，`CTX_TEST_PYDANTIC_AI=required`（CI 的 pydantic-ai 作业）时没装就失败。
+const hasUv = uvInstalled();
+if (!hasUv && process.env['CTX_TEST_PYDANTIC_AI'] === 'required') {
+  throw new Error('CTX_TEST_PYDANTIC_AI=required but uv is not installed.');
 }
 
 describe('examples', () => {
@@ -63,6 +70,19 @@ describe('examples', () => {
       assert.ok(result.sessions[0]);
       assert.equal(result.sessions[1], result.sessions[0]);
       assert.deepEqual(result.toolSources, ['local', 'local']);
+    },
+  );
+
+  test.skipIf(!hasUv)(
+    'pydantic-ai：Python 的 harness 经线上协议跑，日志和工具在 ctx-remote 里',
+    { timeout: 300_000 },
+    async () => {
+      const result = await pydanticAI(quiet);
+      assert.ok(result);
+      for (const answer of result.answers) assert.match(answer, /傍晚有阵雨/);
+      assert.deepEqual(result.harnesses, ['pydantic-ai', 'pydantic-ai']);
+      // 第二轮的历史从日志来，`test` 模型在里面看到了上一轮的工具结果，不再调工具。
+      assert.deepEqual(result.toolSources, ['local']);
     },
   );
 });

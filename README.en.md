@@ -78,6 +78,7 @@ Components, terms and design constraints are in [概念](docs/concepts.md) (conc
 |                 | [`@modelctx-ai/ctx-gateway`](packages/gateway)          | A local OpenAI-compatible gateway that swaps a client's own history for ctx's context                  |
 |                 | [`@modelctx-ai/ctx-otel`](packages/otel)                | OpenTelemetry spans derived from session logs                                                          |
 |                 | [`@modelctx-ai/ctx-claude-code`](packages/claude-code)  | Claude Code as a harness: its trajectory goes into the log as it runs, tools come back to ctx over MCP |
+|                 | [`ctx-pydantic-ai`](python/pydantic-ai) (Python)        | pydantic-ai's `Agent` as a harness, served over the wire protocol                                      |
 | Practice        | [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo) | A resident desktop-pet director built from these packages; see [实践：yoyo](docs/repos.md)             |
 
 ## Quick start

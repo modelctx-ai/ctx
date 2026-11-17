@@ -662,7 +662,7 @@ interface Harness {
   - `context`：用 `ContextBuilder` 组装上下文（`agent.context` 的投影名和事实、`context.overflow`）。自己管上下文的 harness 不跑这一项。
   - `output`：`AgentSpec.output` 的结构化输出和 `version`。
     参考实现全过；`ctx-conformance --harness-levels` 对一个地址按等级跑。
-- **外部 harness 的身份。** 适配器在 `ctx.run.started` 写 `harness`（`HarnessInfo`）：`name`（`claude-code`）、`version`、它自己的会话 `session`。自己存对话的程序把 ctx 的一个会话对到它的一个会话上，下一轮从最近一次记下的 `session` 接着跑；它记录里的位置这类只有适配器用的东西放条目的 `meta`。参考实现不写。已有的适配器：`ctx-claude-code`（`trace`、`execute`、`resume`、`output`），做法和取舍见 [ADR 0010](adr/0010-external-harness-adapters.md)。
+- **外部 harness 的身份。** 适配器在 `ctx.run.started` 写 `harness`（`HarnessInfo`）：`name`（`claude-code`、`pydantic-ai`）、`version`、它自己的会话 `session`。自己存对话的程序把 ctx 的一个会话对到它的一个会话上，下一轮从最近一次记下的 `session` 接着跑；它记录里的位置这类只有适配器用的东西放条目的 `meta`。不存对话的框架每一轮从 ctx 的日志投影历史，不写 `session`。参考实现不写。已有的适配器：`ctx-claude-code`（TypeScript）和 `ctx-pydantic-ai`（Python，经线上协议对外），都过 `trace`、`execute`、`resume`、`output`，做法和取舍见 [ADR 0010](adr/0010-external-harness-adapters.md)。
 - `Hooks` 是 harness 实现的构造参数，不在 `RunRequest` 里：它们是函数，不能跨边界。
 - 权限确认是 `beforeTool` 的一种实现：返回 `{ allow: false }` 时工具结果是一条错误，模型会看到原因，这一轮继续。
 - 参考实现基于 AI SDK 的 `generateText` / `streamText`：把选中的 `ToolDefinition` 包成 AI SDK 工具，`execute` 转给执行环境。
@@ -1128,7 +1128,7 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 - 500 的 `message` 只有一句通用的话和一个编号，原文在服务端的日志里；协议错误（`invalid_request`、`not_found`、`conflict`）照旧带着自己的 `type` 和文字。
 - 客户端可以放心重试的：所有 `GET`、带着 `id` 的 `append`（存储按 `id` 去重）、两个取消。提交运行、执行工具、记忆的写入不幂等，不重试。会话的 `clear` 和三个擦除重发一遍不会多删，但第二次回的条数是 0，本包的客户端不自动重试，调用方想重试可以自己重发。
 
-**对一个地址跑一致性测试。** 被测的服务以一致性模式运行，多一个入口 `POST /conformance/instances`：请求体是 `ConformanceSetup`（`components`、模型剧本 `script`、模型的延迟 `delayMs`、存储的钟 `clock`），回一个新的隔离实例（`baseUrl` 是相对路径，另给契约用的 `agent` 和 `executor: { name, echo }`）。`ctx-conformance --url <地址>`（`@modelctx-ai/ctx-remote`）给每个用例建一个实例，用客户端跑会话、执行环境、harness、编排器、记忆存储的契约测试。任何语言写的服务端，提供这个入口、实现了线上形态，就能这样验证；剧本的语义见 [`packages/remote`](../packages/remote/README.md#对一个地址跑一致性测试)。
+**对一个地址跑一致性测试。** 被测的服务以一致性模式运行，多一个入口 `POST /conformance/instances`：请求体是 `ConformanceSetup`（`components`、模型剧本 `script`、模型的延迟 `delayMs`、存储的钟 `clock`），回一个新的隔离实例（`baseUrl` 是相对路径，另给契约用的 `agent` 和 `executor: { name, echo }`）。`ctx-conformance --url <地址>`（`@modelctx-ai/ctx-remote`）给每个用例建一个实例，用客户端跑会话、执行环境、harness、编排器、记忆存储的契约测试。任何语言写的服务端，提供这个入口、实现了线上形态，就能这样验证（Python 的 `ctx-pydantic-ai` 就这样验证它的 harness，见 [`python/pydantic-ai`](../python/pydantic-ai/README.md#一致性等级)）；剧本的语义见 [`packages/remote`](../packages/remote/README.md#对一个地址跑一致性测试)。
 
 编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 

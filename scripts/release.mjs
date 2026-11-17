@@ -1,6 +1,7 @@
 // 发布用的两个小步骤（约定见 docs/adr/0002-packages.md）：
 //
-//   node scripts/release.mjs version 0.4.0        # 所有包改成同一个版本；正式版本顺带把 CHANGELOG 的「未发布」落成这一版
+//   node scripts/release.mjs version 0.4.0        # 所有包改成同一个版本；正式版本顺带改 Python 的适配器，
+//                                                 # 把 CHANGELOG 的「未发布」落成这一版
 //   node scripts/release.mjs version 0.4.0-next.0 # 预发布版本只改版本号，CHANGELOG 不动
 //   node scripts/release.mjs check v0.4.0         # 发布工作流用：tag 和每个包的版本对得上，正式版本在 CHANGELOG 里有一节
 //
@@ -27,6 +28,22 @@ function manifests() {
     .filter((item) => item.manifest.private !== true);
 }
 
+// Python 的适配器（`python/pydantic-ai`，不发 npm）跟着正式版本走：`pyproject.toml` 和 `uv.lock` 里它自己那一条。
+// 预发布版本（`0.4.0-next.0`）不是 PEP 440 的写法，不动它。
+const PYTHON = [
+  { file: 'python/pydantic-ai/pyproject.toml', pattern: /^(version = ")([^"]*)(")/m },
+  { file: 'python/pydantic-ai/uv.lock', pattern: /(\nname = "ctx-pydantic-ai"\nversion = ")([^"]*)(")/ },
+];
+
+function pythonVersions() {
+  return PYTHON.map(({ file, pattern }) => {
+    const text = readFileSync(path.join(root, file), 'utf8');
+    const match = pattern.exec(text);
+    if (!match) fail(`could not find the version in ${file}`);
+    return { file, text, pattern, version: match[2] };
+  });
+}
+
 function setVersion(version) {
   if (!VERSION.test(version)) fail(`"${version}" is not a version like 0.4.0 or 0.4.0-next.0`);
   for (const { file, text, manifest } of manifests()) {
@@ -37,6 +54,10 @@ function setVersion(version) {
     console.log(`${manifest.name} ${manifest.version} -> ${version}`);
   }
   if (version.includes('-')) return;
+  for (const { file, text, pattern, version: before } of pythonVersions()) {
+    writeFileSync(path.join(root, file), text.replace(pattern, `$1${version}$3`));
+    console.log(`${file} ${before} -> ${version}`);
+  }
 
   const file = path.join(root, 'CHANGELOG.md');
   const changelog = readFileSync(file, 'utf8');
@@ -64,6 +85,13 @@ function check(tag) {
     );
   }
   const prerelease = version.includes('-');
+  const stale = prerelease ? [] : pythonVersions().filter((item) => item.version !== version);
+  if (stale.length > 0) {
+    fail(
+      `tag ${tag} does not match:\n${stale.map((item) => `  ${item.file} is ${item.version}`).join('\n')}\n` +
+        `run \`node scripts/release.mjs version ${version}\`, commit, and tag that commit`,
+    );
+  }
   if (!prerelease && !readFileSync(path.join(root, 'CHANGELOG.md'), 'utf8').includes(`\n## ${version} - `)) {
     fail(`CHANGELOG.md has no "## ${version} - <date>" section`);
   }

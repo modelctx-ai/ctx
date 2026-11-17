@@ -581,6 +581,19 @@ tools.add(tools.executor.definition('research')!);
 
 取消、预算、`settings.timeoutMs` 都走中断：写 `interrupt` 控制消息，过了时限 SIGTERM、再过一样久 SIGKILL。写日志冲突时读末尾之后的条目，自己的 `runId` 已经有 `ctx.run.ended` 就是被围栏，中断进程、不再写；写日志失败时中断进程，`run` reject。同一个实例里同一会话的记录型运行排队。
 
+### 外部 harness：pydantic-ai（Python）
+
+`PydanticAIHarness(store=, executors=, tools=, models=, max_tool_output_chars=, source=)`（[`python/pydantic-ai`](../python/pydantic-ai/README.md)，Python 包 `ctx-pydantic-ai`）把 pydantic-ai 的 `Agent` 接成协议的 `Harness`，`create_app` 把它挂成线上入口（`GET /protocol`、`POST /runs`、`DELETE /runs/:runId`），TypeScript 一侧用 `createRemoteHarness` 连（[ADR 0010](adr/0010-external-harness-adapters.md)）。日志和工具一般在 `ctx-remote` 里，`RemoteSessionStore`、`RemoteExecutor` 是线上协议的 Python 客户端。一轮：
+
+1. 查忙、认重试、带 `expectSeq` 写 `ctx.run.started`（`harness: { name: 'pydantic-ai', version }`，不写 `session`）、记输入：和参考实现同一套规则，照着移植。
+2. 查 `AgentSpec`：映射不了的字段以 `invalid_request` 结束（`spec_problem`），按 `AgentSpec.tools` 从目录里挑工具，按名字找模型（`models`，没给就是 pydantic-ai 的 `infer_model`）。
+3. 读会话的消息和摘要，按协议包 `project` 的缺省规则投影，转成 `message_history`。输入已经在日志里时只把 `prompt` 交给 `Agent.iter`，否则交输入加 `prompt`。
+4. 每轮建一个 `Agent`：ctx 的工具各包成一个 `Tool.from_schema`，`args_validator` 先看权限、按 `inputSchema` 查，不过就 `ToolFailed`；函数体交给执行环境（第一次交给某个执行环境之前 `open`），结果按上限截断。结构化输出是名为 `final_result` 的 `ToolOutput(StructuredDict(schema))`；`settings` 映射成 `ModelSettings`，`timeoutMs` 给 `Agent.iter(timeout=)`，`signal` 接到 `CancellationToken`；`UsageLimits(request_limit=None)`，步数由适配器数。
+5. 一个节点一个节点地走。模型请求的节点：先把 pydantic-ai 补的话（`RetryFeedbackPart`）写成 `pydantic-ai.retry`，查步数和预算，再流式读出增量。工具节点：写这一步的助手消息（带 `meta.step`），流式跑工具，结果到齐按调用的顺序、按执行方分组写成 `tool` 消息。
+6. 收尾同参考实现：没等到结果的工具调用补错误结果，出错写 `ctx.error`，最后写 `ctx.run.ended`；给了 `output` 时按 schema 再查一遍最后交上的对象。写日志冲突时读末尾之后的条目，自己的 `runId` 已经有 `ctx.run.ended` 就是被围栏，不再写。
+
+服务端（Starlette）照 `ctx-remote` 的约定：结果出来之前先发响应头、隔一段时间写一个换行，`?stream=1` 是 NDJSON，取消先于运行到达时记下，断开即中止；`Host` 只认监听地址，带 `Origin` 的请求一律 403。一致性模式（`create_conformance_app`）只给 harness 契约用。
+
 ## 编排器
 
 `createOrchestrator({ harness, store?, owner?, resume?, retainEnded?, logger? })` 是进程内队列：每个会话一条队列，同一会话的运行串行，不同会话并行。

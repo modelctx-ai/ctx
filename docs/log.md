@@ -4,6 +4,12 @@
 
 ## 2026-11-17
 
+- **新增** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md)（Python）的 README：安装、用法（`serve` 加 `createRemoteHarness`，和在 Python 里直接用）、怎么对上（七个问题各一行，加一轮日志的样子）、`AgentSpec` 和 `stopReason` 的映射表、选项和命令行、一致性等级和还没做的、验证（pydantic-ai 2.69.0，对真实的模型服务没有验证）、导出。
+- **更新** [ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和范围加 pydantic-ai，决定记录补一条，写它和 Claude Code 不一样的地方（工具不经 MCP、没有另一份会话、重试不用退回）各对着哪条决定。
+- **更新** [ADR 0002](adr/0002-packages.md)：拆分表和依赖关系表加 Python 的 `ctx-pydantic-ai`，决定记录补一条：不进 pnpm 的工作区、不发包，靠测试和 TypeScript 对齐，版本跟着正式版本改。
+- **更新** [架构](architecture.md)：Harness 一节加「外部 harness：pydantic-ai（Python）」，写一轮的六步和服务端的约定。[概念](concepts.md)的术语表、[协议层](protocol.md)和[英文译本](en/protocol.md)的「外部 harness 的身份」和一致性测试一条、[文档索引](index.md)的「包」、[README](../README.md) 和[英文版](../README.en.md)的包表、[ctx-remote](../packages/remote/README.md) 的一致性测试一节跟上。
+- **更新** [例子](../examples/README.md)：加 `pydantic-ai.ts`（另一种语言的外部 harness）。[AGENTS.md](../AGENTS.md)：命令表加 Python 的测试，「改代码时」写 `python/pydantic-ai` 什么时候要跟着改。
+
 - **新增** [ADR 0010：外部 harness 的适配](adr/0010-external-harness-adapters.md)（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：回答 #23 给每个适配器的七个问题——轨迹从流式输出实时写、工具经 MCP 回到 ctx、它自带的工具只进日志并标明执行方、`ctx.run.started` 记它的身份和会话、失败重试退回到失败之前、映射不了的配置报 `invalid_request`、它压缩自己的上下文时不写 `summary`——和 `ctx-claude-code` 依赖 `ctx-mcp` 这个例外。
 - **新增** [`@modelctx-ai/ctx-claude-code`](../packages/claude-code/README.md) 的 README：用法、怎么对上（七个问题各一行，加一轮日志的样子）、`AgentSpec` 和 `stopReason` 的映射表、选项、一致性等级和还没做的、验证（Claude Code 2.1.326，模型是假接口，对真实的 Anthropic 接口没有验证）、导出。
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`ctx.run.started` 的 `data` 加 `harness`（`HarnessInfo`），Harness 一节加「外部 harness 的身份」，上下文过长的错误一条写 `isContextOverflowText`。[ctx-protocol](../packages/protocol/README.md) 的纯函数表跟上。
