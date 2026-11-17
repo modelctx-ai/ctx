@@ -87,6 +87,47 @@ jobs:
         env:
           CTX_TEST_CLAUDE_CODE: required
 
+  pydantic-ai:
+    # python/pydantic-ai：Python 写的 pydantic-ai 适配器，不在 pnpm 的工作区里，依赖照 uv.lock。
+    # 要 node 的用例（对照 TypeScript 的协议包、对着 ctx-remote 跑、ctx-conformance）读各包的 src/，不用构建，
+    # 但要 `pnpm install`；`CTX_TEST_PYDANTIC_AI=required`：缺了 node、依赖或 uv 就失败，不跳过。
+    # 3.11 是 `requires-python` 的下限。examples/pydantic-ai.ts 也在这里跑（别的作业里没有 uv，它跳过）。
+    name: pydantic-ai (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - working-directory: python/pydantic-ai
+        run: uv sync --locked
+      - working-directory: python/pydantic-ai
+        run: uv run --locked ruff check
+      - working-directory: python/pydantic-ai
+        run: uv run --locked ruff format --check
+      - working-directory: python/pydantic-ai
+        run: uv run --locked pytest
+        env:
+          CTX_TEST_PYDANTIC_AI: required
+      - run: pnpm exec vp test examples
+        env:
+          CTX_TEST_PYDANTIC_AI: required
+
   downstream:
     # yoyo 经 `link:../ctx/packages/*` 读这里的 `dist/`，它的 CI 检出 ctx `main` 的最新提交：
     # 这里合进一个让它编不过的改动，它那边当场就红。所以在 PR 上先试一遍：用这次的构建产物跑 yoyo 的检查和测试。

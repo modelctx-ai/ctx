@@ -34,6 +34,7 @@ okf_version: '0.2'
 - [`@modelctx-ai/ctx-gateway`](../packages/gateway/README.md) - 实现：本机 OpenAI 兼容网关
 - [`@modelctx-ai/ctx-otel`](../packages/otel/README.md) - 实现：从会话日志派生 OpenTelemetry 的 span
 - [`@modelctx-ai/ctx-claude-code`](../packages/claude-code/README.md) - 实现：把 Claude Code 接成 harness，轨迹实时写进日志，工具经 MCP 回到 ctx 的执行环境
+- [`ctx-pydantic-ai`（Python）](../python/pydantic-ai/README.md) - 实现：把 pydantic-ai 的 `Agent` 接成 harness，经线上协议对外，日志和工具在 `ctx-remote` 里
 
 # 记录
 

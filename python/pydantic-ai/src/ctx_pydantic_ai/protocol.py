@@ -1,0 +1,343 @@
+"""ctx 线上协议在 Python 这边用到的部分：版本、错误、条目、工具结果的截断、上下文过长的认法、工具筛选。
+
+形状以 ``docs/protocol.md`` 为准，字段名和线上一样（驼峰）。这里的函数和协议包（``@modelctx-ai/ctx-protocol``）里同名的
+TypeScript 函数一一对应。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+import time
+import uuid
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+#: 线上协议的版本（协议包的 ``PROTOCOL_VERSION``）。``GET /protocol`` 报它，两边不同就连不上。
+PROTOCOL_VERSION = '0.3'
+#: 条目的格式版本（协议包的 ``ENTRY_VERSION``）。
+ENTRY_VERSION = 1
+#: 一次工具结果最多多少字符（UTF-16 码元），协议包的 ``DEFAULT_MAX_TOOL_OUTPUT_CHARS``。
+DEFAULT_MAX_TOOL_OUTPUT_CHARS = 200_000
+
+RUN_STARTED = 'ctx.run.started'
+RUN_ENDED = 'ctx.run.ended'
+CTX_ERROR = 'ctx.error'
+
+#: 远端的 ``agent.settings`` 缺省收的键（``ctx-remote`` 的 ``DEFAULT_ALLOWED_SETTINGS``）。
+DEFAULT_ALLOWED_SETTINGS = (
+    'temperature',
+    'maxOutputTokens',
+    'topP',
+    'topK',
+    'presencePenalty',
+    'frequencyPenalty',
+    'seed',
+    'stopSequences',
+    'maxRetries',
+    'timeoutMs',
+)
+
+#: 记进日志时，请求头的值换成这个（协议包的 ``REDACTED_HEADER``）。
+REDACTED_HEADER = '[redacted]'
+
+Json = Any
+Entry = dict[str, Any]
+
+
+class CtxError(Exception):
+    """协议认得的错误：``type`` 是机器可读的类别（``conflict``、``session_busy``、``invalid_request`` ……）。"""
+
+    def __init__(
+        self,
+        type: str,  # noqa: A002 - 和协议的字段同名
+        message: str,
+        *,
+        retryable: bool | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.type = type
+        self.message = message
+        self.retryable = retryable
+        self.status_code = status_code
+
+    def info(self) -> dict[str, Any]:
+        """``ErrorInfo``。"""
+        out: dict[str, Any] = {'message': self.message, 'type': self.type}
+        if self.retryable is not None:
+            out['retryable'] = self.retryable
+        if self.status_code is not None:
+            out['statusCode'] = self.status_code
+        return out
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def new_id() -> str:
+    return str(uuid.uuid4())
+
+
+def is_object(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def compact(values: Mapping[str, Any]) -> dict[str, Any]:
+    """去掉值是 ``None`` 的键：可选字段不给时不出现在 JSON 里。"""
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def is_framework_kind(kind: str) -> bool:
+    return kind.startswith('ctx.')
+
+
+# ---- 错误 ----
+
+_OVERFLOW_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r'context[_ ]length[_ ]exceeded',
+        r'context[_ ]?window[_ ]?exceeded',
+        r'maximum context length',
+        r'exceed(s|ed|ing)?\b[^.\n]{0,60}\bcontext[ _](window|length|size|limit)',
+        r'context[ _](window|length|size|limit)[^.\n]{0,60}\bexceed',
+        r'prompt is too long',
+        r'input is too long',
+        r'input token count[^.\n]{0,40}exceeds',
+        r'maximum prompt length',
+        r'too many (input )?tokens',
+        r'reduce the length of (the|your) (messages|prompt|input)',
+        r'request_too_large',
+    )
+]
+_NOT_OVERFLOW_STATUS = frozenset({401, 403, 404, 429})
+
+
+def is_context_overflow_text(text: str, status: int | None = None) -> bool:
+    """上游的报错文字（和状态码）是不是在说上下文超过了模型的窗口（协议包的 ``isContextOverflowText``）。"""
+    if status is not None and status in _NOT_OVERFLOW_STATUS:
+        return False
+    if status == 413:
+        return True
+    return any(pattern.search(text) for pattern in _OVERFLOW_PATTERNS)
+
+
+def error_output(message: str, *, retryable: bool | None = None, data: Json = None) -> dict[str, Any]:
+    """``{ type: 'error' }`` 的工具结果。"""
+    return compact({'type': 'error', 'message': message, 'retryable': retryable, 'data': data})
+
+
+# ---- 工具结果的截断 ----
+
+
+def _units(char: str) -> int:
+    return 2 if ord(char) > 0xFFFF else 1
+
+
+def utf16_length(text: str) -> int:
+    """按 UTF-16 码元数（和 TypeScript 的 ``length`` 一样）。"""
+    return sum(_units(char) for char in text)
+
+
+def _clip(text: str, limit: int) -> str:
+    """留下前 ``limit`` 个 UTF-16 码元，不把一个字符切成两半。"""
+    used = 0
+    for index, char in enumerate(text):
+        used += _units(char)
+        if used > limit:
+            return text[:index]
+    return text
+
+
+def _truncated_text(text: str, limit: int) -> str:
+    kept = _clip(text, limit)
+    omitted = utf16_length(text) - utf16_length(kept)
+    return (
+        f'{kept}\n[… truncated {omitted} more characters; narrow the request (filters, paging, a smaller range) '
+        'to see the rest]'
+    )
+
+
+def _json_text(value: Json) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+
+def limit_tool_output(output: dict[str, Any], max_chars: int | None) -> dict[str, Any]:
+    """工具结果的长度兜底（协议包的 ``limitToolOutput``）：超过 ``max_chars`` 时截断并注明省略了多少，没超的原样返回。"""
+    if max_chars is None or not math.isfinite(max_chars) or max_chars <= 0:
+        return output
+    limit = int(max_chars)
+    kind = output.get('type')
+    if kind == 'text':
+        text = str(output.get('text', ''))
+        return output if utf16_length(text) <= limit else {'type': 'text', 'text': _truncated_text(text, limit)}
+    if kind == 'error':
+        message = str(output.get('message', ''))
+        return output if utf16_length(message) <= limit else {**output, 'message': _truncated_text(message, limit)}
+    if kind == 'json':
+        text = _json_text(output.get('value'))
+        return output if utf16_length(text) <= limit else {'type': 'text', 'text': _truncated_text(text, limit)}
+    parts = output.get('parts') or []
+
+    def size_of(part: Mapping[str, Any]) -> int:
+        if part.get('type') == 'text':
+            return utf16_length(str(part.get('text', '')))
+        data = part.get('data') or {}
+        if data.get('type') == 'data':
+            return len(str(data.get('data', '')))
+        return utf16_length(str(data.get('text', ''))) if data.get('type') == 'text' else 0
+
+    if sum(size_of(part) for part in parts) <= limit:
+        return output
+    left = limit
+    cut = False
+    kept: list[dict[str, Any]] = []
+    for part in parts:
+        size = size_of(part)
+        if part.get('type') == 'file':
+            if size <= left:
+                left -= size
+                kept.append(part)
+            else:
+                kept.append(
+                    {
+                        'type': 'text',
+                        'text': f'[{part.get("mediaType")} file omitted: {size} characters of data do not fit in the '
+                        'tool output limit]',
+                    }
+                )
+        elif not cut:
+            if size <= left:
+                left -= size
+                kept.append(part)
+            else:
+                kept.append({'type': 'text', 'text': _truncated_text(str(part.get('text', '')), left)})
+                left = 0
+                cut = True
+    return {'type': 'content', 'parts': kept}
+
+
+# ---- 工具 ----
+
+_TOOL_NAME = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+
+def is_valid_tool_name(name: str) -> bool:
+    return bool(_TOOL_NAME.match(name))
+
+
+def _matches(tool: Mapping[str, Any], selection: Json) -> bool:
+    if isinstance(selection, bool):
+        return selection
+    if isinstance(selection, list):
+        return tool.get('name') in selection
+    if not isinstance(selection, dict):
+        return False
+    names, tags, sources = selection.get('names'), selection.get('tags'), selection.get('sources')
+    if names is not None and tool.get('name') not in names:
+        return False
+    if tags is not None and not any(tag in (tool.get('tags') or []) for tag in tags):
+        return False
+    return not (sources is not None and tool.get('source') not in sources)
+
+
+def select_tools(tools: Sequence[Mapping[str, Any]], selection: Json = True) -> list[dict[str, Any]]:
+    """按 ``ToolSelection`` 挑工具，保持原来的顺序（协议包的 ``selectTools``）。"""
+    if selection is False:
+        return []
+    return [dict(tool) for tool in tools if _matches(tool, selection)]
+
+
+def tool_permission(permissions: Mapping[str, Any] | None, tool: str) -> str:
+    """``allow``、``ask`` 或 ``deny``（协议包的 ``toolPermission``）。"""
+    if not permissions:
+        return 'allow'
+    return (permissions.get('tools') or {}).get(tool) or permissions.get('default') or 'allow'
+
+
+# ---- 运行 ----
+
+
+def run_parent_problem(parent: Json) -> str | None:
+    """``RunRequest.parent`` 的形状不对时说明哪里不对（协议包的 ``runParentProblem``）。"""
+    if parent is None:
+        return None
+    if not isinstance(parent, dict):
+        return 'RunRequest.parent must be an object'
+    session, run_id, call = parent.get('session'), parent.get('runId'), parent.get('toolCallId')
+    if not isinstance(session, str) or session == '':
+        return 'RunRequest.parent.session must be a non-empty string'
+    if not isinstance(run_id, str) or run_id == '':
+        return 'RunRequest.parent.runId must be a non-empty string'
+    if call is not None and not isinstance(call, str):
+        return 'RunRequest.parent.toolCallId must be a string'
+    return None
+
+
+_SPEC_KEYS = (
+    'name',
+    'instructions',
+    'tools',
+    'maxSteps',
+    'window',
+    'context',
+    'version',
+    'output',
+    'toolChoice',
+    'permissions',
+    'budget',
+    'environment',
+)
+
+
+def agent_spec_to_json(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """``ctx.run.started`` 的 ``data.agent``（协议包的 ``agentSpecToJson``）：请求头只留名字。"""
+    out: dict[str, Any] = {'model': spec.get('model')}
+    for key in _SPEC_KEYS:
+        if spec.get(key) is not None:
+            out[key] = spec[key]
+    settings = spec.get('settings')
+    if isinstance(settings, dict):
+        headers = settings.get('headers')
+        out['settings'] = (
+            {**settings, 'headers': {name: REDACTED_HEADER for name in headers}}
+            if isinstance(headers, dict)
+            else dict(settings)
+        )
+    return out
+
+
+# ---- 条目 ----
+
+
+def message_entry(
+    message: Mapping[str, Any],
+    *,
+    source: str | None = None,
+    key: str | None = None,
+    meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return compact({'type': 'message', 'message': dict(message), 'source': source, 'key': key, 'meta': meta})
+
+
+def event_entry(
+    kind: str,
+    *,
+    data: Json = None,
+    text: str | None = None,
+    source: str | None = None,
+    meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    return compact({'type': 'event', 'kind': kind, 'text': text, 'data': data, 'source': source, 'meta': meta})
+
+
+def is_event(entry: Mapping[str, Any] | None, kind: str) -> bool:
+    return entry is not None and entry.get('type') == 'event' and entry.get('kind') == kind
+
+
+def run_id_of(entry: Mapping[str, Any]) -> Json:
+    data = entry.get('data')
+    return data.get('runId') if entry.get('type') == 'event' and isinstance(data, dict) else None

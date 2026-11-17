@@ -9,9 +9,9 @@ status: stable
 # ADR 0010：外部 harness 的适配：轨迹实时落日志、工具经 MCP 回到 ctx、会话一对一
 
 - 状态：已采纳
-- 实施状态：Claude Code 已实施，未发布；pydantic-ai 没做
+- 实施状态：Claude Code、pydantic-ai（Python）已实施，未发布
 - 日期：2026-11-17
-- 范围：`ctx-protocol`（`RunStartedData.harness`、`HarnessInfo`、`isContextOverflowText`）、`ctx-mcp`（`createMcpServer` 的 `maxOutputChars`）、新包 `ctx-claude-code`
+- 范围：`ctx-protocol`（`RunStartedData.harness`、`HarnessInfo`、`isContextOverflowText`）、`ctx-mcp`（`createMcpServer` 的 `maxOutputChars`）、新包 `ctx-claude-code`、Python 的 `ctx-pydantic-ai`（`python/pydantic-ai`）
 - 依据：issue #23
 
 ## 背景
@@ -61,8 +61,16 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - 协议：`RunStartedData.harness`、`HarnessInfo`；`isContextOverflowText` 从核心包挪过来，核心包的 `isContextOverflowError` 改用它。
 - `ctx-mcp`：`createMcpServer` 的 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`），`onResult` 收到截过的结果。
 - `ctx-claude-code`：`createClaudeCodeHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 Claude Code 2.1.326 验证过，模型是本机的假接口；对真实的 Anthropic 接口没有验证。
-- 没做：子代理的轨迹写进子会话；pydantic-ai 的适配器。
+- `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`output` 四级；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。
+- 没做：子代理的轨迹写进子会话；pydantic-ai 的 `ask` 权限、`window` 和 `context`。
 
 ## 决定记录
 
 - 2026-11-17：采纳；Claude Code 的适配器实施。
+- 2026-11-17：pydantic-ai 的适配器实施，用 Python 写：第二种形态（库，不是进程）、第二种语言，验证这份决定和线上协议不只是这一份 TypeScript 的习惯。和 Claude Code 不一样的地方，决定正文不变：
+  - 决定三：工具不经 MCP。pydantic-ai 的工具本来就是进程内的函数，每个 ctx 工具包成一个 `Tool`，调用直接交给执行环境（多半是 `ctx-remote` 上的）；`deny` 的工具照样交给模型、调用时回拒绝，同参考实现。它没有自带的工具。
+  - 决定四：没有另一份会话。pydantic-ai 不存对话，每一轮的历史都从 ctx 的日志投影出来，`HarnessInfo` 只写 `name`、`version`；投影照协议包 `project` 的缺省规则移植，测试对同一组日志和 TypeScript 的结果比。
+  - 决定五：不用退回。历史本来就读 ctx 的日志，重试时不再写输入就够，认法和参考实现一样。
+  - 决定二：pydantic-ai 让模型改了再答时补的话（`RetryFeedbackPart`）记成 `pydantic-ai.retry` 事件。
+  - 决定八：上下文由 ctx 投影，但还不裁窗口、不压缩，`window`、`context` 以 `invalid_request` 结束；不跑 `context` 一级。
+  - 线上协议的服务端（`POST /runs` 的心跳、NDJSON、取消、`Host` 和 `Origin` 的检查）用 Python 再写了一份，一致性模式只给 harness；`PROTOCOL_VERSION`、`ENTRY_VERSION` 和截断、配对用的常量由测试从 TypeScript 源码里读出来比。
