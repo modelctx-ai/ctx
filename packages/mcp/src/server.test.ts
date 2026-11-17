@@ -153,6 +153,33 @@ describe('createMcpServer：把执行环境包成 MCP 服务器', () => {
     }
   });
 
+  test('maxOutputChars：超长的结果截断并注明，onResult 收到的是截过的；0 不限', async () => {
+    const long = `marker${'x'.repeat(5_000)}`;
+    const seen: ToolOutput[] = [];
+    const call = (server: ReturnType<typeof createMcpServer>) =>
+      server.handle({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'echo', arguments: { text: long } },
+      });
+    const limited = createMcpServer({
+      executors: [box()],
+      context: { session: 's' },
+      maxOutputChars: 1_000,
+      onResult: (_call, output) => void seen.push(output),
+    });
+    const { content } = resultOf(await call(limited)) as { content: { text: string }[] };
+    const text = content.map((block) => block.text).join('');
+    assert.ok(text.length < 2_000, `截过的结果有 ${text.length} 个字符`);
+    assert.ok(text.startsWith('marker'));
+    assert.match(text.replace('marker', ''), /\d/, '注明省略了多少');
+    assert.equal(seen[0]?.type === 'text' && seen[0].text, text);
+    const unlimited = createMcpServer({ executors: [box()], context: { session: 's' }, maxOutputChars: 0 });
+    const full = resultOf(await call(unlimited)) as { content: { text: string }[] };
+    assert.equal(full.content[0]?.text, long);
+  });
+
   test('JSON-RPC：版本协商、ping、不认识的方法、通知不回话、客户端取消正在跑的调用', async () => {
     const server = createMcpServer({ executors: { box: box() }, context: () => ({ session: 's' }) });
     const init = await server.handle({
