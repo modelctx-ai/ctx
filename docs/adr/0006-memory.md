@@ -128,4 +128,24 @@ ACT-R 的基础激活 `A = ln Σ (Δt_i + ε)^(−d) + s`：每次召回是一�
   - `ExtractionField` 的 `list.items` 没有 `date`。
 
 - 2026-11-15：`MemoryStore` 加作用域（`scope(name)`），四个集合都按它分开。原先的形状默认一个进程一个用户：`subject` 只写不滤，`core` 全局一份，几个用户共用一份存储时事实、画像互相可见、互相覆盖。没有选「每个方法多一个参数」：视图的写法不改已有方法的签名，隔离由存储保证而不是靠每个调用点记得传；也没有复用 `subject`：它说的是事实关于谁（`user`、`project:agent`），一个用户的记忆里可以有几个 `subject`。`createMemory` 一份只管一个作用域（选项 `scope`），多用户的服务每个用户建一份；另加 `ownsSession`，因为会话日志不分作用域。
+- 2026-11-15：检索和遗忘的规则修订（[#44](https://github.com/modelctx-ai/ctx/issues/44)、[#42](https://github.com/modelctx-ai/ctx/issues/42) 的一条）。上面的决定 3、4、6 和 2026-10-27 的修订 13、14 按下面的读：
+  1. **SQLite 的检索**（取代修订 14）：`instr` 子串匹配换成倒排索引。`instr` 按空白切词，中文问句切不出词，7 个自然的问句 0 命中；每个词拼一个 `OR`，上千个词时 SQLite 报表达式树太深；没有索引，每次全表扫。现在事实写入时用协议包的 `searchTerms` 切成词（字母数字连成的词、中日韩文字相邻两字）存进 `fact_terms`，查询切成同样的词去查，结构版本升到 3。仍然不用 FTS5：它不是每个 Node 自带的 SQLite 都有，自带的分词器也切不了中文（`unicode61` 不切，`trigram` 匹配不到两个字的词）。
+  2. **打分**：两个存储都用重叠系数 `termOverlap`（共同的词数除以较小的那一边），不再是「子串记 1，否则 Ochiai」。Ochiai 在长短悬殊时趋近 0：一段三百个词的话里提到一条十个词的事实，中了四个词也只有 0.07，过不了 `minScore`。代价：英文按整词，`Postgre` 不再命中 `PostgreSQL`；`SearchQuery.text` 的底线从「3 个字符以上的子串命中」改成「有共同的词命中」。
+  3. **激活度有上界，排序用压到 0..1 的值**（修订决定 6「注入排序和夜间归档用同一个 `A`」）：`recalls` 只留最近 32 次，`A` 因此有上界；排序改用 `retrievability`（ACT-R 的提取概率，阈值取 `archiveAt`），归档仍然看 `A`。原先 `A` 直接乘 0.4 加到 0..1 的相似度上，量程从 −2 到 2.6，相似度说了不算。
+  4. **来源自动带出的不每轮都记召回**（修订决定 3 表里 `recall`「只 `touch`」）：主动的 `recall` 每次都记，`source()` 带出的同一条事实一天记一次。没有选「来源完全不记」：只接了来源的应用里，常用的和没人理的事实就分不开了。`recall` 现在还会 `restore` 被召回的归档事实，这也是白天的写。
+  5. **归档多一个条件**（取代修订 13「约 1.09 天后归档」）：激活度低于阈值之外，还要错过 `minChances`（缺省 7）个有召回的日子。没有选「加长时间」：问题不在几天，在于没人用记忆的时候时间照样走。`validFrom` 在未来的事实按离现在多远算（`Δt` 取绝对值），不再永不归档。
+  6. **归档的事实找得回**（修订决定 4「`archive` 退出查询」）：`SearchQuery.archived`、`facts.restore`，`recall` 降权找归档的、被召回就恢复。两样都做：只能搜不能恢复的话，它永远是降权的；只能恢复不能搜的话，没人知道该恢复哪条。
+  7. **`confidence` 是召回的门槛**：缺省 0.5，`RecallOptions.minConfidence`。没有选参与排序：它说的是该不该信，不是相不相关。
+
+  这次没做、仍然留着的：事实没有写入时间，提取出的 `since` 很早的事实从写入的第二夜起仍然按 `validFrom` 算（上面待办的第三条）；检索是字面的，同义词、单个汉字的词（「茶」对「乌龙茶」）靠 `embed`。
+
 - 2026-11-15：提取和证据读日志时用和门控一样的筛选（`gate.entries`，缺省只有消息）。原先 `consolidate` 按区间读原文不带筛选，区间里的事件、摘要也进了提取，等于绕过了「工具输出不进事实」这条防线。
+- 2026-11-16：夜里处理的失败、取代的原子性、多进程和删除（[#43](https://github.com/modelctx-ai/ctx/issues/43)、[#36](https://github.com/modelctx-ai/ctx/issues/36) 的记忆一半）。上面的决定 3、4 和 2026-10-27 的修订 10 按下面的读：
+  1. **失败不是「什么都没说」**（修订 10「读不到原文的笔记直接 settle」以外的失败）：以前提取的回答解析失败时笔记照样 `settle`，这段的记忆永久丢了；一批持续失败时整个 `consolidate` 都过不去。现在按批隔离，失败的笔记 `notes.fail` 记次数和原因，到上限（缺省 3）进死信，不再算待处理，`notes.retry` 放回去；可以重试的错当场再试一次、不记次数。LM 装成的决策、提取模型整个回答取不出 JSON 时 reject（`invalid_response`），不再返回一份全是「不确定」的答案，门控失败时那一段退回启发式。没有选「失败就留着待处理、下次再试」：一段总让模型出错的内容会每夜都试、都失败，谁也看不见。
+  2. **结构化输出**：两个 LM 适配器按问题、字段生成 JSON Schema，经 `Output.object` 要结构化输出；服务商不支持时退回从文字里宽松地取。协议不变：`DecisionModel`、`ExtractionModel` 还是 JSON 进、JSON 出。
+  3. **加新关旧是一个方法**（修订决定 4「变了就 `close` 旧的、`add` 新的」）：`facts.supersede(id, fact, at)` 原子地做两步；分开做时 `close` 失败会留下两条都成立的事实。另加 `facts.reopen`，关错了改得回来。起始日期按条给：以前一个 `since` 套给整批事实，将来的日期还会把现在成立的事实提前关掉；现在新事实的日期在将来时不取代，两条都留着。
+  4. **幂等**：同一段日志只有一条笔记（`notes.add` 按会话和区间去重），事实带可选的 `key`，一个作用域里唯一。参考实现用来源区间加文字算键。排队只在进程里，这是两个进程同时门控、同时整理不写出重复的办法。没有选「存储上的锁」：远端存储上没有好用的锁，幂等对重试也一样管用。
+  5. **删除级联**（[ADR 0007](0007-deletion-and-retention.md) 没有覆盖的记忆一半）：门面加 `forget({ facts?, procedures?, session?, all? })`；存储加 `notes.forget`、`procedures.forget`、`core.clear`。删了事实时画像的历史整个清掉，从剩下的事实按缺省写法重写一版，不经模型：重写要把「上一版画像」喂回去，删掉的内容会回来。会话日志仍然不归记忆删（决定 2），应用自己清。
+  6. **System One 的请求有超时**：`SystemOneSpec.timeoutMs`（缺省 30 秒），超时是可以重试的 `timeout`。
+
+  2026-10-27 的待办里「`NoteQuery` 没有时间过滤」做了（`NoteQuery.since`）。破坏面：自己实现 `MemoryStore` 的要加七个方法（`notes.fail`、`retry`、`forget`，`facts.supersede`、`reopen`，`procedures.forget`，`core.clear`）和 `key`、同一段笔记去重的语义；自己实现 `Memory` 的要加 `forget`；构造 `ConsolidateReport` 的要加 `failed`、`dead`。SQLite 的记忆结构升到 4。

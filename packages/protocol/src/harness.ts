@@ -2,8 +2,8 @@ import type { LanguageModel } from 'ai';
 
 import type { Message, MessageContent } from './message.ts';
 import type { ContextSpec, PreparedCall, WindowOptions } from './context.ts';
-import type { Entry } from './session.ts';
-import type { ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
+import { CTX_EVENTS, messageEntry, type Entry, type EntryOptions, type NewMessageEntry } from './session.ts';
+import type { EnvironmentSpec, ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
 import type { Awaitable, ErrorInfo, JsonObject, JsonValue } from './types.ts';
 
 /**
@@ -46,6 +46,55 @@ export interface AgentSpec {
   /** 这个 agent 的上下文怎么组装：事实用哪些来源、放哪，用哪套投影。见 `ContextSpec`。 */
   readonly context?: ContextSpec;
   readonly settings?: CallSettings;
+  /** 应用给这份配置的版本标识（例如 `support@3`、一个 git 提交）。原样记进 `ctx.run.started`，回看时知道这一轮跑的是哪一版。 */
+  readonly version?: string;
+  /** 结构化输出：最后的回答按这个 JSON Schema 生成并解析，放在 `RunResult.output`。 */
+  readonly output?: OutputSpec;
+  /** 模型怎么选工具，缺省 `auto`。 */
+  readonly toolChoice?: ToolChoice;
+  /** 按工具名的权限：直接执行、先停下等确认、拒绝。见 `ToolPermissions`。 */
+  readonly permissions?: ToolPermissions;
+  /** 整轮的预算：超了在步骤之间停下，`stopReason` 是 `max_budget`。 */
+  readonly budget?: RunBudget;
+  /** 这个 agent 的工具在什么样的执行环境里跑：harness 交给执行环境的 `open`。见 `EnvironmentSpec`。 */
+  readonly environment?: EnvironmentSpec;
+}
+
+/** 结构化输出的 schema。只用 JSON Schema，过得了线。 */
+export interface OutputSpec {
+  readonly schema: JsonObject;
+  /** 给模型看的名字和说明，有的服务商会用。 */
+  readonly name?: string;
+  readonly description?: string;
+}
+
+/** `auto` 模型自己定；`none` 不调工具；`required` 必须调一个；`{ tool }` 必须调这个。 */
+export type ToolChoice = 'auto' | 'none' | 'required' | { readonly tool: string };
+
+/** 一个工具的权限：`allow` 直接执行，`ask` 先停下等确认（走 `requires_action`），`deny` 不执行、模型看到拒绝。 */
+export type ToolPermission = 'allow' | 'ask' | 'deny';
+
+/**
+ * 可序列化的权限策略。`tools` 按工具名，`default` 管没列出的（缺省 `allow`）。`ask` 的调用不执行：这一轮写下调用后以
+ * `requires_action` 结束，应用确认了就让执行方执行（`runPendingTools`），不确认就追加一条错误结果，再不带输入跑一轮。
+ * 和 `Hooks.beforeTool` 叠加：先看权限，`allow` 的再交给钩子。
+ */
+export interface ToolPermissions {
+  readonly default?: ToolPermission;
+  readonly tools?: Readonly<Record<string, ToolPermission>>;
+}
+
+/** 一个工具在这份策略下的权限。 */
+export function toolPermission(permissions: ToolPermissions | undefined, tool: string): ToolPermission {
+  return permissions?.tools?.[tool] ?? permissions?.default ?? 'allow';
+}
+
+/** 整轮的上限。只在步骤之间检查：正在进行的模型调用和工具不会被打断，要硬上限用 `settings.timeoutMs`。 */
+export interface RunBudget {
+  /** 这一轮所有步骤加起来的 `totalTokens`（没有时用输入加输出）。 */
+  readonly maxTotalTokens?: number;
+  /** 从这一轮开始算的墙钟时间。 */
+  readonly maxDurationMs?: number;
 }
 
 /** 模型名的字符串写法：进程内的 `LanguageModel` 记成 `<provider>/<modelId>`。 */
@@ -69,6 +118,12 @@ export function agentSpecToJson(spec: AgentSpec): JsonObject {
   if (spec.maxSteps !== undefined) out['maxSteps'] = spec.maxSteps;
   if (spec.window !== undefined) out['window'] = spec.window;
   if (spec.context !== undefined) out['context'] = spec.context;
+  if (spec.version !== undefined) out['version'] = spec.version;
+  if (spec.output !== undefined) out['output'] = spec.output;
+  if (spec.toolChoice !== undefined) out['toolChoice'] = spec.toolChoice;
+  if (spec.permissions !== undefined) out['permissions'] = spec.permissions;
+  if (spec.budget !== undefined) out['budget'] = spec.budget;
+  if (spec.environment !== undefined) out['environment'] = spec.environment;
   if (spec.settings !== undefined) {
     const { headers, ...rest } = spec.settings;
     out['settings'] = headers
@@ -93,19 +148,92 @@ export interface RunRequest {
   readonly runId?: string;
   /** 写进 `ctx.run.started` 的 `owner`：这一轮属于哪个编排器实例，`recover` 据此只收自己的运行。编排器按自己的 `owner` 填。 */
   readonly owner?: string;
+  /** 这一轮是别的 agent 派来的：记进 `ctx.run.started`，回看子会话时知道它从哪来。见 `RunParent`。 */
+  readonly parent?: RunParent;
   readonly signal?: AbortSignal;
 }
 
 /**
+ * 子运行的来处：父会话、父运行，和父会话里派它的那次工具调用。父会话那一侧，那次调用的结果是 `ChildRunResult`
+ * （`childRunOutput`），两边各记一半，从哪边都找得到另一边。
+ */
+export interface RunParent {
+  readonly session: string;
+  readonly runId: string;
+  readonly toolCallId?: string;
+}
+
+/** `parent` 的形状不对时说明哪里不对，对就是 `undefined`。harness 和 remote 服务端用它校验。 */
+export function runParentProblem(parent: unknown): string | undefined {
+  if (parent === undefined) return undefined;
+  if (typeof parent !== 'object' || parent === null || Array.isArray(parent))
+    return 'RunRequest.parent must be an object';
+  const { session, runId, toolCallId } = parent as Record<string, unknown>;
+  if (typeof session !== 'string' || session === '') return 'RunRequest.parent.session must be a non-empty string';
+  if (typeof runId !== 'string' || runId === '') return 'RunRequest.parent.runId must be a non-empty string';
+  if (toolCallId !== undefined && typeof toolCallId !== 'string')
+    return 'RunRequest.parent.toolCallId must be a string';
+  return undefined;
+}
+
+/**
  * 一轮为什么停：`end_turn` 模型自己停下，`max_steps` 到了步数上限，`max_tokens` 输出被 `maxOutputTokens` 截断，
+ * `max_budget` 超了 `AgentSpec.budget`（在步骤之间停下），
+ * `requires_action` 留下了要在别处执行的工具调用（`RunResult.pending`），等结果追加进日志后不带输入再跑一轮接着走，
  * `aborted` 被取消，`error` 出错。
  */
-export type StopReason = 'end_turn' | 'max_steps' | 'max_tokens' | 'aborted' | 'error';
+export type StopReason =
+  | 'end_turn'
+  | 'max_steps'
+  | 'max_tokens'
+  | 'max_budget'
+  | 'requires_action'
+  | 'aborted'
+  | 'error';
 
+/** token 用量。服务商不给的项就没有，缓存和推理三项是 0 时也不写；各服务商的字段怎么映射过来，没有对真实服务验证。 */
 export interface Usage {
+  /** 输入的 token，含缓存读到的和写进缓存的。 */
   readonly inputTokens?: number;
   readonly outputTokens?: number;
   readonly totalTokens?: number;
+  /** 输入里从提示缓存读到的。 */
+  readonly cacheReadTokens?: number;
+  /** 输入里写进提示缓存的。 */
+  readonly cacheWriteTokens?: number;
+  /** 输出里推理用掉的。 */
+  readonly reasoningTokens?: number;
+}
+
+/**
+ * harness 写进每一步助手消息 `meta.step` 的内容：这是哪一轮的第几步，服务商实际用的模型，这一步的用量。
+ * 整轮的合计在 `ctx.run.ended` 的 `usage`。用 `stepMetaOf(entry)` 读。
+ */
+export interface StepMeta {
+  readonly runId: string;
+  /** 从 0 数。 */
+  readonly step: number;
+  readonly provider?: string;
+  /** 服务商在响应里给的模型标识；走了回落、别名解析到具体版本时和请求的不一样。 */
+  readonly modelId?: string;
+  /** AI SDK 的 `finishReason`：`stop`、`tool-calls`、`length` 等。 */
+  readonly finishReason?: string;
+  readonly usage?: Usage;
+  /**
+   * 只有第一步有：这一步请求的估算输入 token（`PreparedCall.tokens`，校准过的话是校准之后的）。和 `usage.inputTokens`
+   * 一比就知道估算偏了多少；参考实现的 builder 拿它校准下一轮的窗口。
+   */
+  readonly estimatedInputTokens?: number;
+  /** 只有第一步有：`estimatedInputTokens` 里乘上的校准倍数（`PreparedCall.calibration`）。没校准时不出现。 */
+  readonly calibration?: number;
+}
+
+/** 条目 `meta.step` 里的 `StepMeta`；不是 harness 写的步骤消息时返回 `undefined`。 */
+export function stepMetaOf(entry: Entry): StepMeta | undefined {
+  const step = entry.meta?.['step'];
+  if (typeof step !== 'object' || step === null || Array.isArray(step)) return undefined;
+  const { runId, step: index } = step as Record<string, unknown>;
+  return typeof runId === 'string' && typeof index === 'number' ? (step as unknown as StepMeta) : undefined;
 }
 
 export interface RunResult {
@@ -118,19 +246,40 @@ export interface RunResult {
   readonly recorded: readonly Entry[];
   readonly stopReason: StopReason;
   readonly usage?: Usage;
+  /** 给了 `AgentSpec.output` 时，按那份 schema 解析出来的回答。没能解析（模型没给出合法的 JSON）时这一轮以 `error` 结束。 */
+  readonly output?: JsonValue;
+  /** `stopReason` 是 `requires_action` 时，等着别处执行、还没有结果的工具调用。 */
+  readonly pending?: readonly ToolCall[];
   /** `stopReason` 是 `error` 时的原因。 */
   readonly error?: ErrorInfo;
 }
 
-/** 流式运行的事件。`text.delta` 不落日志，其余各有对应的日志条目。 */
+/**
+ * 流式运行的事件。`text.delta`、`reasoning.delta` 不落日志，其余各有对应的日志条目。带 `seq` 的三种是和日志对齐的点：
+ * 发出它的时候，日志已经写到这个 `seq`（`run.started` 是 `ctx.run.started`，`model.ended` 是这一步最后一条，
+ * `run.ended` 是 `ctx.run.ended`）。流断了，从最后收到的 `seq` 起 `watch` 或 `list({ after })` 就能接上。
+ * 不写日志（`record: false`）时没有 `seq`。
+ */
 export type RunEvent =
-  | { readonly type: 'run.started'; readonly runId: string; readonly session: string }
+  | { readonly type: 'run.started'; readonly runId: string; readonly session: string; readonly seq?: number }
   | { readonly type: 'model.started'; readonly runId: string; readonly step: number }
   | { readonly type: 'text.delta'; readonly runId: string; readonly text: string }
+  | { readonly type: 'reasoning.delta'; readonly runId: string; readonly text: string }
   | { readonly type: 'tool.called'; readonly runId: string; readonly call: ToolCall }
   | { readonly type: 'tool.returned'; readonly runId: string; readonly callId: string; readonly output: ToolOutput }
-  | { readonly type: 'model.ended'; readonly runId: string; readonly step: number; readonly usage?: Usage }
-  | { readonly type: 'run.ended'; readonly runId: string; readonly result: Omit<RunResult, 'messages' | 'recorded'> }
+  | {
+      readonly type: 'model.ended';
+      readonly runId: string;
+      readonly step: number;
+      readonly usage?: Usage;
+      readonly seq?: number;
+    }
+  | {
+      readonly type: 'run.ended';
+      readonly runId: string;
+      readonly result: Omit<RunResult, 'messages' | 'recorded'>;
+      readonly seq?: number;
+    }
   | { readonly type: 'error'; readonly runId: string; readonly message: string };
 
 export type RunEventType = RunEvent['type'];
@@ -166,4 +315,172 @@ export interface Hooks {
 export interface Harness {
   run(request: RunRequest): Promise<RunResult>;
   stream?(request: RunRequest): AsyncIterable<RunEvent>;
+}
+
+/** 等着别处执行的一次工具调用：哪一轮留下的，调用写在哪条条目里。 */
+export interface PendingToolCall {
+  readonly call: ToolCall;
+  readonly runId: string;
+  /** 带这次调用的助手消息的 `seq`。 */
+  readonly seq: number;
+}
+
+/**
+ * 会话里等着别处执行、还没有结果的工具调用：以 `requires_action` 结束的那一轮留下的调用，去掉后面已经追加了结果的。
+ * 之后又有运行以别的原因结束（结果没等来，下一轮照常跑了），之前留下的就不再算等待中。条目按 `seq` 排好。
+ * 服务商执行的调用不算。
+ */
+export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
+  let open = new Map<string, PendingToolCall>();
+  let run: { runId: string; calls: Map<string, PendingToolCall> } | undefined;
+  for (const entry of entries) {
+    if (entry.type === 'event' && (entry.kind === CTX_EVENTS.runStarted || entry.kind === CTX_EVENTS.runEnded)) {
+      const data = (entry.data ?? {}) as { runId?: unknown; stopReason?: unknown };
+      if (typeof data.runId !== 'string') continue;
+      if (entry.kind === CTX_EVENTS.runStarted) {
+        run = { runId: data.runId, calls: new Map() };
+        continue;
+      }
+      // 这一轮停下来等结果：它留下的调用等待中；别的结束方式让之前等着的都作废。
+      open = data.stopReason === 'requires_action' && run?.runId === data.runId ? new Map(run.calls) : new Map();
+      run = undefined;
+      continue;
+    }
+    if (entry.type !== 'message' || typeof entry.message.content === 'string') continue;
+    for (const part of entry.message.content) {
+      if (part.type === 'tool-call' && part.providerExecuted !== true && run) {
+        run.calls.set(part.id, {
+          call: { id: part.id, name: part.name, input: part.input },
+          runId: run.runId,
+          seq: entry.seq,
+        });
+      } else if (part.type === 'tool-result') {
+        open.delete(part.id);
+        run?.calls.delete(part.id);
+      }
+    }
+  }
+  return [...open.values()];
+}
+
+/** `toolResultEntry` 用的幂等键前缀：同一次调用的结果只记一次，两个 worker 都执行了也只留先到的。 */
+export const TOOL_RESULT_KEY_PREFIX = 'ctx.tool-result:';
+
+/** 别处执行完一次工具调用，追加回会话的 `tool` 消息。带幂等键 `ctx.tool-result:<id>`。 */
+export function toolResultEntry(
+  call: Pick<ToolCall, 'id' | 'name'>,
+  output: ToolOutput,
+  options: EntryOptions = {},
+): NewMessageEntry {
+  return messageEntry(
+    { role: 'tool', content: [{ type: 'tool-result', id: call.id, name: call.name, output }] },
+    { key: `${TOOL_RESULT_KEY_PREFIX}${call.id}`, ...options },
+  );
+}
+
+// ---- 父子运行 ----
+
+/** 一次子运行在哪：子会话和子运行的 `runId`。 */
+export interface ChildRunRef {
+  readonly session: string;
+  readonly runId: string;
+}
+
+/**
+ * 派子 agent 的那次工具调用的结果（JSON 输出的 `value`；子运行出错或被取消时是错误输出的 `data`）。`child` 指向子运行，
+ * 其余是子运行结果里能序列化、父 agent 用得上的部分。`usage` 是子运行自己的，不含它再派出去的。
+ */
+export interface ChildRunResult {
+  readonly child: ChildRunRef;
+  readonly stopReason: StopReason;
+  readonly text?: string;
+  readonly output?: JsonValue;
+  readonly usage?: Usage;
+  readonly error?: { readonly message: string; readonly type?: string };
+}
+
+/** 父会话那一侧的工具结果：子运行正常结束是 `json`，以 `error` 或 `aborted` 结束是 `error`，两种都带 `ChildRunResult`。 */
+export function childRunOutput(child: ChildRunRef, result: Omit<RunResult, 'messages' | 'recorded'>): ToolOutput {
+  const value: ChildRunResult = {
+    child: { session: child.session, runId: child.runId },
+    stopReason: result.stopReason,
+    ...(result.text !== '' ? { text: result.text } : {}),
+    ...(result.output !== undefined ? { output: result.output } : {}),
+    ...(result.usage !== undefined ? { usage: result.usage } : {}),
+    ...(result.error !== undefined
+      ? {
+          error: {
+            message: result.error.message,
+            ...(result.error.type !== undefined ? { type: result.error.type } : {}),
+          },
+        }
+      : {}),
+  };
+  if (result.stopReason !== 'error' && result.stopReason !== 'aborted') return { type: 'json', value: toJson(value) };
+  const reason = result.error?.message ?? result.stopReason;
+  return {
+    type: 'error',
+    message: `The subagent run in session "${child.session}" ended with ${result.stopReason}: ${reason}`,
+    data: toJson(value),
+  };
+}
+
+function toJson(value: ChildRunResult): JsonValue {
+  return value as unknown as JsonValue;
+}
+
+function childRunResultOf(value: unknown): ChildRunResult | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const { child, stopReason } = value as { child?: unknown; stopReason?: unknown };
+  if (typeof child !== 'object' || child === null || typeof stopReason !== 'string') return undefined;
+  const { session, runId } = child as { session?: unknown; runId?: unknown };
+  if (typeof session !== 'string' || typeof runId !== 'string') return undefined;
+  return value as ChildRunResult;
+}
+
+/** 父会话里一次派出去的子运行：哪次工具调用、在哪条条目里，和那次调用记下的结果。 */
+export interface ChildRun extends ChildRunResult {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  /** 记下这个结果的 `tool` 消息的 `seq`。 */
+  readonly seq: number;
+}
+
+/** 父会话的条目里派出去的子运行，按出现的顺序。认的是 `childRunOutput` 的形状：`child.session`、`child.runId`、`stopReason`。 */
+export function childRunsOf(entries: readonly Entry[]): ChildRun[] {
+  const found: ChildRun[] = [];
+  for (const entry of entries) {
+    if (entry.type !== 'message' || typeof entry.message.content === 'string') continue;
+    for (const part of entry.message.content) {
+      if (part.type !== 'tool-result') continue;
+      const output = part.output;
+      const result = childRunResultOf(
+        output.type === 'json' ? output.value : output.type === 'error' ? output.data : undefined,
+      );
+      if (result) found.push({ ...result, toolCallId: part.id, toolName: part.name, seq: entry.seq });
+    }
+  }
+  return found;
+}
+
+const USAGE_KEYS = [
+  'inputTokens',
+  'outputTokens',
+  'totalTokens',
+  'cacheReadTokens',
+  'cacheWriteTokens',
+  'reasoningTokens',
+] as const;
+
+/** 把几份用量逐项加起来；哪一项都没有的就不写。父运行连同子运行的总用量：`addUsage(parent.usage, ...childRunsOf(entries).map((run) => run.usage))`。 */
+export function addUsage(...usages: readonly (Usage | undefined)[]): Usage {
+  const sum: Partial<Record<(typeof USAGE_KEYS)[number], number>> = {};
+  for (const usage of usages) {
+    if (!usage) continue;
+    for (const key of USAGE_KEYS) {
+      const value = usage[key];
+      if (typeof value === 'number') sum[key] = (sum[key] ?? 0) + value;
+    }
+  }
+  return sum;
 }

@@ -111,6 +111,7 @@ const replies = await gate.decide({
 | `apiKey`    | 有就发 `Authorization: Bearer <apiKey>`                                                                                                                     |
 | `headers`   | 额外的请求头，覆盖同名的缺省头                                                                                                                              |
 | `name`      | 模型的 `name`，缺省 `<provider>:<model>`                                                                                                                    |
+| `timeoutMs` | 一次请求最多等多久（毫秒），连读完正文，缺省 `SYSTEM_ONE_TIMEOUT_MS`（30 秒）。不是正数时建模型就报错                                                       |
 
 第二个参数 `options` 不进配置文件：`fetch` 换掉全局 `fetch`（测试用）。
 
@@ -121,7 +122,7 @@ const replies = await gate.decide({
 - 提取：JSON 的 `state` 先序列化成字符串（Clairic 只收字符串）；空输入（null 或空白文字）不发请求，全部答 `{ value: null, pNull: 1, confidence: 1 }`；`duration` 显式要秒。
 - 服务不收的问题名、字段名（Clef：`[A-Za-z0-9_.-]`，Clairic：字母或 `_` 开头、最多 64 个字符）换成别名发，回答里换回原名。
 - 非 2xx（以及 Cloudflare 外壳里的 `success: false`）抛 `SystemOneError`：继承 `CtxError`，`type` 是 `api_call`，带 `statusCode`、`responseBody`（响应原文），408、429、5xx 的 `retryable` 是 `true`。响应不是 JSON、缺回答、回答类型不对抛 `CtxError('invalid_response')`。
-- `signal` 传给 `fetch`；已经中止时不发请求就 reject。
+- `signal` 和超时合成一个传给 `fetch`；已经中止时不发请求就 reject。超过 `timeoutMs` 抛 `CtxError('timeout')`，`retryable` 是 `true`；调用方的 `signal` 中止时照常 reject 它的原因。
 
 注册别的服务商：
 
@@ -147,4 +148,5 @@ const model = decisions.create({ provider: 'mine', model: 'x' });
 | `createDecisionModelRegistry(factories?)`、`createExtractionModelRegistry(factories?)`                                          | 新注册表：`register(provider, factory)`、`create(spec, options?)`、`providers()`；传入的工厂可以覆盖内置的 |
 | `cloudflareDecision`、`typesafeDecision`、`cloudflareExtraction`                                                                | 内置的工厂                                                                                                 |
 | `SystemOneError`                                                                                                                | 上游非 2xx 时抛的错误                                                                                      |
+| `SYSTEM_ONE_TIMEOUT_MS`                                                                                                         | System One 请求缺省的超时，30000 毫秒                                                                      |
 | `SystemOneSpec`、`SystemOneOptions`、`DecisionFactory`、`ExtractionFactory`、`DecisionModelRegistry`、`ExtractionModelRegistry` | 类型                                                                                                       |

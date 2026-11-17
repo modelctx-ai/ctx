@@ -126,8 +126,8 @@ const DECISION_JSON = JSON.stringify({
 
 describeDecisionModelContract('language model', () => decisionFromLanguageModel(textModel(() => DECISION_JSON)), api);
 describeDecisionModelContract(
-  'language model（回答不是 JSON）',
-  () => decisionFromLanguageModel(textModel(() => '抱歉，我不能回答。')),
+  'language model（回答缺键）',
+  () => decisionFromLanguageModel(textModel(() => '{}')),
   api,
 );
 
@@ -148,10 +148,50 @@ describeExtractionModelContract(
   api,
 );
 describeExtractionModelContract(
-  'language model（回答不是 JSON）',
-  () => extractionFromLanguageModel(textModel(() => '{ 坏的')),
+  'language model（回答缺键）',
+  () => extractionFromLanguageModel(textModel(() => '{"other": 1}')),
   api,
 );
+
+describe('回答整个不是 JSON 对象', () => {
+  test('decide 和 extract 都 reject invalid_response，不当成「什么都没有」', async () => {
+    const decision = decisionFromLanguageModel(textModel(() => '抱歉，我不能回答。'));
+    await assert.rejects(
+      decision.decide({ state: '主人说以后都用 PostgreSQL', questions: GATE }),
+      (error: unknown) => (error as { type?: unknown }).type === 'invalid_response',
+    );
+    const extraction = extractionFromLanguageModel(textModel(() => '{"facts": {"value": ["主人用 Postg'));
+    await assert.rejects(
+      extraction.extract({ state: '主人说以后都用 PostgreSQL', fields: { facts: { type: 'list', items: 'text' } } }),
+      (error: unknown) => (error as { type?: unknown }).type === 'invalid_response',
+    );
+  });
+
+  test('要结构化输出：请求带 JSON Schema，按问题和字段生成', async () => {
+    const model = textModel(() => '{}');
+    await decisionFromLanguageModel(model).decide({ state: 'x', questions: GATE });
+    await extractionFromLanguageModel(model).extract({ state: 'x', fields: { day: { type: 'date' } } });
+    const [decide, extract] = model.doGenerateCalls.map((call) => call.responseFormat);
+    assert.equal(decide?.type, 'json');
+    assert.deepEqual(
+      decide?.type === 'json' ? Object.keys((decide.schema as { properties: object }).properties) : [],
+      Object.keys(GATE),
+    );
+    assert.deepEqual(
+      extract?.type === 'json' ? (extract.schema as { properties: { day: unknown } }).properties.day : undefined,
+      {
+        type: 'object',
+        properties: {
+          value: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          pNull: { type: 'number' },
+          confidence: { type: 'number' },
+        },
+        required: ['value', 'pNull', 'confidence'],
+        additionalProperties: false,
+      },
+    );
+  });
+});
 
 describe('decisionFromLanguageModel', () => {
   test('提示词里有 state 和每个问题的选项、档位；名字来自模型', async () => {

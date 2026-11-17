@@ -463,6 +463,34 @@ describe('schema 迁移', () => {
     store.close();
   });
 
+  test('读摘要走 (session, type, seq) 索引；按 at 筛走 (session, at) 索引，不从 after 起一行行扫', async () => {
+    const store = createSqliteStore({ path: ':memory:' });
+    const plans: string[] = [];
+    const prepare = store.database.prepare.bind(store.database);
+    store.database.prepare = (sql: string) => {
+      if (sql.startsWith('SELECT * FROM ctx_entries'))
+        plans.push(
+          (
+            prepare(`EXPLAIN QUERY PLAN ${sql}`).all(
+              's',
+              ...sql
+                .split('?')
+                .slice(2)
+                .map(() => 1),
+            ) as { detail: string }[]
+          )
+            .map((row) => row.detail)
+            .join('\n'),
+        );
+      return prepare(sql);
+    };
+    await store.list('s', { types: ['summary'] });
+    await store.list('s', { after: 1, atAfter: 5, limit: 10 });
+    assert.match(plans[0]!, /INDEX ctx_entries_type \(session=\? AND type=\?\)/);
+    assert.match(plans[1]!, /INDEX ctx_entries_at \(session=\? AND at>\?\)/);
+    store.close();
+  });
+
   test('比自己新的版本拒绝打开，库原样不动；自己开的库也关掉', () => {
     const path = join(mkdtempSync(join(tmpdir(), 'ctx-sqlite-')), 'ctx.db');
     createSqliteStore({ path }).close();

@@ -18,7 +18,7 @@
 | `pnpm examples`                     | `examples/` 里的例子用剧本模型各跑一遍（读 `dist/`，要先 `pnpm build`）；`pnpm test` 也跑它们的测试                                                                                                          |
 | `pnpm live`                         | `live/smoke.ts`：对配了密钥的真实服务跑冒烟场景，没配的跳过；`--record` 把真实响应录成 `live/fixtures/` 里的夹具。要先 `pnpm build`，要联网。不进 PR 的 CI，`live.yml` 每晚跑；录下的夹具由 `pnpm test` 重放 |
 | `pnpm smoke`                        | `scripts/pack-smoke.mjs`：`pnpm pack` 的产物在干净目录里装上、类型解析、每个入口 `import` 一遍；要先 `pnpm build`，要联网                                                                                    |
-| `pnpm release:version <版本>`       | `scripts/release.mjs`：九个包改成同一个版本，正式版本把 CHANGELOG 的「未发布」落成这一版                                                                                                                     |
+| `pnpm release:version <版本>`       | `scripts/release.mjs`：十个包改成同一个版本，正式版本把 CHANGELOG 的「未发布」落成这一版                                                                                                                     |
 
 仓库里各包互相引用时按源码解析（`@modelctx-ai/source` 条件，见 [ADR 0002](docs/adr/0002-packages.md)），类型检查和测试不用先构建。使用方的 Node 版本和 peer dependency 写在各包 README 的「安装」里。
 
@@ -28,6 +28,7 @@
 
 - 除 `index.md`、`log.md` 以外，每篇开头是 YAML frontmatter：`type`（必填，例如 `Specification`、`Architecture`、`Decision Record`）、`title`（和一级标题一致）、`description`（一句话）、`tags`、`status`（`draft` / `stable` / `deprecated`，对应 ADR 的提案 / 已采纳 / 被取代）。
 - 每个目录一个 `index.md`，只有分组标题和 `- [title](路径) - description` 条目，`title`、`description` 和被链接文档的 frontmatter 一字不差；根目录的 `index.md` 只带 `okf_version` 这一个 frontmatter 键。加、删文档或改 `title`、`description`，同时改所在目录的 `index.md`。
+- 英文译本：`README.en.md` 和 `docs/en/` 里的规范（现在是 [协议层](docs/en/protocol.md)），中文为准。改了 `README.md` 或 `docs/protocol.md`，同一个 PR 改译本并更新它的 `synced` 日期（`README.en.md` 在开头那句里）。`packages/protocol/src/translation.test.ts` 查两边的行内代码（名字、路径、类型）和章节层级一致；中文里新出现带中文的行内代码，在那个文件的 `TRANSLATED_SPANS` 里给出英文写法。架构、ADR、包 README 不译。
 - 链接用相对路径。OKF 推荐的 `/` 开头写法在 GitHub 上会解析到仓库根，不用。
 - `log.md` 按 `## YYYY-MM-DD` 倒序，条目格式见下面「记录」。
 

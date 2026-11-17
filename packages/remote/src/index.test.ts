@@ -18,7 +18,9 @@ import { createMemoryStore as createInMemoryMemoryStore } from '@modelctx-ai/ctx
 import {
   CTX_EVENTS,
   CtxError,
+  ENTRY_VERSION,
   eventEntry,
+  PROTOCOL_VERSION,
   userEntry,
   type Entry,
   type Harness,
@@ -133,7 +135,11 @@ function localHarness(script: readonly ModelScriptStep[], delayMs = 0) {
   const store = createMemoryStore();
   const tools = createToolRegistry();
   tools.executor.register(
-    { name: 'echo', description: '原样返回输入', inputSchema: { type: 'object' } },
+    {
+      name: 'echo',
+      description: '原样返回输入',
+      inputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+    },
     async (input, context) => {
       if ((input as { wait?: unknown } | null)?.wait === true) await waitForAbort(context.signal, 5_000);
       return { type: 'json', value: input };
@@ -316,12 +322,12 @@ describe('远程 harness', () => {
       allowedModels: [agent.model],
       allowedSettings: [...DEFAULT_ALLOWED_SETTINGS, 'headers'],
     });
-    const result = await post({ headers: { 'x-trace': 'abc' } }, createRemoteHarness(client(allowed)));
+    const result = await post({ headers: { 'x-trace': 'trace-secret-value' } }, createRemoteHarness(client(allowed)));
     expect(result.stopReason).toBe('end_turn');
     const started = (await open.store.list('s')).find(
       (entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.runStarted,
     );
-    expect(JSON.stringify(started)).not.toContain('abc');
+    expect(JSON.stringify(started)).not.toContain('trace-secret-value');
     expect(JSON.stringify(started)).toContain('"x-trace":"[redacted]"');
   });
 
@@ -382,12 +388,68 @@ function guardedServer(): Promise<RemoteServer> {
   return serve({ store: createMemoryStore(), maxBodyBytes: 1_024 });
 }
 
+/** 替 `GET /protocol` 回话的 `fetch`：`body` 是 `undefined` 时回 404，别的请求照常发。 */
+function answering(body: unknown): typeof fetch {
+  return (input, init) => {
+    if (new URL(urlOf(input)).pathname.endsWith('/protocol')) {
+      return Promise.resolve(
+        body === undefined
+          ? new Response(JSON.stringify({ error: { message: 'not found', type: 'not_found' } }), { status: 404 })
+          : new Response(JSON.stringify(body), { status: 200 }),
+      );
+    }
+    return fetch(input, init);
+  };
+}
+
+describe('版本和能力：GET /protocol', () => {
+  test('列出版本、条目格式和挂了的组件', async () => {
+    const executor = createFunctionExecutor('box');
+    const store = createMemoryStore();
+    const harness = createHarness({ store, context: createContextBuilder({ store }) });
+    const server = await serve({
+      store,
+      executors: [executor],
+      harness,
+      orchestrator: createOrchestrator({ harness, store }),
+    });
+    const response = await fetch(`${server.baseUrl}/protocol`, { headers: { authorization: `Bearer ${accessToken}` } });
+    expect(await response.json()).toEqual({
+      protocol: PROTOCOL_VERSION,
+      entryVersion: ENTRY_VERSION,
+      components: {
+        sessions: { watch: true },
+        executors: { names: ['box'] },
+        harness: { stream: true },
+        orchestrator: { recover: true, events: true },
+      },
+    });
+  });
+
+  test('客户端第一次请求前握手：版本不同、没有这个入口都是 unsupported_version，checkProtocol: false 不查', async () => {
+    const server = await serve({ store: createMemoryStore() });
+    const old = createRemoteSessionStore({ ...client(server), fetch: answering(undefined) });
+    await expect(old.list('s')).rejects.toMatchObject({ type: 'unsupported_version' });
+    const future = createRemoteSessionStore({
+      ...client(server),
+      fetch: answering({ protocol: '9.9', entryVersion: 1, components: {} }),
+    });
+    await expect(future.list('s')).rejects.toMatchObject({ type: 'unsupported_version' });
+    const unchecked = createRemoteSessionStore({
+      ...client(server),
+      fetch: answering(undefined),
+      checkProtocol: false,
+    });
+    expect(await unchecked.list('s')).toEqual([]);
+  });
+});
+
 describe('会话的条目分页', () => {
   test('服务端一次最多回 maxListEntries 条并带 more；客户端的 list 自己接着读，结果不变', async () => {
     const store = createMemoryStore();
     await store.append(
       's',
-      Array.from({ length: 10 }, (_, i) => userEntry(String(i + 1))),
+      Array.from({ length: 10 }, (_, i) => userEntry(String(i + 1), { at: i + 1 })),
     );
     const server = await serve({ store, maxListEntries: 3 });
     const raw = await fetch(`${server.baseUrl}/sessions/s/entries`, {
@@ -403,6 +465,11 @@ describe('会话的条目分页', () => {
     expect(await texts({ after: 4, limit: 5 })).toEqual(['5', '6', '7', '8', '9']);
     expect(await texts({ limit: 2 })).toEqual(['1', '2']);
     expect(await texts({ last: 2 })).toEqual(['9', '10']);
+    // `last` 比一页多：以前只回服务端的第一页（最后 7 条里最早的 3 条）。
+    expect(await texts({ last: 7 })).toEqual(['4', '5', '6', '7', '8', '9', '10']);
+    expect(await texts({ last: 7, limit: 5 })).toEqual(['4', '5', '6', '7', '8']);
+    expect(await texts({ last: 99 })).toHaveLength(10);
+    expect(await texts({ atAfter: 7 })).toEqual(['8', '9', '10']);
   });
 
   test('没有 watch 的存储：轮询一页一页读，长会话也读得完', async () => {
@@ -450,12 +517,13 @@ describe('会话的擦除', () => {
     expect(await spying.remove('a/b', [written[1]!.id, 'missing'])).toBe(1);
     expect(await spying.redact('a/b', [written[2]!.id])).toBe(1);
     expect(calls).toEqual([
+      'GET /protocol ',
       `POST /sessions/a%2Fb/entries/truncate {"upTo":${written[0]!.seq}}`,
       `POST /sessions/a%2Fb/entries/remove {"ids":["${written[1]!.id}","missing"]}`,
       `POST /sessions/a%2Fb/entries/redact {"ids":["${written[2]!.id}"]}`,
     ]);
     expect(await spying.truncate('a/b', Number.NaN)).toBe(0);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(4);
     const kinds = (await remote.list('a/b')).map((entry) => (entry.type === 'event' ? entry.kind : entry.type));
     expect(kinds).toEqual([CTX_EVENTS.redacted, 'message', CTX_EVENTS.erased, CTX_EVENTS.erased, CTX_EVENTS.erased]);
     expect(await remote.list('a/b')).toEqual(await memory.list('a/b'));
@@ -674,6 +742,7 @@ describe('远程记忆存储', () => {
       ['GET', '/memory/notes/settle'],
       ['POST', '/memory/notes/head'],
       ['GET', '/memory/facts/search'],
+      ['GET', '/memory/facts/restore'],
       ['GET', '/memory/facts/f1/close'],
       ['PUT', '/memory/procedures'],
       ['GET', '/memory/procedures/p1/retire'],
@@ -690,6 +759,10 @@ describe('远程记忆存储', () => {
     expect(((await bad.json()) as { error: { type: string } }).error.type).toBe('invalid_request');
     expect((await call('GET', '/memory/notes/head')).status).toBe(400);
     expect((await call('GET', '/memory/facts?limit=abc')).status).toBe(400);
+    expect((await call('POST', '/memory/facts/search', { text: '茶', archived: 'yes' })).status).toBe(400);
+    expect((await call('POST', '/memory/facts/restore', { ids: 'f1' })).status).toBe(400);
+    const restored = await call('POST', '/memory/facts/restore', { ids: ['missing'] });
+    expect([restored.status, await restored.json()]).toEqual([200, { restored: 0 }]);
     expect((await call('GET', '/memory/procedures?active=yes')).status).toBe(400);
     const missing = await call('POST', '/memory/facts/missing/close', { at: 1 });
     expect(missing.status).toBe(404);
@@ -973,6 +1046,74 @@ describe('长请求、断线和上限', () => {
     expect(body.result).toMatchObject({ runId: 'run-1', text: '好的', stopReason: 'end_turn' });
     expect(body.result.messages).toEqual(ran.messages);
     expect(body.result.recorded.map((entry) => entry.seq)).toEqual(ran.recorded.map((entry) => entry.seq));
+  });
+
+  test('events：服务重启后自己重连，之后的事件照样收到', async () => {
+    const { store, harness } = localHarness([
+      { type: 'text', text: '一' },
+      { type: 'text', text: '二' },
+    ]);
+    const first = await startRemote({ accessToken, store, orchestrator: createOrchestrator({ harness, store }) });
+    const port = Number(new URL(first.origin).port);
+    const remote = createRemoteOrchestrator({ baseUrl: first.baseUrl, accessToken, ...quick });
+    const completed: string[] = [];
+    const controller = new AbortController();
+    const done = (async () => {
+      for await (const event of remote.events({ signal: controller.signal })) {
+        if (event.type === 'run.completed') completed.push(event.runId);
+      }
+    })();
+    await pause(50);
+    await (
+      await remote.submit({ session: 'a', agent, input: '在吗', runId: 'before' })
+    ).done;
+    await eventually(
+      async () => completed.length,
+      (count) => count === 1,
+    );
+    await first.close();
+    await serve({ store, port, orchestrator: createOrchestrator({ harness, store }) });
+    // 断开那一阵的事件收不到：等它重连上再提交。
+    await pause(400);
+    await (
+      await remote.submit({ session: 'b', agent, input: '在吗', runId: 'after' })
+    ).done;
+    await eventually(
+      async () => completed.length,
+      (count) => count === 2,
+    );
+    controller.abort();
+    await done;
+    expect(completed).toEqual(['before', 'after']);
+  });
+
+  test('经编排器提交、还没结束的运行到了 maxPendingRuns 回 429，结束一个又能提交', async () => {
+    const { store, harness } = localHarness(
+      [
+        { type: 'text', text: '一' },
+        { type: 'text', text: '二' },
+        { type: 'text', text: '三' },
+      ],
+      300,
+    );
+    const server = await serve({ store, orchestrator: createOrchestrator({ harness, store }), maxPendingRuns: 2 });
+    const post = (session: string): Promise<Response> =>
+      fetch(`${server.baseUrl}/orchestrator/runs`, {
+        method: 'POST',
+        headers: auth,
+        body: JSON.stringify({ session, agent, input: '在吗' }),
+      });
+    const remote = createRemoteOrchestrator(client(server));
+    const running = await remote.submit({ session: 'a', agent, input: '在吗' });
+    expect((await post('b')).status).toBe(200);
+    const refused = await post('c');
+    expect(refused.status).toBe(429);
+    expect(await refused.json()).toMatchObject({ error: { type: 'rate_limit_error', retryable: true } });
+    await running.done;
+    await eventually(
+      async () => (await post('c')).status,
+      (code) => code === 200,
+    );
   });
 
   test('到了并发上限回 429（retryable），放掉以后又能用', async () => {

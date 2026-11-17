@@ -235,7 +235,13 @@ describe('orchestrator', () => {
         (options) => options.last === 1 && options.kinds?.join() === 'ctx.run.started,ctx.run.ended',
       ),
     );
-    assert.equal(lists.length - lifecycleReads.length, 3, '只有找到断点的会话多读一次末尾');
+    const rest = lists.filter((options) => options.kinds === undefined);
+    assert.equal(rest.length, 6, '只有找到断点的会话多读两次：末尾，和这一轮写下的消息');
+    assert.equal(
+      rest.filter((options) => options.after !== undefined && options.types?.join() === 'message').length,
+      3,
+      '消息只读 ctx.run.started 之后的（`after`），不读整个会话',
+    );
     await orchestrator.close();
   });
 });

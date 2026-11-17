@@ -13,6 +13,10 @@ okf_version: '0.2'
 - [架构：进程内参考实现](architecture.md) - `@modelctx-ai/ctx` 和各实现包怎么做：条目和存储、投影、调用和记录、压缩、来源、工具和 MCP、harness、编排器、记忆、网关、扩展点、实现约束
 - [实践：yoyo 和三个仓库](repos.md) - ctx、yoyo、dsh-pet 各管什么，契约、依赖、运行时拓扑和本地联调
 
+# 英文
+
+- [English](en/index.md) - 规范部分的英文译本：协议层（含线上形态）；中文为准，译本记着同步日期，行内代码和章节由测试对齐
+
 # 决策记录
 
 - [ADR](adr/index.md) - 改变设计决策时的背景、决定、代价和没有采用的方案，编号递增
@@ -28,6 +32,7 @@ okf_version: '0.2'
 - [`@modelctx-ai/ctx-exec`](../packages/exec/README.md) - 实现：本机子进程执行环境
 - [`@modelctx-ai/ctx-remote`](../packages/remote/README.md) - 实现：会话、执行环境、harness、编排、记忆的 HTTP 服务端和客户端
 - [`@modelctx-ai/ctx-gateway`](../packages/gateway/README.md) - 实现：本机 OpenAI 兼容网关
+- [`@modelctx-ai/ctx-otel`](../packages/otel/README.md) - 实现：从会话日志派生 OpenTelemetry 的 span
 
 # 记录
 

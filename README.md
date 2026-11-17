@@ -2,7 +2,9 @@
 
 面向 agent 原生程序的上下文与运行框架，for programs as yet unthought of。
 
-一个 agent 被拆成七个组件：会话、上下文、工具、执行环境、harness、编排、模型。每个组件一个协议，组件之间只通过协议交互：任何一个都能单独替换，也能放在任何地方托管。会话可以在内存、SQLite 或第三方存储，执行环境可以是本机进程或容器，harness 和编排可以是远端服务；模型经 Vercel AI SDK v7 接任何服务商。第八个组件记忆从会话日志里提炼跨会话的事实、经验和画像。
+[English](README.en.md)
+
+一个 agent 被拆成七个组件：会话、上下文、工具、执行环境、harness、编排、模型。每个组件一个协议，组件之间只通过协议交互，任何一个都能单独替换。会话、执行环境、harness、编排、记忆存储还有线上形态（HTTP，带 JSON Schema、OpenAPI 和对一个地址跑的一致性测试），能放在另一个进程或别处托管，也能用别的语言实现；上下文、工具目录、模型跟着 harness 在同一个进程里。会话可以在内存、SQLite 或第三方存储，执行环境可以是本机进程或容器，harness 和编排可以是远端服务；模型经 Vercel AI SDK v7 接任何服务商。第八个组件记忆从会话日志里提炼跨会话的事实、经验和画像。
 
 ## 架构
 
@@ -74,6 +76,7 @@ sequenceDiagram
 |      | [`@modelctx-ai/ctx-exec`](packages/exec)                | 本机子进程执行环境                                            |
 |      | [`@modelctx-ai/ctx-remote`](packages/remote)            | 会话、执行环境、harness、编排、记忆的 HTTP 服务端和客户端     |
 |      | [`@modelctx-ai/ctx-gateway`](packages/gateway)          | 本机 OpenAI 兼容网关，把客户端带来的历史换成 ctx 的上下文     |
+|      | [`@modelctx-ai/ctx-otel`](packages/otel)                | 从会话日志派生 OpenTelemetry 的 span                          |
 | 实践 | [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo) | 用这些包组合出来的常驻桌宠导演，见[实践：yoyo](docs/repos.md) |
 
 ## 快速开始
@@ -91,6 +94,7 @@ overrides:
   '@modelctx-ai/ctx-mcp': link:../ctx/packages/mcp
   '@modelctx-ai/ctx-memory': link:../ctx/packages/memory
   '@modelctx-ai/ctx-models': link:../ctx/packages/models
+  '@modelctx-ai/ctx-otel': link:../ctx/packages/otel
   '@modelctx-ai/ctx-protocol': link:../ctx/packages/protocol
   '@modelctx-ai/ctx-remote': link:../ctx/packages/remote
   '@modelctx-ai/ctx-sqlite': link:../ctx/packages/sqlite

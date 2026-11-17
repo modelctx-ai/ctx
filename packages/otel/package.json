@@ -1,0 +1,51 @@
+{
+  "name": "@modelctx-ai/ctx-otel",
+  "version": "0.3.0",
+  "description": "ctx 的 OpenTelemetry 适配：从会话日志的条目派生 span（运行、模型调用、工具调用），按 GenAI 语义约定填属性，不另记一套。",
+  "keywords": [
+    "ai",
+    "agent",
+    "opentelemetry",
+    "tracing",
+    "observability"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/otel"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "vp pack"
+  },
+  "peerDependencies": {
+    "@modelctx-ai/ctx-protocol": "workspace:^",
+    "@opentelemetry/api": "^1.9.0"
+  },
+  "devDependencies": {
+    "@modelctx-ai/ctx": "workspace:^",
+    "@modelctx-ai/ctx-protocol": "workspace:^",
+    "@opentelemetry/api": "~1.9.0",
+    "@opentelemetry/sdk-trace-base": "^2.0.0"
+  }
+}

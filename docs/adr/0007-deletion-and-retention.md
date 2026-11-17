@@ -9,7 +9,7 @@ status: stable
 # ADR 0007：会话的擦除和保留期
 
 - 状态：已采纳
-- 实施状态：会话这一半已实施，未发布。记忆那一半（`forget` 级联到画像、画像历史、笔记和向量，「按会话或按用户全部删除」的入口）不在这篇里，单独做
+- 实施状态：会话这一半已实施，未发布。记忆那一半（`forget` 级联到画像、画像历史、笔记和向量，「按会话或按用户全部删除」的入口）不在这篇里，已经单独实施，未发布：`Memory.forget`，见 [ADR 0006](0006-memory.md#决定记录) 2026-11-16 的一条
 - 日期：2026-11-15
 - 范围：`ctx-protocol`（`SessionStore`）、`@modelctx-ai/ctx`（内存存储、harness、`pruneSession`）、`ctx-sqlite`、`ctx-remote`
 - 依据：issue #36、#32、#38；在 Node 22.23 自带的 SQLite 3.53.4 上实测

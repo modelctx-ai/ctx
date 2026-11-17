@@ -93,6 +93,34 @@ await hub.close();
 - `close()` 中止还在进行的连接，断开全部连接，清空状态，并从写过的每个注册表里删掉这些工具。
 - stdio 的 `env` 只写额外的变量，`PATH`、`HOME` 等会自动带上。
 
+## 反方向：把执行环境交给 MCP 客户端
+
+自带循环的程序（Claude Code、pi 这类进程级的 harness）只认 MCP。`createMcpServer` 把 ctx 的执行环境包成 MCP 服务器，它们调的工具就落在 ctx 的执行环境上：
+
+```ts
+import { createServer } from 'node:http';
+
+import { createMcpHttpHandler, createMcpServer, serveMcpStdio } from '@modelctx-ai/ctx-mcp';
+
+const server = createMcpServer({
+  executors: [local, box], // 工具按定义的 executor 找执行环境
+  context: { session: 'user:42', runId }, // 调用记在哪个会话、哪一轮
+  onResult: (call, output) => console.log(call.name, output.type), // 适配器在这里把调用记进日志
+});
+
+// Streamable HTTP：POST /mcp
+createServer(createMcpHttpHandler(server, { accessToken: process.env.MCP_TOKEN })).listen(7801, '127.0.0.1');
+// 或者 stdio：一行一条
+await serveMcpStdio(server);
+```
+
+- 只做工具：`initialize`、`ping`、`tools/list`、`tools/call` 和客户端的 `notifications/cancelled`（中止那次调用）。不依赖 MCP 的 SDK。协议版本认 `MCP_PROTOCOL_VERSIONS`（`2025-06-18`、`2025-03-26`、`2024-11-05`），客户端要的不在里面就回最新的。
+- 工具：`tools` 给了就交出这些定义，不给就是各执行环境 `tools()` 报的全部，同名的留第一个。调用前按 `inputSchema` 查输入（`validateInput: false` 关掉）：MCP 客户端不经过 harness 的那一层。
+- 结果按 `toolOutputToMcp` 转：文字是 `text`；`json` 是它的 JSON 文字，值是对象时另放进 `structuredContent`；图片、音频是它们自己的块，别的内联文件是嵌入的资源，地址是 `resource_link`；`{ type: 'error' }` 是 `isError: true` 的结果（`retryable`、`data` 跟在信息后面），不是 JSON-RPC 错误，模型看得到。执行环境抛错也是这样。
+- `createMcpHttpHandler(server, { path?, accessToken?, allowedOrigins?, maxBodyBytes? })`：只认 `POST <path>`（缺省 `/mcp`），请求回 `application/json`，通知回 202；`GET`、`DELETE` 回 405（不开服务器发起的流，不建会话）。带 `Origin` 的请求缺省 403，给了 `accessToken` 要 `Authorization: Bearer`。客户端断开时那次调用中止。
+- `serveMcpStdio(server, { input?, output? })`：缺省 `process.stdin`、`process.stdout`，输入结束时 resolve，正在跑的调用中止。请求不排队，慢的调用不挡 `ping` 和取消。日志别写 stdout。
+- 用本包的 hub（`@ai-sdk/mcp` 的客户端）验证过 HTTP 和 stdio 两种传输；Claude Code、pi 这些真实的客户端没有验证。
+
 ## 导出
 
 | 导出                                                                                                                                                         | 说明                                                                                                                                                                                                                                                                       |
@@ -106,3 +134,8 @@ await hub.close();
 | `namespaced(server, tool)`                                                                                                                                   | 缺省的命名规则                                                                                                                                                                                                                                                             |
 | `isStdioConfig(config)`                                                                                                                                      | 是不是 stdio 配置                                                                                                                                                                                                                                                          |
 | `McpServers`、`McpServerConfig`、`StdioServerConfig`、`RemoteServerConfig`、`McpServerStatus`、`McpConnection`、`McpConnectOptions`、`McpTool`、`McpToolSet` | 类型                                                                                                                                                                                                                                                                       |
+| `createMcpServer(options)`、`McpServer`、`McpServerOptions`、`McpCallContext`                                                                                | 把执行环境包成 MCP 服务器：`handle(message, { signal? })` 处理一条 JSON-RPC 消息，`close()` 中止正在跑的调用                                                                                                                                                               |
+| `createMcpHttpHandler(server, options?)`、`McpHttpOptions`                                                                                                   | Streamable HTTP 的处理函数，挂到 `node:http` 上                                                                                                                                                                                                                            |
+| `serveMcpStdio(server, options?)`、`McpStdioOptions`                                                                                                         | 走 stdio                                                                                                                                                                                                                                                                   |
+| `toolOutputToMcp(output)`                                                                                                                                    | `ToolOutput` 转成 MCP 的 `CallToolResult`                                                                                                                                                                                                                                  |
+| `MCP_PROTOCOL_VERSIONS`                                                                                                                                      | 认得的 MCP 协议版本，新的在前                                                                                                                                                                                                                                              |

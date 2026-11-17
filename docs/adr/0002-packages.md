@@ -27,6 +27,7 @@ status: stable
 | `@modelctx-ai/ctx-exec`     | 本机子进程执行环境                                                                              | 要 `node:child_process`；不跑命令的应用用不到                                                           |
 | `@modelctx-ai/ctx-remote`   | 会话存储、执行环境、harness、编排器、记忆存储的 HTTP 服务端和客户端                             | 服务端要 `node:http`；进程内用法用不到                                                                  |
 | `@modelctx-ai/ctx-gateway`  | OpenAI 兼容网关                                                                                 | 本机 HTTP 服务；只有要接 OpenAI 协议客户端的应用才用                                                    |
+| `@modelctx-ai/ctx-otel`     | 从会话日志派生 OpenTelemetry 的 span                                                            | 带进 `@opentelemetry/api`；不接追踪后端的应用用不到                                                     |
 
 没选一个包加子路径（`@modelctx-ai/ctx/sqlite`）：适配器的依赖要么所有人都装上，要么变成可选的 peer 让使用方自己补；各部分对 Node 版本的要求也不一样。
 
@@ -39,17 +40,18 @@ status: stable
 
 ## 依赖关系
 
-| 包                          | `dependencies`                                   | `peerDependencies`    |
-| --------------------------- | ------------------------------------------------ | --------------------- |
-| `@modelctx-ai/ctx-protocol` | —                                                | `ai`（只用类型）      |
-| `@modelctx-ai/ctx`          | `ai`                                             | `ctx-protocol`、`zod` |
-| `@modelctx-ai/ctx-sqlite`   | —                                                | `ctx-protocol`        |
-| `@modelctx-ai/ctx-models`   | `@ai-sdk/openai-compatible`、`@ai-sdk/anthropic` | `ctx-protocol`、`ai`  |
-| `@modelctx-ai/ctx-memory`   | —                                                | `ctx-protocol`、`ai`  |
-| `@modelctx-ai/ctx-mcp`      | `@ai-sdk/mcp`                                    | `ctx-protocol`        |
-| `@modelctx-ai/ctx-exec`     | —                                                | `ctx-protocol`        |
-| `@modelctx-ai/ctx-remote`   | —                                                | `ctx-protocol`        |
-| `@modelctx-ai/ctx-gateway`  | —                                                | `ctx-protocol`        |
+| 包                          | `dependencies`                                   | `peerDependencies`                   |
+| --------------------------- | ------------------------------------------------ | ------------------------------------ |
+| `@modelctx-ai/ctx-protocol` | —                                                | `ai`（只用类型）                     |
+| `@modelctx-ai/ctx`          | `ai`                                             | `ctx-protocol`、`zod`                |
+| `@modelctx-ai/ctx-sqlite`   | —                                                | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-models`   | `@ai-sdk/openai-compatible`、`@ai-sdk/anthropic` | `ctx-protocol`、`ai`                 |
+| `@modelctx-ai/ctx-memory`   | —                                                | `ctx-protocol`、`ai`                 |
+| `@modelctx-ai/ctx-mcp`      | `@ai-sdk/mcp`                                    | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-exec`     | —                                                | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-remote`   | —                                                | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-gateway`  | —                                                | `ctx-protocol`                       |
+| `@modelctx-ai/ctx-otel`     | —                                                | `ctx-protocol`、`@opentelemetry/api` |
 
 依赖只朝一个方向：协议 ← 实现 ← 实践。实现包把协议包当 peer：应用里只有一份协议包，`SessionStore`、`Executor`、`Harness` 这些类型来自同一份。实现包之间不互相依赖；测试里需要一个会话存储时把 `@modelctx-ai/ctx` 列进 `devDependencies`。ctx-models、ctx-memory 把协议包和 `ai` 都当 peer：返回的 `LanguageModel`、`DecisionModel`、`ExtractionModel` 和应用用的是同一份 AI SDK、同一份协议包。仓库里对协议包的 peer 写成 `workspace:^`，同时列进 `devDependencies` 供测试和构建使用。
 
@@ -113,9 +115,9 @@ Trusted publishing 只能给已经存在的包配置，所以第一次要先把�
 
 已经有的（2026-11-15）：
 
-- 九个包的 `publishConfig`（`access: public`、`provenance: true`）、`files: ["dist"]`、`workspace:^`。
-- `scripts/release.mjs`：`version <版本>` 把九个包改成同一个版本，正式版本顺带把 `CHANGELOG.md` 的「未发布」落成 `## <版本> - <日期>`；`check <tag>` 核对 tag 和各包版本、正式版本在 `CHANGELOG.md` 里有一节，给出 dist-tag。
-- `scripts/pack-smoke.mjs`（`pnpm smoke`）：每个包 `pnpm pack`，查包里的内容（有 `dist/`、`README.md`、`LICENSE`，没有 `src/` 和测试，没有残留的 `workspace:`，`exports` 指的文件都在），在干净目录里用 npm 一次装上九个 tarball，不打开源码条件用 `tsc`（`skipLibCheck: false`）把每个入口的类型解析一遍，再把每个入口 `import` 一遍、内存存储和 SQLite 存储各写读一次。
+- 十个包的 `publishConfig`（`access: public`、`provenance: true`）、`files: ["dist"]`、`workspace:^`。
+- `scripts/release.mjs`：`version <版本>` 把十个包改成同一个版本，正式版本顺带把 `CHANGELOG.md` 的「未发布」落成 `## <版本> - <日期>`；`check <tag>` 核对 tag 和各包版本、正式版本在 `CHANGELOG.md` 里有一节，给出 dist-tag。
+- `scripts/pack-smoke.mjs`（`pnpm smoke`）：每个包 `pnpm pack`，查包里的内容（有 `dist/`、`README.md`、`LICENSE`，没有 `src/` 和测试，没有残留的 `workspace:`，`exports` 指的文件都在），在干净目录里用 npm 一次装上十个 tarball，不打开源码条件用 `tsc`（`skipLibCheck: false`）把每个入口的类型解析一遍，再把每个入口 `import` 一遍、内存存储和 SQLite 存储各写读一次。
 - CI 的 `Pack smoke` 任务：上面的检查每个 PR 都跑；`import` 那一步另在 Node 22.0.0、22.13.0 上跑，按各包自己的 `engines.node` 决定跑哪些，`engines` 写低了这里会失败。
 - `.github/workflows/release.yml`：tag `v<版本>` 触发，`check`、`pnpm check`、冒烟检查都过了才 `pnpm -r publish`。正式版本的 tag 必须在 `main` 上，发到 `latest`；带 `-` 的预发布版本（`v0.4.0-next.0`）发到 `next`，给下游先试。
 
@@ -127,10 +129,11 @@ Trusted publishing 只能给已经存在的包配置，所以第一次要先把�
 2. 在那个提交上打 tag `v0.4.0` 并推上去。
 3. 工作流发完以后，yoyo 这类下游把 `overrides` 里的 `link:` 去掉。
 
-`engines.node` 核对过（2026-11-15）：各包 `dist/` 用到的最新的运行时 API 是 `Promise.withResolvers`（Node 22.0）和不用开关的 `node:sqlite`（22.13），依赖 `ai@7`、`@ai-sdk/mcp` 自己要求 `>=22`。所以八个包保持 `>=22.0.0`，`ctx-sqlite` 保持 `>=22.13.0`；根目录的 `>=22.18.0` 是开发要求（直接运行 `.ts`、Vitest 5），不随包发布。
+`engines.node` 核对过（2026-11-15）：各包 `dist/` 用到的最新的运行时 API 是 `Promise.withResolvers`（Node 22.0）和不用开关的 `node:sqlite`（22.13），依赖 `ai@7`、`@ai-sdk/mcp` 自己要求 `>=22`。所以九个包保持 `>=22.0.0`，`ctx-sqlite` 保持 `>=22.13.0`；根目录的 `>=22.18.0` 是开发要求（直接运行 `.ts`、Vitest 5），不随包发布。
 
 ## 决定记录
 
 - 2026-11-15：占位版本要给九个包名发；当初写「5 个」是 0.1 的包数。
 - 2026-11-15：暂不引入 changesets。`CHANGELOG.md` 继续手写（「未发布」一节），发版时由 `scripts/release.mjs version` 统一改版本号和落版本标题。九个包、版本一起升、一个人维护，changesets 的每 PR 一份变更说明换不来什么；包多到要分组、或者有了外部贡献者再议。
 - 2026-11-15：加预发布通道。带 `-` 的版本发到 npm 的 `next`，不动 `latest`，tag 不要求在 `main` 上。
+- 2026-11-16：加第十个包 `@modelctx-ai/ctx-otel`（[#46](https://github.com/modelctx-ai/ctx/issues/46)）：OpenTelemetry 的适配带进 `@opentelemetry/api`，按「带额外依赖的各成一个适配包」单独成包，不进核心包。它只依赖协议包，`@opentelemetry/api` 是 peer：应用里只有一份 OpenTelemetry API，全局的 tracer provider 才对得上。正文里「现在九个」按十个读；占位版本也要给它发。

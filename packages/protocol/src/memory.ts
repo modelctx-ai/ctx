@@ -31,21 +31,31 @@ export interface Note {
   readonly kind?: string;
   /** 应用定义的主题名。 */
   readonly topic?: string;
-  /** 夜里处理过的时刻；没有就是待处理。 */
+  /** 夜里处理过的时刻；没有、也没进死信（`failedAt`）就是待处理。 */
   readonly settledAt?: number;
+  /** 处理失败过几次（`fail` 记）；没失败过没有这一项。 */
+  readonly attempts?: number;
+  /** 最后一次失败的原因，写给人看。 */
+  readonly error?: string;
+  /** 失败次数到了上限、进死信的时刻。死信不算待处理，`retry` 放回去。 */
+  readonly failedAt?: number;
 }
 
 /**
  * 写入的笔记：`id` 由存储生成。`settledAt` 可以直接给：门控没过的那段也写一条已处理的笔记（`settledAt` 等于 `at`），
- * 这样 `head` 照样前进，同一段日志不会被再打一次分，打过的分也留作阈值的分布。
+ * 这样 `head` 照样前进，同一段日志不会被再打一次分，打过的分也留作阈值的分布。失败的记录只能由 `fail` 写。
  */
-export type NewNote = Omit<Note, 'id'>;
+export type NewNote = Omit<Note, 'id' | 'attempts' | 'error' | 'failedAt'>;
 
 /** `notes.list` 的筛选。结果按写入顺序。 */
 export interface NoteQuery {
   readonly session?: string;
-  /** `true` 只要待处理的（没有 `settledAt`），`false` 只要处理过的；不给不限。 */
+  /** `true` 只要待处理的（没有 `settledAt`、也没进死信），`false` 只要处理过的（有 `settledAt`）；不给不限。 */
   readonly pending?: boolean;
+  /** `true` 只要死信（有 `failedAt`），`false` 不要死信；不给不限。 */
+  readonly failed?: boolean;
+  /** 只要 `at` 不早于它的。 */
+  readonly since?: number;
   /** 最多返回多少条（最早写入的那些）。小数向下取整，不是正数时返回空；不给就不限。 */
   readonly limit?: number;
 }
@@ -53,6 +63,11 @@ export interface NoteQuery {
 /** 记忆里的事实：一句能独立成立的话，带有效期、证据和召回记录。文字写入后不改。 */
 export interface MemoryFact {
   readonly id: string;
+  /**
+   * 幂等键：一个作用域里不重复，`add`、`supersede` 遇到已有的键返回已有的那条、什么都不写。几个进程夜里处理同一批笔记时
+   * 不会写出重复的事实。参考实现用来源区间加文字算。
+   */
+  readonly key?: string;
   /** `user`、`project:agent`……应用定义。 */
   readonly subject: string;
   readonly predicate?: string;
@@ -71,9 +86,9 @@ export interface MemoryFact {
   readonly salience: number;
   /** 必填、非空：不允许没有证据的事实。`cite` 追加。 */
   readonly sources: readonly SourceRef[];
-  /** 每次被召回的时刻，按记录先后，激活度公式里的 `t_i`。`touch` 追加。 */
+  /** 最近几次被召回的时刻，按记录先后，激活度公式里的 `t_i`。`touch` 追加，只留最后 `MAX_FACT_RECALLS` 个。 */
   readonly recalls: readonly number[];
-  /** 归档的时刻；没有就是没归档。归档的事实退出 `open` 的查询，但不删。 */
+  /** 归档的时刻；没有就是没归档。归档的事实退出 `open` 的查询，但不删：`search` 带 `archived` 还搜得到，`restore` 恢复。 */
   readonly archivedAt?: number;
 }
 
@@ -105,7 +120,11 @@ export interface FactQuery {
 }
 
 export interface SearchQuery {
-  /** 实现决定用全文、向量还是两者。至少要做到：`text` 是事实文字的子串（3 个字符以上）时命中。 */
+  /**
+   * 实现决定用全文、向量还是两者。至少要做到：`text` 和事实文字有共同的词（`searchTerms`：字母数字连成的一串算一个词，
+   * 中日韩文字每相邻两个字算一个词）时命中，共同的词占得越多分越高（`termOverlap`）。多长都不报错：
+   * 实现最多看 `MAX_SEARCH_TERMS` 个不同的词（`searchTerms(text, MAX_SEARCH_TERMS)`）。
+   */
   readonly text: string;
   /** 按字面相等。 */
   readonly topic?: string;
@@ -113,6 +132,19 @@ export interface SearchQuery {
   readonly k?: number;
   /** `true`（缺省）只看仍然成立且没归档的；`false` 不限，连同关闭、归档的一起搜。 */
   readonly open?: boolean;
+  /**
+   * `true` 时仍然成立的事实里连归档的一起搜（关闭的还是不看）；缺省 `false`。`open: false` 时本来就不限，这一项不起作用。
+   * 存储不给归档的事实降权，分数怎么打折由调用方定（参考实现的 `recall` 乘 0.5）。
+   */
+  readonly archived?: boolean;
+}
+
+/** `notes.fail` 的选项。 */
+export interface FailNoteOptions {
+  /** 失败的原因，记进 `Note.error`。 */
+  readonly error: string;
+  /** 失败几次进死信：这次记完 `attempts` 不小于它时写 `failedAt`。 */
+  readonly maxAttempts: number;
 }
 
 /** `facts.close` 的选项。 */
@@ -178,7 +210,9 @@ export function checkMemoryScope(scope: unknown): asserts scope is string {
 /**
  * 记忆的存储：笔记、事实、程序、画像四个集合。全部只收发 JSON，可以放到进程边界另一侧；身份是字符串，由存储生成。
  * 时刻都由调用方给（毫秒），存储不看钟。错误用 `CtxError`：参数不合法是 `invalid_request`（例如没有证据、
- * `from > upTo`），认不得的 `id` 是 `not_found`；批量方法（`settle`、`touch`、`archive`、`forget`）跳过认不得的 `id`，不报错。
+ * `from > upTo`），认不得的 `id` 是 `not_found`；批量方法（`settle`、`fail`、`retry`、`touch`、`archive`、`restore`、
+ * `reopen`、`forget`）跳过认不得的 `id`，不报错。每个方法单独是原子的：`supersede` 的「加新关旧」要么都成，要么都不成。
+ * 几个进程共用一份存储时，同一段日志的笔记（`notes.add` 按区间）和同一个键的事实（`key`）只写一次。
  * 记忆只读会话日志，存储从不写它。
  *
  * 一份存储按作用域分开（`scope`）：一个用户、租户或项目一个作用域，名字由应用定。四个集合都在作用域里面，
@@ -193,17 +227,37 @@ export interface MemoryStore {
    */
   scope(scope: string): MemoryStore;
   readonly notes: {
-    /** 按输入顺序返回写入的笔记（带 `id`）。区间不合法时整批不写，抛 `invalid_request`。 */
+    /**
+     * 按输入顺序返回写入的笔记（带 `id`）。区间不合法时整批不写，抛 `invalid_request`。同一个会话、同样的 `from` 和 `upTo`
+     * 已经有笔记时不再写，返回已有的那条：两个进程同时门控同一段日志只留一条。
+     */
     add(notes: readonly NewNote[]): Promise<Note[]>;
     list(query?: NoteQuery): Promise<Note[]>;
-    /** 把待处理的标成处理过（`settledAt = at`），返回这次真正标上的条数；已经处理过的不改。可重复调。 */
+    /** 把待处理的标成处理过（`settledAt = at`），返回这次真正标上的条数；已经处理过的、死信不改。可重复调。 */
     settle(ids: readonly string[], at: number): Promise<number>;
-    /** 这个会话的笔记（含处理过的）覆盖到的最大 `seq`；没有就是 0。`gate` 从它之后读。 */
+    /**
+     * 记一次处理失败：待处理的笔记 `attempts` 加 1、`error` 换成这次的；加完不小于 `maxAttempts` 时 `failedAt = at`，进死信。
+     * 返回这次改了的笔记。处理过的、已经是死信的不改。
+     */
+    fail(ids: readonly string[], at: number, options: FailNoteOptions): Promise<Note[]>;
+    /** 死信放回待处理：清掉 `failedAt`、`attempts`、`error`，返回放回的条数。不是死信的不改。 */
+    retry(ids: readonly string[]): Promise<number>;
+    /**
+     * 删掉这个会话的笔记，不给会话就删掉作用域里全部的笔记；返回删掉的条数。删完 `head` 回到 0：会话日志还在的话，
+     * 下次 `gate` 从头读。
+     */
+    forget(session?: string): Promise<number>;
+    /** 这个会话的笔记（含处理过的、死信）覆盖到的最大 `seq`；没有就是 0。`gate` 从它之后读。 */
     head(session: string): Promise<number>;
   };
   readonly facts: {
-    /** 没有证据或证据区间不合法时不写，抛 `invalid_request`。 */
+    /** 没有证据或证据区间不合法时不写，抛 `invalid_request`。`key` 已经有了时不写，返回已有的那条。 */
     add(fact: NewMemoryFact): Promise<MemoryFact>;
+    /**
+     * 原子的「加新关旧」：写入 `fact`，再把 `id` 那条 `close(id, at, { supersededBy: 新的 })`，返回新写的。`id` 认不得时
+     * 抛 `not_found`，什么都不写；`id` 已经关闭时只写新的。`fact.key` 已经有了时返回已有的那条，什么都不改。
+     */
+    supersede(id: string, fact: NewMemoryFact, at: number): Promise<MemoryFact>;
     /**
      * 关闭有效期：`validTo = at`，给了 `supersededBy` 一并记下。事实的文字永不改写：变了就 `add` 新的、`close` 旧的。
      * 已经关闭的不改（第二次 `close` 什么都不做）。`id` 或 `supersededBy` 认不得时抛 `not_found`。
@@ -214,10 +268,14 @@ export interface MemoryStore {
      * 所以重复调不会重复记。`sources` 为空或不合法抛 `invalid_request`，`id` 认不得抛 `not_found`。
      */
     cite(id: string, sources: readonly SourceRef[]): Promise<MemoryFact>;
-    /** 记一次召回：每个 `id` 的 `recalls` 追加 `at`。 */
+    /** 记一次召回：每个 `id` 的 `recalls` 追加 `at`，超过 `MAX_FACT_RECALLS` 个时丢掉最早的。 */
     touch(ids: readonly string[], at: number): Promise<void>;
     /** 归档（`archivedAt = at`），返回这次真正归档的条数；已经归档的不改。 */
     archive(ids: readonly string[], at: number): Promise<number>;
+    /** 恢复归档的事实（清掉 `archivedAt`），返回这次真正恢复的条数；没归档的不改。有效期不动：关闭的恢复了还是关闭的。 */
+    restore(ids: readonly string[]): Promise<number>;
+    /** 撤销关闭：清掉 `validTo` 和 `supersededBy`，返回这次真正重新打开的条数；没关闭的不改。关错了的改回来用它。 */
+    reopen(ids: readonly string[]): Promise<number>;
     /** 真删除，连同别的事实里指向它的 `supersededBy` 一起清掉，返回删掉的条数。主人的权利。 */
     forget(ids: readonly string[]): Promise<number>;
     list(query?: FactQuery): Promise<MemoryFact[]>;
@@ -235,6 +293,8 @@ export interface MemoryStore {
     confirm(id: string, evidence: readonly SourceRef[]): Promise<Procedure>;
     /** `retiredAt = at`；已经退役的不改。`id` 认不得抛 `not_found`。 */
     retire(id: string, at: number): Promise<void>;
+    /** 真删除，返回删掉的条数。 */
+    forget(ids: readonly string[]): Promise<number>;
     list(query?: ProcedureQuery): Promise<Procedure[]>;
   };
   readonly core: {
@@ -244,6 +304,8 @@ export interface MemoryStore {
     set(text: string, at: number): Promise<void>;
     /** 历史版本，按写入顺序。 */
     history(options?: CoreHistoryOptions): Promise<CoreVersion[]>;
+    /** 删掉全部版本（真删除，`get` 回到 null），返回删掉的个数。事实删了以后画像里还留着的，用它清。 */
+    clear(): Promise<number>;
   };
 }
 
@@ -352,13 +414,18 @@ export interface RecallOptions {
   readonly k?: number;
   /** 事实文字的 token 预算（`estimateTextTokens`）。 */
   readonly budgetTokens?: number;
+  /** `MemoryFact.confidence` 低于它的事实不召回。缺省由实现定（参考实现 0.5）；给 0 就不筛。 */
+  readonly minConfidence?: number;
   /** 带回事实和程序的证据原文（`Recalled.evidence`）。工具调用时带，作为来源时不带。 */
   readonly evidence?: boolean;
   readonly signal?: AbortSignal;
 }
 
 export interface Recalled {
-  /** 按 `rankFacts` 排好，已经 `touch` 过（返回的是 `touch` 之前读到的样子）。 */
+  /**
+   * 按 `rankFacts` 排好，已经 `touch` 过（`recalls` 是 `touch` 之前读到的样子）。里面原先归档的已经恢复，
+   * 返回的不带 `archivedAt`。
+   */
   readonly facts: readonly MemoryFact[];
   readonly procedures: readonly Procedure[];
   /** 只在 `RecallOptions.evidence` 时有：返回的事实和程序的证据区间里的条目，按 `id` 去重，按会话、`seq` 排。 */
@@ -374,11 +441,17 @@ export interface ConsolidateOptions {
 export interface ConsolidateReport {
   /** 这次处理（`settle`）的笔记数。 */
   readonly notes: number;
+  /** 这次处理失败、留着下次再试的笔记数（不含进了死信的）。 */
+  readonly failed: number;
+  /** 这次失败次数到了上限、进死信的笔记数。 */
+  readonly dead: number;
   readonly facts: {
     readonly added: number;
     readonly merged: number;
     readonly superseded: number;
     readonly archived: number;
+    /** 原文里找不到支撑、置信度被降下来的事实数。参考实现总是给；别的实现可以不给。 */
+    readonly ungrounded?: number;
   };
   readonly procedures: { readonly added: number; readonly confirmed: number };
   /** 升级给 `LanguageModel` 的判断数。 */
@@ -396,11 +469,35 @@ export interface MemorySourceOptions {
   readonly k?: number;
 }
 
+/**
+ * `Memory.forget` 要删什么，几项可以一起给。删的都是真删除；画像从剩下的事实重新渲染（不经模型，
+ * 删掉的内容不会被「上一版画像」带回来），历史版本一起清掉。
+ */
+export interface ForgetRequest {
+  /** 这些事实。 */
+  readonly facts?: readonly string[];
+  /** 这些程序。 */
+  readonly procedures?: readonly string[];
+  /** 这个会话留下的：它的笔记，证据里有它的事实和程序（证据还指向别的会话的也删）。 */
+  readonly session?: string;
+  /** 这份记忆（它的作用域）里的全部：笔记、事实、程序、画像。 */
+  readonly all?: boolean;
+  readonly signal?: AbortSignal;
+}
+
+export interface ForgetReport {
+  readonly notes: number;
+  readonly facts: number;
+  readonly procedures: number;
+  /** 删掉的画像版本数（不含重新渲染后写的那一版）。 */
+  readonly core: number;
+}
+
 /** 记忆作为工具时的工具名。输入 `{ query: string, since_days?: number }`。 */
 export const MEMORY_RECALL_TOOL = 'recall';
 
 /**
- * 记忆的门面：五个操作，参考实现是 `@modelctx-ai/ctx-memory` 的 `createMemory(options)`。它本身是一个 `Executor`
+ * 记忆的门面：五个操作加删除，参考实现是 `@modelctx-ai/ctx-memory` 的 `createMemory(options)`。它本身是一个 `Executor`
  * （名字缺省 `memory`），`tools()` 报出 `recall` 工具。只读会话日志，从不写它；只有 `consolidate` 改写事实、程序和 `core`。
  */
 export interface Memory extends Executor {
@@ -409,11 +506,23 @@ export interface Memory extends Executor {
    * 门控没过的那段也写一条已处理的笔记（`settledAt` 等于 `at`），`head` 照样前进；没有新条目时返回空、什么都不写。
    */
   gate(session: string, options?: GateOptions): Promise<Note[]>;
-  /** 白天：按文字召回仍然成立的事实，按相似度和激活度排序（`rankFacts`），记一次 `touch`；带上匹配主题的程序。 */
+  /**
+   * 白天：按文字召回仍然成立的事实，按相似度和激活度排序（`rankFacts`），记一次 `touch`；带上匹配主题的程序。
+   * 归档的事实也找（相似度打折），被召回的那些恢复成没归档的；`confidence` 低于 `minConfidence` 的不召回。
+   */
   recall(query: string, options?: RecallOptions): Promise<Recalled>;
-  /** 夜里：处理待处理的笔记，衰减归档，重写 `core`。整体可重复执行：处理过的笔记不再处理。 */
+  /**
+   * 夜里：处理待处理的笔记，衰减归档，重写 `core`。整体可重复执行：处理过的笔记不再处理。按批隔离：一批失败不挡后面的，
+   * 失败的笔记留着（`notes.fail`），失败次数到上限进死信。
+   */
   consolidate(options?: ConsolidateOptions): Promise<ConsolidateReport>;
-  /** 作为来源：`core` 加按 `query` 召回的事实，渲染成文字；什么都没有时返回空。 */
+  /** 删除（`ForgetRequest`）。和 `consolidate` 排同一个队，不会和夜里的处理交错。 */
+  forget(request: ForgetRequest): Promise<ForgetReport>;
+  /**
+   * 作为来源：`core` 加按 `query` 召回的事实，渲染成文字；什么都没有时返回空。来源每一轮都会被调，
+   * 所以它带出的事实不是每次都记 `touch`：实现要限制频率（参考实现是同一条事实一天记一次），不然被带出的事实
+   * 激活度越滚越高，别的再也排不上。
+   */
   source(options?: MemorySourceOptions): ContextSource;
   /** 作为工具：`recall`（`MEMORY_RECALL_TOOL`），绑定到这个执行环境（`executor` 是 `name`）。 */
   tools(): Promise<ToolDefinition[]>;
@@ -424,6 +533,9 @@ export interface Memory extends Executor {
 // ---- 纯函数 ----
 
 const DAY_MS = 86_400_000;
+
+/** 一条事实最多留多少个召回时刻（`MemoryFact.recalls`）。`touch` 超过时丢掉最早的，激活度也只看这么多个。 */
+export const MAX_FACT_RECALLS = 32;
 
 /** 激活度和归档的缺省参数：衰减 `d`、`ε`、归档阈值 `archiveAt`。 */
 export const ACTIVATION_DEFAULTS = { d: 0.5, epsilon: 0.02, archiveAt: 0.55 } as const;
@@ -436,8 +548,11 @@ export interface ActivationOptions {
 }
 
 /**
- * ACT-R 的基础激活：`A = ln Σᵢ (Δtᵢ + ε)^(−d) + s`，`Δtᵢ = (now − tᵢ) / 1 天`，`tᵢ ∈ { validFrom, ...recalls }`，
- * `s` 是 `salience`。晚于 `now` 的时刻按 `Δt = 0` 算。注入排序和夜间归档（低于 `archiveAt` 就归档）用同一个值。
+ * ACT-R 的基础激活：`A = ln Σᵢ (Δtᵢ + ε)^(−d) + s`，`Δtᵢ = |now − tᵢ| / 1 天`，`tᵢ` 是 `validFrom` 和最近
+ * `MAX_FACT_RECALLS` 次召回，`s` 是 `salience`。晚于 `now` 的时刻按它离 `now` 有多远算：十天后才生效的事实和十天前
+ * 生效的一样活跃，临近时回升，所以 `validFrom` 在未来的事实也会衰减。
+ * 有上界：`ln((MAX_FACT_RECALLS + 1) · ε^(−d)) + s`，缺省参数下是 `5.45 + s`。夜间归档看它是不是低于 `archiveAt`；
+ * 排序用的是压到 0..1 的 `retrievability`。
  */
 export function activation(
   fact: Pick<MemoryFact, 'validFrom' | 'recalls' | 'salience'>,
@@ -447,20 +562,41 @@ export function activation(
   const d = options?.d ?? ACTIVATION_DEFAULTS.d;
   const epsilon = options?.epsilon ?? ACTIVATION_DEFAULTS.epsilon;
   let sum = 0;
-  for (const t of [fact.validFrom, ...fact.recalls]) sum += (Math.max(0, now - t) / DAY_MS + epsilon) ** -d;
+  for (const t of [fact.validFrom, ...fact.recalls.slice(-MAX_FACT_RECALLS)])
+    sum += (Math.abs(now - t) / DAY_MS + epsilon) ** -d;
   return Math.log(sum) + fact.salience;
 }
 
-export interface RankOptions extends ActivationOptions {
+export interface RetrievabilityOptions extends ActivationOptions {
+  /** 归档阈值，也就是提取阈值 `τ`，缺省 0.55。 */
+  readonly archiveAt?: number;
+}
+
+/**
+ * 激活度压到 0..1：ACT-R 的提取概率 `1 / (1 + e^(−(A − τ)))`，`τ` 是归档阈值 `archiveAt`（噪声取 1）。
+ * 正好在阈值上是 0.5，刚写的事实（`s = 0.6`）约 0.88，一个月没动的约 0.16；召回再多也到不了 1。召回的排序用它，不直接用 `A`：
+ * `A` 没有固定的量程，直接加权会盖过相似度。
+ */
+export function retrievability(
+  fact: Pick<MemoryFact, 'validFrom' | 'recalls' | 'salience'>,
+  now: number,
+  options?: RetrievabilityOptions,
+): number {
+  const archiveAt = options?.archiveAt ?? ACTIVATION_DEFAULTS.archiveAt;
+  return 1 / (1 + Math.exp(archiveAt - activation(fact, now, options)));
+}
+
+export interface RankOptions extends RetrievabilityOptions {
   /** 算激活度的时刻，缺省是当前时间。 */
   readonly now?: number;
-  /** 两项的权重，缺省 `{ similarity: 0.6, activation: 0.4 }`。 */
+  /** 两项的权重，缺省 `{ similarity: 0.6, activation: 0.4 }`。`activation` 乘的是 `retrievability`。 */
   readonly weights?: { readonly similarity: number; readonly activation: number };
 }
 
 /**
- * 召回的排序：`score = 0.6 × similarity + 0.4 × activation`，从高到低，分数相同时保持输入顺序。
- * `scores` 是事实 `id` → 相似度（一般是 `FactHit.score`），没有的按 0 算。
+ * 召回的排序：`score = 0.6 × similarity + 0.4 × retrievability`，两项都在 0..1，从高到低，分数相同时保持输入顺序。
+ * `scores` 是事实 `id` → 相似度（一般是 `FactHit.score`），没有的按 0 算。激活度最多贡献 0.4：
+ * 相似度差 0.67 以上的，召回次数再多也翻不过来。
  */
 export function rankFacts(
   facts: readonly MemoryFact[],
@@ -472,15 +608,82 @@ export function rankFacts(
   return facts
     .map((fact) => ({
       fact,
-      score: weights.similarity * (scores[fact.id] ?? 0) + weights.activation * activation(fact, now, options),
+      score: weights.similarity * (scores[fact.id] ?? 0) + weights.activation * retrievability(fact, now, options),
     }))
     .toSorted((a, b) => b.score - a.score)
     .map((item) => item.fact);
 }
 
+// 中日韩文字没有空白分词：汉字、假名、谚文按相邻两个字切，其余按字母数字连成的词切。够全文检索用，不是分词器。
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const WORD = /[\p{L}\p{N}]/u;
+
+/** `search` 最多看查询里多少个不同的词。再长的查询也只是这么多次索引查找。 */
+export const MAX_SEARCH_TERMS = 256;
+
+/**
+ * 文字切成检索用的词：先做 NFKC 归一（全角字母、半角假名并到一起）、转小写；字母和数字连成的一串是一个词，
+ * 中日韩文字每相邻两个字是一个词（落单的一个字自成一个）。去重，按第一次出现的先后。
+ * 给了 `max`、词又比它多时，取开头的一半和结尾的一半：长长的一段话，要问的事多半在头尾。
+ * 存储的 `search` 和索引都用它切，所以同一句话在哪个实现上切出来的词都一样。
+ */
+export function searchTerms(text: string, max: number = Infinity): string[] {
+  const out = new Set<string>();
+  let word = '';
+  let cjk: string[] = [];
+  const flushWord = (): void => {
+    if (word) out.add(word);
+    word = '';
+  };
+  const flushCjk = (): void => {
+    if (cjk.length === 1) out.add(cjk[0]!);
+    else for (let i = 0; i + 1 < cjk.length; i += 1) out.add(cjk[i]! + cjk[i + 1]!);
+    cjk = [];
+  };
+  for (const char of text.normalize('NFKC').toLowerCase()) {
+    if (CJK.test(char)) {
+      flushWord();
+      cjk.push(char);
+    } else if (WORD.test(char)) {
+      flushCjk();
+      word += char;
+    } else {
+      flushWord();
+      flushCjk();
+    }
+  }
+  flushWord();
+  flushCjk();
+  const terms = [...out];
+  if (terms.length <= max) return terms;
+  const size = Math.max(0, Math.floor(max));
+  const head = Math.ceil(size / 2);
+  return [...terms.slice(0, head), ...terms.slice(terms.length - (size - head))];
+}
+
+/**
+ * 两组词的相似度，0..1：重叠系数 `shared / min(a, b)`，`shared` 是共同的词数，`a`、`b` 是两边各有多少个不同的词。
+ * 一边的词全在另一边里就是 1，所以短的查询对长的事实、长的一段话对短的事实都打得出分（Ochiai 在长短悬殊时趋近 0）。
+ * 任何一边没有词时是 0。
+ */
+export function termOverlap(shared: number, a: number, b: number): number {
+  const smaller = Math.min(a, b);
+  return smaller > 0 ? Math.min(1, shared / smaller) : 0;
+}
+
 /** 仍然成立（没有 `validTo`）且没归档。`FactQuery.open`、`SearchQuery.open` 的语义。 */
 export function isOpenFact(fact: Pick<MemoryFact, 'validTo' | 'archivedAt'>): boolean {
   return fact.validTo === undefined && fact.archivedAt === undefined;
+}
+
+/** 这条事实在不在 `search` 要看的范围里：`topic`、`open`、`archived` 三项的语义写成纯函数，内存里的存储可以直接用。 */
+export function inSearchScope(
+  fact: Pick<MemoryFact, 'topic' | 'validTo' | 'archivedAt'>,
+  query: Pick<SearchQuery, 'topic' | 'open' | 'archived'>,
+): boolean {
+  if (query.topic !== undefined && fact.topic !== query.topic) return false;
+  if (query.open === false) return true;
+  return fact.validTo === undefined && (query.archived === true || fact.archivedAt === undefined);
 }
 
 /** `FactQuery` 的语义写成纯函数：内存里的存储可以直接用。输入不必排序。 */

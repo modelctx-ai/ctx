@@ -167,16 +167,16 @@ sequenceDiagram
 
 ## 存储
 
-| 方法                                                  | 行为                                                                                                                                                                                                                                                                                                                      |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `append(session, entries, { expectSeq? })`            | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）。给了 `expectSeq` 而会话末尾 `seq` 不等于它（空会话是 0）时整批不写，抛 `conflict`（`retryable`），检查先于去重                                                                                    |
-| `list(session, { after, last, limit, types, kinds })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；`limit` 取过滤之后最早的 N 条，和 `after` 配合翻页（和 `last` 同时给时先取 `last`）；`kinds` 只要 `kind` 在其中的事件（消息和摘要不返回），与 `types` 取交集；都可以组合，`last` 在过滤之后取 |
-| `clear(session)`                                      | 删掉整个会话，返回条数。不留记录，末尾回到 0                                                                                                                                                                                                                                                                              |
-| `truncate(session, upTo)`                             | 删掉 `seq ≤ upTo` 的条目，返回条数。`upTo` 小数向下取整，不是有限数时不删                                                                                                                                                                                                                                                 |
-| `remove(session, ids)`                                | 按 `id` 真删，返回条数；认不得的、别的会话的 `id` 跳过。读不了的行也删得掉                                                                                                                                                                                                                                                |
-| `redact(session, ids)`                                | 按 `id` 涂改：条目变成 `ctx.redacted` 事件，`id`、`seq`、`at`、`key`、`source` 留着，内容和 `meta` 去掉；已经涂改过的跳过                                                                                                                                                                                                 |
-| `sessions({ prefix, after, limit })`                  | 有内容的会话，按名字升序（码点序）。`prefix` 按字面匹配，`after` 是上一页最后一个名字（不含），`limit` 限条数，小数向下取整，不是正数时返回空；都不给就是全部                                                                                                                                                             |
-| `watch(session, { after, signal })`                   | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                                                                                                                                                                                                     |
+| 方法                                                           | 行为                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `append(session, entries, { expectSeq? })`                     | 追加，一批是原子的。`id` 重复或同会话 `key` 重复的条目静默跳过，其余照写；返回真正写入的条目（已带 `id`、`seq`、`at`）。给了 `expectSeq` 而会话末尾 `seq` 不等于它（空会话是 0）时整批不写，抛 `conflict`（`retryable`），检查先于去重                                                                                                                                |
+| `list(session, { after, last, limit, types, kinds, atAfter })` | 按 `seq` 升序（写入顺序）。`after` 是 `seq`，不含；`last` 取 `seq` 最大的 N 条，仍升序，小数向下取整，不是有限正数时返回空；`limit` 取过滤之后最早的 N 条，和 `after` 配合翻页（和 `last` 同时给时先取 `last`）；`kinds` 只要 `kind` 在其中的事件（消息和摘要不返回），与 `types` 取交集；`atAfter` 只要 `at` 大于它的，`NaN` 不过滤；都可以组合，`last` 在过滤之后取 |
+| `clear(session)`                                               | 删掉整个会话，返回条数。不留记录，末尾回到 0                                                                                                                                                                                                                                                                                                                          |
+| `truncate(session, upTo)`                                      | 删掉 `seq ≤ upTo` 的条目，返回条数。`upTo` 小数向下取整，不是有限数时不删                                                                                                                                                                                                                                                                                             |
+| `remove(session, ids)`                                         | 按 `id` 真删，返回条数；认不得的、别的会话的 `id` 跳过。读不了的行也删得掉                                                                                                                                                                                                                                                                                            |
+| `redact(session, ids)`                                         | 按 `id` 涂改：条目变成 `ctx.redacted` 事件，`id`、`seq`、`at`、`key`、`source` 留着，内容和 `meta` 去掉；已经涂改过的跳过                                                                                                                                                                                                                                             |
+| `sessions({ prefix, after, limit })`                           | 有内容的会话，按名字升序（码点序）。`prefix` 按字面匹配，`after` 是上一页最后一个名字（不含），`limit` 限条数，小数向下取整，不是正数时返回空；都不给就是全部                                                                                                                                                                                                         |
+| `watch(session, { after, signal })`                            | 先给出 `after` 之后已有的条目，再持续给出新写入的，直到 `signal` 中止                                                                                                                                                                                                                                                                                                 |
 
 实现有 `createMemoryStore()`（核心包，进程内；`watch` 靠内存里的订阅，写入立刻唤醒；写入和读出各拷一份，和落盘的存储一样不把存着的对象交出去）和 `createSqliteStore()`（ctx-sqlite；`watch` 轮询 `list(after)`，一次读一页，缺省每 250ms，别的进程写进同一个库的也能读到；`unreadable: 'placeholder'` 时解不了的行读成 `ctx.unreadable` 事件，见[协议层](protocol.md#会话-sessionstore)）。条目只追加；框架自己不删不改，删除和涂改只在应用调下面这几个方法时发生。
 
@@ -246,15 +246,17 @@ sequenceDiagram
 
 不设 `window` 就不裁剪：最近一条摘要之后的历史全部带上。
 
+builder 的 `view`、`build` 经 `projectSession` 读会话：有窗口时不把摘要之后的历史整段读出来再裁，只读够用的尾部。先读最后 256 条（再加 `maxMessages` 的四倍），用 `atAfter` 补上 `at` 排在这段之后的更早的条目，投影一次；窗口挤掉的组比开头可能不完整的那几组多，结果就和读整段一样，否则读 4 倍那么多再来。30 万条、没压缩过的会话，`maxMessages: 20` 的 `view` 读几百条。只读了尾部时 `dropped` 只数读到的那部分。压缩（`compact`）要看全部，照旧读整段；`ContextSpec.inherit` 的父会话也读整段。
+
 投影照常输出 `system` 消息（例如摘要渲染成 `system`）；组装调用时 builder 把它们从消息里拿出来，接到指令后面（见[调用](#调用)）。
 
-结果 `Projection`：`messages`；`items`，每条带 `from`、`upTo`（它来自的条目里最小和最大的 `seq`）、`at`（来自的条目里最晚的 `at`）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数；`truncated` 被截短的消息条数；`summary` 生效的摘要条目。
+结果 `Projection`：`messages`；`items`，每条带 `from`、`upTo`（它来自的条目里最小和最大的 `seq`）、`at`（来自的条目里最晚的 `at`）、`pinned`、`tokens`；`tokens` 合计；`dropped` 被丢掉的消息条数（`projectSession` 只读了尾部时只数读到的部分）；`truncated` 被截短的消息条数；`summary` 生效的摘要条目。
 
 缺省的 token 估算不依赖分词器：中日韩文字一个字约 1 token，ASCII 约 4 个字符 1 token，其余文字（西里尔、阿拉伯、表情……）约 2 个字符 1 token，每条消息另加 4。附件按 `estimateFileTokens`：内联文字按字数，base64 按解码后的大小（图片 64 KiB 以内 256、更大 1600；文本类按字节数除以 4；其余每 20 字节 1 个、至少 256），只有地址或服务商引用、不知道大小的按 256；工具结果里的文件一样算。只用于预算和裁剪，不用于计费。
 
 ## 调用
 
-`createContextBuilder({ store, projection, projections, sources, sourceTimeoutMs, logger, factsPlacement, model, models, now })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
+`createContextBuilder({ store, projection, projections, sources, sourceTimeoutMs, logger, factsPlacement, model, models, now, calibrate })` 的 `build(request)` 组装一次调用，`context.prepare(options)` 是它加上工具的 `ToolSet`：
 
 1. 收集事实（`facts: false` 跳过；`FactsSpec.sources` 只用指定的来源）。投影名先认：不认识就以 `not_found` 失败，不回退，也不先去收事实。
 2. 读视图：只读最近一条摘要和它之后的条目，再投影。请求带了 `window` 就整个换掉投影里配的上限（`{}` 是不裁剪），`estimate` 始终用投影里配的。`build` 时 `maxTokens` 先扣掉历史之外已经占掉的部分——指令、事实、工具定义、`input`、`prompt` 的估算——剩下的才是历史的预算，所以它管的是整次调用；`view` 没有这些，不扣。
@@ -262,7 +264,9 @@ sequenceDiagram
 4. 投影里的 `system` 消息（摘要、事件规则或 `message` 钩子渲染成的，以及存成消息条目的）不放进 `messages`，文字按顺序接在指令最后，同样用空行隔开。
 5. 消息：视图 + `input`（这一轮用户说的话）+ `prompt`（最后一条临时用户消息；可以是函数，拿到事实）。
 6. 工具：`build` 收候选的 `ToolDefinition[]`，给出工具名单；`context.prepare` 的 `tools` 缺省是注册表里全部，`false` 不给，名字列表、`{ names, tags, sources }` 或 `(definition) => boolean` 筛选。
-7. `PreparedCall.tokens`：第 2 步扣掉的那部分加上历史的估算，也就是整次调用的估算。harness 的超窗检查用它（见 [Harness](#harness)）。
+7. `PreparedCall.tokens`：第 2 步扣掉的那部分加上历史的估算，也就是整次调用的估算。harness 的超窗检查用它（见 [Harness](#harness)），也把它记进第一步的 `StepMeta.estimatedInputTokens`。
+
+估算不分词，偏差随文字和服务商而变。builder 拿上一轮的实际用量校准（`calibrate`，缺省开着）：往回最多看 64 条消息，找上一轮第一步的 `meta.step`，`usage.inputTokens` 比 `estimatedInputTokens` 多几倍（样本里已经乘过的 `calibration` 换算回去再比，所以不会来回摆），这一轮 `maxTokens` 就按估算的单位收紧几倍，`PreparedCall.tokens` 乘上它，`PreparedCall.calibration` 记下倍数。只往小里收（估算偏高时不放宽），最多 `MAX_CALIBRATION`（4）倍；投影接了自己的 `window.estimate`（分词器）时不校准。`view` 带 `maxTokens` 时一样校准。样本只有一个、按会话取，同一个会话换了模型时头一轮还是按上一个模型的偏差算。
 
 `instructions` 和 `prompt` 只要有一个是函数，事实就不再自动放进去；投影出的 `system` 消息照样接上。
 
@@ -434,6 +438,13 @@ await hub.close();
 - `close()` 断开全部连接、清空状态，并从写过的每个注册表里删掉这些工具。
 - MCP 工具和本地工具一样经 harness 的工具循环，调用和结果作为消息写进日志。
 
+反方向，`createMcpServer` 把 ctx 的执行环境包成 MCP 服务器，给只认 MCP 的进程级 harness 用（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：
+
+- 一个服务器对应一组执行环境和一个 `ExecutionContext`（会话、`runId`）：适配器每起一轮就建一个，调用记到那一轮的会话上。`context` 是函数时每次调用取一次。
+- JSON-RPC 自己写，不依赖 MCP 的 SDK：只有工具这一块（`initialize`、`ping`、`tools/list`、`tools/call`、`notifications/cancelled`），每个请求各自跑，取消按请求 id 中止那次调用的 `signal`。
+- 调用前按 `inputSchema` 查输入（`checkJsonSchema`），结果经 `toolOutputToMcp` 转；执行环境的错误结果和抛错都是 `isError` 的结果。`onResult` 在每次调用之后调，适配器在这里把经 ctx 执行的调用记进日志，抛错只记告警。
+- 传输：`createMcpHttpHandler` 只认 `POST`，回 JSON 不开 SSE 流，`Origin` 和令牌的检查照 `ctx-remote`；`serveMcpStdio` 一行一条。
+
 ## 函数执行环境
 
 `createFunctionExecutor(name = 'local')` 是进程内的 `Executor`：一张 `名字 → (input, context) => ToolOutput` 的表。
@@ -457,6 +468,16 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
 - `execute` 从不抛：不认识的工具（错误里列出可用的）、`signal` 已中止、函数抛错、`dispose()` 之后都返回 `{ type: 'error', message }`，模型看得到原因。
 - `context` 是协议的 `ExecutionContext`（`session`、`runId`、`signal`）加上这次调用的 `callId`。
 - 注册表的 `addTool` 就是往它的函数执行环境里 `register`。
+- `open(session)`、`close(session)` 只记下开着的会话（`openSessions()`），不做别的：函数在 harness 的进程里，没有要准备的环境。
+
+### 每会话的执行环境
+
+[ADR 0009](adr/0009-hosted-prerequisites.md) 的参考实现：
+
+- harness 每一轮建一张「这一轮已经 `open` 过的执行环境」的表。第一次把调用交给某个执行环境之前调它的 `open(session, { environment: agent.environment, signal })`，同一轮的后续调用复用那次的结果。`open` 抛错时，这一轮交给它的调用都回 `Executor "x" could not prepare session "s" for tool …: 原因`，模型看得到，这一轮照常往下走；没有 `open` 的执行环境不管。外部执行的工具（`external`）不经这一步。
+- `closeExecutorSessions(executors, session)` 依次调各个执行环境的 `close`，没有的跳过，一个失败不挡别的，返回 `{ closed, failed }`。harness 和编排器都不调它：会话什么时候算结束是应用的事。
+- `ctx-exec` 的 `sessionCwd: true`：`cwd` 下 `session-<会话名 sha256 的前 16 位>` 是这个会话的工作目录，`run_command`、固定命令工具和文件工具都以它为根（越界检查也按它），第一次调用或 `open` 时建，`close` 时连同内容删掉。`open` 收到镜像、包、出站白名单，或者 `env` 里要的变量它的 `env` 选项里没有，抛 `invalid_request`。
+- `ctx-remote`：`POST /executors/:name/sessions/:session/open`、`DELETE /executors/:name/sessions/:session` 转给服务端挂的执行环境，客户端的 `open`、`close` 连不上时按 `retry` 重试（两个都可以重复调）。
 
 ## Harness
 
@@ -467,11 +488,17 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
 3. `agent.model` 是字符串时经 `models(name)` 造模型，没给 `models` 就以 `error` 结束。
 4. `tools.select(agent.tools)` 得到候选工具，`context.build(...)` 得到 `PreparedCall`。`agent.context.overflow` 配了、`PreparedCall.tokens` 又超过它的 `maxTokens` 时，按协议的三步走（见[协议层](protocol.md#harness)）：压缩（builder 抛 `no_model` 时带上这一轮的模型再调一次；失败只告警）→ 带 `truncate` 的窗口重新 `build` → 还超就抛 `context_overflow`。然后才交给 `beforeModel`（之后的每个工具步骤也会再调一次）；钩子换掉的调用不再检查。
 5. 调模型。每个工具调用：按定义的 `inputSchema` 查输入（`checkJsonSchema`；不合就不往下走，模型看到 `Invalid input for tool …` 和具体哪里不对，这一轮继续；`addTool` 加的工具不在这里查，函数执行环境按它原来的 zod 校验，注册表的 `validatesInput(name)` 告诉 harness 是哪些）→ `beforeTool`（可以拒绝或改写输入；拒绝时模型看到 `not allowed: <原因>`，这一轮继续）→ 按定义的 `executor` 找执行环境 `execute` → `afterTool`（可以改写结果）→ 结果超过 `maxToolOutputChars`（缺省 20 万字符）时截断并注明（`limitToolOutput`）。找不到执行环境、执行环境本身抛错也变成给模型看的错误。`validateToolInput: false` 关掉输入检查，`true` 连 `addTool` 的也查，`maxToolOutputChars: 0` 关掉截断。
-6. 记产出（`source: 'model'`）和 `ctx.run.ended`（`stopReason`、`usage`），同一批写。
+6. 每一步即时记产出（`source: 'model'`），用 AI SDK 的两个回调：`onLanguageModelCallEnd`（模型调用的结果解析完、工具执行之前）在这一步有要本地执行的工具调用时，照 AI SDK 生成响应消息的规则把这次的内容转成助手消息先写下；`onStepEnd` 写这一步剩下的（工具结果，或者没有工具调用时的助手消息）。AI SDK 等这两个回调写完才执行工具、才走下一步，`generateText` 和 `streamText` 都一样。它吞掉回调里的异常，所以写日志失败或被围栏时 harness 记下错误、中止这一轮，再按那个错误收尾。同一轮的写入排成一队，不交错。有服务商执行的工具结果、审批请求这些照抄不了的部件时，这一步退回在结束时一起写。
+   每一步的助手消息带 `meta.step`（`StepMeta`）：工具执行前写下的那条取模型调用结束时的 `provider`、`modelId`（服务商响应里的）、`finishReason`、用量，步骤结束时写的取 `StepResult` 的同几项。用量的缓存和推理取 AI SDK 的 `inputTokenDetails.cacheReadTokens`、`cacheWriteTokens` 和 `outputTokenDetails.reasoningTokens`。
+7. `ctx.run.ended`（`stopReason`、`usage`）。中途出错或被取消时，写下了调用、没等到结果的工具调用先补一条错误结果（`The run ended before this tool call returned; its result is unknown.`），再写 `ctx.error` 和 `ctx.run.ended`；已经写下的步骤留着。
 
-`stopReason`：模型自己停下是 `end_turn`；步数用完还想调工具是 `max_steps`；被 `maxOutputTokens` 截断是 `max_tokens`；`signal` 中止是 `aborted`；其他错误是 `error`，另记一条 `ctx.error`。出错和取消都照常返回 `RunResult` 并写 `ctx.run.ended`，只有写日志失败才 reject。`record: false` 一条都不写。
+`AgentSpec` 的几项交给 AI SDK：`output` 是 `Output.object({ schema: jsonSchema(...) })`，`toolChoice` 原样（`{ tool }` 换成 `{ type: 'tool', toolName }`），`budget` 是 `stopWhen` 里和 `stepCountIs` 并列的一个停止条件（记下是它让循环停的）。回答的解析不靠 AI SDK：`generateText` 自己解析失败时抛 `NoObjectGeneratedError`，`errorInfo` 把它映射成 `invalid_output`；流式时 harness 在结束时自己 `JSON.parse` 最后的文字、按 `checkJsonSchema` 校验，两条路的结果一样。`permissions` 在 `setup` 里用：`ask` 的工具和 `external` 的一样包成不带 `execute` 的，`deny` 的分发直接回一条错误，不进 `beforeTool`。
+
+`stopReason`：模型自己停下是 `end_turn`；最后一步留下了外部执行（或等确认）的工具调用是 `requires_action`；`budget` 让循环停下是 `max_budget`；步数用完还想调工具是 `max_steps`；被 `maxOutputTokens` 截断是 `max_tokens`；`signal` 中止是 `aborted`；其他错误是 `error`，另记一条 `ctx.error`。出错和取消都照常返回 `RunResult` 并写 `ctx.run.ended`，只有写日志失败才 reject。`record: false` 一条都不写。
 
 `error.type`（`errorInfo(error)` 给出，重试错误取最后一次）：接口错误是 `api_call`，带 `statusCode`、`responseBody` 和 AI SDK 判断的 `retryable`；`CtxError` 是它自己的 `type`（`session_busy`、`not_found`、`unsupported_part`……）；上下文过长是 `context_overflow`、`retryable: false`，来源有两个——超窗检查自己抛的，和 `isContextOverflowError(error)` 认出来的服务商错误。后者 AI SDK 没有专门的类型，只能看状态码和文字：已经标成 `context_overflow` 的、HTTP 413、消息或响应正文里有常见写法的（`context_length_exceeded`、`maximum context length`、`prompt is too long`、`exceeds the context window`、`input is too long`、`input token count … exceeds`、`maximum prompt length`、`too many tokens`、`reduce the length of the messages`、`request_too_large` 等）算，401、403、404、429 一律不算（「too many tokens per minute」是限流）。这张表是按各家文档和常见报错整理的，**没有对真实服务验证**；认不出来的照旧是 `api_call`，应用可以自己再判断 `responseBody`。Anthropic 在输出途中撞到窗口上限时回的是 `stop_reason: model_context_window_exceeded`，AI SDK 把它归成 `length`，这里就是 `max_tokens`，不是错误。
+
+`external` 列出在别处执行的执行环境的名字（[ADR 0008](adr/0008-tool-calls-through-the-log.md)）：绑定到它们的工具经 `toToolSet` 的 `external` 选项包成不带 `execute` 的 AI SDK 工具，模型调用时 AI SDK 停下这一轮；harness 看最后一步里有调用、没有结果的（服务商执行的不算），有就以 `requires_action` 结束，`pending` 是这些调用；本地的工具在同一步里照常执行。列了的名字不给 `executors` 也不告警。执行方用 `runPendingTools(store, session, { executor, tools?, source?, maxOutputChars?, signal? })`：读最后一个生命周期事件，是以 `requires_action` 结束的 `ctx.run.ended` 才往下；从那一轮的 `ctx.run.started` 起读条目，`pendingToolCalls` 找出等待中的，归这个执行环境的（`tools` 或 `executor.tools()` 报的名字）逐个 `execute`，每个结果截断后追加一条 `toolResultEntry`（`source` 缺省是执行环境的名字）。执行时抛错的不记，留在 `remaining` 里。
 
 `executors` 可以是数组（按各自的 `name`）或 `{ 名字: 执行环境 }`；`tools` 是 `createToolRegistry()` 建的注册表时，它自带的函数执行环境自动加进来。
 
@@ -515,18 +542,42 @@ for await (const event of harness.stream({
 }
 ```
 
-`stream` 的事件：`run.started` → 每一步 `model.started`、`text.delta`、`tool.called`、`tool.returned`、`model.ended` → 出错时 `error` → `run.ended`（带去掉 `messages`、`recorded` 的结果）。调用方提前不读时取消模型调用，照样写 `ctx.run.ended`（`aborted`）。
+`stream` 的事件：`run.started` → 每一步 `model.started`、`reasoning.delta`、`text.delta`、`tool.called`、`tool.returned`、`model.ended` → 出错时 `error` → `run.ended`（带去掉 `messages`、`recorded` 的结果）。调用方提前不读时取消模型调用，照样写 `ctx.run.ended`（`aborted`）。`model.ended` 等这一步写进日志再发，带上写到的 `seq`；`run.started`、`run.ended` 带 `ctx.run.started`、`ctx.run.ended` 的 `seq`。
+
+### 子 agent
+
+`createSubagentTool({ name, runner, agent, session?, input?, context?, store?, inputSchema?, description? })` 是派子 agent 的工具，返回 `{ definition, execute }`，注册进函数执行环境：
+
+```ts
+import { createSubagentTool } from '@modelctx-ai/ctx';
+
+const research = createSubagentTool({
+  name: 'research',
+  description: '把一个需要查资料的问题交给研究员',
+  runner: harness, // 或者编排器：子运行排进它的队列
+  agent: { model: 'deepseek-chat', instructions: '你是研究员。', tools: { names: ['web_search'] } },
+  context: 'inherit', // 带上父会话到这次调用之前的投影；缺省 'fresh'
+  store,
+});
+tools.executor.register(research.definition, research.execute);
+tools.add(tools.executor.definition('research')!);
+```
+
+- 模型调用它：子会话缺省是 `<父会话>/<工具名>/<调用 id>`，输入缺省取 `task`。先生成子运行的 `runId`，`parent` 是父会话、父 `runId` 和调用 id。`runner` 是 harness 就直接 `run`，带上工具调用的 `signal`，父运行取消时子运行跟着中止；是编排器就 `submit`，`signal` 中止时 `cancel(子 runId)`。
+- 结果是 `childRunOutput({ session, runId }, result)`。子运行以 `error` 或 `aborted` 结束时，模型看到一条错误；父会话的日志里，结果照样指向子会话。
+- `context: 'inherit'` 在 `store` 里找到带着这次调用的那条助手消息，取它前一个 `seq` 作 `inherit.upTo`：子 agent 看得到父会话到这里的投影，看不到那个还没有结果的调用。builder 先投影本会话（`reserve` 是指令、事实、工具、输入），再用剩下的窗口投影父会话，两段拼起来：父会话在前，本会话的摘要生效。
+- 子会话和父会话同名会排在自己后面，永远等不到，这时直接回错误。`agent.tools` 不限制时子 agent 也拿得到这个工具，要不要允许递归由应用的工具选择决定。
 
 ## 编排器
 
-`createOrchestrator({ harness, store?, owner?, retainEnded?, logger? })` 是进程内队列：每个会话一条队列，同一会话的运行串行，不同会话并行。
+`createOrchestrator({ harness, store?, owner?, resume?, retainEnded?, logger? })` 是进程内队列：每个会话一条队列，同一会话的运行串行，不同会话并行。
 
 ```ts
 import { createOrchestrator } from '@modelctx-ai/ctx';
 
 // harness、store 接上一段
 const orchestrator = createOrchestrator({ harness, store, owner: 'pet' }); // owner：这个实例的稳定名字
-await orchestrator.recover?.(); // 启动时：先给上次崩溃时断掉的运行补 ctx.run.ended（error），再接新的 submit
+await orchestrator.recover?.(); // 启动时：先收上次崩溃时断掉的运行（给了 resume 的接着跑），再接新的 submit
 
 // 状态变化：run.queued → run.running → run.completed
 void (async () => {
@@ -542,8 +593,9 @@ await orchestrator.close(); // 不再收新运行，等运行中的结束
 ```
 
 - 状态：`completed` 跑完；`failed` 是 `stopReason: 'error'` 或 harness 抛错（`done` 跟着 reject）；`cancelled` 是被 `cancel` 或请求的 `signal` 取消。
-- `cancel(runId)`：排队中的直接取消，`done` 给出 `stopReason: 'aborted'` 的空结果，不调 harness；运行中的中止传给 harness 的 `signal`。跑完的或不认识的返回 `false`。
-- `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外），补一条 `ctx.run.ended`（`stopReason: 'error'`，`source: 'orchestrator'`），不续跑。
+- `cancel(runId)`：排队中的直接取消，`done` 给出 `stopReason: 'aborted'` 的空结果，不调 harness；运行中的中止传给 harness 的 `signal`。跑完的或不认识的返回 `false`。先把这个编排器里 `request.parent.runId` 是它的运行（排队的、运行中的）一个个 `cancel`，子运行再往下传。
+- `recover()`：只在给了 `store` 时有。用 `sessions({ limit, after })` 一页一页读会话名，每个会话一次 `list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`，不读消息正文；最后一个生命周期事件是 `ctx.run.started` 的就是断掉的运行（这个编排器自己正在跑的除外）。找到断点的会话再读一次末尾、一次这一轮 `ctx.run.started` 之后的消息（`types: ['message']`），写下了调用、没有结果的工具调用（服务商执行的不算）补一条错误结果，和 `ctx.run.ended`（`stopReason: 'error'`）一批写，`source: 'orchestrator'`。
+- `resume(run)`：给了才续跑。`run` 带 `session`、`runId`、`ctx.run.started` 里记下的 `agent`（`agentSpecToJson` 的结果：模型只剩名字，请求头打了码，不能原样拿来跑）、补了结果的调用个数 `interrupted`，是子运行时还有 `ctx.run.started` 里的 `parent`；返回 `AgentSpec` 就在这个会话上 `submit` 一轮不带输入的运行，`RecoveredRun.resumed` 是它的 `runId`；返回 `undefined` 只结束不续跑。续跑的那一轮从日志接着走：做完的工具不再执行，结果未知的那次由模型看到错误结果后自己决定。
 - 结束的运行只留状态给 `status` 查，最多 `retainEnded` 个（缺省 1000），再多就从最早结束的开始忘，忘掉之后 `status` 返回 `undefined`；请求和结果在运行结束时就放手，常驻进程的内存不随运行数增长。留着状态的 `runId` 不能再 `submit`。
 - `owner`：写进每个运行的 `ctx.run.started`；`recover()` 只收 `owner` 相同的断点（都没配置也算相同），两个进程共用一个库时各配一个名字。写 `ctx.run.ended` 时带 `expectSeq`，读和写之间会话有新条目就跳过那个运行。
 - 用缺省 `record`（写日志）的应用，进程崩溃留下的未结束运行会让该会话一直 `session_busy`，所以启动时要先 `recover()` 再 `submit`；`record: false` 的运行不留生命周期事件，没有这个要求。harness 里同一会话最多一个未结束的运行（跨进程也成立；同一个 harness 实例内部先按会话排队，一个接一个，`session_busy` 只出现在跨进程或别的 harness 实例上，`record: false` 不排），每次写入带 `expectSeq`，被 `recover` 结束的运行在下一次写入时发现自己被围栏，以 `aborted` 停下、不再写 `ctx.run.ended`；运行中途会话被 `clear` 也一样（冲突后发现自己的 `ctx.run.started` 不在了），删掉的会话不会被这一轮的收尾写回来。`truncate`、`remove`、`redact` 追加的 `ctx.erased` 让这一轮的下一次写入必然冲突一次，harness 在冲突后把它和生命周期事件一起读（一次 `list`，`kinds` 多一项）：记录动了这一轮自己写的条目（`recorded` 里的 `seq`）就同样停下，动的是更早的历史或别人写的条目就换个末尾接着写。
@@ -574,24 +626,32 @@ interface MemoryOptions {
     k?: number; // 缺省 5
     budgetTokens?: number; // 作为来源时事实文字的预算，缺省不限
     minScore?: number; // 相似度下限，缺省 0.1
+    minConfidence?: number; // confidence 低于它的事实不召回，缺省 0.5
+    archivedWeight?: number; // 归档的事实参与召回时相似度乘多少，缺省 0.5；0 就不找归档的
+    spacingMs?: number; // 来源自动带出的事实多久记一次 touch，缺省一天
     confirmations?: number; // 程序要几次确认才带上，缺省 2
   };
-  decay?: { d?: number; epsilon?: number; archiveAt?: number }; // 缺省 ACTIVATION_DEFAULTS：0.5、0.02、0.55
+  // d、epsilon、archiveAt 缺省 ACTIVATION_DEFAULTS：0.5、0.02、0.55；minChances 是归档前要错过几次机会，缺省 7
+  decay?: { d?: number; epsilon?: number; archiveAt?: number; minChances?: number };
   consolidate?: {
     escalateBelow?: number; // 并入判断的 confidence 低于它、又有 model 时升级，缺省 0.6
     maxPNull?: number; // 提取字段的 pNull 高于它当作没说，缺省 0.3
     maxTokens?: number; // 一次提取的原文上限，超过就分批，缺省 6000
+    maxAttempts?: number; // 一批失败几次进死信，缺省 3
+    minEvidenceOverlap?: number; // 事实的字词在原文里至少出现多少，缺省 0.5，0 不查
+    ungroundedConfidence?: number; // 原文里找不到支撑的事实，置信度最多多高，缺省 0.4
   };
   core?: { budgetTokens?: number }; // 缺省 2000
   embed?: (text: string) => Promise<readonly number[]>; // 召回时再加一路余弦，和存储 search 的分取大的
   name?: string; // 执行环境的名字，缺省 memory
   now?: () => number; // 缺省 Date.now
   logger?: Logger;
+  onDeadLetter?: (notes: readonly Note[], error: unknown) => void; // 笔记进了死信时调
 }
 function createMemory(options: MemoryOptions): Memory;
 ```
 
-参考实现在同一会话上的 `gate` 排队执行，`consolidate` 整体排队执行，不并发。
+参考实现在同一会话上的 `gate` 排队执行，`consolidate` 和 `forget` 排同一个队，不并发。排队只在进程里；几个进程共用一份存储时靠存储的幂等（同一段只有一条笔记、同一个 `key` 只有一条事实）不写出重复的。
 
 `ctx-memory` 的 `createMemoryStore` 造的是内存 `MemoryStore`，和核心包 `@modelctx-ai/ctx` 的会话存储 `createMemoryStore`（造 `SessionStore`）同名；两个一起用时改名导入，例如 `import { createMemoryStore as createSessionStore } from '@modelctx-ai/ctx'`。
 
@@ -617,16 +677,25 @@ if (salience >= theta) await store.notes.add([{ session, from, upTo, at: now, sa
 
 - 一次调用四个问题，一次前向。只打分、只写笔记，不提取。新条目超过 `gate.maxTokens`（缺省 4000 估算 token）时拆成几段，各问一次、各写一条笔记。渲染成文字时 `tool` 角色的消息不进来；只剩没有文字的条目时写一条 0 分的已处理笔记。
 - 看哪些条目由应用定（`gate.entries`）：缺省只看消息，事件按 `kinds` 挑。
+- 决策模型失败（服务不可用、回答取不出 JSON）时这一段改用启发式打分，告警一次：不给一个假的 0.5 分让它悄悄过不了阈值，也不让一段日志一直卡住这个会话的门控。
 - 阈值：`gate.auto` 开着（缺省）时取最近 7 天笔记的 `salience`，按 `theta` 算待处理的占比；落在 10–25% 就用 `theta`，否则取分位让占比落到最近的边界。最近 7 天的笔记少于 20 条时用 `theta`（缺省 0.6）。`auto: false` 固定用 `theta`。
 - 启发式退路 `createHeuristicDecisionModel`：惊讶（1 − 与已有事实的最大相似度，乘信息量）、强调（「记住」「以后」「别再」、改变、偏好）、重复（这段里用户反复说的、最近几段里说过的）、情绪（报错、失败、纠正）四项加权，权重 `HEURISTIC_WEIGHTS` 是 0.3、0.4、0.1、0.2。只认这四个问题，别的问题返回均匀分布。`createMemory` 没给 `decision` 时用它：「惊讶」接 `store.facts.search`，「重复」看这个进程最近 7 天门控过的段落（存在进程里，重启后从空开始）。够用就不上模型。
 
 ### 召回 `recall`
 
 ```
-score(fact) = 0.6 × similarity(query, fact.text) + 0.4 × activation(fact, now)
+score(fact) = 0.6 × similarity(query, fact.text) + 0.4 × retrievability(fact, now)
 ```
 
-取 `open` 的事实做 `search`（给了 `embed` 再和余弦取大的），相似度低于 `recall.minScore`（缺省 0.1）的不要，按 `score` 排，按 `k` 和 `budgetTokens` 截断，`touch` 返回的那些。程序带上没退役、确认不少于 `recall.confirmations`（缺省 2）次、并且主题匹配的（`topic` 选项，或者召回的事实的主题；没有主题时看 `when` / `do` 和 `query` 的相似度）。作为来源时结果渲染成事实文字；作为工具时（`evidence: true`）还带回证据原文。被召回就是一次 `t_i`，衰减从头算：这是「回忆即再巩固」。
+两项都在 0..1（见协议的[激活度](protocol.md#激活度-activationretrievability)）：激活度最多贡献 0.4，召回次数再多也盖不过相似度高出一截的事实。
+
+1. 候选：`open` 的事实做 `search`（给了 `embed` 再和余弦取大的）；归档的事实另搜一次（`archived: true`），相似度乘 `recall.archivedWeight`（缺省 0.5），所以它们排在同样相关的 open 事实后面，也占不了 open 事实的名额。关闭的不要。
+2. 筛：相似度低于 `recall.minScore`（缺省 0.1）的不要；`confidence` 低于 `recall.minConfidence`（缺省 0.5）的不要。0.5 的依据：低于它就是提取模型自己都觉得多半不对；模型没报置信度时适配器填的是 0.5（`extractionFromLanguageModel`）或 `1 − pNull`（`pNull` 不超过 `consolidate.maxPNull` = 0.3，所以不低于 0.7），都不会被筛掉。单次调用用 `RecallOptions.minConfidence` 改。
+3. 排：`rankFacts`，按 `k` 和 `budgetTokens` 截断。
+4. 恢复：返回的事实里原先归档的 `restore`。归档是「暂时用不上」，相关的问题来了就回到 open 里。
+5. `touch`：主动的召回（直接调 `recall`、模型调 `recall` 工具）每次都记。来源（`source()`）自动带出的，同一条事实离它上一次记下的召回不到 `recall.spacingMs`（缺省一天）就不再记。来源每一轮都跑，带出谁又是按激活度排的：以前每轮都记，被带出过的事实激活度越滚越高，别的再也排不上。
+
+程序带上没退役、确认不少于 `recall.confirmations`（缺省 2）次、并且主题匹配的（`topic` 选项，或者召回的事实的主题；没有主题时看 `when` / `do` 和 `query` 的相似度）。作为来源时结果渲染成事实文字；作为工具时（`evidence: true`）还带回证据原文。被召回就是一次 `t_i`，衰减从头算：这是「回忆即再巩固」。
 
 ### 巩固 `consolidate`
 
@@ -641,43 +710,62 @@ sequenceDiagram
   M->>S: notes.list({ pending: true })
   loop 每个主题
     M->>L: list(from..upTo) 读原文
-    M->>X: extract：facts、since、decisions、lesson
+    M->>X: extract：facts、decisions、lesson
     loop 每条提出的事实
       M->>S: facts.list({ topic, open: true })
       M->>D: decide：关系是 new / merge / supersede，对应哪条
       alt confidence < 0.6
         M->>LM: 升级：让推理模型判断
       end
-      M->>S: add / cite + touch / add + close
+      M->>S: add / cite + touch / supersede
     end
     opt lesson 非空
       M->>LM: 反思：写成 when / do / evidence
       M->>S: procedures.add 或 confirm
     end
-    M->>S: notes.settle
+    M->>S: notes.settle（这批失败了是 notes.fail）
   end
-  M->>S: 衰减：activation < archiveAt 的 facts.archive
+  M->>S: 衰减：activation < archiveAt 且错过了 minChances 次机会的 facts.archive
   M->>LM: 从 open facts 重写 core（≤ budgetTokens）
   M->>S: core.set
 ```
 
-- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`since`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说；`since` 为空时 `validFrom` 取这批第一条的 `at`。证据是这批笔记的区间。
-- 并入：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。措辞相同（空白和句读归一、不分大小写后相等）的直接并入，不调 `decide`；否则有对照的事实放进 `state`，这就是分类问题。置信度低于 `consolidate.escalateBelow`（缺省 0.6）、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是 `add` 新的、`close` 旧的（`supersededBy` 指向新的）。
+- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说。起始日期按条给：对话里说了某一条从哪天起成立的，那一条开头写 `[YYYY-MM-DD]`，就是它的 `validFrom`；没写的取这批第一条的 `at`。以前一个 `since` 字段套给整批，一条的日期会被安到别的事实上。
+- 证据：以前证据就是这批笔记的区间，只保证「有区间」，不保证区间里真有这句话。现在每条事实先在原文里找支撑：事实的字词（`evidenceTerms`：中文一个字一个，转述常换掉相邻的字，按两个字切太严；去掉虚字、代词，和「主人」「用户」、`subject` 这些主语，原文里主人说的是「我」），某一条原文覆盖了至少 `consolidate.minEvidenceOverlap`（缺省 0.5），或者几条合起来覆盖到。有支撑的，每条笔记的证据收窄到和事实有共同字词的条目（`sourceRef`），一条都没有的笔记不当证据。没有支撑的，证据仍是整批，置信度降到不超过 `consolidate.ungroundedConfidence`（缺省 0.4，低于召回的缺省门槛 0.5），报告的 `facts.ungrounded` 记一笔：模型编的、从别处推出来的、被注入的话进不了召回，但留在存储里给人看。这是启发式，防的是凭空写进记忆的话，不是证明；「我不吃肉」推出「主人吃素」这种推断也会被降下来，要收的话调低 `minEvidenceOverlap`。
+- 并入：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。措辞相同（空白和句读归一、不分大小写后相等）的直接并入，不调 `decide`；否则有对照的事实放进 `state`，这就是分类问题。置信度低于 `consolidate.escalateBelow`（缺省 0.6）、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是存储的 `supersede`：新的写进去、旧的关掉（`supersededBy` 指向新的），一步完成，不会留下两条都成立的。旧的按新事实自己写的日期关（早于旧事实生效时按今天），没写日期按今天。新事实的日期在将来（「下个月起改用……」）时不取代，两条都留着，各带各的起始日期：协议的有效期只有「关了」和「没关」，关在将来的日期上等于现在就关了。
+- 幂等键：新事实的 `key` 是 `m1:` 加来源区间和归一化文字的 53 位哈希。同一批笔记再处理一次（另一个进程同时在跑、上次半途失败）算出的是同一个键，存储返回已有的那条。
 - 反思是唯一的开放生成，只在 `lesson` 非空且有 `model` 时做：和同主题已有的程序是同一条就 `confirm`，否则 `add`。`add` 时 `confirmations` 是 1，相同的证据 `confirm` 不计数；召回只带 `confirmations ≥ recall.confirmations`（缺省 2）的。
+- 按批隔离：每一批（和每一组读原文）单独 `try`，一批失败不挡后面的。可以重试的错（`retryable: true`：超时、429、5xx）当场再试一次，还不行就留着下次，不记次数，报告的 `failed` 数它。别的错（包括模型的回答取不出 JSON、`invalid_response`）`notes.fail` 记一次，次数到 `consolidate.maxAttempts`（缺省 3）进死信，告警并调 `onDeadLetter`；死信不再处理，修好原因后 `store.notes.retry(ids)` 放回去。以前一批持续失败（某段内容总让模型输出坏 JSON）时整个 `consolidate` 都过不去，解析失败的那批又被当成「什么都没说」标掉，记忆悄悄丢了。
 - 读不到原文的笔记（会话清掉了）直接 `settle`，什么都不写。既没有 `extraction` 也没有 `model` 时不处理笔记，笔记保持待处理，只做衰减和 `core` 的缺省渲染，第一次告警一次。
-- 衰减：按协议的[激活度](protocol.md#激活度-activation)归档。这一轮刚写入或刚并入的事实不在同一轮归档（提取出的 `validFrom` 可能早于今天）。
+- 衰减：open 的事实同时满足两条才归档。一是[激活度](protocol.md#激活度-activationretrievability)低于 `decay.archiveAt`。二是错过了至少 `decay.minChances`（缺省 7）次机会：这条事实最后一次活动（`validFrom` 或最后一次被召回，取晚的）之后，记忆有这么多个不同的日子（UTC）召回过别的事实，它一次都没轮上。日子从 open 事实的 `recalls` 里数。只看时间的话，一条 `s = 0.6` 的新事实 1.09 天后就归档，头两天没碰上相关的问题就没了；没人用记忆的日子现在不算，主人离开一个月回来也不会全归档。缺省取 7 是一周的节律：只在周末或每周例会上用得到的事实，七个有召回的日子里轮得到一次。`minChances: 0` 回到只看激活度。`validFrom` 在未来的事实按它离现在多远算（和激活度一样折回过去），所以远期的也会归档，临近的不会。这一轮刚写入或刚并入的事实不在同一轮归档（提取出的 `validFrom` 可能早于今天）。归档不是删除：召回还找得到它（降权），被召回就恢复。没有写入时间这个字段，所以提取出的 `since` 很早的事实，从写入的第二夜起仍然按 `validFrom` 算。
 - `core`：有 `model` 时从 open 事实重写；open 事实的集合和上次重写时一样就不再调模型（这个记录在进程里，重启后第一夜会重写一次）；输出为空或超预算时回到 `renderCore`。没有 `model` 时用 `renderCore`。文字和当前版本相同就不写新版本。
-- 幂等：笔记 `settle` 之后不再处理；中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下一夜重做，重做时措辞相同的事实直接并入，同一段证据不会记两次。白天不受影响。
+- 幂等：笔记 `settle` 之后不再处理；中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下一夜重做，重做时同一个键的事实不再写，措辞相同的直接并入，同一段证据不会记两次。白天不受影响。
 - 报告里 `facts.added` 只数 `new`，取代的那条新事实算在 `superseded` 里；`escalated` 数调了几次 `LanguageModel` 做并入判断。
+- 报告的 `failed`、`dead` 数这次失败留着的和进了死信的笔记。
 - 什么时候跑由编排器定：每天固定时刻、空闲时、待处理笔记够多时。框架不替应用决定。
+
+### 删除 `forget`
+
+- `facts`、`procedures` 按 `id` 删；`session` 删这个会话的笔记（`notes.forget(session)`）、证据里有它的事实和程序；`all` 删这个作用域里的全部。几项可以一起给。
+- 删了事实（或 `all`）时画像整个重来：`core.clear()` 删掉全部版本，再从剩下的 open 事实按 `renderCore` 写一版。不经模型重写：重写要把上一版画像喂回去，删掉的内容又会回来。下一次 `consolidate` 照常用模型重写（记着的「上次重写时的事实集合」清掉了）。
+- 召回用的向量缓存（`embed`）删掉对应的；启发式门控记着的最近几段原文清空。
+- 会话日志不归它删：`forget({ session })` 之后应用自己 `sessions.clear(session)`（或 `truncate`、`remove`）。
 
 ### SQLite 和内存存储
 
-SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，前缀缺省 `memory_`；结构版本 1 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。`search` 不用 FTS5（Node 22.13 自带的 SQLite 没编进去），用 `instr(lower(text))` 做子串匹配：整句命中的分数是 `0.5 + 0.5 × 查询长度 / 文字长度`，否则按空白切出的词里命中的那些的长度占比乘 0.5。内存存储的 `search` 是子串命中记 1 分，否则按词重叠打分，给了 `embed` 再和余弦取大的。
+SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，加检索用的 `fact_docs`、`fact_terms`，前缀缺省 `memory_`；结构版本 4 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。
+
+两个存储的 `search` 是同一套：协议包的 `searchTerms` 切词（字母数字连成的词、中日韩文字相邻两字），`termOverlap` 打分（共同的词数除以较小的那一边），分数相同时共同的词多的在前、再相同按 `id`。同一组事实、同一个查询，两边的命中和分数一样。
+
+- SQLite 是倒排索引。`fact_terms(scope, term, doc)` 一个词一行，主键以 `scope` 开头；`fact_docs(doc, scope, fact_id, terms)` 给每条事实一个短的整数编号（事实的 `id` 是 UUID，每个词都带着它太占地方）并记下它有几个词。`facts.add` 在同一个事务里写索引，`forget` 把它的词删干净；事实的文字不改，别的方法不动索引。查询的词（最多 `MAX_SEARCH_TERMS` 个）当一个 JSON 参数传进去，`json_each` 展开后每个词按主键查一次，按事实数命中了几个，只有命中的事实才读事实表。语句的形状不随词数变，所以上千个词也不会撑破表达式树；CROSS JOIN 固定了连接顺序，库里没有统计信息时规划器自己排会先扫整个作用域。3 万条事实的库里，一个常见词的查询约 7 毫秒，罕见词不到 1 毫秒（以前是全表 `instr`，19–41 毫秒；900 个词的查询约 4 秒）。
+- 没有用 FTS5：它不是每个 Node 自带的 SQLite 都编进去了（这个包的 `engines` 从 22.13 起），自带的 `unicode61` 分词器不切中文，`trigram` 匹配不到两个字的词。自己切词、用普通表，哪个版本都一样。
+- 版本 2 的库打开时升到 3：建两张表，已有的事实（各个作用域的，含关闭、归档的）补进索引，`recalls` 超过 `MAX_FACT_RECALLS` 个的截到最近的那些。
+- 版本 4：`notes` 加 `attempts`、`error`、`failed_at`，`(scope, session, from_seq, up_to)` 上有唯一索引（建之前已有的重复只留最早的一条），`notes.add` 用 `ON CONFLICT DO NOTHING`；`facts` 加 `fact_key`，`(scope, fact_key)` 上有部分唯一索引（没有键的不限）。待处理的部分索引换成也排除死信的 `notes_scope_waiting`。`supersede` 在一个 `BEGIN IMMEDIATE` 里写新的、关旧的。
+- 内存存储每次扫一遍这个作用域的事实，每条事实的词只切一次、按 `id` 记着；给了 `embed` 再和余弦取大的。
 
 ### 模型
 
-`ctx-models` 按配置造 System One 模型：`createDecisionModel(spec, options?)`、`createExtractionModel(spec, options?)`。`SystemOneSpec` 的写法和 `createModel` 的 `ModelSpec` 一致，可以直接写进配置文件；差别是 `provider` 必填、没有缺省，`cloudflare` 另要 `accountId`。第二个参数 `options` 不进配置文件，只有 `fetch`（测试里注入）。决策模型内置 `cloudflare`、`typesafe`；提取模型只内置 `cloudflare`，因为 TypeSafe 的公开 API（OpenAPI 只有 `/v1/systemone`）没有提取接口。别的服务商用 `createDecisionModelRegistry`、`createExtractionModelRegistry` 注册。非 2xx 抛 `SystemOneError`（继承 `CtxError`，带 `statusCode`、`responseBody`，408、429、5xx 可重试）。
+`ctx-models` 按配置造 System One 模型：`createDecisionModel(spec, options?)`、`createExtractionModel(spec, options?)`。`SystemOneSpec` 的写法和 `createModel` 的 `ModelSpec` 一致，可以直接写进配置文件；差别是 `provider` 必填、没有缺省，`cloudflare` 另要 `accountId`。第二个参数 `options` 不进配置文件，只有 `fetch`（测试里注入）。一次请求最多等 `timeoutMs`（缺省 `SYSTEM_ONE_TIMEOUT_MS`，30 秒，连读完正文），超时抛 `CtxError('timeout')`，`retryable: true`。决策模型内置 `cloudflare`、`typesafe`；提取模型只内置 `cloudflare`，因为 TypeSafe 的公开 API（OpenAPI 只有 `/v1/systemone`）没有提取接口。别的服务商用 `createDecisionModelRegistry`、`createExtractionModelRegistry` 注册。非 2xx 抛 `SystemOneError`（继承 `CtxError`，带 `statusCode`、`responseBody`，408、429、5xx 可重试）。
 
 请求、响应的映射依据两家的公开文档写成，**没有对真实服务验证过**；测试用的是假 `fetch`。
 
@@ -721,6 +809,8 @@ const llm = createModel({ provider: 'anthropic', apiKey: process.env.ANTHROPIC_A
 const slowGate = decisionFromLanguageModel(llm);
 const slowExtractor = extractionFromLanguageModel(llm);
 ```
+
+两个适配器要结构化输出：按问题、字段生成 JSON Schema，经 `Output.object` 交给服务商约束解码。服务商不支持（回答不合 JSON 或不合 schema）时退回从文字里宽松地取第一个 JSON 对象。整个回答都取不出 JSON 对象（例如被截断）时 reject，`invalid_response`；以前返回全部「不确定」，门控因此得 0.5 分悄悄过不了阈值，提取被当成「什么都没说」把笔记标掉。
 
 ### 组装
 
@@ -802,7 +892,7 @@ sequenceDiagram
 - 只转发调用方的 `content-type`、`accept`，加上 `upstream.headers`；有 `upstream.apiKey` 时设 `Authorization: Bearer <apiKey>`。调用方的令牌不会到上游，上游的密钥不会到调用方。
 - 响应的状态码和头原样转回（去掉逐跳头和 `content-encoding`、`content-length`），正文边收边转，SSE 不缓冲。调用方中途断开时取消上游请求，不算出错。
 - 错误正文是 OpenAI 的形状：`{ "error": { "message", "type" } }`，`type` 是 `authentication_error`（401）、`permission_error`（403）或 `gateway_error`。
-- `accessToken` 是空串时抛错；`startGateway` 听在非本机地址上又没有 `accessToken` 时拒绝启动，除非写 `allowUnauthenticated: true`。`ctx-remote` 的 `startRemote` 是同样的规则。
+- `accessToken` 是空串时抛错；`startGateway` 听在非本机地址上又没有 `accessToken` 时拒绝启动，除非写 `allowUnauthenticated: true`。`ctx-remote` 的 `startRemote` 是同样的规则（给了 `authenticate` 也算有鉴权）。
 - 缺省只听 `127.0.0.1`、随机端口。`createGatewayHandler(options)` 返回 `(req, res) => Promise<void>`，可以挂到已有的 HTTP 服务上。
 
 `replaceHistory(history, { keepSystem })` 生成改写函数：保留调用方的 `system` / `developer` 消息（`keepSystem: false` 时去掉），中间换成 `toChatMessages(await history())`（去掉其中的 `system`），再接上调用方从最后一句用户话起的尾巴：这句话，以及它之后的工具调用、工具结果和预填的助手话（调用方没有用户话时只留最后一条预填的助手话）。完整历史的最后一条和这句用户话内容相同时这句不重复带：比的是归一后的内容，字符串和分段写法算一样，图片比地址。完整历史里没配对的工具调用和工具结果先去掉。请求的 `messages` 逐条校验，不合的回 400；改写函数抛错回 500、连不上上游回 502，两种的原因都只进 `onError`，不回给调用方。`withContext(context)` 就是 `replaceHistory(async () => (await context.view()).messages)`；`withContext(builder, session)` 直接用一个 `ContextBuilder` 和会话名。
@@ -818,6 +908,10 @@ sequenceDiagram
 | `user` 图片、`image` / `image/*` 文件 | `image_url`：URL 原样；base64 和二进制转 data URL（类型只写到 `image` 或带 `*` 时用 `image/png`）。AI SDK v7 带标签的 `{ type: 'data' }`、`{ type: 'url' }` 也认；服务商侧的文件引用和其他分段丢掉 |
 | `assistant` 文字、工具调用            | `content` + `tool_calls`（`arguments` 是 JSON 字符串）；只有工具调用时 `content: null`。推理和服务商执行的工具调用丢掉，什么都不剩的消息整条丢掉                                                   |
 | `tool` 工具结果                       | 每个结果一条 `{ role: 'tool', tool_call_id, content }`：文字原样，JSON 序列化，拒绝执行写明原因                                                                                                    |
+
+## 追踪
+
+`@modelctx-ai/ctx-otel` 把结束了的运行换成 OpenTelemetry 的 span，全部从会话日志的条目派生，不在 harness、编排器里插桩，核心包不依赖它。`deriveSpans(entries)` 是纯函数：从 `ctx.run.started` 到同一个 `runId` 的 `ctx.run.ended` 是一棵 `invoke_agent`；中间每条带 `meta.step` 的助手消息是一个 `chat`，从它前一条条目的 `at` 到它自己的 `at`；这条消息里本地执行的每个工具调用是一个 `execute_tool`，结束在带它结果的那条 `tool` 消息，到下一步都没有结果就记成 `ERROR`。没结束的运行不发，`upTo` 停在最后一个结束了的运行的 `ctx.run.ended`。`emitSpans` 用 `startSpan({ startTime })`、`end(at)` 把时间设成条目的 `at`，父子关系经 `trace.setSpan` 传。`traceSession(store, session, { tracer, after })` 是 `list({ after })` 加上这两步。属性见包的 README；消息正文、工具输入输出不进属性。
 
 ## 错误和日志
 

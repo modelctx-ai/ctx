@@ -1,5 +1,12 @@
 import type { Message, MessageContent } from './message.ts';
-import { compareEntries, type Entry, type EventEntry, type MessageEntry, type SummaryEntry } from './session.ts';
+import {
+  compareEntries,
+  type Entry,
+  type EventEntry,
+  type MessageEntry,
+  type SessionStore,
+  type SummaryEntry,
+} from './session.ts';
 import type { ModelRef } from './harness.ts';
 import { estimateTokens, truncateMessage } from './tokens.ts';
 import type { ToolDefinition } from './tools.ts';
@@ -223,15 +230,26 @@ function paired(group: readonly ProjectedMessage[], estimate: (message: Message)
   return first.message.role === 'tool' ? out.filter((item) => item !== first) : out;
 }
 
+function startsWithUser(group: readonly ProjectedMessage[]): boolean {
+  return group[0]?.message.role === 'user';
+}
+
+/**
+ * `settled`：预算挤掉的组（不算开头孤立的工具结果、不算为了以用户消息开头多丢的）比含 `edge` 的开头几组多。
+ * 这时结果只取决于后面完整的那些组，见 `projectSession`。
+ */
 function windowed(
   pinned: readonly ProjectedMessage[],
   rest: readonly ProjectedMessage[],
   window: ProjectionWindow | undefined,
   estimate: (message: Message) => number,
-): { kept: ProjectedMessage[]; dropped: number; truncated: number } {
+  edge: ReadonlySet<ProjectedMessage> = new Set(),
+): { kept: ProjectedMessage[]; dropped: number; truncated: number; settled: boolean } {
   const maxMessages = window?.maxMessages;
   const maxTokens = window?.maxTokens;
   let dropped = 0;
+  // 含 `edge` 的组里，最后一组是第几组（从 1 数）；0 是没有。
+  let edgeGroups = 0;
   const groups: ProjectedMessage[][] = [];
   for (const group of blocks(rest)) {
     // 开头是工具结果的组：它的调用不在视图里（被摘要盖住了），整组不要。
@@ -240,9 +258,10 @@ function windowed(
       continue;
     }
     groups.push(paired(group, estimate));
+    if (group.some((item) => edge.has(item))) edgeGroups = groups.length;
   }
   if (maxMessages === undefined && maxTokens === undefined) {
-    return { kept: [...pinned, ...groups.flat()], dropped, truncated: 0 };
+    return { kept: [...pinned, ...groups.flat()], dropped, truncated: 0, settled: false };
   }
 
   const pinnedTokens = pinned.reduce((sum, item) => sum + item.tokens, 0);
@@ -254,23 +273,30 @@ function windowed(
   let tokens = pinnedTokens + groups.reduce((sum, group) => sum + group.reduce((s, item) => s + item.tokens, 0), 0);
   const over = (): boolean =>
     (maxMessages !== undefined && count > maxMessages) || (maxTokens !== undefined && tokens > maxTokens);
+  // 从前往后丢，只挪下标：几十万组时 `shift()` 每次都要搬动整个数组。
+  let start = 0;
   const drop = (): void => {
-    const group = groups.shift()!;
+    const group = groups[start]!;
+    start += 1;
     count -= group.length;
     tokens -= group.reduce((sum, item) => sum + item.tokens, 0);
     dropped += group.length;
   };
   const before = dropped;
+  let budgetDrops = 0;
   // 至少留下最后一组，宁可超预算也不交一份空上下文。
-  while (groups.length > 1 && over()) drop();
+  while (groups.length - start > 1 && over()) {
+    drop();
+    budgetDrops += 1;
+  }
   // 裁过之后开头落在助手消息上、前面又没有摘要垫着：有的服务商要求第一条是用户消息，接着裁到下一条用户消息。
   // 后面一条用户消息都没有时不动，同样是不交空上下文。
-  if (dropped > before && pinned.length === 0 && groups.some((group) => group[0]?.message.role === 'user')) {
-    while (groups[0]?.[0]?.message.role !== 'user') drop();
+  if (dropped > before && pinned.length === 0 && groups.slice(start).some(startsWithUser)) {
+    while (!startsWithUser(groups[start]!)) drop();
   }
-  const kept = [...pinned, ...groups.flat()];
+  const kept = [...pinned, ...groups.slice(start).flat()];
   if (truncating && tokens > maxTokens) fitted(kept, tokens - maxTokens, estimate, cut);
-  return { kept, dropped, truncated: kept.filter((item) => cut.has(item)).length };
+  return { kept, dropped, truncated: kept.filter((item) => cut.has(item)).length, settled: budgetDrops > edgeGroups };
 }
 
 /** 一条消息最少留这么多 token：再截就只剩说明了。 */
@@ -346,6 +372,13 @@ function fitted(
  *    `window.truncate` 时先给单条消息封顶，裁到只剩最后一组还超 `maxTokens` 就接着截短剩下的消息。
  */
 export function project(entries: readonly Entry[], options: ProjectionOptions = {}): Projection {
+  return projected(entries, options).projection;
+}
+
+function projected(
+  entries: readonly Entry[],
+  options: ProjectionOptions,
+): { projection: Projection; settled: boolean } {
   const estimate = options.window?.estimate ?? estimateTokens;
   const sorted = entries.toSorted(compareEntries);
   const summary = latestSummary(sorted);
@@ -370,6 +403,8 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
     );
 
   const rest: ProjectedMessage[] = [];
+  // 第一条看得见的条目是要合并的事件时，它那一组在一段尾巴里可能不完整（前面还有同类的）：记下来给 `windowed`。
+  const edge = new Set<ProjectedMessage>();
   const rules = options.events ?? {};
   // 没有规则的事件对模型不可见，也不打断前后同类事件的合并。
   const shown = visible.filter((entry) => entry.type === 'message' || rules[entry.kind] !== undefined);
@@ -399,11 +434,15 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
     }
     // 一组按 `at` 排好了，最后一条的 `at` 最晚。
     const at = group.at(-1)!.at;
-    for (const message of asList(rule.render(group))) rest.push(make(message, from, upTo, at));
+    for (const message of asList(rule.render(group))) {
+      const item = make(message, from, upTo, at);
+      rest.push(item);
+      if (rule.fold && entry === shown[0]) edge.add(item);
+    }
   }
 
-  const { kept, dropped, truncated } = windowed(pinned, rest, options.window, estimate);
-  const result: Projection = {
+  const { kept, dropped, truncated, settled } = windowed(pinned, rest, options.window, estimate, edge);
+  const projection: Projection = {
     messages: kept.map((item) => item.message),
     items: kept,
     tokens: kept.reduce((sum, item) => sum + item.tokens, 0),
@@ -411,7 +450,71 @@ export function project(entries: readonly Entry[], options: ProjectionOptions = 
     truncated,
     ...(summary ? { summary } : {}),
   };
-  return result;
+  return { projection, settled };
+}
+
+/** `projectSession` 第一次读多少条（再加窗口 `maxMessages` 的四倍）；不够就乘 4 再读。 */
+const TAIL_PAGE = 256;
+
+/**
+ * 一个会话的投影：生效的摘要加它之后的条目，和读出来再 `project` 的结果一样。有窗口时只读够用的尾部，
+ * 长会话不必整段读出来：
+ * 1. 按 `seq` 读最后 N 条（`last`），再用 `atAfter` 把写得更早、`at` 却排在这 N 条里最早一条之后的条目补进来
+ *    （把到期时间当 `at` 的提醒）。读到的是投影顺序里完整的一段尾巴。
+ * 2. 投影这段尾巴。开头那组可能不完整：同类事件合成的一组被切开（它渲染出的几条消息都算），或者开头的工具结果
+ *    的调用在更前面（这种组本来就不要）。预算把它们和后面至少一个完整的组都挤掉了时，结果和读整段的一样：
+ *    更早的部分再长也只会被挤掉。
+ * 3. 不够就读 4 倍那么多再来；读到的不满 N 条就是整段。
+ *
+ * 只读了尾部时，`dropped` 只数读到的那部分里被裁掉的。没有窗口（或者是 `{}`）时读整段。
+ */
+export async function projectSession(
+  store: Pick<SessionStore, 'list'>,
+  session: string,
+  options: ProjectionOptions = {},
+): Promise<Projection> {
+  // 生效的摘要是 covers 最大的，不一定是最后写的（两个进程同时压缩时），所以读全部摘要再挑。
+  const summary = latestSummary(await store.list(session, { types: ['summary'] }));
+  const base = summary ? { after: summary.covers } : {};
+  const withSummary = (entries: Entry[]): Entry[] =>
+    !summary || entries.some((entry) => entry.id === summary.id) ? entries : [summary, ...entries];
+  const window = options.window;
+  if (window?.maxMessages === undefined && window?.maxTokens === undefined) {
+    return project(withSummary(await store.list(session, base)), options);
+  }
+  for (let size = TAIL_PAGE + 4 * Math.max(0, Math.floor(window.maxMessages ?? 0)); ; size *= 4) {
+    const tail = await store.list(session, { ...base, last: size });
+    if (tail.length < size) return project(withSummary(tail), options);
+    let first = tail[0]!;
+    for (const entry of tail) if (compareEntries(entry, first) < 0) first = entry;
+    const earlier = await laterEntries(store, session, summary?.covers, first.at, tail[0]!.seq);
+    const { projection, settled } = projected(withSummary([...earlier, ...tail]), options);
+    if (settled) return projection;
+  }
+}
+
+/** `seq` 在 `(after, before)` 里、`at` 大于 `at` 的条目，按 `seq` 一页页读。 */
+async function laterEntries(
+  store: Pick<SessionStore, 'list'>,
+  session: string,
+  after: number | undefined,
+  at: number,
+  before: number,
+): Promise<Entry[]> {
+  const out: Entry[] = [];
+  for (let cursor = after; ;) {
+    const page = await store.list(session, {
+      ...(cursor !== undefined ? { after: cursor } : {}),
+      atAfter: at,
+      limit: TAIL_PAGE,
+    });
+    for (const entry of page) {
+      if (entry.seq >= before) return out;
+      out.push(entry);
+    }
+    if (page.length < TAIL_PAGE) return out;
+    cursor = page.at(-1)!.seq;
+  }
 }
 
 // ---- 组装 ----
@@ -437,6 +540,19 @@ export interface ContextSpec {
   readonly projection?: string;
   /** 整次调用超过模型窗口时怎么办；缺省不检查。见 `OverflowSpec`。 */
   readonly overflow?: OverflowSpec;
+  /** 把另一个会话（一般是父会话）的投影接在这个会话的历史前面。见 `InheritSpec`。 */
+  readonly inherit?: InheritSpec;
+}
+
+/**
+ * 子 agent 带着父会话的上下文：`build` 时先投影 `session` 里 `seq` 不超过 `upTo` 的条目，再接上本会话的历史。
+ * 只读不写，父会话之后的变化不影响已经写进子会话的东西。上下文怎么给子 agent（全新、一段摘要、父的投影）是应用的决定：
+ * 全新就是不给它，摘要就是写进子运行的输入。窗口先给本会话的历史，剩下的才给父会话，放不下时先丢父会话最旧的。
+ */
+export interface InheritSpec {
+  readonly session: string;
+  /** 只取到这个 `seq` 为止，缺省全部。派子 agent 时取那次工具调用之前，子 agent 不会看到一个没有结果的调用。 */
+  readonly upTo?: number;
 }
 
 /** 超窗之后压缩用的参数：`CompactOptions` 里能序列化的那几项。摘要模型不在这里选（见 `OverflowSpec.compact`）。 */
@@ -481,6 +597,8 @@ export interface BuildRequest {
   readonly facts?: boolean | FactsSpec;
   /** 投影配置名，缺省 `default`（来自 `AgentSpec.context.projection`）。不认识的名字以 `not_found` 失败。 */
   readonly projection?: string;
+  /** 接在历史前面的另一个会话的投影（来自 `AgentSpec.context.inherit`）。 */
+  readonly inherit?: InheritSpec;
   readonly signal?: AbortSignal;
 }
 
@@ -494,10 +612,16 @@ export interface PreparedCall {
   readonly facts: readonly Fact[];
   readonly projection: Projection;
   /**
-   * 整次调用的估算 token：指令、事实、工具定义、消息（历史、`input`、`prompt`）合起来，按 builder 自己的估算。
-   * harness 的超窗检查（`OverflowSpec`）用它；builder 不给时 harness 用缺省的估算自己算。
+   * 整次调用的估算 token：指令、事实、工具定义、消息（历史、`input`、`prompt`）合起来，按 builder 自己的估算，
+   * 校准过的话乘上了 `calibration`。harness 的超窗检查（`OverflowSpec`）用它，也把它记进第一步的
+   * `StepMeta.estimatedInputTokens`；builder 不给时 harness 用缺省的估算自己算。
    */
   readonly tokens?: number;
+  /**
+   * builder 按上一轮的实际用量校准过时乘上的倍数（大于 1）：服务商实际计的输入 token 比估算多这么多，窗口的
+   * `maxTokens` 照它收紧过。没校准时不出现。
+   */
+  readonly calibration?: number;
 }
 
 export interface ViewOptions {

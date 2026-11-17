@@ -35,10 +35,19 @@ import {
 import { ENTRY_VERSION } from './version.ts';
 import { copySession, exportSession, importSession } from './transfer.ts';
 import { project } from './context.ts';
-import { selectTools, type Executor, type ToolDefinition, type ToolFilter, type ToolRegistry } from './tools.ts';
+import {
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+  selectTools,
+  type Executor,
+  type ToolDefinition,
+  type ToolFilter,
+  type ToolOutput,
+  type ToolRegistry,
+} from './tools.ts';
 import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 import {
   MAX_DECISION_QUESTIONS,
+  MAX_FACT_RECALLS,
   MEMORY_RECALL_TOOL,
   checkSourceRef,
   filterFacts,
@@ -492,6 +501,27 @@ export function describeSessionStoreContract(
       assert.equal((await store.list('s', { types: ['event'] })).length, 5, '不给 kinds 时不过滤');
     });
 
+    test('atAfter 只要 at 更晚的（不含等于），仍按 seq 返回；和 after、types、last、limit 一起用；NaN 不过滤', async () => {
+      const store = await factory({ now: Date.now });
+      const written = await store.append('s', [
+        userEntry('提醒', { at: 9_000 }),
+        userEntry('一', { at: 100 }),
+        eventEntry('pet.whisper', { text: '二', at: 200 }),
+        userEntry('三', { at: 300 }),
+        userEntry('四', { at: 300 }),
+      ]);
+      await store.append('other', [userEntry('别的会话', { at: 9_999 })]);
+      assert.deepEqual(texts(await store.list('s', { atAfter: 200 })), ['提醒', '三', '四'], '按 seq，不按 at');
+      assert.deepEqual(texts(await store.list('s', { atAfter: 200, after: written[0]!.seq })), ['三', '四']);
+      assert.deepEqual(texts(await store.list('s', { atAfter: 100, types: ['event'] })), ['二']);
+      assert.deepEqual(texts(await store.list('s', { atAfter: 100, limit: 2 })), ['提醒', '二'], '过滤之后取最早的');
+      assert.deepEqual(texts(await store.list('s', { atAfter: 100, last: 1 })), ['四'], '过滤之后取最后的');
+      assert.deepEqual(await store.list('s', { atAfter: 9_000 }), []);
+      assert.equal((await store.list('s', { atAfter: Number.NaN })).length, 5, 'NaN 不过滤');
+      assert.equal((await store.list('s', { atAfter: Number.NEGATIVE_INFINITY })).length, 5);
+      assert.deepEqual(await store.list('s', { atAfter: Number.POSITIVE_INFINITY }), []);
+    });
+
     test('kinds 只看事件自己的 kind：消息正文和事件数据里的 kind 字样不算', async () => {
       const store = await factory({ now: Date.now });
       await store.append('s', [
@@ -876,9 +906,9 @@ export function describeSessionStoreContract(
     test('redact：id、seq、at、key、source 留着，内容换成 ctx.redacted；位置不变，再涂一遍是空操作', async () => {
       const store = await factory({ now: Date.now });
       const written = await store.append('s', [
-        userEntry('银行卡号 6222', { key: 'k1', source: 'user', at: 111, meta: { secret: '6222' } }),
-        assistantEntry('记下了 6222'),
-        eventEntry('pet.whisper', { text: '6222', data: { card: '6222' } }),
+        userEntry('我的卡号机密', { key: 'k1', source: 'user', at: 111, meta: { secret: '卡号机密' } }),
+        assistantEntry('记下了 卡号机密'),
+        eventEntry('pet.whisper', { text: '卡号机密', data: { card: '卡号机密' } }),
         userEntry('别的'),
       ]);
       const [user, assistant, event, keep] = written;
@@ -890,7 +920,10 @@ export function describeSessionStoreContract(
         written.map((entry) => entry.seq),
         '位置不变',
       );
-      assert.ok(!JSON.stringify(left).includes('6222'), '内容、数据、meta 都不在了');
+      assert.ok(
+        !JSON.stringify(left).includes('卡号机密'),
+        '内容、数据、meta 都不在了（标记不会出现在 id 和时间戳里）',
+      );
       assert.deepEqual(left[0], {
         type: 'event',
         kind: CTX_EVENTS.redacted,
@@ -917,7 +950,7 @@ export function describeSessionStoreContract(
       assert.equal(await store.redact('s', [user!.id, assistant!.id]), 0, '已经涂改过的跳过');
       assert.equal((await erasures(store, 's')).length, 1);
       assert.deepEqual(
-        await store.append('s', [userEntry('银行卡号 6222', { key: 'k1' })]),
+        await store.append('s', [userEntry('我的卡号机密', { key: 'k1' })]),
         [],
         'key 还在，重试写不回来',
       );
@@ -926,7 +959,7 @@ export function describeSessionStoreContract(
     test('redact 一条摘要：它不再是摘要；别的会话的 id 涂不到', async () => {
       const store = await factory({ now: Date.now });
       const [first] = await store.append('s', [userEntry('一')]);
-      const [summary] = await store.append('s', [summaryEntry('摘要里有 6222', first!.seq)]);
+      const [summary] = await store.append('s', [summaryEntry('摘要里有 卡号机密', first!.seq)]);
       assert.equal(await store.redact('other', [summary!.id]), 0);
       assert.equal(await store.redact('s', [summary!.id]), 1);
       assert.deepEqual(await store.list('s', { types: ['summary'] }), []);
@@ -1150,6 +1183,21 @@ export function describeExecutorContract(
         assert.notEqual(output.type, 'error');
       });
     });
+
+    test('open、close（有时）按会话：都可以重复调，close 之后还能再 open，open 过的会话照常执行', async () => {
+      await withExecutor(factory, async ({ executor, echo }) => {
+        if (!executor.open || !executor.close) return;
+        const session = 'contract-session';
+        await executor.open(session);
+        await executor.open(session);
+        const output = await executor.execute({ id: 'c5', name: echo, input: { text: 'in session' } }, { session });
+        assert.notEqual(output.type, 'error');
+        await executor.close(session);
+        await executor.close(session);
+        await executor.open(session);
+        await executor.close(session);
+      });
+    });
   });
 }
 
@@ -1275,7 +1323,10 @@ export interface HarnessFixture {
   readonly harness: Harness;
   /** harness 写日志用的存储，用例从这里读日志。 */
   readonly store: SessionStore;
-  /** 一个能跑的 agent：模型按剧本回答（流式和非流式都要支持），工具里有回显工具。 */
+  /**
+   * 一个能跑的 agent：模型按剧本回答（流式和非流式都要支持），工具里有回显工具：`inputSchema` 要求 `text` 是字符串
+   * （`{ type: 'object', properties: { text: { type: 'string' } } }`，别的键不限），结果里原样带着输入。
+   */
   readonly agent: AgentSpec;
 }
 
@@ -1310,13 +1361,77 @@ function randomMarker(): string {
   return `echo-${Math.random().toString(36).slice(2)}`;
 }
 
+/**
+ * harness 的一致性等级（#23）。前三级是 trace、execute、resume，后两项是和等级正交的能力：
+ *
+ * - `trace`：一轮写进会话日志：生命周期事件、输入、回复、错误、取消、`runId`、`owner`、`parent`，`record: false` 不写，
+ *   流的事件顺序。做到这一级，日志可看，记忆可用，别的组件可以订阅。
+ * - `execute`：工具调用交给 ctx 的 `Executor`，每一步结束就落日志。
+ * - `resume`：一个会话一个未结束的运行（`session_busy`）、输入的幂等（`inputKey`、失败的重试不再记输入），崩溃后能从日志接着跑。
+ * - `context`：用 `ContextBuilder` 组装上下文：`agent.context`（投影名、事实）、`context.overflow`。自己管上下文的 harness 不跑。
+ * - `output`：`AgentSpec.output` 的结构化输出和 `version`。
+ */
+export type HarnessLevel = 'trace' | 'execute' | 'resume' | 'context' | 'output';
+
+export const HARNESS_LEVELS: readonly HarnessLevel[] = ['trace', 'execute', 'resume', 'context', 'output'];
+
+export interface HarnessContractOptions {
+  /** 跑哪几级，缺省全部。参考实现全过；适配器按自己做到的跑，并在文档里写明。 */
+  readonly levels?: readonly HarnessLevel[];
+  /**
+   * 被测的 harness 一次工具结果最多留多少字符，缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`。`execute` 级回显一个比它长的输入，
+   * 查日志里的结果截到了它以内（另留一千字符给说明）。
+   */
+  readonly maxToolOutputChars?: number;
+}
+
+/** 日志里的工具结果，按顺序。 */
+function toolResults(entries: readonly Entry[]): { id: string; output: ToolOutput }[] {
+  return entries.flatMap((entry) =>
+    entry.type === 'message' && entry.message.role === 'tool'
+      ? entry.message.content.flatMap((part) =>
+          part.type === 'tool-result' ? [{ id: part.id, output: part.output }] : [],
+        )
+      : [],
+  );
+}
+
+/** 工具结果里给模型看的文字：错误信息、序列化的 `json`、`content` 各段（内联文件的数据也算）连起来。 */
+function outputText(output: ToolOutput): string {
+  if (output.type === 'text') return output.text;
+  if (output.type === 'error') return output.message;
+  if (output.type === 'json') return JSON.stringify(output.value) ?? 'null';
+  return output.parts
+    .map((part) => {
+      if (part.type === 'text') return part.text;
+      if (part.data.type === 'data') return part.data.data;
+      return part.data.type === 'text' ? part.data.text : '';
+    })
+    .join('');
+}
+
+/** 截断时给说明留的字符数。 */
+const TRUNCATION_NOTE_CHARS = 1_000;
+
 export function describeHarnessContract(
   name: string,
   factory: HarnessFactory,
   { describe, test }: ContractTestApi,
+  options: HarnessContractOptions = {},
 ): void {
+  const levels = new Set(options.levels ?? HARNESS_LEVELS);
+  for (const level of levels) {
+    if (!HARNESS_LEVELS.includes(level)) throw new Error(`Unknown harness level "${level}".`);
+  }
+  const maxToolOutputChars = options.maxToolOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
+  if (!Number.isSafeInteger(maxToolOutputChars) || maxToolOutputChars <= 0) {
+    throw new Error(`maxToolOutputChars must be a positive integer, got ${String(options.maxToolOutputChars)}.`);
+  }
+  const atLevel = (level: HarnessLevel, title: string, fn: () => Promise<void>): void => {
+    if (levels.has(level)) test(`[${level}] ${title}`, fn);
+  };
   describe(`Harness contract: ${name}`, () => {
-    test('一轮：ctx.run.started → 输入 → 回复 → ctx.run.ended，recorded 就是写进日志的', async () => {
+    atLevel('trace', '一轮：ctx.run.started → 输入 → 回复 → ctx.run.ended，recorded 就是写进日志的', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '在的' }] });
       const result = await harness.run({ session: 's', agent, input: '在吗', runId: 'run-1' });
       assert.equal(result.runId, 'run-1');
@@ -1337,7 +1452,7 @@ export function describeHarnessContract(
       assert.ok(roundTrips(eventData(log, CTX_EVENTS.runStarted)), 'ctx.run.started 的 data 能序列化');
     });
 
-    test('不给 runId 时生成一个，两轮不同', async () => {
+    atLevel('trace', '不给 runId 时生成一个，两轮不同', async () => {
       const { harness, agent } = await factory({
         script: [
           { type: 'text', text: '一' },
@@ -1351,7 +1466,7 @@ export function describeHarnessContract(
       assert.notEqual(first.runId, second.runId);
     });
 
-    test('工具调用交给执行环境，结果回到模型，调用和结果都记下', async () => {
+    atLevel('execute', '工具调用交给执行环境，结果回到模型，调用和结果都记下', async () => {
       const text = randomMarker();
       const { harness, store, agent } = await factory({
         script: [
@@ -1375,7 +1490,7 @@ export function describeHarnessContract(
       assert.ok(JSON.stringify(tool).includes(text), '工具结果里有回显的输入');
     });
 
-    test('模型出错：run 照常返回 stopReason error 和 error，日志里有 ctx.run.ended', async () => {
+    atLevel('trace', '模型出错：run 照常返回 stopReason error 和 error，日志里有 ctx.run.ended', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'error', message: 'model exploded' }] });
       const result = await harness.run({ session: 's', agent: noRetry(agent), input: '在吗' });
       assert.equal(result.stopReason, 'error');
@@ -1390,7 +1505,129 @@ export function describeHarnessContract(
       );
     });
 
-    test('inputKey：失败后用同一个键重试，输入只记一次', async () => {
+    atLevel('execute', '每一步结束就落日志：工具调用之后模型出错，前一步的调用和结果留在日志里', async () => {
+      const text = randomMarker();
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'tool-call', id: 'call-1', input: { text } },
+          { type: 'error', message: 'model exploded' },
+        ],
+      });
+      const result = await harness.run({ session: 's', agent: noRetry(agent), input: '回显一下' });
+      assert.equal(result.stopReason, 'error');
+      const log = await store.list('s');
+      assert.deepEqual(kinds(log), [
+        CTX_EVENTS.runStarted,
+        'user',
+        'assistant',
+        'tool',
+        CTX_EVENTS.error,
+        CTX_EVENTS.runEnded,
+      ]);
+      const tool = log.find((entry) => entry.type === 'message' && entry.message.role === 'tool');
+      assert.ok(JSON.stringify(tool).includes(text), '工具结果在日志里');
+    });
+
+    atLevel(
+      'execute',
+      '工具输入不合 inputSchema：不执行，问题作为 { type: "error" } 回给模型；改对了再调照常执行',
+      async () => {
+        const text = randomMarker();
+        const { harness, store, agent } = await factory({
+          script: [
+            { type: 'tool-call', id: 'call-1', input: { text: 42 } },
+            { type: 'tool-call', id: 'call-2', input: { text } },
+            { type: 'text', text: '好了' },
+          ],
+        });
+        const result = await harness.run({ session: 's', agent: { ...agent, maxSteps: 4 }, input: '回显一下' });
+        assert.equal(result.text, '好了');
+        assert.equal(result.stopReason, 'end_turn');
+        const log = await store.list('s');
+        assert.deepEqual(kinds(log), [
+          CTX_EVENTS.runStarted,
+          'user',
+          'assistant',
+          'tool',
+          'assistant',
+          'tool',
+          'assistant',
+          CTX_EVENTS.runEnded,
+        ]);
+        const [invalid, valid] = toolResults(log);
+        assert.ok(invalid && valid, '两次调用都有结果');
+        assert.equal(invalid.id, 'call-1');
+        assert.equal(invalid.output.type, 'error', '回显工具不会回错误：这是执行前拦下的');
+        assert.ok(outputText(invalid.output).length > 0, '说明哪里不对');
+        assert.equal(valid.id, 'call-2');
+        assert.notEqual(valid.output.type, 'error');
+        assert.ok(outputText(valid.output).includes(text), '改对了的照常回显');
+      },
+    );
+
+    atLevel('execute', '工具结果超过上限：截到上限以内并注明省略了多少，模型拿到截过的结果接着跑', async () => {
+      const marker = randomMarker();
+      // 回显的结果比上限长得多；填充用的 `x` 里没有数字，截过的结果里有数字就是说明里省略了多少。
+      const text = `${marker}${'x'.repeat(maxToolOutputChars + 4 * TRUNCATION_NOTE_CHARS)}`;
+      const { harness, store, agent } = await factory({
+        script: [
+          { type: 'tool-call', id: 'call-1', input: { text } },
+          { type: 'text', text: '好了' },
+        ],
+      });
+      const result = await harness.run({ session: 's', agent, input: '回显一个很长的' });
+      assert.equal(result.text, '好了');
+      assert.equal(result.stopReason, 'end_turn');
+      const log = await store.list('s');
+      assert.deepEqual(kinds(log), [
+        CTX_EVENTS.runStarted,
+        'user',
+        'assistant',
+        'tool',
+        'assistant',
+        CTX_EVENTS.runEnded,
+      ]);
+      const [cut] = toolResults(log);
+      assert.ok(cut, '日志里有工具结果');
+      const shown = outputText(cut.output);
+      assert.ok(
+        shown.length <= maxToolOutputChars + TRUNCATION_NOTE_CHARS,
+        `结果有 ${shown.length} 个字符，上限 ${maxToolOutputChars}`,
+      );
+      assert.ok(shown.includes(marker), '截的是回显的结果，不是换成别的');
+      assert.match(shown.replace(marker, ''), /\d/, '注明省略了多少');
+    });
+
+    atLevel(
+      'output',
+      'AgentSpec.output：最后的回答按 schema 解析进 RunResult.output；version 原样记进 ctx.run.started',
+      async () => {
+        const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '{"answer":42}' }] });
+        const result = await harness.run({
+          session: 's',
+          agent: {
+            ...agent,
+            version: 'contract@1',
+            output: { schema: { type: 'object', properties: { answer: { type: 'number' } }, required: ['answer'] } },
+          },
+          input: '答案是多少？',
+        });
+        assert.equal(result.stopReason, 'end_turn');
+        assert.deepEqual(result.output, { answer: 42 });
+        const [started] = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+        assert.equal((started?.['agent'] as Record<string, unknown> | undefined)?.['version'], 'contract@1');
+      },
+    );
+
+    atLevel('trace', 'RunRequest.parent 原样记进 ctx.run.started：子会话知道自己是谁派的', async () => {
+      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+      const parent = { session: 'parent', runId: 'r-parent', toolCallId: 'call-1' };
+      await harness.run({ session: 's', agent, input: '子任务', parent });
+      const [started] = eventData(await store.list('s'), CTX_EVENTS.runStarted);
+      assert.deepEqual(started?.['parent'], parent);
+    });
+
+    atLevel('resume', 'inputKey：失败后用同一个键重试，输入只记一次', async () => {
       const { harness, store, agent } = await factory({
         script: [
           { type: 'error', message: 'network down' },
@@ -1407,7 +1644,7 @@ export function describeHarnessContract(
       assert.ok(!retry.recorded.some((entry) => entry.type === 'message' && entry.message.role === 'user'));
     });
 
-    test('record: false 一条都不写，输入照样交给模型', async () => {
+    atLevel('trace', 'record: false 一条都不写，输入照样交给模型', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       const result = await harness.run({ session: 's', agent, input: '不记', record: false });
       assert.equal(result.text, '好');
@@ -1415,37 +1652,45 @@ export function describeHarnessContract(
       assert.deepEqual(await store.list('s'), []);
     });
 
-    test('会话里有未结束的运行（最后一个生命周期事件是 started）：run 以 session_busy 结束，什么都不写', async () => {
-      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
-      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
-      const before = await store.list('s');
-      const result = await harness.run({ session: 's', agent, input: '在吗' });
-      assert.equal(result.stopReason, 'error');
-      assert.equal(result.error?.type, 'session_busy');
-      assert.equal(result.error?.retryable, true);
-      assert.deepEqual(result.recorded, []);
-      assert.deepEqual(await store.list('s'), before, '一条都没写');
-      // 别的会话不受影响；那个运行结束以后就能接着跑。
-      assert.equal((await harness.run({ session: 't', agent, input: '在吗' })).stopReason, 'end_turn');
-    });
+    atLevel(
+      'resume',
+      '会话里有未结束的运行（最后一个生命周期事件是 started）：run 以 session_busy 结束，什么都不写',
+      async () => {
+        const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+        await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
+        const before = await store.list('s');
+        const result = await harness.run({ session: 's', agent, input: '在吗' });
+        assert.equal(result.stopReason, 'error');
+        assert.equal(result.error?.type, 'session_busy');
+        assert.equal(result.error?.retryable, true);
+        assert.deepEqual(result.recorded, []);
+        assert.deepEqual(await store.list('s'), before, '一条都没写');
+        // 别的会话不受影响；那个运行结束以后就能接着跑。
+        assert.equal((await harness.run({ session: 't', agent, input: '在吗' })).stopReason, 'end_turn');
+      },
+    );
 
-    test('上一轮已经 ended：可以接着跑；record: false 的运行不受未结束的运行影响，也不留生命周期事件', async () => {
-      const { harness, store, agent } = await factory({
-        script: [
-          { type: 'text', text: '一' },
-          { type: 'text', text: '二' },
-        ],
-      });
-      await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'old'), lifecycle(CTX_EVENTS.runEnded, 'old')]);
-      assert.equal((await harness.run({ session: 's', agent, input: '1' })).stopReason, 'end_turn');
-      await store.append('t', [lifecycle(CTX_EVENTS.runStarted, 'stuck')]);
-      const quiet = await harness.run({ session: 't', agent, input: '2', record: false });
-      assert.equal(quiet.stopReason, 'end_turn');
-      assert.equal(quiet.text, '二');
-      assert.deepEqual(kinds(await store.list('t')), [CTX_EVENTS.runStarted], '只有原来那一条');
-    });
+    atLevel(
+      'resume',
+      '上一轮已经 ended：可以接着跑；record: false 的运行不受未结束的运行影响，也不留生命周期事件',
+      async () => {
+        const { harness, store, agent } = await factory({
+          script: [
+            { type: 'text', text: '一' },
+            { type: 'text', text: '二' },
+          ],
+        });
+        await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'old'), lifecycle(CTX_EVENTS.runEnded, 'old')]);
+        assert.equal((await harness.run({ session: 's', agent, input: '1' })).stopReason, 'end_turn');
+        await store.append('t', [lifecycle(CTX_EVENTS.runStarted, 'stuck')]);
+        const quiet = await harness.run({ session: 't', agent, input: '2', record: false });
+        assert.equal(quiet.stopReason, 'end_turn');
+        assert.equal(quiet.text, '二');
+        assert.deepEqual(kinds(await store.list('t')), [CTX_EVENTS.runStarted], '只有原来那一条');
+      },
+    );
 
-    test('stream（有时）：会话忙时 run.ended 带 session_busy，不写日志', async () => {
+    atLevel('resume', 'stream（有时）：会话忙时 run.ended 带 session_busy，不写日志', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       if (!harness.stream) return;
       await store.append('s', [lifecycle(CTX_EVENTS.runStarted, 'other')]);
@@ -1456,7 +1701,7 @@ export function describeHarnessContract(
       assert.equal((await store.list('s')).length, 1);
     });
 
-    test('owner 写进 ctx.run.started；不给就没有这个字段', async () => {
+    atLevel('trace', 'owner 写进 ctx.run.started；不给就没有这个字段', async () => {
       const { harness, store, agent } = await factory({
         script: [
           { type: 'text', text: '一' },
@@ -1473,28 +1718,36 @@ export function describeHarnessContract(
       assert.ok(!('owner' in started[1]!));
     });
 
-    test('agent.context 交给 ContextBuilder：不认识的投影名以 not_found 结束，不调模型；facts: false 照常跑', async () => {
-      const { harness, store, agent } = await factory({
-        script: [
-          { type: 'text', text: '好' },
-          { type: 'text', text: '多余' },
-        ],
-      });
-      // 忽略 `context` 的 builder 会静默回到缺省，在这里被暴露。
-      const unknown = await harness.run({
-        session: 's',
-        agent: { ...agent, context: { projection: 'no-such-projection' } },
-        input: '在吗',
-      });
-      assert.equal(unknown.stopReason, 'error');
-      assert.equal(unknown.error?.type, 'not_found');
-      assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
-      const quiet = await harness.run({ session: 't', agent: { ...agent, context: { facts: false } }, input: '在吗' });
-      assert.equal(quiet.stopReason, 'end_turn');
-      assert.equal(quiet.text, '好');
-    });
+    atLevel(
+      'context',
+      'agent.context 交给 ContextBuilder：不认识的投影名以 not_found 结束，不调模型；facts: false 照常跑',
+      async () => {
+        const { harness, store, agent } = await factory({
+          script: [
+            { type: 'text', text: '好' },
+            { type: 'text', text: '多余' },
+          ],
+        });
+        // 忽略 `context` 的 builder 会静默回到缺省，在这里被暴露。
+        const unknown = await harness.run({
+          session: 's',
+          agent: { ...agent, context: { projection: 'no-such-projection' } },
+          input: '在吗',
+        });
+        assert.equal(unknown.stopReason, 'error');
+        assert.equal(unknown.error?.type, 'not_found');
+        assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
+        const quiet = await harness.run({
+          session: 't',
+          agent: { ...agent, context: { facts: false } },
+          input: '在吗',
+        });
+        assert.equal(quiet.stopReason, 'end_turn');
+        assert.equal(quiet.text, '好');
+      },
+    );
 
-    test('agent.context 记进 ctx.run.started 的 agent，能 JSON 往返', async () => {
+    atLevel('context', 'agent.context 记进 ctx.run.started 的 agent，能 JSON 往返', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       const context = {
         facts: { sources: ['clock'], placement: 'prompt', heading: '环境' },
@@ -1506,7 +1759,7 @@ export function describeHarnessContract(
       assert.deepEqual((started?.['agent'] as Record<string, unknown> | undefined)?.['context'], context);
     });
 
-    test('不给 inputKey：上一轮失败留下的输入，带同样的输入重试不再记一遍；换一句照常记', async () => {
+    atLevel('resume', '不给 inputKey：上一轮失败留下的输入，带同样的输入重试不再记一遍；换一句照常记', async () => {
       const { harness, store, agent } = await factory({
         script: [
           { type: 'error', message: 'network down' },
@@ -1530,7 +1783,7 @@ export function describeHarnessContract(
       assert.equal(await users(), 3);
     });
 
-    test('模型报上下文过长：以 error 结束，error.type 是 context_overflow，不可重试', async () => {
+    atLevel('trace', '模型报上下文过长：以 error 结束，error.type 是 context_overflow，不可重试', async () => {
       const { harness, store, agent } = await factory({
         script: [
           {
@@ -1547,21 +1800,25 @@ export function describeHarnessContract(
       assert.equal(eventData(await store.list('s'), CTX_EVENTS.error)[0]?.['type'], 'context_overflow');
     });
 
-    test('agent.context.overflow：超了又选 error 就不调模型，以 context_overflow 结束；没超照常跑', async () => {
-      const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
-      const strict = { ...agent, context: { overflow: { maxTokens: 1, strategy: 'error' } } } as const;
-      const over = await harness.run({ session: 's', agent: strict, input: '在吗' });
-      assert.equal(over.stopReason, 'error');
-      assert.equal(over.error?.type, 'context_overflow');
-      assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
-      // 剧本只有一步：上面要是调了模型，这里就没得回了。
-      const roomy = { ...agent, context: { overflow: { maxTokens: 1_000_000, strategy: 'error' } } } as const;
-      const fine = await harness.run({ session: 't', agent: roomy, input: '在吗' });
-      assert.equal(fine.stopReason, 'end_turn');
-      assert.equal(fine.text, '好');
-    });
+    atLevel(
+      'context',
+      'agent.context.overflow：超了又选 error 就不调模型，以 context_overflow 结束；没超照常跑',
+      async () => {
+        const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
+        const strict = { ...agent, context: { overflow: { maxTokens: 1, strategy: 'error' } } } as const;
+        const over = await harness.run({ session: 's', agent: strict, input: '在吗' });
+        assert.equal(over.stopReason, 'error');
+        assert.equal(over.error?.type, 'context_overflow');
+        assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'error');
+        // 剧本只有一步：上面要是调了模型，这里就没得回了。
+        const roomy = { ...agent, context: { overflow: { maxTokens: 1_000_000, strategy: 'error' } } } as const;
+        const fine = await harness.run({ session: 't', agent: roomy, input: '在吗' });
+        assert.equal(fine.stopReason, 'end_turn');
+        assert.equal(fine.text, '好');
+      },
+    );
 
-    test('agent.context.overflow：历史超了，裁到放得下再调模型（trim 不写摘要）', async () => {
+    atLevel('context', 'agent.context.overflow：历史超了，裁到放得下再调模型（trim 不写摘要）', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '好' }] });
       await store.append('s', dialogue(40, 400));
       const result = await harness.run({
@@ -1574,14 +1831,14 @@ export function describeHarnessContract(
       assert.deepEqual(await store.list('s', { types: ['summary'] }), []);
     });
 
-    test('signal 已中止：返回 stopReason aborted，写 ctx.run.ended', async () => {
+    atLevel('trace', 'signal 已中止：返回 stopReason aborted，写 ctx.run.ended', async () => {
       const { harness, store, agent } = await factory({ script: [{ type: 'text', text: '不该说' }] });
       const result = await harness.run({ session: 's', agent, input: '在吗', signal: AbortSignal.abort() });
       assert.equal(result.stopReason, 'aborted');
       assert.equal(eventData(await store.list('s'), CTX_EVENTS.runEnded)[0]?.['stopReason'], 'aborted');
     });
 
-    test('stream（有时）：run.started 在最前、run.ended 在最后，工具事件在两次模型调用之间', async () => {
+    atLevel('trace', 'stream（有时）：run.started 在最前、run.ended 在最后，工具事件在两次模型调用之间', async () => {
       const text = randomMarker();
       const { harness, store, agent } = await factory({
         script: [
@@ -1613,7 +1870,7 @@ export function describeHarnessContract(
       assert.equal(kinds(await store.list('s')).at(-1), CTX_EVENTS.runEnded);
     });
 
-    test('stream（有时）：模型出错时先给 error 再给 run.ended，不抛', async () => {
+    atLevel('trace', 'stream（有时）：模型出错时先给 error 再给 run.ended，不抛', async () => {
       const { harness, agent } = await factory({ script: [{ type: 'error', message: 'model exploded' }] });
       if (!harness.stream) return;
       const types: string[] = [];
@@ -1950,6 +2207,39 @@ export function describeOrchestratorContract(
       });
     });
 
+    test('recover（有时）：写下了调用、没有结果的工具调用补一条错误结果，再补 ctx.run.ended', async () => {
+      await withOrchestrator(factory, answers(0), async ({ orchestrator, store }) => {
+        if (!orchestrator.recover) return;
+        await store.append('crashed', [
+          lifecycle(CTX_EVENTS.runStarted, 'lost'),
+          userEntry('两件事'),
+          messageEntry({
+            role: 'assistant',
+            content: [
+              { type: 'tool-call', id: 'done', name: 'echo', input: {} },
+              { type: 'tool-call', id: 'hung', name: 'echo', input: {} },
+            ],
+          }),
+          messageEntry({
+            role: 'tool',
+            content: [{ type: 'tool-result', id: 'done', name: 'echo', output: { type: 'text', text: '好了' } }],
+          }),
+        ]);
+        assert.deepEqual(
+          (await orchestrator.recover()).map(({ session, runId }) => ({ session, runId })),
+          [{ session: 'crashed', runId: 'lost' }],
+        );
+        const log = await store.list('crashed');
+        assert.deepEqual(kinds(log).slice(4), ['tool', CTX_EVENTS.runEnded]);
+        const patched = log[4];
+        assert.ok(patched?.type === 'message' && patched.message.role === 'tool');
+        assert.deepEqual(
+          patched.message.content.map((part) => (part.type === 'tool-result' ? [part.id, part.output.type] : [])),
+          [['hung', 'error']],
+        );
+      });
+    });
+
     test('recover（有时）：只收 owner 相同的运行，别的实例的断点不动', async () => {
       await withOrchestrator(factory, answers(0), async ({ orchestrator, store }) => {
         if (!orchestrator.recover) return;
@@ -2035,6 +2325,22 @@ async function factById(store: MemoryStore, id: string): Promise<MemoryFact | un
   return (await store.facts.list()).find((fact) => fact.id === id);
 }
 
+/** `search` 命中的事实的 `id`，按返回的顺序。 */
+async function searchIds(store: MemoryStore, query: Parameters<MemoryStore['facts']['search']>[0]): Promise<string[]> {
+  return (await store.facts.search(query)).map((hit) => hit.fact.id);
+}
+
+/** 自然的中文问句和它该找回的事实：两边没有一个整句的子串，只有零散的共同的词。 */
+const CHINESE_RECALL: readonly (readonly [question: string, fact: string])[] = [
+  ['我们项目现在用的是什么数据库？', '主人的项目数据库从 MySQL 换成了 PostgreSQL'],
+  ['我平时喜欢喝什么茶？', '主人喜欢喝乌龙茶，不喝咖啡'],
+  ['你还记得我住在哪个城市吗', '主人住在杭州西湖区'],
+  ['数据库一般什么时候备份', '主人每周五下午备份数据库'],
+  ['我家的猫叫什么名字', '主人的猫叫年糕，三岁'],
+  ['我有什么过敏的东西吗', '主人对花生过敏'],
+  ['下个月出差是去哪里', '主人下个月要去东京出差'],
+];
+
 export function describeMemoryStoreContract(
   name: string,
   factory: MemoryStoreFactory,
@@ -2098,6 +2404,7 @@ export function describeMemoryStoreContract(
       await assert.rejects(bob.facts.cite(fact.id, [ref(5)]), hasType('not_found'));
       await bob.facts.touch([fact.id], 20);
       assert.equal(await bob.facts.archive([fact.id], 20), 0);
+      assert.equal(await bob.facts.restore([fact.id]), 0);
       assert.equal(await bob.facts.forget([fact.id]), 0);
       await assert.rejects(bob.procedures.confirm(rule.id, [ref(5)]), hasType('not_found'));
       await assert.rejects(bob.procedures.retire(rule.id, 20), hasType('not_found'));
@@ -2126,6 +2433,30 @@ export function describeMemoryStoreContract(
       await assert.rejects(
         Promise.resolve().then(() => store.scope(`${long}x`).facts.list()),
         hasType('invalid_request'),
+      );
+    });
+
+    test('scope：检索的索引、归档和恢复也按作用域分开', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const alice = store.scope('user:alice');
+      const bob = store.scope('user:bob');
+      const hers = await alice.facts.add(newFact('主人住在杭州西湖区'));
+      const his = await bob.facts.add(newFact('主人住在上海浦东'));
+      const question = '主人住在哪里';
+      assert.deepEqual(await searchIds(alice, { text: question }), [hers.id]);
+      assert.deepEqual(await searchIds(bob, { text: question }), [his.id]);
+      assert.deepEqual(await searchIds(bob, { text: '杭州西湖', open: false }), [], '别的作用域里才有的词搜不到');
+
+      assert.equal(await alice.facts.archive([hers.id], 5), 1);
+      assert.equal(await bob.facts.restore([hers.id]), 0, '恢复不了别的作用域里归档的事实');
+      assert.deepEqual(await searchIds(bob, { text: question, archived: true }), [his.id]);
+      assert.deepEqual(await searchIds(alice, { text: question, archived: true }), [hers.id]);
+      assert.equal(await alice.facts.forget([hers.id]), 1);
+      assert.deepEqual(await searchIds(alice, { text: question, open: false }), []);
+      assert.deepEqual(
+        await searchIds(bob, { text: question }),
+        [his.id],
+        '删掉一个作用域的事实，别的作用域里同样的词还搜得到',
       );
     });
 
@@ -2280,6 +2611,19 @@ export function describeMemoryStoreContract(
       assert.deepEqual((await factById(store, b.id))?.recalls, [200]);
     });
 
+    test(`facts：recalls 只留最近 ${MAX_FACT_RECALLS} 次，早的丢掉，一条事实不随召回次数无限变长`, async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.facts.add(newFact('甲'));
+      const b = await store.facts.add(newFact('乙'));
+      await store.facts.touch([b.id], 1);
+      for (let i = 0; i < MAX_FACT_RECALLS + 5; i += 1) await store.facts.touch([a.id], 1000 + i);
+      const expected = Array.from({ length: MAX_FACT_RECALLS }, (_, i) => 1005 + i);
+      assert.deepEqual((await factById(store, a.id))?.recalls, expected, '留下的是最近的那些，仍按先后');
+      await store.facts.touch([a.id, b.id], 5000);
+      assert.deepEqual((await factById(store, a.id))?.recalls, [...expected.slice(1), 5000]);
+      assert.deepEqual((await factById(store, b.id))?.recalls, [1, 5000], '没满的照常追加');
+    });
+
     test('facts：archive 退出 open 的查询但不删，返回真正归档的条数', async () => {
       const store = await factory(MEMORY_STORE_SETUP);
       const a = await store.facts.add(newFact('甲'));
@@ -2291,6 +2635,28 @@ export function describeMemoryStoreContract(
       assert.equal((await factById(store, b.id))?.archivedAt, 200);
       assert.deepEqual(ids(await store.facts.list({ open: true })), [c.id]);
       assert.equal((await store.facts.list()).length, 3);
+    });
+
+    test('facts：restore 恢复归档的事实，返回真正恢复的条数；有效期不动；恢复之后可以再归档', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.facts.add(newFact('甲'));
+      const b = await store.facts.add(newFact('乙'));
+      const c = await store.facts.add(newFact('丙'));
+      const open = async (): Promise<string[]> => ids(await store.facts.list({ open: true })).toSorted();
+      assert.equal(await store.facts.archive([a.id, b.id], 100), 2);
+      assert.equal(await store.facts.restore([a.id, c.id, 'missing']), 1, '没归档的、认不得的不算');
+      assert.deepEqual(await factById(store, a.id), a, '恢复之后和归档之前一样，没有 archivedAt');
+      assert.equal(await store.facts.restore([a.id, a.id]), 0, '已经恢复的不算');
+      assert.equal(await store.facts.restore([]), 0);
+      assert.deepEqual(await open(), [a.id, c.id].toSorted());
+
+      await store.facts.close(b.id, 150);
+      assert.equal(await store.facts.restore([b.id]), 1);
+      assert.deepEqual(await factById(store, b.id), { ...b, validTo: 150 }, '关闭的恢复了还是关闭的');
+      assert.deepEqual(await open(), [a.id, c.id].toSorted());
+
+      assert.equal(await store.facts.archive([a.id], 300), 1);
+      assert.equal((await factById(store, a.id))?.archivedAt, 300, '再归档记的是新的时刻');
     });
 
     test('facts：forget 真删，并清掉别的事实里指向它的 supersededBy', async () => {
@@ -2393,6 +2759,94 @@ export function describeMemoryStoreContract(
       assert.deepEqual(await hits({ text: '主人的', k: 0 }), []);
     });
 
+    test('facts：search 的 archived：仍然成立的里面连归档的一起搜，关闭的不搜；open: false 本来就不限', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const open = await store.facts.add(newFact('项目用 Kubernetes 部署'));
+      const archived = await store.facts.add(newFact('以前在 Kubernetes 上跑批处理'));
+      const closed = await store.facts.add(newFact('Kubernetes 的版本是 1.28'));
+      const both = await store.facts.add(newFact('Kubernetes 集群放在机房'));
+      await store.facts.archive([archived.id, both.id], MEMORY_NOW + 1);
+      await store.facts.close(closed.id, MEMORY_NOW + 1);
+      await store.facts.close(both.id, MEMORY_NOW + 2);
+      const found = async (query: { open?: boolean; archived?: boolean }): Promise<Set<string>> =>
+        new Set(await searchIds(store, { text: 'Kubernetes', ...query }));
+      const all = new Set([open.id, archived.id, closed.id, both.id]);
+      assert.deepEqual(await found({}), new Set([open.id]));
+      assert.deepEqual(await found({ archived: false }), new Set([open.id]));
+      assert.deepEqual(await found({ archived: true }), new Set([open.id, archived.id]), '关闭的归档了也不搜');
+      assert.deepEqual(await found({ open: true, archived: true }), new Set([open.id, archived.id]));
+      assert.deepEqual(await found({ open: false }), all);
+      assert.deepEqual(await found({ open: false, archived: false }), all, 'open: false 时 archived 不起作用');
+      const hit = (await store.facts.search({ text: 'Kubernetes', archived: true })).find(
+        (item) => item.fact.id === archived.id,
+      );
+      assert.equal(hit?.fact.archivedAt, MEMORY_NOW + 1, '归档的命中带着 archivedAt，调用方据此降权');
+
+      assert.equal(await store.facts.restore([archived.id]), 1);
+      assert.deepEqual(await found({}), new Set([open.id, archived.id]), '恢复之后缺省的搜索又搜得到');
+    });
+
+    test('facts：search 中文问句：没有空白分词也找得回该找回的那条；没有共同的词就不命中', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const added: MemoryFact[] = [];
+      for (const [, text] of CHINESE_RECALL) added.push(await store.facts.add(newFact(text)));
+      for (const [i, [question, text]] of CHINESE_RECALL.entries()) {
+        const found = await searchIds(store, { text: question });
+        assert.ok(found.includes(added[i]!.id), `「${question}」应该找回「${text}」`);
+      }
+      assert.deepEqual(await store.facts.search({ text: '明天天气怎么样' }), []);
+      assert.deepEqual(await store.facts.search({ text: '' }), [], '空的查询什么都不命中');
+      assert.deepEqual(await store.facts.search({ text: ' ，。？ ' }), [], '只有空白和标点的查询什么都不命中');
+    });
+
+    test('facts：search 超长的查询（上千个不同的词）不报错，开头和结尾的词照样命中', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const head = await store.facts.add(newFact('主人的项目用 PostgreSQL 存数据'));
+      const tail = await store.facts.add(newFact('服务部署在 Kubernetes 集群上'));
+      const other = await store.facts.add(newFact('主人每天早上跑步'));
+      const filler = Array.from({ length: 1500 }, (_, i) => `filler${i}`).join(' ');
+      const hits = await store.facts.search({ text: `PostgreSQL ${filler} Kubernetes` });
+      const found = hits.map((hit) => hit.fact.id);
+      assert.ok(found.includes(head.id), '开头的词命中');
+      assert.ok(found.includes(tail.id), '结尾的词命中');
+      assert.ok(!found.includes(other.id));
+      for (const hit of hits) assert.ok(hit.score > 0 && hit.score <= 1, `score ${hit.score} 在 0..1`);
+
+      // 没有空白的一长段中文：三千个字，接着一句问话。
+      const prose = Array.from({ length: 3000 }, (_, i) => String.fromCodePoint(0x4e00 + ((i * 7) % 2000))).join('');
+      const asked = await store.facts.search({ text: `${prose}。主人每天早上跑步吗`, k: 2 });
+      assert.ok(asked.length <= 2, 'k 照样生效');
+      assert.ok(
+        asked.some((hit) => hit.fact.id === other.id),
+        '长段后面的问话照样命中',
+      );
+      const huge = Array.from({ length: 20_000 }, (_, i) => `w${i}`).join(' ');
+      assert.deepEqual(await store.facts.search({ text: huge }), [], '两万个不同的词也只是没有命中');
+    });
+
+    test('facts：search 按相关度排：共同的词占得多的在前，分数也高；不相关的不出现', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const partial = await store.facts.add(newFact('集群跑在 Kubernetes 上'));
+      const unrelated = await store.facts.add(newFact('主人每天早上跑步'));
+      const full = await store.facts.add(newFact('Kubernetes 集群每周五部署'));
+      const hits = await store.facts.search({ text: '周五 部署 Kubernetes 集群' });
+      assert.deepEqual(
+        hits.map((hit) => hit.fact.id),
+        [full.id, partial.id],
+        '四个词全中的排在只中两个的前面，和写入的先后无关',
+      );
+      assert.ok(hits[0]!.score > hits[1]!.score && hits[1]!.score > 0, JSON.stringify(hits.map((hit) => hit.score)));
+      assert.ok(!hits.some((hit) => hit.fact.id === unrelated.id));
+      // 问句里零散地提到：提到得多的在前。
+      const asked = await searchIds(store, { text: '我们的集群是哪天部署来着？是每周五吗' });
+      assert.deepEqual(asked.slice(0, 2), [full.id, partial.id]);
+      assert.deepEqual(
+        await searchIds(store, { text: '周五 部署 Kubernetes 集群', k: 1 }),
+        [full.id],
+        'k 取的是最相关的',
+      );
+    });
+
     test('procedures：add 的 confirmations 是 1；confirm 加 1 并追加证据，相同的证据不算；没有证据抛 invalid_request；认不得的 id 抛 not_found', async () => {
       const store = await factory(MEMORY_STORE_SETUP);
       const input = {
@@ -2457,6 +2911,166 @@ export function describeMemoryStoreContract(
       assert.deepEqual(await store.core.history({ last: 0 }), []);
       await store.core.set('一', 4);
       assert.deepEqual(await store.core.get(), { text: '一', at: 4 }, '回滚就是把旧文字再 set 一次');
+    });
+
+    test('notes：同一个会话、同样区间的笔记只写一次，add 返回已有的那条；同一批里重复的也一样', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const draft = { session: 's', from: 1, upTo: 3, at: 10, salience: 0.8 };
+      const [first] = await store.notes.add([draft]);
+      const again = await store.notes.add([
+        { ...draft, at: 11, salience: 0.2 },
+        { ...draft, from: 2 },
+        { ...draft, from: 2, at: 12 },
+      ]);
+      assert.ok(first);
+      assert.equal(again[0]?.id, first.id);
+      assert.equal(again[0]?.salience, 0.8, '已有的不改');
+      assert.equal(again[1]?.id, again[2]?.id);
+      assert.deepEqual(ids(await store.notes.list()), [first.id, again[1]!.id]);
+      const [other] = await store.notes.add([{ ...draft, session: 't' }]);
+      assert.notEqual(other?.id, first.id, '别的会话的同一个区间是另一条');
+      const [scoped] = await store.scope('user:alice').notes.add([draft]);
+      assert.notEqual(scoped?.id, first.id, '别的作用域的是另一条');
+    });
+
+    test('notes：fail 记失败次数和原因，到 maxAttempts 进死信；死信不算待处理，retry 放回去；list 的 failed、since', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const [a, b, done] = await store.notes.add([
+        { session: 's', from: 1, upTo: 1, at: 10, salience: 0.8 },
+        { session: 's', from: 2, upTo: 2, at: 20, salience: 0.8 },
+        { session: 's', from: 3, upTo: 3, at: 30, salience: 0.8, settledAt: 30 },
+      ]);
+      assert.ok(a && b && done);
+      const once = await store.notes.fail([a.id, b.id, done.id, 'missing'], 40, { error: '坏的 JSON', maxAttempts: 2 });
+      assert.deepEqual(ids(once), [a.id, b.id], '处理过的、认不得的跳过');
+      assert.equal(once[0]?.attempts, 1);
+      assert.equal(once[0]?.error, '坏的 JSON');
+      assert.equal(once[0]?.failedAt, undefined);
+      assert.deepEqual(ids(await store.notes.list({ pending: true })), [a.id, b.id], '失败一次还是待处理');
+
+      const twice = await store.notes.fail([a.id], 50, { error: '还是坏的', maxAttempts: 2 });
+      assert.equal(twice[0]?.attempts, 2);
+      assert.equal(twice[0]?.error, '还是坏的');
+      assert.equal(twice[0]?.failedAt, 50, '到上限进死信');
+      assert.deepEqual(ids(await store.notes.list({ pending: true })), [b.id], '死信不算待处理');
+      assert.deepEqual(ids(await store.notes.list({ failed: true })), [a.id]);
+      assert.deepEqual(ids(await store.notes.list({ failed: false })), [b.id, done.id]);
+      assert.deepEqual(ids(await store.notes.list({ pending: false })), [done.id], '死信也不算处理过');
+      assert.deepEqual(await store.notes.fail([a.id], 60, { error: 'x', maxAttempts: 2 }), [], '死信不再记');
+      assert.equal(await store.notes.settle([a.id], 60), 0, '死信不能直接标成处理过');
+      assert.equal(await store.notes.head('s'), 3, 'head 含死信');
+
+      assert.equal(await store.notes.retry([a.id, b.id, 'missing']), 1, '只有死信放得回去');
+      const [back] = (await store.notes.list()).filter((note) => note.id === a.id);
+      assert.equal(back?.failedAt, undefined);
+      assert.equal(back?.attempts, undefined);
+      assert.equal(back?.error, undefined);
+      assert.deepEqual(ids(await store.notes.list({ pending: true })), [a.id, b.id]);
+      assert.deepEqual(ids(await store.notes.list({ since: 20 })), [b.id, done.id]);
+      assert.equal((await store.scope('user:bob').notes.fail([b.id], 70, { error: 'x', maxAttempts: 1 })).length, 0);
+    });
+
+    test('notes：forget 删掉一个会话的笔记（head 回到 0），不给会话删掉全部；别的作用域不动', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const alice = store.scope('user:alice');
+      const draft = { from: 1, upTo: 3, at: 10, salience: 0.8 };
+      await store.notes.add([
+        { ...draft, session: 's' },
+        { ...draft, session: 's', from: 4, upTo: 5 },
+        { ...draft, session: 't' },
+      ]);
+      await alice.notes.add([{ ...draft, session: 's' }]);
+      assert.equal(await store.notes.forget('s'), 2);
+      assert.equal(await store.notes.head('s'), 0);
+      assert.deepEqual(
+        (await store.notes.list()).map((note) => note.session),
+        ['t'],
+      );
+      assert.equal(await store.notes.forget('s'), 0);
+      assert.equal(await store.notes.forget(), 1);
+      assert.deepEqual(await store.notes.list(), []);
+      assert.equal((await alice.notes.list()).length, 1, '别的作用域的还在');
+    });
+
+    test('facts：key 一个作用域里不重复，add 遇到已有的键返回已有的那条、什么都不写', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const first = await store.facts.add(newFact('主人住在杭州', { key: 'k1' }));
+      assert.equal(first.key, 'k1');
+      const again = await store.facts.add(newFact('主人住在上海', { key: 'k1' }));
+      assert.deepEqual(again, first);
+      assert.deepEqual(ids(await store.facts.list()), [first.id]);
+      const other = await store.scope('user:alice').facts.add(newFact('主人住在上海', { key: 'k1' }));
+      assert.notEqual(other.id, first.id, '别的作用域的同一个键是另一条');
+      const plain = [await store.facts.add(newFact('没有键')), await store.facts.add(newFact('没有键'))];
+      assert.notEqual(plain[0]!.id, plain[1]!.id, '没有键的不去重');
+      assert.equal((await store.facts.list()).length, 3);
+    });
+
+    test('facts：supersede 原子地加新关旧；认不得的 id 什么都不写；键已经有了什么都不改；已经关闭的只写新的', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const old = await store.facts.add(newFact('主人住在杭州'));
+      const added = await store.facts.supersede(old.id, newFact('主人住在上海', { key: 'move' }), 50);
+      assert.equal(added.text, '主人住在上海');
+      const closed = await factById(store, old.id);
+      assert.equal(closed?.validTo, 50);
+      assert.equal(closed?.supersededBy, added.id);
+      assert.equal((await factById(store, added.id))?.validTo, undefined);
+
+      await assert.rejects(store.facts.supersede('missing', newFact('不该写'), 60), hasType('not_found'));
+      assert.deepEqual(
+        (await store.facts.list()).map((fact) => fact.text).toSorted(),
+        ['主人住在上海', '主人住在杭州'],
+        '认不得的 id：新的也没写',
+      );
+      await assert.rejects(
+        store.facts.supersede(added.id, newFact('没有证据', { sources: [] }), 60),
+        hasType('invalid_request'),
+      );
+
+      const repeated = await store.facts.supersede(added.id, newFact('主人住在上海', { key: 'move' }), 70);
+      assert.equal(repeated.id, added.id, '同一个键：返回已有的');
+      assert.equal((await factById(store, added.id))?.validTo, undefined, '什么都不改：没有把自己关掉');
+
+      const again = await store.facts.supersede(old.id, newFact('主人住在北京'), 80);
+      assert.equal((await factById(store, old.id))?.validTo, 50, '已经关闭的不改');
+      assert.equal((await factById(store, old.id))?.supersededBy, added.id);
+      assert.equal((await factById(store, again.id))?.text, '主人住在北京');
+      await assert.rejects(
+        store.scope('user:bob').facts.supersede(added.id, newFact('别的作用域'), 90),
+        hasType('not_found'),
+      );
+    });
+
+    test('facts：reopen 撤销关闭，清掉 validTo 和 supersededBy，返回真正重新打开的条数', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const old = await store.facts.add(newFact('主人住在杭州'));
+      const added = await store.facts.supersede(old.id, newFact('主人住在上海'), 50);
+      assert.equal(await store.facts.reopen([old.id, added.id, 'missing']), 1);
+      const reopened = await factById(store, old.id);
+      assert.equal(reopened?.validTo, undefined);
+      assert.equal(reopened?.supersededBy, undefined);
+      assert.deepEqual(ids(await store.facts.list({ open: true })).toSorted(), [old.id, added.id].toSorted());
+      assert.equal((await searchIds(store, { text: '杭州' }))[0], old.id, '回到 open 的搜索里');
+      assert.equal(await store.facts.reopen([old.id]), 0);
+      assert.equal(await store.scope('user:bob').facts.reopen([old.id]), 0);
+    });
+
+    test('procedures：forget 真删，返回删掉的条数；core：clear 删掉全部版本，get 回到 null', async () => {
+      const store = await factory(MEMORY_STORE_SETUP);
+      const a = await store.procedures.add({ when: '部署前', do: '先跑测试', evidence: [ref(1)], at: 1 });
+      const b = await store.procedures.add({ when: '发版后', do: '看监控', evidence: [ref(2)], at: 2 });
+      assert.equal(await store.scope('user:bob').procedures.forget([a.id]), 0);
+      assert.equal(await store.procedures.forget([a.id, a.id, 'missing']), 1);
+      assert.deepEqual(ids(await store.procedures.list()), [b.id]);
+
+      await store.core.set('一', 1);
+      await store.core.set('二', 2);
+      await store.scope('user:bob').core.set('bob', 3);
+      assert.equal(await store.core.clear(), 2);
+      assert.equal(await store.core.get(), null);
+      assert.deepEqual(await store.core.history(), []);
+      assert.equal(await store.core.clear(), 0);
+      assert.equal((await store.scope('user:bob').core.get())?.text, 'bob', '别的作用域的不动');
     });
   });
 }
@@ -3134,6 +3748,37 @@ export function describeMemoryContract(
       });
     });
 
+    test('recall：归档的事实也找得回来，被召回的恢复成没归档的', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory, store, now } = fixture;
+        const archived = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据');
+        assert.equal(await store.facts.archive([archived.id], now), 1);
+        const recalled = await memory.recall('PostgreSQL');
+        const found = recalled.facts.find((fact) => fact.id === archived.id);
+        assert.ok(found, '归档的事实也召回');
+        assert.equal(found.archivedAt, undefined, '返回的已经不带 archivedAt');
+        assert.ok(roundTrips(recalled));
+        const after = await factById(store, archived.id);
+        assert.equal(after?.archivedAt, undefined, '被召回就恢复');
+        assert.deepEqual(after?.recalls, [now], '恢复的同时记了一次召回');
+        assert.deepEqual(ids(await store.facts.list({ open: true })), [archived.id]);
+      });
+    });
+
+    test('recall：minConfidence 筛掉置信度低的事实，给 0 就不筛', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory, store } = fixture;
+        const sure = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据', { confidence: 0.9 });
+        const unsure = await seedFact(fixture, '主人的项目好像要换掉 PostgreSQL', { confidence: 0.2 });
+        const strict = await memory.recall('PostgreSQL', { minConfidence: 0.5 });
+        assert.ok(ids(strict.facts).includes(sure.id));
+        assert.ok(!ids(strict.facts).includes(unsure.id), '置信度低于门槛的不召回');
+        assert.deepEqual((await factById(store, unsure.id))?.recalls, [], '没召回的不 touch');
+        const loose = await memory.recall('PostgreSQL', { minConfidence: 0 });
+        assert.ok(ids(loose.facts).includes(sure.id) && ids(loose.facts).includes(unsure.id), '给 0 就不筛');
+      });
+    });
+
     test('source：名字缺省 memory；collect 带出 core 和按最近一条用户消息召回的事实；什么都没有时是空', async () => {
       await withMemory(factory, {}, async (fixture) => {
         const { memory, store, sessions, now } = fixture;
@@ -3153,6 +3798,22 @@ export function describeMemoryContract(
         const named = memory.source({ name: 'memory2', query: async () => 'PostgreSQL', k: 1 });
         assert.equal(named.name, 'memory2');
         assert.ok((await named.collect({ session: 'nobody' }))?.includes(pg.text), '用给的 query 召回');
+      });
+    });
+
+    test('source：同一条事实连着带出几轮，recalls 不跟着涨；主动的 recall 照常记', async () => {
+      await withMemory(factory, {}, async (fixture) => {
+        const { memory, store, sessions } = fixture;
+        const pg = await seedFact(fixture, '主人的项目用 PostgreSQL 存数据');
+        await sessions.append('chat', [userEntry('PostgreSQL')]);
+        const source = memory.source();
+        for (let round = 0; round < 4; round += 1) {
+          assert.ok((await source.collect({ session: 'chat' }))?.includes(pg.text), `第 ${round + 1} 轮照样带出`);
+        }
+        const auto = (await factById(store, pg.id))?.recalls.length ?? 0;
+        assert.ok(auto <= 1, `来源每一轮都跑，不能每轮都记一次召回：记了 ${auto} 次`);
+        await memory.recall('PostgreSQL');
+        assert.equal((await factById(store, pg.id))?.recalls.length, auto + 1, '主动召回记一次');
       });
     });
 

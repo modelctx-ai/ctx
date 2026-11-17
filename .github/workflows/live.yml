@@ -58,6 +58,24 @@ jobs:
           CTX_LIVE_MCP_TOOL: ${{ vars.CTX_LIVE_MCP_TOOL || 'read_wiki_structure' }}
           CTX_LIVE_MCP_INPUT: ${{ vars.CTX_LIVE_MCP_INPUT || '{"repoName":"modelcontextprotocol/servers"}' }}
 
+      # 记忆的召回率、误记率：只报数，不设门槛（还没有基线）。冒烟没过也照样跑。
+      - name: Memory eval
+        if: ${{ !cancelled() }}
+        run: node live/memory-eval.ts
+        env:
+          CTX_LIVE_OPENAI_BASE_URL: ${{ vars.CTX_LIVE_OPENAI_BASE_URL }}
+          CTX_LIVE_OPENAI_MODEL: ${{ vars.CTX_LIVE_OPENAI_MODEL }}
+          CTX_LIVE_OPENAI_API_KEY: ${{ secrets.CTX_LIVE_OPENAI_API_KEY }}
+          CTX_LIVE_ANTHROPIC_API_KEY: ${{ secrets.CTX_LIVE_ANTHROPIC_API_KEY }}
+          CTX_LIVE_ANTHROPIC_MODEL: ${{ vars.CTX_LIVE_ANTHROPIC_MODEL }}
+          CTX_LIVE_ANTHROPIC_BASE_URL: ${{ vars.CTX_LIVE_ANTHROPIC_BASE_URL }}
+          CTX_LIVE_CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CTX_LIVE_CLOUDFLARE_ACCOUNT_ID }}
+          CTX_LIVE_CLOUDFLARE_API_TOKEN: ${{ secrets.CTX_LIVE_CLOUDFLARE_API_TOKEN }}
+          CTX_LIVE_CLOUDFLARE_DECISION_MODEL: ${{ vars.CTX_LIVE_CLOUDFLARE_DECISION_MODEL }}
+          CTX_LIVE_CLOUDFLARE_EXTRACTION_MODEL: ${{ vars.CTX_LIVE_CLOUDFLARE_EXTRACTION_MODEL }}
+          CTX_LIVE_TYPESAFE_API_KEY: ${{ secrets.CTX_LIVE_TYPESAFE_API_KEY }}
+          CTX_LIVE_TYPESAFE_MODEL: ${{ vars.CTX_LIVE_TYPESAFE_MODEL }}
+
       - name: Upload fixtures
         if: ${{ inputs.record }}
         uses: actions/upload-artifact@v4

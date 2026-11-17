@@ -19,6 +19,8 @@ import {
   type ExtractionAnswer,
   type ExtractionField,
   type ExtractionModel,
+  type ForgetReport,
+  type ForgetRequest,
   type JsonValue,
   type ListOptions,
   type Logger,
@@ -26,6 +28,7 @@ import {
   type MemoryFact,
   type MemoryStore,
   type ModelRef,
+  type NewMemoryFact,
   type NewNote,
   type Note,
   type Procedure,
@@ -43,6 +46,7 @@ import {
   clamp01,
   cosine,
   DAY_MS,
+  evidenceTerms,
   isoDate,
   renderEntries,
   renderEntry,
@@ -73,6 +77,19 @@ export interface MemoryRecallOptions {
   readonly budgetTokens?: number;
   /** 相似度低于它的命中不要，缺省 0.1。 */
   readonly minScore?: number;
+  /**
+   * `confidence` 低于它的事实不召回，缺省 0.5：提取模型自己都觉得多半不对的，不当成事实交给模型。
+   * 模型没报置信度时适配器填的是 0.5（`extractionFromLanguageModel`）或 `1 − pNull`（不低于 0.7），都不会被筛掉。
+   * 单次调用可以用 `RecallOptions.minConfidence` 改；给 0 就不筛。
+   */
+  readonly minConfidence?: number;
+  /** 归档的事实参与召回时相似度乘多少，缺省 0.5；被召回的那些恢复成没归档的。给 0 就不找归档的。 */
+  readonly archivedWeight?: number;
+  /**
+   * 作为来源（`source()`）自动带出的事实，离它上一次记下的召回不到这么久就不再记 `touch`，缺省一天。
+   * 来源每一轮都跑，带出谁又是按激活度排的：每次都记的话，被带出的越来越靠前。主动的 `recall`（工具或直接调）每次都记。
+   */
+  readonly spacingMs?: number;
   /** 程序要几次独立确认才带上，缺省 2。 */
   readonly confirmations?: number;
 }
@@ -82,8 +99,14 @@ export interface MemoryDecayOptions {
   readonly d?: number;
   /** 缺省 0.02（天）。 */
   readonly epsilon?: number;
-  /** 激活度低于它的 open 事实夜里归档，缺省 0.55。 */
+  /** 激活度低于它的 open 事实夜里可以归档，缺省 0.55。也是排序里 `retrievability` 的中点。 */
   readonly archiveAt?: number;
+  /**
+   * 归档前至少要错过几次机会，缺省 7：这条事实最后一次活动（生效或被召回）之后，记忆有这么多个不同的日子（UTC）
+   * 召回过别的事实，它一次都没轮上。没人用记忆的日子不算，所以新事实不会只因为头几天没碰上相关的问题就归档，
+   * 主人离开一个月回来也不会全没了。给 0 就只看激活度。
+   */
+  readonly minChances?: number;
 }
 
 export interface MemoryConsolidateOptions {
@@ -93,6 +116,20 @@ export interface MemoryConsolidateOptions {
   readonly maxPNull?: number;
   /** 一次提取最多多少估算 token 的原文，同一主题超过就分几批，缺省 6000。 */
   readonly maxTokens?: number;
+  /**
+   * 一批笔记处理失败几次进死信，缺省 3。失败是提取、判断、写入抛了错，包括模型的回答取不出 JSON（`invalid_response`）。
+   * 可以重试的错（`retryable: true`，例如超时、429、5xx）当场再试一次，还不行就留到下次，不记失败次数。
+   */
+  readonly maxAttempts?: number;
+  /**
+   * 事实要在原文里有支撑：事实的字词（中文一个字一个，去掉虚字、代词和主语）至少有这么大的比例出现在这批原文的
+   * 某一条里，或者几条合起来，缺省 0.5。有支撑的，每条笔记的证据收窄到和事实有共同字词的条目，一条都没有的笔记不当证据；
+   * 没有支撑的（模型编的、从别处推出来的），证据仍是整批，置信度降到不超过
+   * `ungroundedConfidence`，`ConsolidateReport.facts.ungrounded` 记一笔。0 是不查。
+   */
+  readonly minEvidenceOverlap?: number;
+  /** 原文里没有支撑的事实，置信度最多这么高，缺省 0.4：低于召回的缺省门槛 0.5，留着给人看，不会被召回。 */
+  readonly ungroundedConfidence?: number;
 }
 
 export interface MemoryOptions {
@@ -135,7 +172,15 @@ export interface MemoryOptions {
   /** 时钟，缺省 `Date.now`。门控的 `at`、召回的 `touch`、`consolidate` 缺省的 `now` 都用它。 */
   readonly now?: () => number;
   readonly logger?: Logger;
+  /**
+   * 笔记进了死信时调（`consolidate` 里，失败次数到了 `consolidate.maxAttempts`）：`notes` 是这次进死信的，`error` 是最后一次的错。
+   * 同时会 `logger.warn`。放回去处理用 `store.notes.retry(ids)`。
+   */
+  readonly onDeadLetter?: (notes: readonly Note[], error: unknown) => void;
 }
+
+/** 事实里指代主人的词：查证据时不算（原文里主人说的是「我」）。 */
+const SUBJECT_WORDS = ['主人', '用户', 'user', 'owner'];
 
 /** 参考实现的缺省值。 */
 export const MEMORY_DEFAULTS = {
@@ -148,10 +193,17 @@ export const MEMORY_DEFAULTS = {
   gateMaxTokens: 4000,
   k: 5,
   minScore: 0.1,
+  minConfidence: 0.5,
+  archivedWeight: 0.5,
+  spacingMs: 86_400_000, // 1 天
+  minChances: 7,
   confirmations: 2,
   escalateBelow: 0.6,
   maxPNull: 0.3,
   consolidateMaxTokens: 6000,
+  maxAttempts: 3,
+  minEvidenceOverlap: 0.5,
+  ungroundedConfidence: 0.4,
   coreBudgetTokens: 2000,
 } as const;
 
@@ -173,10 +225,15 @@ const EXTRACT_FIELDS: Readonly<Record<string, ExtractionField>> = {
   facts: {
     type: 'list',
     items: 'text',
-    instructions: '这段对话里新出现或改变了的、值得长期记住的事实。每条一句能独立成立的话，写清主语，不用代词',
+    instructions:
+      '这段对话里新出现或改变了的、值得长期记住的事实。每条一句能独立成立的话，写清主语，不用代词；' +
+      '对话里说了某一条从哪天起成立的，在那一条开头写 [YYYY-MM-DD]',
   },
-  since: { type: 'date', instructions: '这些事实从哪天起成立；对话里没说就留空' },
-  decisions: { type: 'list', items: 'text', instructions: '对话里做出的决定，每条一句能独立成立的话' },
+  decisions: {
+    type: 'list',
+    items: 'text',
+    instructions: '对话里做出的决定，每条一句能独立成立的话；说了从哪天起的，开头写 [YYYY-MM-DD]',
+  },
   lesson: { type: 'text', instructions: '从失败、纠正或成功里得到的、下次能照着做的教训；没有就留空' },
 };
 
@@ -220,6 +277,42 @@ function strings(value: JsonValue): string[] {
   if (typeof value === 'string') return value.trim() ? [value.trim()] : [];
   if (!Array.isArray(value)) return [];
   return value.filter((item): item is string => typeof item === 'string' && item.trim() !== '').map((s) => s.trim());
+}
+
+/** 一条提取出的事实开头的 `[YYYY-MM-DD]`：从哪天起成立。没写或日期不对时只返回文字。 */
+function datedText(raw: string): { text: string; since?: number } {
+  const match = /^\[(\d{4}-\d{2}-\d{2})\]\s*/u.exec(raw);
+  if (!match) return { text: raw };
+  const since = Date.parse(match[1]!);
+  const text = raw.slice(match[0].length).trim();
+  return Number.isFinite(since) && text ? { text, since } : { text: text || raw };
+}
+
+/** 53 位的字符串哈希（cyrb53），十六进制。幂等键用，不是密码学哈希。 */
+function hash(text: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, '0');
+}
+
+/** 事实的幂等键：来源区间加归一化的文字。同一批笔记再处理一次（另一个进程、上次半途失败）写出的是同一个键。 */
+function factKey(refs: readonly SourceRef[], text: string): string {
+  return `m1:${hash(refs.map(refText).toSorted().join(',') + '\n' + normalized(text))}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isRetryable(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { retryable?: unknown }).retryable === true;
 }
 
 function choiceOf(answer: DecisionAnswer | undefined): { choice: string; confidence: number } | undefined {
@@ -299,7 +392,9 @@ function renderRecalled(core: string | undefined, recalled: Recalled, evidence: 
 
 interface MutableReport {
   notes: number;
-  facts: { added: number; merged: number; superseded: number; archived: number };
+  failed: number;
+  dead: number;
+  facts: { added: number; merged: number; superseded: number; archived: number; ungrounded: number };
   procedures: { added: number; confirmed: number };
   escalated: number;
   core: boolean;
@@ -308,11 +403,49 @@ interface MutableReport {
 interface RecallInternal extends RecallOptions {
   /** 只要 `validFrom` 不早于它的事实（工具的 `since_days`）。 */
   readonly since?: number;
+  /** 来源自动带出的召回：`touch` 按 `spacingMs` 限频。 */
+  readonly auto?: boolean;
+}
+
+function dayOf(ms: number): number {
+  return Math.floor(ms / DAY_MS);
+}
+
+/** 这些事实被召回过的日子（UTC 的日序号），升序、去重。 */
+function recallDays(facts: readonly MemoryFact[]): number[] {
+  const days = new Set<number>();
+  for (const fact of facts) for (const at of fact.recalls) days.add(dayOf(at));
+  return [...days].toSorted((a, b) => a - b);
+}
+
+/** 事实最后一次活动的时刻：`validFrom` 和各次召回里最晚的。晚于 `now` 的按离 `now` 多远折回过去，和 `activation` 一样。 */
+function lastActivity(fact: Pick<MemoryFact, 'validFrom' | 'recalls'>, now: number): number {
+  let last = -Infinity;
+  for (const at of [fact.validFrom, ...fact.recalls]) last = Math.max(last, at > now ? 2 * now - at : at);
+  return last;
+}
+
+/** 错过的机会：`days`（升序）里晚于事实最后一次活动那天、又不晚于今天的有几个。 */
+function missedChances(fact: Pick<MemoryFact, 'validFrom' | 'recalls'>, days: readonly number[], now: number): number {
+  const from = dayOf(lastActivity(fact, now));
+  const to = dayOf(now);
+  // 二分找第一个大于 `bound` 的位置。
+  const after = (bound: number): number => {
+    let low = 0;
+    let high = days.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (days[middle]! > bound) high = middle;
+      else low = middle + 1;
+    }
+    return low;
+  };
+  return Math.max(0, after(to) - after(from));
 }
 
 /**
- * 记忆的参考实现：五个操作，按 [记忆](../../docs/memory.md) 的设计。只读会话日志；`gate` 只写笔记，`recall` 只 `touch`，
- * 只有 `consolidate` 改写事实、程序和 `core`。它本身是一个执行环境，报一个 `recall` 工具。
+ * 记忆的参考实现：五个操作，按 [记忆](../../docs/memory.md) 的设计。只读会话日志；`gate` 只写笔记，`recall` 只 `touch`
+ * 和恢复被召回的归档事实，只有 `consolidate` 改写事实、程序和 `core`。它本身是一个执行环境，报一个 `recall` 工具。
  */
 export function createMemory(options: MemoryOptions): Memory {
   const { sessions } = options;
@@ -334,8 +467,16 @@ export function createMemory(options: MemoryOptions): Memory {
     epsilon: options.decay?.epsilon ?? ACTIVATION_DEFAULTS.epsilon,
   };
   const archiveAt = options.decay?.archiveAt ?? ACTIVATION_DEFAULTS.archiveAt;
+  const minChances = options.decay?.minChances ?? MEMORY_DEFAULTS.minChances;
+  const archivedWeight = clamp01(recallOptions.archivedWeight ?? MEMORY_DEFAULTS.archivedWeight);
+  const spacingMs = recallOptions.spacingMs ?? MEMORY_DEFAULTS.spacingMs;
   const escalateBelow = options.consolidate?.escalateBelow ?? MEMORY_DEFAULTS.escalateBelow;
+  const maxAttempts = Math.max(1, countOf(options.consolidate?.maxAttempts, MEMORY_DEFAULTS.maxAttempts));
   const maxPNull = options.consolidate?.maxPNull ?? MEMORY_DEFAULTS.maxPNull;
+  const minEvidenceOverlap = clamp01(options.consolidate?.minEvidenceOverlap ?? MEMORY_DEFAULTS.minEvidenceOverlap);
+  const ungroundedConfidence = clamp01(
+    options.consolidate?.ungroundedConfidence ?? MEMORY_DEFAULTS.ungroundedConfidence,
+  );
   const coreBudget = options.core?.budgetTokens ?? MEMORY_DEFAULTS.coreBudgetTokens;
   const minScore = recallOptions.minScore ?? MEMORY_DEFAULTS.minScore;
   const minConfirmations = recallOptions.confirmations ?? MEMORY_DEFAULTS.confirmations;
@@ -344,12 +485,11 @@ export function createMemory(options: MemoryOptions): Memory {
 
   // 启发式门控的「重复」：这个进程里最近 7 天门控过的段落。不持久，重启后从空开始。
   const recent: { at: number; text: string }[] = [];
-  const decision =
-    options.decision ??
-    createHeuristicDecisionModel({
-      known: async (text) => (await store.facts.search({ text, k: 10 })).map((hit) => hit.fact.text),
-      recent: () => recent.map((item) => item.text),
-    });
+  const heuristic = createHeuristicDecisionModel({
+    known: async (text) => (await store.facts.search({ text, k: 10 })).map((hit) => hit.fact.text),
+    recent: () => recent.map((item) => item.text),
+  });
+  const decision = options.decision ?? heuristic;
 
   const vectors = new Map<string, Promise<readonly number[]>>();
   let warnedNoExtraction = false;
@@ -392,8 +532,7 @@ export function createMemory(options: MemoryOptions): Memory {
   async function threshold(now: number): Promise<number> {
     const base = gateOptions.theta ?? MEMORY_DEFAULTS.theta;
     if (gateOptions.auto === false) return base;
-    const scores = (await store.notes.list())
-      .filter((note) => note.at >= now - MEMORY_DEFAULTS.autoWindowMs)
+    const scores = (await store.notes.list({ since: now - MEMORY_DEFAULTS.autoWindowMs }))
       .map((note) => note.salience)
       .toSorted((a, b) => a - b);
     if (scores.length < MEMORY_DEFAULTS.autoSamples) return base;
@@ -427,7 +566,22 @@ export function createMemory(options: MemoryOptions): Memory {
     const state = renderEntries(entries);
     // 只有工具输出之类没有可判断的文字：记一条 0 分的已处理笔记，head 照样前进。
     if (!state) return { ...range, at, salience: 0, settledAt: at };
-    const answers = await decision.decide({ state, questions: gateQuestions(), ...(signal ? { signal } : {}) });
+    const request = { state, questions: gateQuestions(), ...(signal ? { signal } : {}) };
+    let answers: Record<string, DecisionAnswer>;
+    try {
+      answers = await decision.decide(request);
+    } catch (error) {
+      // 决策模型失败（服务不可用、回答取不出来）时这一段用启发式打分：不给一个假的 0.5 分让它悄悄过不了阈值，
+      // 也不让一段日志一直卡住整个会话的门控。
+      if (signal?.aborted || decision === heuristic) throw error;
+      logger.warn('memory: decision model failed while gating; scoring this segment with the heuristic.', {
+        session,
+        from: range.from,
+        upTo: range.upTo,
+        error: errorMessage(error),
+      });
+      answers = await heuristic.decide(request);
+    }
     const keep = answers['keep']?.type === 'noul' ? clamp01(answers['keep'].noul) : 0;
     const score = answers['salience']?.type === 'score' ? clamp01(answers['salience'].score) : 0;
     const kind = choiceOf(answers['kind'])?.choice;
@@ -458,11 +612,21 @@ export function createMemory(options: MemoryOptions): Memory {
     return vector;
   }
 
-  /** 事实 id → { 事实, 相似度 }：存储的 `search`，给了 `embed` 再和余弦取大的。只看 open 的。 */
+  /**
+   * 事实 id → { 事实, 相似度 }：存储的 `search`，给了 `embed` 再和余弦取大的。open 的和归档的各搜一次：
+   * 归档的分数乘 `archivedWeight`，而且占不了 open 的名额。关闭的不要。余弦那一路只看 open 的。
+   */
   async function similar(query: string, topic: string | undefined, k: number): Promise<Map<string, FactScore>> {
     const out = new Map<string, FactScore>();
-    const hits = await store.facts.search({ text: query, k, ...(topic !== undefined ? { topic } : {}) });
-    for (const hit of hits) if (isOpenFact(hit.fact)) out.set(hit.fact.id, { fact: hit.fact, score: hit.score });
+    const base = { text: query, k, ...(topic !== undefined ? { topic } : {}) };
+    for (const hit of await store.facts.search(base))
+      if (isOpenFact(hit.fact)) out.set(hit.fact.id, { fact: hit.fact, score: hit.score });
+    if (archivedWeight > 0) {
+      for (const hit of await store.facts.search({ ...base, archived: true })) {
+        if (hit.fact.validTo !== undefined || hit.fact.archivedAt === undefined) continue;
+        out.set(hit.fact.id, { fact: hit.fact, score: hit.score * archivedWeight });
+      }
+    }
     const { embed } = options;
     if (!embed) return out;
     const target = await embed(query);
@@ -504,16 +668,19 @@ export function createMemory(options: MemoryOptions): Memory {
     const now = clock();
     const k = countOf(recallOpts.k ?? recallOptions.k, MEMORY_DEFAULTS.k);
     const budget = recallOpts.budgetTokens ?? recallOptions.budgetTokens ?? Infinity;
+    const minConfidence = recallOpts.minConfidence ?? recallOptions.minConfidence ?? MEMORY_DEFAULTS.minConfidence;
     let facts: MemoryFact[] = [];
     if (query.trim() !== '' && k > 0) {
       const scored = [...(await similar(query, recallOpts.topic, Math.max(4 * k, 20))).values()].filter(
         ({ fact, score }) =>
-          score >= minScore && (recallOpts.since === undefined || fact.validFrom >= recallOpts.since),
+          score >= minScore &&
+          fact.confidence >= minConfidence &&
+          (recallOpts.since === undefined || fact.validFrom >= recallOpts.since),
       );
       const ranked = rankFacts(
         scored.map((item) => item.fact),
         Object.fromEntries(scored.map((item) => [item.fact.id, item.score])),
-        { now, ...decay },
+        { now, ...decay, archiveAt },
       );
       let used = 0;
       for (const fact of ranked) {
@@ -524,13 +691,20 @@ export function createMemory(options: MemoryOptions): Memory {
         used += cost;
       }
       recallOpts.signal?.throwIfAborted();
-      if (facts.length > 0)
+      // 被召回的归档事实恢复：相关的问题终于来了。
+      const archived = facts.filter((fact) => fact.archivedAt !== undefined).map((fact) => fact.id);
+      if (archived.length > 0) await store.facts.restore(archived);
+      // 主动的召回每次都记；来源自动带出的，离上一次记下的召回不到 `spacingMs` 就不再记。
+      const touched = recallOpts.auto
+        ? facts.filter((fact) => fact.recalls.every((at) => Math.abs(now - at) >= spacingMs))
+        : facts;
+      if (touched.length > 0)
         await store.facts.touch(
-          facts.map((fact) => fact.id),
+          touched.map((fact) => fact.id),
           now,
         );
     }
-    facts = facts.map((fact) => ({ ...fact }));
+    facts = facts.map(({ archivedAt: _restored, ...fact }) => fact);
     const procedures = await matchingProcedures(query, recallOpts.topic, facts);
     if (!recallOpts.evidence) return { facts, procedures };
     const evidence = await readRefs([
@@ -588,20 +762,63 @@ export function createMemory(options: MemoryOptions): Memory {
     readonly topic: string | undefined;
     readonly notes: readonly Note[];
     readonly refs: readonly SourceRef[];
+    /** 每条笔记读到的原文，查事实在哪几条里有支撑。 */
+    readonly groups: readonly { readonly note: Note; readonly entries: readonly Entry[] }[];
     readonly state: string;
     readonly firstAt: number;
     readonly salience: number;
   }
 
+  /**
+   * 事实在这批原文里的支撑：单条覆盖了事实的词的 `minEvidenceOverlap` 以上的条目；没有这样的一条时，几条合起来
+   * 够也算（事实是从几句话里归纳的）。返回按会话收窄的证据，找不到支撑是 `undefined`。
+   */
+  function evidenceFor(text: string, batch: Batch): SourceRef[] | undefined {
+    if (minEvidenceOverlap === 0) return [...batch.refs];
+    const terms = new Set(evidenceTerms(text, [subject, ...SUBJECT_WORDS]));
+    // 全是虚字、主语的事实没有可查的：照整批记。
+    if (terms.size === 0) return [...batch.refs];
+    const groups = batch.groups.map(({ note, entries }) => ({
+      note,
+      hits: entries.flatMap((entry) => {
+        const shared = new Set(evidenceTerms(renderEntry(entry)).filter((term) => terms.has(term)));
+        return shared.size > 0 ? [{ entry, shared }] : [];
+      }),
+    }));
+    const hits = groups.flatMap((group) => group.hits);
+    const best = Math.max(0, ...hits.map((hit) => hit.shared.size));
+    const covered = new Set(hits.flatMap((hit) => [...hit.shared]));
+    if (best / terms.size < minEvidenceOverlap && covered.size / terms.size < minEvidenceOverlap) return undefined;
+    return groups.flatMap(({ note, hits: found }) =>
+      found.length > 0
+        ? [
+            sourceRef(
+              note.session,
+              found.map((hit) => hit.entry),
+            ),
+          ]
+        : [],
+    );
+  }
+
   async function integrate(
     text: string,
     batch: Batch,
-    found: { readonly validFrom: number; readonly confidence: number },
+    proposed: { readonly validFrom: number; readonly confidence: number; readonly dated: boolean },
     report: MutableReport,
     written: Set<string>,
     now: number,
     signal: AbortSignal | undefined,
   ): Promise<void> {
+    const evidence = evidenceFor(text, batch);
+    if (!evidence) {
+      report.facts.ungrounded += 1;
+      logger.debug?.('memory: a fact has no support in its notes; lowering its confidence.', { text });
+    }
+    const sources = evidence ?? batch.refs;
+    const found = evidence
+      ? proposed
+      : { ...proposed, confidence: Math.min(proposed.confidence, ungroundedConfidence) };
     const candidates = await candidatesFor(text, batch.topic);
     let relation: Relation = 'new';
     let target: MemoryFact | undefined = candidates.find((fact) => normalized(fact.text) === normalized(text));
@@ -640,27 +857,41 @@ export function createMemory(options: MemoryOptions): Memory {
     }
 
     if (relation === 'merge' && target) {
-      await store.facts.cite(target.id, batch.refs);
+      await store.facts.cite(target.id, sources);
       await store.facts.touch([target.id], now);
       written.add(target.id);
       report.facts.merged += 1;
       return;
     }
-    const added = await store.facts.add({
+    const draft: NewMemoryFact = {
+      key: factKey(batch.refs, text),
       subject,
       text,
       ...(batch.topic !== undefined ? { topic: batch.topic } : {}),
       validFrom: found.validFrom,
       confidence: clamp01(found.confidence),
       salience: batch.salience,
-      sources: batch.refs,
-    });
-    written.add(added.id);
+      sources,
+    };
+    // 将来才成立的变化不关掉现在成立的那条：两条都留着，各带各的起始日期。
+    if (relation === 'supersede' && target && found.validFrom > now) {
+      logger.debug?.('memory: a superseding fact starts in the future; keeping the current one open.', {
+        text,
+        target: target.id,
+      });
+      relation = 'new';
+    }
     if (relation === 'supersede' && target) {
-      const closeAt = found.validFrom >= target.validFrom ? found.validFrom : now;
-      await store.facts.close(target.id, closeAt, { supersededBy: added.id });
+      // 只有这一条自己写了日期才按它关旧的；不然就是今天。早于旧事实生效的日期也按今天。
+      const closeAt = found.dated && found.validFrom >= target.validFrom ? found.validFrom : now;
+      const added = await store.facts.supersede(target.id, draft, closeAt);
+      written.add(added.id);
       report.facts.superseded += 1;
-    } else report.facts.added += 1;
+      return;
+    }
+    const added = await store.facts.add(draft);
+    written.add(added.id);
+    report.facts.added += 1;
   }
 
   /** 教训反思成 when / do：和同主题已有的程序是一回事就 `confirm`，否则 `add`。 */
@@ -731,6 +962,7 @@ export function createMemory(options: MemoryOptions): Memory {
         topic,
         notes: readable.map((item) => item.note),
         refs: readable.map(({ note }) => ({ session: note.session, from: note.from, upTo: note.upTo })),
+        groups: readable.map(({ note, entries }) => ({ note, entries })),
         state: readable.map((item) => renderEntries(item.entries)).join('\n'),
         firstAt: Math.min(...readable.flatMap((item) => item.entries.map((entry) => entry.at))),
         salience: Math.max(...readable.map((item) => item.note.salience)),
@@ -740,20 +972,25 @@ export function createMemory(options: MemoryOptions): Memory {
         fields: EXTRACT_FIELDS,
         ...(signal ? { signal } : {}),
       });
-      const since = said(answers['since'], maxPNull);
-      const sinceMs = typeof since === 'string' ? Date.parse(since) : Number.NaN;
-      const validFrom = Number.isFinite(sinceMs) ? sinceMs : batch.firstAt;
-      // 事实和决定都当事实写；同一句只写一次，置信度取说出它的那个字段的。
-      const proposals = new Map<string, { text: string; confidence: number }>();
+      // 事实和决定都当事实写；同一句只写一次，置信度取说出它的那个字段的。起始日期按条给（开头的 [YYYY-MM-DD]），
+      // 没写的从这批原文最早的条目算。
+      const proposals = new Map<string, { text: string; confidence: number; since?: number }>();
       for (const key of ['facts', 'decisions']) {
         const answer = answers[key];
-        for (const text of strings(said(answer, maxPNull))) {
+        for (const raw of strings(said(answer, maxPNull))) {
+          const { text, since } = datedText(raw);
           if (!proposals.has(normalized(text)))
-            proposals.set(normalized(text), { text, confidence: answer!.confidence });
+            proposals.set(normalized(text), {
+              text,
+              confidence: answer!.confidence,
+              ...(since !== undefined ? { since } : {}),
+            });
         }
       }
-      for (const { text, confidence } of proposals.values())
-        await integrate(text, batch, { validFrom, confidence }, report, written, now, signal);
+      for (const { text, confidence, since } of proposals.values()) {
+        const found = { validFrom: since ?? batch.firstAt, confidence, dated: since !== undefined };
+        await integrate(text, batch, found, report, written, now, signal);
+      }
       const lesson = strings(said(answers['lesson'], maxPNull))[0];
       if (lesson && lm) await reflect(lesson, batch, report, now, signal);
     }
@@ -795,13 +1032,65 @@ export function createMemory(options: MemoryOptions): Memory {
     return store.facts.list({ open: true });
   }
 
+  /**
+   * 一批失败了：可以重试的当场再试一次（`retry`），还不行就留着下次、不记次数；别的记一次失败（`notes.fail`），
+   * 到了上限进死信，告警并调 `onDeadLetter`。
+   */
+  async function processSafely(
+    notes: readonly Note[],
+    work: () => Promise<void>,
+    report: MutableReport,
+    now: number,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    let error: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await work();
+        return;
+      } catch (caught) {
+        if (signal?.aborted) throw caught;
+        error = caught;
+        if (!isRetryable(caught)) break;
+      }
+    }
+    const ids = notes.map((note) => note.id);
+    const message = errorMessage(error);
+    if (isRetryable(error)) {
+      logger.warn('memory: a batch of notes failed with a retryable error; leaving it for next time.', {
+        notes: ids,
+        error: message,
+      });
+      report.failed += notes.length;
+      return;
+    }
+    const failed = await store.notes.fail(ids, now, { error: message, maxAttempts });
+    const dead = failed.filter((note) => note.failedAt !== undefined);
+    report.failed += failed.length - dead.length;
+    report.dead += dead.length;
+    logger.warn('memory: a batch of notes failed.', { notes: ids, error: message, dead: dead.map((note) => note.id) });
+    if (dead.length > 0) {
+      logger.warn('memory: notes moved to the dead letter state; fix the cause and call store.notes.retry(ids).', {
+        notes: dead.map((note) => note.id),
+        error: message,
+      });
+      try {
+        options.onDeadLetter?.(dead, error);
+      } catch (hookError) {
+        logger.warn('memory: onDeadLetter threw.', { error: errorMessage(hookError) });
+      }
+    }
+  }
+
   async function consolidate(consolidateOpts: { now?: number; signal?: AbortSignal } = {}): Promise<ConsolidateReport> {
     const { signal } = consolidateOpts;
     signal?.throwIfAborted();
     const now = consolidateOpts.now ?? clock();
     const report: MutableReport = {
       notes: 0,
-      facts: { added: 0, merged: 0, superseded: 0, archived: 0 },
+      failed: 0,
+      dead: 0,
+      facts: { added: 0, merged: 0, superseded: 0, archived: 0, ungrounded: 0 },
       procedures: { added: 0, confirmed: 0 },
       escalated: 0,
       core: false,
@@ -825,19 +1114,41 @@ export function createMemory(options: MemoryOptions): Memory {
       const maxTokens = options.consolidate?.maxTokens ?? MEMORY_DEFAULTS.consolidateMaxTokens;
       for (const [key, notes] of groups) {
         signal?.throwIfAborted();
-        // 一个会话只读一次，再按每条笔记的区间分开。
-        const entries = await readRefs(notes);
-        const read = notes.map((note) => ({ note, entries: entries.filter((entry) => inSourceRef(entry, note)) }));
-        const parts = batches(read, (item) => estimateTextTokens(renderEntries(item.entries)), maxTokens);
+        const topic = key === '' ? undefined : key;
+        // 一个会话只读一次，再按每条笔记的区间分开。读原文失败算这一组全部失败，不挡别的组。
+        let parts: { note: Note; entries: Entry[] }[][] = [];
+        await processSafely(
+          notes,
+          async () => {
+            const entries = await readRefs(notes);
+            const read = notes.map((note) => ({ note, entries: entries.filter((entry) => inSourceRef(entry, note)) }));
+            parts = batches(read, (item) => estimateTextTokens(renderEntries(item.entries)), maxTokens);
+          },
+          report,
+          now,
+          signal,
+        );
+        // 按批隔离：一批失败（模型的回答坏了、服务出错）只记那一批的笔记，后面的照常处理。
         for (const part of parts)
-          await processBatch(extraction, key === '' ? undefined : key, part, report, written, now, signal);
+          await processSafely(
+            part.map((item) => item.note),
+            () => processBatch(extraction, topic, part, report, written, now, signal),
+            report,
+            now,
+            signal,
+          );
       }
     }
 
-    // 衰减：这一夜刚写、刚并入的不归档（提取出的 validFrom 可能早于今天）。
+    // 衰减：激活度低于阈值、又错过了足够多次机会的归档。这一夜刚写、刚并入的不归档（提取出的 validFrom 可能早于今天）。
     signal?.throwIfAborted();
-    const stale = (await openFacts()).filter(
-      (fact) => !written.has(fact.id) && activation(fact, now, decay) < archiveAt,
+    const candidates = await openFacts();
+    const days = recallDays(candidates);
+    const stale = candidates.filter(
+      (fact) =>
+        !written.has(fact.id) &&
+        activation(fact, now, decay) < archiveAt &&
+        missedChances(fact, days, now) >= minChances,
     );
     report.facts.archived = await store.facts.archive(
       stale.map((fact) => fact.id),
@@ -868,6 +1179,46 @@ export function createMemory(options: MemoryOptions): Memory {
       report.core = true;
     }
     return report;
+  }
+
+  // ---- 删除 ----
+
+  async function forget(request: ForgetRequest): Promise<ForgetReport> {
+    const { signal } = request;
+    signal?.throwIfAborted();
+    const all = request.all === true;
+    const { session } = request;
+    const factIds = new Set(request.facts ?? []);
+    const procedureIds = new Set(request.procedures ?? []);
+    if (all || session !== undefined) {
+      const fromHere = (refs: readonly SourceRef[]): boolean => all || refs.some((ref) => ref.session === session);
+      for (let after: string | undefined; ;) {
+        const page = await store.facts.list({ limit: 500, ...(after !== undefined ? { after } : {}) });
+        if (page.length === 0) break;
+        for (const fact of page) if (fromHere(fact.sources)) factIds.add(fact.id);
+        after = page.at(-1)!.id;
+      }
+      for (const procedure of await store.procedures.list())
+        if (fromHere(procedure.evidence)) procedureIds.add(procedure.id);
+    }
+    signal?.throwIfAborted();
+    const notes = all ? await store.notes.forget() : session !== undefined ? await store.notes.forget(session) : 0;
+    const facts = await store.facts.forget([...factIds]);
+    for (const id of factIds) vectors.delete(id);
+    const procedures = await store.procedures.forget([...procedureIds]);
+    // 进程里门控过的原文也清掉：启发式判断「重复」时会拿它比。
+    if (notes > 0 || all) recent.length = 0;
+    let core = 0;
+    if (facts > 0 || all) {
+      // 画像是事实压出来的，删掉的内容可能还在里面，历史版本里也有：全部清掉，从剩下的事实按缺省写法重新渲染。
+      // 不经模型重写：那样要把「上一版画像」喂回去，删掉的东西又回来了。下一次 consolidate 再照常重写。
+      core = await store.core.clear();
+      const now = clock();
+      const text = renderCore(await openFacts(), coreBudget, { now, ...decay });
+      if (text) await store.core.set(text, now);
+      coreBasis = undefined;
+    }
+    return { notes, facts, procedures, core };
   }
 
   // ---- 来源和工具 ----
@@ -936,6 +1287,8 @@ export function createMemory(options: MemoryOptions): Memory {
 
     consolidate: (consolidateOpts) => queue('consolidate', () => consolidate(consolidateOpts)),
 
+    forget: (request) => queue('consolidate', () => forget(request)),
+
     source(sourceOpts) {
       return {
         name: sourceOpts?.name ?? 'memory',
@@ -948,6 +1301,7 @@ export function createMemory(options: MemoryOptions): Memory {
           const core = (await store.core.get())?.text;
           const recalled: Recalled = query.trim()
             ? await recall(query, {
+                auto: true,
                 ...(sourceOpts?.k !== undefined ? { k: sourceOpts.k } : {}),
                 ...(recallOptions.budgetTokens !== undefined ? { budgetTokens: recallOptions.budgetTokens } : {}),
                 ...(signal ? { signal } : {}),

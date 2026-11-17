@@ -321,7 +321,24 @@ describe('System One 决策模型', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     controller.abort();
     await assert.rejects(pending, { name: 'AbortError' });
-    assert.equal(hanging.seen[0]?.signal, controller.signal);
+    assert.equal(hanging.seen[0]?.signal?.aborted, true, '传给 fetch 的 signal 跟着中止');
+  });
+
+  test('timeoutMs：服务一直不回，超时抛 timeout，可以重试；不是正数报错', async () => {
+    const hanging = fakeFetch(
+      (_body) =>
+        new Promise<Response>((_, reject) => {
+          const signal = hanging.seen.at(-1)?.signal;
+          signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+        }),
+    );
+    const model = createDecisionModel({ ...TYPESAFE, timeoutMs: 20 }, { fetch: hanging.fetch });
+    await assert.rejects(
+      model.decide({ state: 's', questions: ASK }),
+      (error: unknown) =>
+        error instanceof CtxError && error.type === 'timeout' && error.retryable === true && /20ms/.test(error.message),
+    );
+    assert.throws(() => createDecisionModel({ ...TYPESAFE, timeoutMs: 0 }), /timeoutMs/);
   });
 });
 

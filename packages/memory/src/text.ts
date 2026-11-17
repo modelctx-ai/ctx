@@ -1,38 +1,8 @@
-import { textOf, type Entry } from '@modelctx-ai/ctx-protocol';
+import { searchTerms, textOf, type Entry } from '@modelctx-ai/ctx-protocol';
 
-// 汉字、假名、谚文按两字一组切，其余按字母数字连成的词切。够全文检索和启发式用，不是分词器。
-const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
-const WORD = /[\p{L}\p{N}]/u;
-
-/** 文字切成小写的词：拉丁字母和数字按连续的一串，汉字按相邻两字（单个汉字自成一个）。去重。 */
+/** 文字切成小写的词（协议包的 `searchTerms`：字母数字连成的一串、中日韩文字相邻两字），去重。 */
 export function tokens(text: string): Set<string> {
-  const out = new Set<string>();
-  let word = '';
-  let han = '';
-  const flushWord = (): void => {
-    if (word) out.add(word);
-    word = '';
-  };
-  const flushHan = (): void => {
-    if (han.length === 1) out.add(han);
-    else for (let i = 0; i + 1 < han.length; i += 1) out.add(han.slice(i, i + 2));
-    han = '';
-  };
-  for (const char of text.toLowerCase()) {
-    if (CJK.test(char)) {
-      flushWord();
-      han += char;
-    } else if (WORD.test(char)) {
-      flushHan();
-      word += char;
-    } else {
-      flushWord();
-      flushHan();
-    }
-  }
-  flushWord();
-  flushHan();
-  return out;
+  return new Set(searchTerms(text));
 }
 
 /**
@@ -113,6 +83,40 @@ export function stripTags(text: string, tag: string): string {
 /** 去掉 `<memory>` 包裹用的标签。 */
 export function stripMemoryTags(text: string): string {
   return stripTags(text, 'memory');
+}
+
+const CJK_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+const WORD_CHAR = /[\p{L}\p{N}]/u;
+/** 查证据时不算的字词：虚字、代词，换个说法就会变的那些。 */
+const EVIDENCE_STOP = new Set([
+  ...'的了是在和与及就也都还又很太我你他她它们这那个一有不没被把给对着过吗呢吧啊呀要会能想说'.split(''),
+  ...'a an the is are was were be been am to of in on at for and or but with that this it its i me my mine you your he she they we our their his her as by from not no do does did have has had will would can could should just so'.split(
+    ' ',
+  ),
+]);
+
+/**
+ * 查「事实在原文里有没有支撑」用的词：中日韩文字一个字一个词（转述常换掉相邻的字，按两个字切太严），字母数字连成的一串
+ * 是一个词；去掉虚字、代词和 `ignore` 里的词（事实的主语，例如「主人」：原文里是「我」）。去重。
+ */
+export function evidenceTerms(text: string, ignore: readonly string[] = []): string[] {
+  const skip = new Set(EVIDENCE_STOP);
+  for (const word of ignore) for (const term of evidenceTerms(word)) skip.add(term);
+  const out = new Set<string>();
+  let word = '';
+  const flush = (): void => {
+    if (word && !skip.has(word)) out.add(word);
+    word = '';
+  };
+  for (const char of text.normalize('NFKC').toLowerCase()) {
+    if (CJK_CHAR.test(char)) {
+      flush();
+      if (!skip.has(char)) out.add(char);
+    } else if (WORD_CHAR.test(char)) word += char;
+    else flush();
+  }
+  flush();
+  return [...out];
 }
 
 export const DAY_MS = 86_400_000;

@@ -1,5 +1,6 @@
 import {
   checkJsonSchema,
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   errorOutput,
   isValidToolName,
   limitToolOutput,
@@ -55,13 +56,15 @@ export interface ToolSetOptions {
   readonly validateInput?: boolean | ((definition: ToolDefinition) => boolean);
   /** 结果超过这么多字符时截断并注明（`limitToolOutput`），缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`；0 或 Infinity 不限。 */
   readonly maxOutputChars?: number;
+  /**
+   * 不在这里执行的工具：交给模型的定义照旧，但不带 `execute`，模型调用它时 AI SDK 停下这一轮，调用留给别处执行
+   * （harness 以 `requires_action` 结束）。
+   */
+  readonly external?: (definition: ToolDefinition) => boolean;
 }
 
-/**
- * 工具结果长度的兜底，20 万字符（大约 5 万到 20 万 token）。该截断、分页的是执行环境，它知道怎么截才有用；
- * 这一层只保证哪个执行环境忘了也不会把一次结果原样塞满上下文。
- */
-export const DEFAULT_MAX_TOOL_OUTPUT_CHARS = 200_000;
+/** 不在这里执行的工具的输出结构：别处执行，结果经日志回来，这里不校验。 */
+const EXTERNAL_OUTPUT = jsonSchema({});
 
 /** 缺省的分发：找到绑定的执行环境执行。找不到、或执行环境本身抛错，都变成给模型看的错误。 */
 export function dispatchTo(executors: Executors | undefined): ToolDispatch {
@@ -97,6 +100,15 @@ export function toToolSet(
   const maxOutputChars = options.maxOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
   const out: ToolSet = {};
   for (const definition of definitions) {
+    if (options.external?.(definition)) {
+      out[definition.name] = dynamicTool({
+        ...(definition.description !== undefined ? { description: definition.description } : {}),
+        inputSchema: jsonSchema(definition.inputSchema as Parameters<typeof jsonSchema>[0]),
+        outputSchema: EXTERNAL_OUTPUT,
+        toModelOutput: ({ output }) => toolOutputToAiSdk(output as ToolOutput) as ToolResultPart['output'],
+      });
+      continue;
+    }
     out[definition.name] = dynamicTool({
       ...(definition.description !== undefined ? { description: definition.description } : {}),
       inputSchema: jsonSchema(definition.inputSchema as Parameters<typeof jsonSchema>[0]),
@@ -282,4 +294,24 @@ export function createToolRegistry(options: ToolRegistryOptions = {}): LocalTool
     },
   };
   return registry;
+}
+
+/**
+ * 会话结束了：让每个执行环境释放这个会话（`close`，没有就跳过）。一个失败不挡别的，失败的列在 `failed` 里。
+ * 什么时候算会话结束由应用决定（ADR 0009）。
+ */
+export async function closeExecutorSessions(
+  executors: Executors,
+  session: string,
+): Promise<{ readonly closed: string[]; readonly failed: { readonly executor: string; readonly error: unknown }[] }> {
+  const entries = [...executorMap(executors)].filter(([, executor]) => typeof executor.close === 'function');
+  const settled = await Promise.allSettled(entries.map(([, executor]) => executor.close!(session)));
+  const closed: string[] = [];
+  const failed: { executor: string; error: unknown }[] = [];
+  settled.forEach((result, index) => {
+    const name = entries[index]![0];
+    if (result.status === 'fulfilled') closed.push(name);
+    else failed.push({ executor: name, error: result.reason });
+  });
+  return { closed, failed };
 }

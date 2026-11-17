@@ -7,6 +7,7 @@
     "@modelctx-ai/ctx": "workspace:^",
     "@modelctx-ai/ctx-gateway": "workspace:^",
     "@modelctx-ai/ctx-mcp": "workspace:^",
+    "@modelctx-ai/ctx-memory": "workspace:^",
     "@modelctx-ai/ctx-models": "workspace:^",
     "@modelctx-ai/ctx-protocol": "workspace:^",
     "ai": "^7.0.150",

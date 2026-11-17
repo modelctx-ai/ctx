@@ -1,5 +1,5 @@
 import type { Message, MessageContent } from './message.ts';
-import type { StopReason, Usage } from './harness.ts';
+import type { RunParent, StopReason, Usage } from './harness.ts';
 import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 
 interface EntryBase {
@@ -79,6 +79,11 @@ export interface ListOptions {
    * 空列表什么都不匹配。`last` 在过滤之后取。
    */
   readonly kinds?: readonly string[];
+  /**
+   * 只要 `at` 大于它的条目（不含）。和别的条件取交集，`last`、`limit` 在过滤之后取；`NaN` 不过滤。
+   * 投影按 `at` 排：只读尾部的一方用它找写得早、`at` 却排在尾部之后的条目（把到期时间当 `at` 的提醒）。
+   */
+  readonly atAfter?: number;
 }
 
 /** `append` 的写入前提。 */
@@ -219,6 +224,7 @@ export function compareEntries(a: Pick<Entry, 'at' | 'seq'>, b: Pick<Entry, 'at'
 export function filterEntries(entries: readonly Entry[], options: ListOptions | undefined): Entry[] {
   let out = entries.filter((entry) => {
     if (options?.after !== undefined && entry.seq <= options.after) return false;
+    if (options?.atAfter !== undefined && entry.at <= options.atAfter) return false;
     if (options?.types && !options.types.includes(entry.type)) return false;
     if (options?.kinds && (entry.type !== 'event' || !options.kinds.includes(entry.kind))) return false;
     return true;
@@ -323,6 +329,8 @@ export interface RunStartedData {
   readonly agent: JsonObject;
   /** 这一轮属于哪个编排器实例（`createOrchestrator({ owner })`）；`recover` 只收同一个 `owner` 的运行。 */
   readonly owner?: string;
+  /** 这一轮是别的 agent 派来的（`RunRequest.parent`）。 */
+  readonly parent?: RunParent;
 }
 
 /** `ctx.run.ended` 的 `data`。崩溃恢复靠「有 started 没有 ended」找出断掉的运行。 */

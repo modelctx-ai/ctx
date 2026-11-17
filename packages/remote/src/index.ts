@@ -4,17 +4,20 @@
  */
 import {
   checkMemoryScope,
+  checkProtocolInfo,
   checkSessionName,
   CtxError,
   DEFAULT_MEMORY_SCOPE,
   ENTRY_VERSION,
   errorOutput,
+  PROTOCOL_VERSION,
   unreadableEntry,
   type AppendOptions,
   type CoreVersion,
   type Entry,
   type ErrorInfo,
   type ExecutionContext,
+  type ExecutorSessionOptions,
   type Executor,
   type FactHit,
   type Harness,
@@ -65,6 +68,11 @@ export interface RemoteClientOptions {
   readonly fetch?: typeof fetch;
   /** 连不上、连接中途断了、服务端回 429/502/503/504 时怎么重试。只用在重试了也不会多做一遍的请求上。 */
   readonly retry?: RetryOptions;
+  /**
+   * 第一次请求之前读 `GET /protocol`，协议版本不同、对方的条目格式比这一端新就以 `unsupported_version` 失败，
+   * 不去猜对方的形状。缺省查；`false` 不查（例如对面是只实现了部分路径的服务）。每个客户端只查一次。
+   */
+  readonly checkProtocol?: boolean;
 }
 
 /**
@@ -107,6 +115,8 @@ const TRANSIENT_STATUS: readonly number[] = [429, 502, 503, 504];
 /** 暂时性的错：连不上、连接断了（`fetch` 抛的不是 `RemoteError`），或者上面那几个状态码。 */
 function transient(error: unknown): boolean {
   if (isRemoteError(error)) return TRANSIENT_STATUS.includes(error.status);
+  // 协议层认得的错误（握手时的版本不对）重试也不会变。
+  if (error instanceof CtxError) return false;
   return !(error instanceof Error && error.name === 'AbortError');
 }
 
@@ -170,7 +180,37 @@ function connect(options: RemoteClientOptions): Connection {
     }
   }
 
+  /** 握手：第一次请求前读一次 `GET /protocol`。失败了下次再试，不把一次连不上记成版本不对。 */
+  let handshake: Promise<void> | undefined;
+  function ensureProtocol(signal: AbortSignal | undefined): Promise<void> {
+    if (options.checkProtocol === false) return Promise.resolve();
+    handshake ??= retrying('GET', signal ? { signal } : {}, async () => {
+      let response: Response;
+      try {
+        response = await send('GET', '/protocol', signal ? { signal } : {});
+      } catch (error) {
+        if (isRemoteError(error) && error.status === 404) {
+          throw new CtxError(
+            'unsupported_version',
+            `${baseUrl} has no GET /protocol: the server predates ctx protocol ${PROTOCOL_VERSION}, or is not a ctx server.`,
+          );
+        }
+        throw error;
+      }
+      checkProtocolInfo(parse(await response.text()));
+    }).catch((error: unknown) => {
+      if (!(error instanceof CtxError)) handshake = undefined;
+      throw error;
+    });
+    return handshake;
+  }
+
   async function once(method: string, path: string, init: RequestInit = {}): Promise<Response> {
+    await ensureProtocol(init.signal);
+    return send(method, path, init);
+  }
+
+  async function send(method: string, path: string, init: RequestInit = {}): Promise<Response> {
     const headers: Record<string, string> = { accept: 'application/json, application/x-ndjson', ...options.headers };
     if (options.accessToken) headers['authorization'] = `Bearer ${options.accessToken}`;
     if (init.body !== undefined) headers['content-type'] = 'application/json; charset=utf-8';
@@ -242,6 +282,12 @@ function messageOf(error: unknown): string {
 
 // ---- 会话 ----
 
+/** 放进一段路径的会话名：`.`、`..`、空串发出去之前就拒绝。 */
+function checkedSession(session: string): string {
+  checkSessionName(session);
+  return session;
+}
+
 function entriesPath(session: string): string {
   // `.`、`..`、空串放不进一段路径，发出去之前就拒绝。
   checkSessionName(session);
@@ -288,13 +334,19 @@ export function createRemoteSessionStore(options: RemoteSessionStoreOptions): Se
   };
 
   async function list(session: string, listOptions: ListOptions = {}): Promise<Entry[]> {
-    const { last, limit, types, kinds } = listOptions;
+    const { limit, types, kinds, atAfter } = listOptions;
     // kinds 用逗号分隔，带逗号的 kind 过不了线；与其静默拆成两个，不如直接报错。
     if (kinds?.some((kind) => kind.includes(','))) throw new Error('An entry kind cannot contain a comma.');
     const wanted = limit === undefined ? undefined : Number.isFinite(limit) ? Math.floor(limit) : 0;
     if (wanted !== undefined && wanted <= 0) return [];
+    const lastN =
+      listOptions.last === undefined ? undefined : Number.isFinite(listOptions.last) ? Math.floor(listOptions.last) : 0;
+    if (lastN !== undefined && lastN <= 0) return [];
     // 服务端一次只回一页（`more: true` 表示后面还有）：接着用 `after` 读，直到读完或够了 `limit`。
+    // 带 `last` 时第一页是最后 N 条里最早的那一段；它们是按 `seq` 的一段后缀，所以后面几页不带 `last`、
+    // 只从这一页的末尾接着读。其间又写进来的会多出来，最后只留最后 N 条。
     const out: Entry[] = [];
+    let last = lastN;
     for (let after = listOptions.after; ;) {
       const body = await connection.json<{ entries: Entry[]; more?: boolean }>('GET', entriesPath(session), {
         query: {
@@ -303,13 +355,15 @@ export function createRemoteSessionStore(options: RemoteSessionStoreOptions): Se
           limit: wanted !== undefined ? String(wanted - out.length) : undefined,
           types: types ? types.join(',') : undefined,
           kinds: kinds ? kinds.join(',') : undefined,
+          atAfter: atAfter !== undefined && !Number.isNaN(atAfter) ? String(atAfter) : undefined,
         },
       });
       out.push(...body.entries.map(checked));
       const tail = body.entries.at(-1);
-      // `last` 是从末尾数的，翻页会改变它的意思：只读服务端给的这一页。
-      if (!body.more || tail === undefined || last !== undefined) return out;
+      if (!body.more || tail === undefined)
+        return lastN !== undefined && wanted === undefined ? out.slice(-lastN) : out;
       after = tail.seq;
+      last = undefined;
     }
   }
 
@@ -431,6 +485,8 @@ export interface RemoteExecutorOptions extends RemoteClientOptions {
  */
 export function createRemoteExecutor(options: RemoteExecutorOptions): Executor & {
   tools(): Promise<ToolDefinition[]>;
+  open(session: string, options?: ExecutorSessionOptions): Promise<void>;
+  close(session: string): Promise<void>;
 } {
   const connection = connect(options);
   const { name } = options;
@@ -440,6 +496,17 @@ export function createRemoteExecutor(options: RemoteExecutorOptions): Executor &
     async tools() {
       const body = await connection.json<{ tools: ToolDefinition[] }>('GET', `${base}/tools`);
       return body.tools.map((tool) => ({ ...tool, executor: name }));
+    },
+    // 会话的准备和释放（ADR 0009）：出错照常抛，harness 把它变成这个执行环境的错误结果。准备可以重复，所以重试。
+    async open(session, sessionOptions = {}) {
+      await connection.json('POST', `${base}/sessions/${segment(checkedSession(session))}/open`, {
+        body: sessionOptions.environment ? { environment: sessionOptions.environment } : {},
+        retry: true,
+        ...(sessionOptions.signal ? { signal: sessionOptions.signal } : {}),
+      });
+    },
+    async close(session) {
+      await connection.json('DELETE', `${base}/sessions/${segment(checkedSession(session))}`, { retry: true });
     },
     async execute(call: ToolCall, context: ExecutionContext): Promise<ToolOutput> {
       const { signal } = context;
@@ -662,18 +729,38 @@ export function createRemoteOrchestrator(options: RemoteOrchestratorOptions): Or
       signal?.addEventListener('abort', stop, { once: true });
       streams.add(controller);
       try {
-        const opening = connection.request('GET', '/orchestrator/events', { signal: controller.signal });
-        connecting.add(opening);
-        let response: Response;
-        try {
-          response = await opening;
-        } finally {
-          connecting.delete(opening);
+        // 连接断了就退避重连，和 `watch` 一样。编排器的事件没有位置，断开那一阵的事件收不到：要不漏就按 `runId` 查状态。
+        for (let failures = 0; ;) {
+          if (controller.signal.aborted) return;
+          let connectedAt: number | undefined;
+          try {
+            const opening = connection.request('GET', '/orchestrator/events', {
+              signal: controller.signal,
+              retry: false,
+            });
+            connecting.add(opening);
+            let response: Response;
+            try {
+              response = await opening;
+            } finally {
+              connecting.delete(opening);
+            }
+            connectedAt = Date.now();
+            for await (const event of lines<OrchestratorEvent>(response)) {
+              failures = 0;
+              yield event;
+            }
+            // 服务端自己结束了这条流。
+            return;
+          } catch (error) {
+            if (isAbort(error, controller.signal)) return;
+            // 连上以后撑了一阵才断的不算连续失败。
+            if (connectedAt !== undefined && Date.now() - connectedAt > connection.maxDelayMs) failures = 0;
+            if (failures >= connection.retries || !transient(error)) throw error;
+            await pause(connection.delay(failures), controller.signal);
+            failures += 1;
+          }
         }
-        yield* lines<OrchestratorEvent>(response);
-      } catch (error) {
-        if (isAbort(error, controller.signal)) return;
-        throw error;
       } finally {
         streams.delete(controller);
         signal?.removeEventListener('abort', stop);
@@ -735,15 +822,29 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
         return (await call<{ notes: Note[] }>('POST', '/notes', { body: { notes } })).notes;
       },
       async list(query = {}) {
-        const { session, pending, limit } = query;
+        const { session, pending, failed, since, limit } = query;
         return (
           await call<{ notes: Note[] }>('GET', '/notes', {
-            query: { session, pending: flag(pending), limit: count(limit) },
+            query: { session, pending: flag(pending), failed: flag(failed), since: count(since), limit: count(limit) },
           })
         ).notes;
       },
       async settle(ids, at) {
         return (await call<{ settled: number }>('POST', '/notes/settle', { body: { ids, at } })).settled;
+      },
+      async fail(ids, at, failOptions) {
+        const { error, maxAttempts } = failOptions;
+        return (await call<{ notes: Note[] }>('POST', '/notes/fail', { body: { ids, at, error, maxAttempts } })).notes;
+      },
+      async retry(ids) {
+        return (await call<{ retried: number }>('POST', '/notes/retry', { body: { ids } })).retried;
+      },
+      async forget(session) {
+        return (
+          await call<{ forgotten: number }>('POST', '/notes/forget', {
+            body: session === undefined ? {} : { session },
+          })
+        ).forgotten;
       },
       async head(session) {
         return (await call<{ head: number }>('GET', '/notes/head', { query: { session } })).head;
@@ -752,6 +853,10 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
     facts: {
       async add(fact) {
         return (await call<{ fact: MemoryFact }>('POST', '/facts', { body: { fact } })).fact;
+      },
+      async supersede(id, fact, at) {
+        return (await call<{ fact: MemoryFact }>('POST', `/facts/${segment(id)}/supersede`, { body: { fact, at } }))
+          .fact;
       },
       async close(id, at, closeOptions) {
         const supersededBy = closeOptions?.supersededBy;
@@ -767,6 +872,12 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
       },
       async archive(ids, at) {
         return (await call<{ archived: number }>('POST', '/facts/archive', { body: { ids, at } })).archived;
+      },
+      async restore(ids) {
+        return (await call<{ restored: number }>('POST', '/facts/restore', { body: { ids } })).restored;
+      },
+      async reopen(ids) {
+        return (await call<{ reopened: number }>('POST', '/facts/reopen', { body: { ids } })).reopened;
       },
       async forget(ids) {
         return (await call<{ forgotten: number }>('POST', '/facts/forget', { body: { ids } })).forgotten;
@@ -795,6 +906,9 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
       async retire(id, at) {
         await call('POST', `/procedures/${segment(id)}/retire`, { body: { at } });
       },
+      async forget(ids) {
+        return (await call<{ forgotten: number }>('POST', '/procedures/forget', { body: { ids } })).forgotten;
+      },
       async list(query = {}) {
         const { topic, active } = query;
         return (
@@ -817,6 +931,9 @@ function remoteMemoryScope(connection: Connection, scope: string): MemoryStore {
             query: { last: count(historyOptions.last) },
           })
         ).versions;
+      },
+      async clear() {
+        return (await call<{ cleared: number }>('DELETE', '/core')).cleared;
       },
     },
   };

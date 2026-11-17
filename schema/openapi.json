@@ -1,0 +1,4502 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ctx remote",
+    "version": "0.3",
+    "description": "`ctx-remote` 的 HTTP 线上形态。鉴权是 `Authorization: Bearer <token>`；客户端第一次请求前读 `GET /protocol`，版本不同就失败。路径可以整体挂在一个前缀下。"
+  },
+  "security": [
+    {
+      "bearer": []
+    }
+  ],
+  "paths": {
+    "/protocol": {
+      "get": {
+        "tags": ["发现"],
+        "summary": "协议版本、条目格式、挂了哪些组件",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProtocolInfo"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/protocol/schema": {
+      "get": {
+        "tags": ["发现"],
+        "summary": "线上形状的 JSON Schema",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/protocol/openapi": {
+      "get": {
+        "tags": ["发现"],
+        "summary": "这份 OpenAPI 文档",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions": {
+      "get": {
+        "tags": ["会话"],
+        "summary": "sessions：会话名，升序",
+        "parameters": [
+          {
+            "name": "prefix",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "sessions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": ["sessions"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session}": {
+      "delete": {
+        "tags": ["会话"],
+        "summary": "clear",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["deleted"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session}/entries": {
+      "get": {
+        "tags": ["会话"],
+        "summary": "list：一次最多一页，more 时用最后一条的 seq 当 after 接着读",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "last",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "types",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kinds",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "atAfter",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Entry"
+                      }
+                    },
+                    "more": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["entries"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "post": {
+        "tags": ["会话"],
+        "summary": "append：expectSeq 对不上是 409 conflict",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "entries": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/NewEntry"
+                    }
+                  },
+                  "expectSeq": {
+                    "type": "integer"
+                  }
+                },
+                "required": ["entries"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "entries": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Entry"
+                      }
+                    }
+                  },
+                  "required": ["entries"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session}/entries/stream": {
+      "get": {
+        "tags": ["会话"],
+        "summary": "watch",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/Entry"
+                },
+                "description": "每行一个值；空行是心跳；出错时最后一行是 { error }"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session}/entries/truncate": {
+      "post": {
+        "tags": ["会话"],
+        "summary": "truncate",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "upTo": {
+                    "type": "integer"
+                  }
+                },
+                "required": ["upTo"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["deleted"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session}/entries/remove": {
+      "post": {
+        "tags": ["会话"],
+        "summary": "remove",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": ["ids"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "removed": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["removed"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/sessions/{session}/entries/redact": {
+      "post": {
+        "tags": ["会话"],
+        "summary": "redact",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": ["ids"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "redacted": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["redacted"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/executors": {
+      "get": {
+        "tags": ["执行环境"],
+        "summary": "执行环境的名字",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "executors": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": ["executors"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/executors/{name}/tools": {
+      "get": {
+        "tags": ["执行环境"],
+        "summary": "tools",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tools": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ToolDefinition"
+                      }
+                    }
+                  },
+                  "required": ["tools"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/executors/{name}/sessions/{session}/open": {
+      "post": {
+        "tags": ["执行环境"],
+        "summary": "open：为一个会话准备好，可以重复调",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "environment": {
+                    "$ref": "#/components/schemas/EnvironmentSpec"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/executors/{name}/sessions/{session}": {
+      "delete": {
+        "tags": ["执行环境"],
+        "summary": "close",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/executors/{name}/execute": {
+      "post": {
+        "tags": ["执行环境"],
+        "summary": "execute：断开即中止；等结果时先发 200 和心跳换行",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "call": {
+                    "$ref": "#/components/schemas/ToolCall"
+                  },
+                  "context": {
+                    "type": "object",
+                    "properties": {
+                      "session": {
+                        "type": "string"
+                      },
+                      "runId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["session"]
+                  }
+                },
+                "required": ["call", "context"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "output": {
+                      "$ref": "#/components/schemas/ToolOutput"
+                    }
+                  },
+                  "required": ["output"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/runs": {
+      "post": {
+        "tags": ["Harness"],
+        "summary": "run；带 stream=1 时是 stream（NDJSON RunEvent，断开即中止）",
+        "parameters": [
+          {
+            "name": "stream",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunResult"
+                }
+              },
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunEvent"
+                },
+                "description": "每行一个值；空行是心跳；出错时最后一行是 { error }"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/runs/{runId}": {
+      "delete": {
+        "tags": ["Harness"],
+        "summary": "取消（signal）",
+        "parameters": [
+          {
+            "name": "runId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "cancelled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["cancelled"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/orchestrator/runs": {
+      "post": {
+        "tags": ["编排"],
+        "summary": "submit",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runId": {
+                      "type": "string"
+                    },
+                    "session": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["runId", "session"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/orchestrator/runs/{runId}": {
+      "get": {
+        "tags": ["编排"],
+        "summary": "status / done：wait 是长轮询的毫秒数；给了 session 时结果可以从会话日志还原",
+        "parameters": [
+          {
+            "name": "runId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "runId": {
+                      "type": "string"
+                    },
+                    "status": {
+                      "$ref": "#/components/schemas/RunStatus"
+                    },
+                    "session": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "$ref": "#/components/schemas/RunResult"
+                    },
+                    "error": {
+                      "$ref": "#/components/schemas/ErrorInfo"
+                    }
+                  },
+                  "required": ["runId", "status"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "tags": ["编排"],
+        "summary": "cancel",
+        "parameters": [
+          {
+            "name": "runId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "cancelled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["cancelled"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/orchestrator/recover": {
+      "post": {
+        "tags": ["编排"],
+        "summary": "recover",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "recovered": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/RecoveredRun"
+                      }
+                    }
+                  },
+                  "required": ["recovered"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/orchestrator/events": {
+      "get": {
+        "tags": ["编排"],
+        "summary": "events",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrchestratorEvent"
+                },
+                "description": "每行一个值；空行是心跳；出错时最后一行是 { error }"
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/notes": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "notes.add",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "notes": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/NewNote"
+                    }
+                  }
+                },
+                "required": ["notes"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "notes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Note"
+                      }
+                    }
+                  },
+                  "required": ["notes"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "get": {
+        "tags": ["记忆"],
+        "summary": "notes.list",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pending",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "failed",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "notes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Note"
+                      }
+                    }
+                  },
+                  "required": ["notes"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/notes/settle": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "notes.settle",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "at": {
+                    "type": "number"
+                  }
+                },
+                "required": ["ids", "at"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "settled": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["settled"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/notes/fail": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "notes.fail",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "at": {
+                    "type": "number"
+                  },
+                  "error": {
+                    "type": "string"
+                  },
+                  "maxAttempts": {
+                    "type": "integer"
+                  }
+                },
+                "required": ["ids", "at", "error"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "notes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Note"
+                      }
+                    }
+                  },
+                  "required": ["notes"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/notes/retry": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "notes.retry",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": ["ids"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "retried": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["retried"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/notes/forget": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "notes.forget",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "session": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "forgotten": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["forgotten"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/notes/head": {
+      "get": {
+        "tags": ["记忆"],
+        "summary": "notes.head",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "session",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "head": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["head"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.add",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "fact": {
+                    "$ref": "#/components/schemas/NewMemoryFact"
+                  }
+                },
+                "required": ["fact"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "fact": {
+                      "$ref": "#/components/schemas/MemoryFact"
+                    }
+                  },
+                  "required": ["fact"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "get": {
+        "tags": ["记忆"],
+        "summary": "facts.list",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "subject",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "topic",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "open",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "facts": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/MemoryFact"
+                      }
+                    }
+                  },
+                  "required": ["facts"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/search": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.search",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SearchQuery"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "hits": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/FactHit"
+                      }
+                    }
+                  },
+                  "required": ["hits"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/touch": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.touch",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "at": {
+                    "type": "number"
+                  }
+                },
+                "required": ["ids", "at"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/archive": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.archive",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "at": {
+                    "type": "number"
+                  }
+                },
+                "required": ["ids", "at"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "archived": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["archived"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/restore": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.restore",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": ["ids"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "restored": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["restored"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/reopen": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.reopen",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": ["ids"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "reopened": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["reopened"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/forget": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.forget",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": ["ids"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "forgotten": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["forgotten"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/{id}/supersede": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.supersede",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "fact": {
+                    "$ref": "#/components/schemas/NewMemoryFact"
+                  },
+                  "at": {
+                    "type": "number"
+                  }
+                },
+                "required": ["fact", "at"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "fact": {
+                      "$ref": "#/components/schemas/MemoryFact"
+                    }
+                  },
+                  "required": ["fact"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/{id}/close": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.close",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "at": {
+                    "type": "number"
+                  },
+                  "supersededBy": {
+                    "type": "string"
+                  }
+                },
+                "required": ["at"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/facts/{id}/cite": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "facts.cite",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "sources": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/SourceRef"
+                    }
+                  }
+                },
+                "required": ["sources"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "fact": {
+                      "$ref": "#/components/schemas/MemoryFact"
+                    }
+                  },
+                  "required": ["fact"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/procedures": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "procedures.add",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "procedure": {
+                    "$ref": "#/components/schemas/NewProcedure"
+                  }
+                },
+                "required": ["procedure"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "procedure": {
+                      "$ref": "#/components/schemas/Procedure"
+                    }
+                  },
+                  "required": ["procedure"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "get": {
+        "tags": ["记忆"],
+        "summary": "procedures.list",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "topic",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "active",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "procedures": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Procedure"
+                      }
+                    }
+                  },
+                  "required": ["procedures"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/procedures/forget": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "procedures.forget",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": ["ids"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "forgotten": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["forgotten"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/procedures/{id}/confirm": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "procedures.confirm",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "evidence": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/SourceRef"
+                    }
+                  }
+                },
+                "required": ["evidence"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "procedure": {
+                      "$ref": "#/components/schemas/Procedure"
+                    }
+                  },
+                  "required": ["procedure"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/procedures/{id}/retire": {
+      "post": {
+        "tags": ["记忆"],
+        "summary": "procedures.retire",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "at": {
+                    "type": "number"
+                  }
+                },
+                "required": ["at"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/core": {
+      "get": {
+        "tags": ["记忆"],
+        "summary": "core.get",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "core": {
+                      "anyOf": [
+                        {
+                          "$ref": "#/components/schemas/CoreVersion"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": ["core"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "put": {
+        "tags": ["记忆"],
+        "summary": "core.set",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "text": {
+                    "type": "string"
+                  },
+                  "at": {
+                    "type": "number"
+                  }
+                },
+                "required": ["text", "at"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {}
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "tags": ["记忆"],
+        "summary": "core.clear",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "cleared": {
+                      "type": "integer"
+                    }
+                  },
+                  "required": ["cleared"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/memory/core/history": {
+      "get": {
+        "tags": ["记忆"],
+        "summary": "core.history",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "last",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "versions": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/CoreVersion"
+                      }
+                    }
+                  },
+                  "required": ["versions"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "JsonValue": {
+        "description": "任何 JSON 值"
+      },
+      "JsonObject": {
+        "type": "object"
+      },
+      "ErrorInfo": {
+        "type": "object",
+        "description": "跨边界的错误：`{ error: ErrorInfo }`",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "statusCode": {
+            "type": "integer"
+          },
+          "responseBody": {
+            "type": "string"
+          }
+        },
+        "required": ["message"],
+        "additionalProperties": false
+      },
+      "MessageProviderOptions": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "object"
+        }
+      },
+      "ToolFileData": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "data"
+              },
+              "data": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "data"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "url"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "url"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "reference"
+              },
+              "reference": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": ["type", "reference"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "text"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "text"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "TextPart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "text"
+          },
+          "text": {
+            "type": "string"
+          },
+          "providerOptions": {
+            "$ref": "#/components/schemas/MessageProviderOptions"
+          }
+        },
+        "required": ["type", "text"],
+        "additionalProperties": false
+      },
+      "FilePart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "file"
+          },
+          "mediaType": {
+            "type": "string"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ToolFileData"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "providerOptions": {
+            "$ref": "#/components/schemas/MessageProviderOptions"
+          }
+        },
+        "required": ["type", "mediaType", "data"],
+        "additionalProperties": false
+      },
+      "ReasoningPart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "reasoning"
+          },
+          "text": {
+            "type": "string"
+          },
+          "providerOptions": {
+            "$ref": "#/components/schemas/MessageProviderOptions"
+          }
+        },
+        "required": ["type", "text"],
+        "additionalProperties": false
+      },
+      "ReasoningFilePart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "reasoning-file"
+          },
+          "mediaType": {
+            "type": "string"
+          },
+          "data": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "data"
+                  },
+                  "data": {
+                    "type": "string"
+                  }
+                },
+                "required": ["type", "data"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "url"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": ["type", "url"],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "providerOptions": {
+            "$ref": "#/components/schemas/MessageProviderOptions"
+          }
+        },
+        "required": ["type", "mediaType", "data"],
+        "additionalProperties": false
+      },
+      "CustomPart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "custom"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "providerOptions": {
+            "$ref": "#/components/schemas/MessageProviderOptions"
+          }
+        },
+        "required": ["type", "kind"],
+        "additionalProperties": false
+      },
+      "ToolCallPart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "tool-call"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "input": {},
+          "providerExecuted": {
+            "type": "boolean"
+          },
+          "providerOptions": {
+            "$ref": "#/components/schemas/MessageProviderOptions"
+          }
+        },
+        "required": ["type", "id", "name", "input"],
+        "additionalProperties": false
+      },
+      "ToolResultPart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "tool-result"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "output": {
+            "$ref": "#/components/schemas/ToolOutput"
+          },
+          "providerOptions": {
+            "$ref": "#/components/schemas/MessageProviderOptions"
+          }
+        },
+        "required": ["type", "id", "name", "output"],
+        "additionalProperties": false
+      },
+      "ToolApprovalRequestPart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "tool-approval-request"
+          },
+          "approvalId": {
+            "type": "string"
+          },
+          "callId": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "isAutomatic": {
+            "type": "boolean"
+          },
+          "signature": {
+            "type": "string"
+          },
+          "inputSchemaInput": {}
+        },
+        "required": ["type", "approvalId", "callId"],
+        "additionalProperties": false
+      },
+      "ToolApprovalResponsePart": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "tool-approval-response"
+          },
+          "approvalId": {
+            "type": "string"
+          },
+          "approved": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "providerExecuted": {
+            "type": "boolean"
+          }
+        },
+        "required": ["type", "approvalId", "approved"],
+        "additionalProperties": false
+      },
+      "MessageContent": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/TextPart"
+                },
+                {
+                  "$ref": "#/components/schemas/FilePart"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "Message": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "role": {
+                "const": "system"
+              },
+              "content": {
+                "type": "string"
+              },
+              "providerOptions": {
+                "$ref": "#/components/schemas/MessageProviderOptions"
+              }
+            },
+            "required": ["role", "content"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "role": {
+                "const": "user"
+              },
+              "content": {
+                "$ref": "#/components/schemas/MessageContent"
+              },
+              "providerOptions": {
+                "$ref": "#/components/schemas/MessageProviderOptions"
+              }
+            },
+            "required": ["role", "content"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "role": {
+                "const": "assistant"
+              },
+              "content": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "oneOf": [
+                        {
+                          "$ref": "#/components/schemas/TextPart"
+                        },
+                        {
+                          "$ref": "#/components/schemas/FilePart"
+                        },
+                        {
+                          "$ref": "#/components/schemas/ReasoningPart"
+                        },
+                        {
+                          "$ref": "#/components/schemas/ReasoningFilePart"
+                        },
+                        {
+                          "$ref": "#/components/schemas/CustomPart"
+                        },
+                        {
+                          "$ref": "#/components/schemas/ToolCallPart"
+                        },
+                        {
+                          "$ref": "#/components/schemas/ToolResultPart"
+                        },
+                        {
+                          "$ref": "#/components/schemas/ToolApprovalRequestPart"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "providerOptions": {
+                "$ref": "#/components/schemas/MessageProviderOptions"
+              }
+            },
+            "required": ["role", "content"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "role": {
+                "const": "tool"
+              },
+              "content": {
+                "type": "array",
+                "items": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ToolResultPart"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ToolApprovalResponsePart"
+                    }
+                  ]
+                }
+              },
+              "providerOptions": {
+                "$ref": "#/components/schemas/MessageProviderOptions"
+              }
+            },
+            "required": ["role", "content"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "MessageEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "session": {
+            "type": "string"
+          },
+          "v": {
+            "type": "integer"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "at": {
+            "type": "number"
+          },
+          "type": {
+            "const": "message"
+          },
+          "message": {
+            "$ref": "#/components/schemas/Message"
+          },
+          "key": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "required": ["id", "session", "v", "seq", "at", "type", "message"],
+        "additionalProperties": false
+      },
+      "EventEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "session": {
+            "type": "string"
+          },
+          "v": {
+            "type": "integer"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "at": {
+            "type": "number"
+          },
+          "type": {
+            "const": "event"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object"
+          },
+          "text": {
+            "type": "string"
+          },
+          "data": {}
+        },
+        "required": ["id", "session", "v", "seq", "at", "type", "kind"],
+        "additionalProperties": false
+      },
+      "SummaryEntry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "session": {
+            "type": "string"
+          },
+          "v": {
+            "type": "integer"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "at": {
+            "type": "number"
+          },
+          "type": {
+            "const": "summary"
+          },
+          "text": {
+            "type": "string"
+          },
+          "covers": {
+            "type": "integer"
+          },
+          "key": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "required": ["id", "session", "v", "seq", "at", "type", "text", "covers"],
+        "additionalProperties": false
+      },
+      "Entry": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/MessageEntry"
+          },
+          {
+            "$ref": "#/components/schemas/EventEntry"
+          },
+          {
+            "$ref": "#/components/schemas/SummaryEntry"
+          }
+        ]
+      },
+      "NewEntry": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "message"
+              },
+              "message": {
+                "$ref": "#/components/schemas/Message"
+              },
+              "id": {
+                "type": "string"
+              },
+              "at": {
+                "type": "number"
+              },
+              "key": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "meta": {
+                "type": "object"
+              }
+            },
+            "required": ["type", "message"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "event"
+              },
+              "kind": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "at": {
+                "type": "number"
+              },
+              "key": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "meta": {
+                "type": "object"
+              },
+              "text": {
+                "type": "string"
+              },
+              "data": {}
+            },
+            "required": ["type", "kind"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "summary"
+              },
+              "text": {
+                "type": "string"
+              },
+              "covers": {
+                "type": "integer"
+              },
+              "id": {
+                "type": "string"
+              },
+              "at": {
+                "type": "number"
+              },
+              "key": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "meta": {
+                "type": "object"
+              }
+            },
+            "required": ["type", "text", "covers"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "ToolCall": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "input": {}
+        },
+        "required": ["id", "name", "input"],
+        "additionalProperties": false
+      },
+      "ToolContentPart": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "text"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "text"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "file"
+              },
+              "mediaType": {
+                "type": "string"
+              },
+              "data": {
+                "$ref": "#/components/schemas/ToolFileData"
+              },
+              "filename": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "mediaType", "data"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "ToolOutput": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "text"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "text"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "json"
+              },
+              "value": {}
+            },
+            "required": ["type", "value"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "content"
+              },
+              "parts": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ToolContentPart"
+                }
+              }
+            },
+            "required": ["type", "parts"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "error"
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "data": {}
+            },
+            "required": ["type", "message"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "ToolDefinition": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "inputSchema": {
+            "type": "object"
+          },
+          "executor": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": ["name", "inputSchema", "executor"],
+        "additionalProperties": false
+      },
+      "ToolSelection": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "object",
+            "properties": {
+              "names": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "sources": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "Usage": {
+        "type": "object",
+        "properties": {
+          "inputTokens": {
+            "type": "number"
+          },
+          "outputTokens": {
+            "type": "number"
+          },
+          "totalTokens": {
+            "type": "number"
+          },
+          "cacheReadTokens": {
+            "type": "number"
+          },
+          "cacheWriteTokens": {
+            "type": "number"
+          },
+          "reasoningTokens": {
+            "type": "number"
+          }
+        },
+        "additionalProperties": false
+      },
+      "StopReason": {
+        "enum": ["end_turn", "max_steps", "max_tokens", "max_budget", "requires_action", "aborted", "error"]
+      },
+      "CallSettings": {
+        "type": "object",
+        "properties": {
+          "temperature": {
+            "type": "number"
+          },
+          "maxOutputTokens": {
+            "type": "integer"
+          },
+          "topP": {
+            "type": "number"
+          },
+          "topK": {
+            "type": "number"
+          },
+          "presencePenalty": {
+            "type": "number"
+          },
+          "frequencyPenalty": {
+            "type": "number"
+          },
+          "seed": {
+            "type": "integer"
+          },
+          "stopSequences": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "maxRetries": {
+            "type": "integer"
+          },
+          "timeoutMs": {
+            "type": "number"
+          },
+          "headers": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "providerOptions": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "WindowOptions": {
+        "type": "object",
+        "properties": {
+          "maxMessages": {
+            "type": "integer"
+          },
+          "maxTokens": {
+            "type": "number"
+          },
+          "truncate": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ContextSpec": {
+        "type": "object",
+        "properties": {
+          "facts": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "sources": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "placement": {
+                    "enum": ["instructions", "prompt"]
+                  },
+                  "heading": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          },
+          "projection": {
+            "type": "string"
+          },
+          "overflow": {
+            "type": "object",
+            "properties": {
+              "maxTokens": {
+                "type": "number"
+              },
+              "strategy": {
+                "enum": ["compact", "trim", "error"]
+              },
+              "compact": {
+                "type": "object",
+                "properties": {
+                  "keep": {
+                    "type": "integer"
+                  },
+                  "minimum": {
+                    "type": "integer"
+                  },
+                  "instructions": {
+                    "type": "string"
+                  },
+                  "maxInputTokens": {
+                    "type": "number"
+                  },
+                  "maxOutputTokens": {
+                    "type": "integer"
+                  },
+                  "timeoutMs": {
+                    "type": "number"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": ["maxTokens"],
+            "additionalProperties": false
+          },
+          "inherit": {
+            "type": "object",
+            "properties": {
+              "session": {
+                "type": "string"
+              },
+              "upTo": {
+                "type": "integer"
+              }
+            },
+            "required": ["session"],
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      },
+      "AgentSpec": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "description": "模型名：跨边界时只能是名字"
+          },
+          "name": {
+            "type": "string"
+          },
+          "instructions": {
+            "type": "string"
+          },
+          "tools": {
+            "$ref": "#/components/schemas/ToolSelection"
+          },
+          "maxSteps": {
+            "type": "integer"
+          },
+          "window": {
+            "$ref": "#/components/schemas/WindowOptions"
+          },
+          "context": {
+            "$ref": "#/components/schemas/ContextSpec"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/CallSettings"
+          },
+          "version": {
+            "type": "string"
+          },
+          "output": {
+            "type": "object",
+            "properties": {
+              "schema": {
+                "type": "object"
+              },
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "required": ["schema"],
+            "additionalProperties": false
+          },
+          "toolChoice": {
+            "anyOf": [
+              {
+                "enum": ["auto", "none", "required"]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "tool": {
+                    "type": "string"
+                  }
+                },
+                "required": ["tool"],
+                "additionalProperties": false
+              }
+            ]
+          },
+          "permissions": {
+            "type": "object",
+            "properties": {
+              "default": {
+                "$ref": "#/components/schemas/ToolPermission"
+              },
+              "tools": {
+                "type": "object",
+                "additionalProperties": {
+                  "$ref": "#/components/schemas/ToolPermission"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "budget": {
+            "type": "object",
+            "properties": {
+              "maxTotalTokens": {
+                "type": "number"
+              },
+              "maxDurationMs": {
+                "type": "number"
+              }
+            },
+            "additionalProperties": false
+          },
+          "environment": {
+            "$ref": "#/components/schemas/EnvironmentSpec"
+          }
+        },
+        "required": ["model"],
+        "additionalProperties": false
+      },
+      "EnvironmentSpec": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "image": {
+            "type": "string"
+          },
+          "packages": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "network": {
+            "type": "object",
+            "properties": {
+              "allow": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "additionalProperties": false
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ToolPermission": {
+        "enum": ["allow", "ask", "deny"]
+      },
+      "RunParent": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "toolCallId": {
+            "type": "string"
+          }
+        },
+        "required": ["session", "runId"],
+        "additionalProperties": false
+      },
+      "RunRequest": {
+        "type": "object",
+        "description": "`POST /runs`、`POST /orchestrator/runs` 的请求体：`RunRequest` 去掉 `signal`",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "agent": {
+            "$ref": "#/components/schemas/AgentSpec"
+          },
+          "input": {
+            "$ref": "#/components/schemas/MessageContent"
+          },
+          "inputKey": {
+            "type": "string"
+          },
+          "prompt": {
+            "$ref": "#/components/schemas/MessageContent"
+          },
+          "record": {
+            "type": "boolean"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "parent": {
+            "$ref": "#/components/schemas/RunParent"
+          },
+          "aborted": {
+            "type": "boolean",
+            "description": "线上才有：发出时调用方已经取消了"
+          }
+        },
+        "required": ["session", "agent"],
+        "additionalProperties": false
+      },
+      "RunResultSummary": {
+        "type": "object",
+        "description": "`RunResult` 去掉 `messages`、`recorded`：`run.ended` 事件和编排器的结果",
+        "properties": {
+          "runId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "stopReason": {
+            "$ref": "#/components/schemas/StopReason"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          },
+          "output": {},
+          "pending": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ToolCall"
+            }
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorInfo"
+          }
+        },
+        "required": ["runId", "text", "stopReason"],
+        "additionalProperties": false
+      },
+      "RunResult": {
+        "type": "object",
+        "properties": {
+          "runId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "messages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            }
+          },
+          "recorded": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Entry"
+            }
+          },
+          "stopReason": {
+            "$ref": "#/components/schemas/StopReason"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          },
+          "output": {},
+          "pending": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ToolCall"
+            }
+          },
+          "error": {
+            "$ref": "#/components/schemas/ErrorInfo"
+          }
+        },
+        "required": ["runId", "text", "messages", "recorded", "stopReason"],
+        "additionalProperties": false
+      },
+      "RunEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "run.started"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "session": {
+                "type": "string"
+              },
+              "seq": {
+                "type": "integer"
+              }
+            },
+            "required": ["type", "runId", "session"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "model.started"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "step": {
+                "type": "integer"
+              }
+            },
+            "required": ["type", "runId", "step"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "text.delta"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "runId", "text"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "reasoning.delta"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "runId", "text"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "tool.called"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "call": {
+                "$ref": "#/components/schemas/ToolCall"
+              }
+            },
+            "required": ["type", "runId", "call"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "tool.returned"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "callId": {
+                "type": "string"
+              },
+              "output": {
+                "$ref": "#/components/schemas/ToolOutput"
+              }
+            },
+            "required": ["type", "runId", "callId", "output"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "model.ended"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "step": {
+                "type": "integer"
+              },
+              "usage": {
+                "$ref": "#/components/schemas/Usage"
+              },
+              "seq": {
+                "type": "integer"
+              }
+            },
+            "required": ["type", "runId", "step"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "run.ended"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "result": {
+                "$ref": "#/components/schemas/RunResultSummary"
+              },
+              "seq": {
+                "type": "integer"
+              }
+            },
+            "required": ["type", "runId", "result"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "error"
+              },
+              "runId": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": ["type", "runId", "message"],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "StepMeta": {
+        "type": "object",
+        "properties": {
+          "runId": {
+            "type": "string"
+          },
+          "step": {
+            "type": "integer"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "modelId": {
+            "type": "string"
+          },
+          "finishReason": {
+            "type": "string"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          },
+          "estimatedInputTokens": {
+            "type": "number"
+          },
+          "calibration": {
+            "type": "number"
+          }
+        },
+        "required": ["runId", "step"],
+        "additionalProperties": false
+      },
+      "ChildRunResult": {
+        "type": "object",
+        "properties": {
+          "child": {
+            "type": "object",
+            "properties": {
+              "session": {
+                "type": "string"
+              },
+              "runId": {
+                "type": "string"
+              }
+            },
+            "required": ["session", "runId"],
+            "additionalProperties": false
+          },
+          "stopReason": {
+            "$ref": "#/components/schemas/StopReason"
+          },
+          "text": {
+            "type": "string"
+          },
+          "output": {},
+          "usage": {
+            "$ref": "#/components/schemas/Usage"
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["child", "stopReason"],
+        "additionalProperties": false
+      },
+      "RunStatus": {
+        "enum": ["queued", "running", "completed", "failed", "cancelled"]
+      },
+      "OrchestratorEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "enum": ["run.queued", "run.running", "run.completed", "run.failed", "run.cancelled"]
+          },
+          "runId": {
+            "type": "string"
+          },
+          "session": {
+            "type": "string"
+          }
+        },
+        "required": ["type", "runId", "session"],
+        "additionalProperties": false
+      },
+      "RecoveredRun": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "resumed": {
+            "type": "string"
+          }
+        },
+        "required": ["session", "runId"],
+        "additionalProperties": false
+      },
+      "SourceRef": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "upTo": {
+            "type": "integer"
+          }
+        },
+        "required": ["session", "from", "upTo"],
+        "additionalProperties": false
+      },
+      "Note": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "session": {
+            "type": "string"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "upTo": {
+            "type": "integer"
+          },
+          "at": {
+            "type": "number"
+          },
+          "salience": {
+            "type": "number"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "topic": {
+            "type": "string"
+          },
+          "settledAt": {
+            "type": "number"
+          },
+          "attempts": {
+            "type": "integer"
+          },
+          "error": {
+            "type": "string"
+          },
+          "failedAt": {
+            "type": "number"
+          }
+        },
+        "required": ["id", "session", "from", "upTo", "at", "salience"],
+        "additionalProperties": false
+      },
+      "NewNote": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "from": {
+            "type": "integer"
+          },
+          "upTo": {
+            "type": "integer"
+          },
+          "at": {
+            "type": "number"
+          },
+          "salience": {
+            "type": "number"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "topic": {
+            "type": "string"
+          },
+          "settledAt": {
+            "type": "number"
+          }
+        },
+        "required": ["session", "from", "upTo", "at", "salience"],
+        "additionalProperties": false
+      },
+      "MemoryFact": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "validFrom": {
+            "type": "number"
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "salience": {
+            "type": "number"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceRef"
+            }
+          },
+          "recalls": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "key": {
+            "type": "string"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "topic": {
+            "type": "string"
+          },
+          "validTo": {
+            "type": "number"
+          },
+          "supersededBy": {
+            "type": "string"
+          },
+          "archivedAt": {
+            "type": "number"
+          }
+        },
+        "required": ["id", "subject", "text", "validFrom", "confidence", "salience", "sources", "recalls"],
+        "additionalProperties": false
+      },
+      "NewMemoryFact": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "validFrom": {
+            "type": "number"
+          },
+          "confidence": {
+            "type": "number"
+          },
+          "salience": {
+            "type": "number"
+          },
+          "sources": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceRef"
+            }
+          },
+          "key": {
+            "type": "string"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "topic": {
+            "type": "string"
+          }
+        },
+        "required": ["subject", "text", "validFrom", "confidence", "salience", "sources"],
+        "additionalProperties": false
+      },
+      "FactHit": {
+        "type": "object",
+        "properties": {
+          "fact": {
+            "$ref": "#/components/schemas/MemoryFact"
+          },
+          "score": {
+            "type": "number"
+          }
+        },
+        "required": ["fact", "score"],
+        "additionalProperties": false
+      },
+      "SearchQuery": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "topic": {
+            "type": "string"
+          },
+          "k": {
+            "type": "integer"
+          },
+          "open": {
+            "type": "boolean"
+          },
+          "archived": {
+            "type": "boolean"
+          }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "Procedure": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "when": {
+            "type": "string"
+          },
+          "do": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceRef"
+            }
+          },
+          "at": {
+            "type": "number"
+          },
+          "confirmations": {
+            "type": "integer"
+          },
+          "topic": {
+            "type": "string"
+          },
+          "retiredAt": {
+            "type": "number"
+          }
+        },
+        "required": ["id", "when", "do", "evidence", "at", "confirmations"],
+        "additionalProperties": false
+      },
+      "NewProcedure": {
+        "type": "object",
+        "properties": {
+          "when": {
+            "type": "string"
+          },
+          "do": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceRef"
+            }
+          },
+          "at": {
+            "type": "number"
+          },
+          "topic": {
+            "type": "string"
+          }
+        },
+        "required": ["when", "do", "evidence", "at"],
+        "additionalProperties": false
+      },
+      "CoreVersion": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "at": {
+            "type": "number"
+          }
+        },
+        "required": ["text", "at"],
+        "additionalProperties": false
+      },
+      "ProtocolInfo": {
+        "type": "object",
+        "description": "`GET /protocol` 的响应",
+        "properties": {
+          "protocol": {
+            "type": "string"
+          },
+          "entryVersion": {
+            "type": "integer"
+          },
+          "components": {
+            "type": "object",
+            "properties": {
+              "sessions": {
+                "type": "object",
+                "properties": {
+                  "watch": {
+                    "type": "boolean"
+                  }
+                },
+                "required": ["watch"],
+                "additionalProperties": false
+              },
+              "executors": {
+                "type": "object",
+                "properties": {
+                  "names": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                },
+                "required": ["names"],
+                "additionalProperties": false
+              },
+              "harness": {
+                "type": "object",
+                "properties": {
+                  "stream": {
+                    "type": "boolean"
+                  }
+                },
+                "required": ["stream"],
+                "additionalProperties": false
+              },
+              "orchestrator": {
+                "type": "object",
+                "properties": {
+                  "recover": {
+                    "type": "boolean"
+                  },
+                  "events": {
+                    "type": "boolean"
+                  }
+                },
+                "required": ["recover", "events"],
+                "additionalProperties": false
+              },
+              "memory": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": ["protocol", "entryVersion", "components"],
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "错误正文：`{ error: ErrorInfo }`",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/ErrorInfo"
+                }
+              },
+              "required": ["error"]
+            }
+          }
+        }
+      }
+    }
+  }
+}

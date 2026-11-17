@@ -32,7 +32,15 @@
       "types": "./dist/server.d.ts",
       "default": "./dist/server.js"
     },
+    "./conformance": {
+      "@modelctx-ai/source": "./src/conformance.ts",
+      "types": "./dist/conformance.d.ts",
+      "default": "./dist/conformance.js"
+    },
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "ctx-conformance": "./dist/cli.js"
   },
   "files": [
     "dist"

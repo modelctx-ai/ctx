@@ -8,6 +8,8 @@ import {
   estimateTokens,
   latestSummary,
   project,
+  projectSession,
+  stepMetaOf,
   renderFacts,
   summaryEntry,
   textOf,
@@ -19,6 +21,7 @@ import {
   type ContextSource,
   type FactsSpec,
   type Entry,
+  type InheritSpec,
   type Fact,
   type Logger,
   type Message,
@@ -69,7 +72,19 @@ export interface ContextBuilderOptions {
    * 存储换了钟（测试）时这里给同一个。
    */
   readonly now?: () => number;
+  /**
+   * 按上一轮的实际用量校准估算，缺省 `true`。上一轮第一步的 `StepMeta` 里服务商实际计的输入 token
+   * （`usage.inputTokens`）比估算（`estimatedInputTokens`）多多少倍，这一轮的 `maxTokens` 就收紧多少倍
+   * （最多 `MAX_CALIBRATION` 倍，只往小里收），`PreparedCall.tokens` 也乘上它。投影配了自己的 `window.estimate`
+   * （接了分词器）时不校准。
+   */
+  readonly calibrate?: boolean;
 }
+
+/** 校准倍数的上限：估算再偏，窗口也不收到四分之一以下。 */
+export const MAX_CALIBRATION = 4;
+/** 找校准样本时最多往回看多少条消息：上一轮的第一步要在这里面。 */
+const CALIBRATION_LOOKBACK = 64;
 
 /** 参考实现另外给出事实收集，`createContext` 的 `facts()` 用它。 */
 export interface LocalContextBuilder extends ContextBuilder {
@@ -243,9 +258,16 @@ export function resolveModel(model: ModelRef, models: ((name: string) => Languag
  * 请求能过线、带不了函数，换上限不该顺手把应用接的分词器换回缺省估算。
  * `reserve` 是历史之外已经占掉的 token，从 `maxTokens` 里扣。
  */
-function windowOf(chosen: ProjectionOptions, request: WindowOptions | undefined, reserve = 0): ProjectionWindow {
+function windowOf(
+  chosen: ProjectionOptions,
+  request: WindowOptions | undefined,
+  reserve = 0,
+  calibration = 1,
+): ProjectionWindow {
   const limits: WindowOptions = request ?? chosen.window ?? {};
-  const maxTokens = limits.maxTokens === undefined ? undefined : Math.max(0, limits.maxTokens - reserve);
+  // 校准过：估算偏低这么多倍，预算就按估算的单位收紧这么多倍。
+  const maxTokens =
+    limits.maxTokens === undefined ? undefined : Math.max(0, Math.floor(limits.maxTokens / calibration) - reserve);
   return {
     ...(limits.maxMessages !== undefined ? { maxMessages: limits.maxMessages } : {}),
     ...(maxTokens !== undefined ? { maxTokens } : {}),
@@ -309,9 +331,58 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
     return after.some((entry) => entry.id === summary.id) ? after : [summary, ...after];
   }
 
+  /**
+   * 上一轮第一步实际计的输入 token 比估算多的倍数，在 1 和 `MAX_CALIBRATION` 之间；找不到样本是 1。
+   * 样本里记着当时已经乘上的倍数，这里换算回没校准的估算再比，下一轮不会来回摆。
+   */
+  async function calibrationOf(session: string): Promise<number> {
+    const recent = await store.list(session, { types: ['message'], last: CALIBRATION_LOOKBACK });
+    for (let index = recent.length - 1; index >= 0; index -= 1) {
+      const meta = stepMetaOf(recent[index]!);
+      if (meta?.step !== 0) continue;
+      const estimated = meta.estimatedInputTokens;
+      const actual = meta.usage?.inputTokens;
+      if (estimated === undefined || actual === undefined || !(estimated > 0) || !(actual > 0)) return 1;
+      const applied = meta.calibration !== undefined && meta.calibration >= 1 ? meta.calibration : 1;
+      const factor = (actual / estimated) * applied;
+      if (!Number.isFinite(factor)) return 1;
+      return Math.round(Math.min(MAX_CALIBRATION, Math.max(1, factor)) * 1000) / 1000;
+    }
+    return 1;
+  }
+
+  /**
+   * 这一次用不用校准、用多少。接了分词器（投影自己的 `estimate`）就不校准：估算本来就准，样本里的偏差多半是别的原因。
+   * 没有 `maxTokens` 时窗口用不上它；`build` 还要拿它校准 `PreparedCall.tokens`（超窗检查用），所以照样算。
+   */
+  async function calibrationFor(
+    session: string,
+    chosen: ProjectionOptions,
+    window: WindowOptions | undefined,
+    always = false,
+  ): Promise<number> {
+    if (options.calibrate === false || chosen.window?.estimate) return 1;
+    if (!always && (window ?? chosen.window)?.maxTokens === undefined) return 1;
+    return calibrationOf(session);
+  }
+
+  /** 另一个会话里 `seq` 不超过 `upTo` 的部分。生效的摘要在 `upTo` 之后时它不算，退回读整段。 */
+  async function inherited(spec: InheritSpec): Promise<Entry[]> {
+    const { session, upTo } = spec;
+    if (upTo === undefined) return load(session);
+    let entries = await load(session);
+    if (entries.some((entry) => entry.type === 'summary' && entry.seq > upTo)) entries = await store.list(session);
+    return entries.filter((entry) => entry.seq <= upTo);
+  }
+
   async function view(session: string, viewOptions: ViewOptions = {}): Promise<Projection> {
     const chosen = projectionNamed(viewOptions.projection);
-    return project(await load(session), { ...chosen, window: windowOf(chosen, viewOptions.window) });
+    const calibration = await calibrationFor(session, chosen, viewOptions.window);
+    // 有窗口时只读够用的尾部，长会话不必整段读出来；结果和读整段一样。
+    return projectSession(store, session, {
+      ...chosen,
+      window: windowOf(chosen, viewOptions.window, 0, calibration),
+    });
   }
 
   /** 不裁剪的整段视图：压缩要看到全部，builder 配的窗口不能挡着。 */
@@ -356,10 +427,20 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
       (request.tools?.length ? estimateTextTokens(JSON.stringify(request.tools)) : 0) +
       sized(request.input) +
       sized(request.prompt);
-    const projected = project(await load(request.session), {
+    const calibration = await calibrationFor(request.session, chosen, request.window, true);
+    const own = await projectSession(store, request.session, {
       ...chosen,
-      window: windowOf(chosen, request.window, reserve),
+      window: windowOf(chosen, request.window, reserve, calibration),
     });
+    const projected = request.inherit
+      ? withInherited(
+          project(await inherited(request.inherit), {
+            ...chosen,
+            window: windowOf(chosen, request.window, reserve + own.tokens, calibration),
+          }),
+          own,
+        )
+      : own;
     const call = assemble({
       projection: projected,
       facts: collected,
@@ -371,7 +452,8 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
       prompt: request.prompt,
       tools: request.tools,
     });
-    return { ...call, tokens: reserve + projected.tokens };
+    const tokens = reserve + projected.tokens;
+    return calibration > 1 ? { ...call, tokens: Math.ceil(tokens * calibration), calibration } : { ...call, tokens };
   }
 
   const now = options.now ?? Date.now;
@@ -585,4 +667,16 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
   }
 
   return { store, build, view, facts, compact, compactDetailed, recompact };
+}
+
+/** 父会话的投影接在本会话的前面：消息、token、丢弃和截短的条数相加，生效的摘要取本会话的。 */
+function withInherited(parent: Projection, own: Projection): Projection {
+  return {
+    messages: [...parent.messages, ...own.messages],
+    items: [...parent.items, ...own.items],
+    tokens: parent.tokens + own.tokens,
+    dropped: parent.dropped + own.dropped,
+    truncated: parent.truncated + own.truncated,
+    ...(own.summary ? { summary: own.summary } : {}),
+  };
 }

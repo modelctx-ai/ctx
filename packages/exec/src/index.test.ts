@@ -79,6 +79,67 @@ describeExecutorContract(
   api,
 );
 
+describeExecutorContract(
+  'process（sessionCwd）',
+  () => ({
+    executor: createProcessExecutor({
+      cwd: root,
+      sessionCwd: true,
+      commands: { echo: { command: (input) => ['echo', String((input as { text?: unknown }).text)] } },
+    }),
+    echo: 'echo',
+  }),
+  api,
+);
+
+describe('sessionCwd：每个会话一个工作目录', () => {
+  test('两个会话各在自己的目录里，互相看不到；close 删掉目录，之后还能再用', async () => {
+    const box = executor({ sessionCwd: true });
+    const a = { session: 'tenant-a/1' };
+    const b = { session: 'tenant-b/1' };
+    await box.open!(a.session);
+    expect(box.sessionCwd(a.session)).not.toBe(box.sessionCwd(b.session));
+    expect(box.sessionCwd(a.session).startsWith(root)).toBe(true);
+    await box.execute({ id: 'w', name: 'write_file', input: { path: 'note.txt', content: 'a 的' } }, a);
+    expect(text(await box.execute({ id: 'r', name: 'read_file', input: { path: 'note.txt' } }, a))).toBe('a 的');
+    expect(error(await box.execute({ id: 'r', name: 'read_file', input: { path: 'note.txt' } }, b))).toMatch(
+      /File not found/,
+    );
+    const pwd = text(await box.execute({ id: 'p', name: 'run_command', input: { command: 'pwd' } }, b));
+    expect(pwd).toContain(box.sessionCwd(b.session).split(/[\\/]/).at(-1));
+    expect(error(await box.execute({ id: 'x', name: 'read_file', input: { path: '../note.txt' } }, b))).toMatch(
+      /outside/i,
+    );
+    await box.close!(a.session);
+    await expect(lstat(box.sessionCwd(a.session))).rejects.toThrow(/ENOENT/);
+    await box.close!(a.session);
+    await box.execute({ id: 'w', name: 'write_file', input: { path: 'again.txt', content: '再来' } }, a);
+    expect(text(await box.execute({ id: 'l', name: 'list_dir', input: {} }, a))).toBe('again.txt');
+    await box.close!(a.session);
+    await box.close!(b.session);
+  });
+
+  test('不按会话时没有 open、close，sessionCwd 就是 cwd', () => {
+    const box = executor();
+    expect('open' in box).toBe(false);
+    expect('close' in box).toBe(false);
+    expect(box.sessionCwd('s')).toBe(box.cwd);
+  });
+
+  test('open 满足不了 environment 时抛 invalid_request，不静默降级', async () => {
+    const box = executor({ sessionCwd: true, env: { API_BASE: 'https://example.test' } });
+    await expect(box.open!('s', { environment: { image: 'python:3.12' } })).rejects.toMatchObject({
+      type: 'invalid_request',
+    });
+    await expect(box.open!('s', { environment: { network: { allow: ['pypi.org'] } } })).rejects.toThrow(
+      /network.allow/,
+    );
+    await expect(box.open!('s', { environment: { env: ['API_BASE', 'MISSING_KEY'] } })).rejects.toThrow(/MISSING_KEY/);
+    await box.open!('s', { environment: { name: 'plain', env: ['API_BASE'] } });
+    await box.close!('s');
+  });
+});
+
 describe('run_command', () => {
   test('报四个工具，绑定自己的名字', async () => {
     const tools = await executor({ name: 'box' }).tools();

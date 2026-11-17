@@ -10,8 +10,8 @@ export {
   type ToolFunctionContext,
 } from './executor.ts';
 export {
+  closeExecutorSessions,
   createToolRegistry,
-  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   dispatchTo,
   toToolSet,
   type Executors,
@@ -24,6 +24,7 @@ export {
 export {
   createContextBuilder,
   DEFAULT_COMPACT_INPUT_TOKENS,
+  MAX_CALIBRATION,
   type ContextBuilderOptions,
   type FactsPlacement,
   type LocalContextBuilder,
@@ -36,8 +37,15 @@ export {
   type StreamTextResult,
 } from './harness.ts';
 export { findLossySummaries, recompactLossy, type FindLossyOptions, type LossySummary } from './migrate.ts';
-export { createOrchestrator, type LocalOrchestrator, type OrchestratorOptions } from './orchestrator.ts';
+export {
+  createOrchestrator,
+  type InterruptedRun,
+  type LocalOrchestrator,
+  type OrchestratorOptions,
+} from './orchestrator.ts';
 export { pruneSession, type PruneOptions } from './retention.ts';
+export { runPendingTools, type PendingToolsResult, type RunPendingToolsOptions } from './pending.ts';
+export { createSubagentTool, type SubagentContext, type SubagentTool, type SubagentToolOptions } from './subagent.ts';
 export * from './errors.ts';
 export * from './context.ts';
 export {

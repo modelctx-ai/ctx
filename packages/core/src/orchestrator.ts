@@ -2,19 +2,42 @@ import {
   CTX_EVENTS,
   headSeq,
   isConflict,
+  messageEntry,
   runEndedEntry,
+  runParentProblem,
   silentLogger,
+  type AgentSpec,
+  type Entry,
   type Harness,
+  type JsonObject,
   type Logger,
   type Orchestrator,
   type OrchestratorEvent,
   type RecoveredRun,
   type RunHandle,
+  type RunParent,
   type RunRequest,
   type RunResult,
   type RunStatus,
   type SessionStore,
 } from '@modelctx-ai/ctx-protocol';
+
+import { interruptedResults } from './harness.ts';
+
+/** `recover` 找到的断掉的运行，交给 `resume` 决定续不续跑。 */
+export interface InterruptedRun {
+  readonly session: string;
+  readonly runId: string;
+  /** 它的 `ctx.run.started` 里记下的 `AgentSpec`（`agentSpecToJson` 的结果：模型只剩名字，请求头打了码）。 */
+  readonly agent: JsonObject;
+  /** 补了错误结果的悬空工具调用有几个。 */
+  readonly interrupted: number;
+  /**
+   * 它是别的 agent 派来的子运行（`ctx.run.started` 的 `parent`）。父运行多半也断了：父运行续跑时模型会重新决定派不派，
+   * 子运行单独续跑可能白做一遍，所以一般只续跑没有 `parent` 的。
+   */
+  readonly parent?: RunParent;
+}
 
 export interface OrchestratorOptions {
   readonly harness: Harness;
@@ -26,6 +49,12 @@ export interface OrchestratorOptions {
    */
   readonly owner?: string;
   /**
+   * `recover` 收了一个断掉的运行之后续不续跑：返回一个 `AgentSpec`，就用它在这个会话上提交一轮不带新输入的运行，
+   * 从日志接着跑（`RecoveredRun.resumed` 是它的 `runId`）；返回 `undefined` 或不给这个选项，只结束不续跑。
+   * 日志里存的 `AgentSpec` 模型只剩名字、请求头打了码，不能原样拿来跑，所以由应用按 `run.agent` 给出完整的。
+   */
+  readonly resume?: (run: InterruptedRun) => AgentSpec | undefined | Promise<AgentSpec | undefined>;
+  /**
    * 结束的运行只留状态，给 `status` 查，最多留这么多个（缺省 1000），再多就从最早结束的开始忘，
    * 忘掉之后 `status` 返回 `undefined`。请求、结果这些大对象在运行结束时就放手，常驻进程的内存不随运行数增长。
    */
@@ -35,6 +64,12 @@ export interface OrchestratorOptions {
 
 export interface LocalOrchestrator extends Orchestrator {
   events(options?: { readonly signal?: AbortSignal }): AsyncIterable<OrchestratorEvent>;
+}
+
+/** `ctx.run.started` 里形状对的 `parent`。 */
+function parentOf(data: unknown): { parent?: RunParent } {
+  const parent = (data as { parent?: unknown } | undefined)?.parent;
+  return parent !== undefined && runParentProblem(parent) === undefined ? { parent: parent as RunParent } : {};
 }
 
 interface Run {
@@ -55,10 +90,24 @@ const RECOVER_PAGE = 100;
 /** 结束的运行留多少个状态。 */
 const RETAIN_ENDED = 1000;
 
+/** 断掉的运行里写下了调用、没有结果的工具调用（`id` → 工具名）。服务商执行的不算。 */
+function danglingCalls(entries: readonly Entry[]): Map<string, string> {
+  const open = new Map<string, string>();
+  for (const entry of entries) {
+    if (entry.type !== 'message' || typeof entry.message.content === 'string') continue;
+    for (const part of entry.message.content) {
+      if (part.type === 'tool-call' && part.providerExecuted !== true) open.set(part.id, part.name);
+      else if (part.type === 'tool-result') open.delete(part.id);
+    }
+  }
+  return open;
+}
+
 /**
  * 进程内编排器：每个会话一条队列，同一会话的运行串行，不同会话并行；一个 harness。
- * `recover` 给 `owner` 相同、日志里最后一个生命周期事件是 `ctx.run.started`（没有配对的 `ctx.run.ended`）的运行补一条
- * `ctx.run.ended`（`stopReason: error`），不续跑；写的时候带 `expectSeq`，读到写入之间会话有新条目就说明那个运行其实在动，跳过。
+ * `recover` 收 `owner` 相同、日志里最后一个生命周期事件是 `ctx.run.started`（没有配对的 `ctx.run.ended`）的运行：
+ * 写下了调用、没有结果的工具调用补一条错误结果，再补 `ctx.run.ended`（`stopReason: error`），一次写入，带 `expectSeq`，
+ * 读到写入之间会话有新条目就说明那个运行其实在动，跳过。给了 `resume` 的再按它续跑。
  */
 export function createOrchestrator(options: OrchestratorOptions): LocalOrchestrator {
   const { harness, store } = options;
@@ -158,6 +207,10 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
     async cancel(runId) {
       const run = runs.get(runId);
       if (!run) return false;
+      // 取消沿着父子链往下传：这个编排器里以它为 `parent` 的运行一起取消。
+      for (const child of runs.values()) {
+        if (child.request.parent?.runId === runId && child.runId !== runId) await orchestrator.cancel(child.runId);
+      }
       if (run.status === 'queued') {
         emit(run, 'cancelled');
         run.done.resolve(skipped(run));
@@ -228,18 +281,36 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
           if ((typeof data?.owner === 'string' ? data.owner : undefined) !== options.owner) continue;
           // 这个编排器自己正在跑的不算断掉。
           if (runs.has(runId)) continue;
-          // 写 ended 时带这个末尾：读和写之间会话有新条目，说明那个运行在动。只有找到断点的会话才多读这一次。
+          // 写 ended 时带这个末尾：读和写之间会话有新条目，说明那个运行在动。只有找到断点的会话才多读这两次。
           const head = await headSeq(store, session);
+          const open = danglingCalls(await store.list(session, { after: last.seq, types: ['message'] }));
           try {
-            await store.append(session, [runEndedEntry({ runId, stopReason: 'error' }, { source: 'orchestrator' })], {
-              expectSeq: head,
-            });
+            await store.append(
+              session,
+              [
+                ...(open.size > 0 ? [messageEntry(interruptedResults(open), { source: 'orchestrator' })] : []),
+                runEndedEntry({ runId, stopReason: 'error' }, { source: 'orchestrator' }),
+              ],
+              { expectSeq: head },
+            );
           } catch (error) {
             // 读和写之间会话有新条目：那个运行在动，不收。
             if (isConflict(error)) continue;
             throw error;
           }
-          recovered.push({ session, runId });
+          const agent = await options.resume?.({
+            session,
+            runId,
+            agent: ((data as { agent?: unknown }).agent ?? {}) as JsonObject,
+            interrupted: open.size,
+            ...parentOf(data),
+          });
+          if (agent === undefined || closed) {
+            recovered.push({ session, runId });
+            continue;
+          }
+          const handle = await orchestrator.submit({ session, agent });
+          recovered.push({ session, runId, resumed: handle.runId });
         }
         const next = page.at(-1);
         // 不满一页就是读完了；存储不认 `after` 时每页都一样，不能原地转圈。
