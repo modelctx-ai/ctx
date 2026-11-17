@@ -2,6 +2,17 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-11-17
+
+- **新增** [ADR 0010：外部 harness 的适配](adr/0010-external-harness-adapters.md)（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：回答 #23 给每个适配器的七个问题——轨迹从流式输出实时写、工具经 MCP 回到 ctx、它自带的工具只进日志并标明执行方、`ctx.run.started` 记它的身份和会话、失败重试退回到失败之前、映射不了的配置报 `invalid_request`、它压缩自己的上下文时不写 `summary`——和 `ctx-claude-code` 依赖 `ctx-mcp` 这个例外。
+- **新增** [`@modelctx-ai/ctx-claude-code`](../packages/claude-code/README.md) 的 README：用法、怎么对上（七个问题各一行，加一轮日志的样子）、`AgentSpec` 和 `stopReason` 的映射表、选项、一致性等级和还没做的、验证（Claude Code 2.1.326，模型是假接口，对真实的 Anthropic 接口没有验证）、导出。
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`ctx.run.started` 的 `data` 加 `harness`（`HarnessInfo`），Harness 一节加「外部 harness 的身份」，上下文过长的错误一条写 `isContextOverflowText`。[ctx-protocol](../packages/protocol/README.md) 的纯函数表跟上。
+- **更新** [架构](architecture.md)：Harness 一节加「外部 harness：Claude Code」，写一轮的六步、取消、围栏；工具与 MCP 一节写 `createMcpServer` 的结果截断、Claude Code 的适配器为什么不用 `onResult`；实现约束表写 `claude` 子进程放在哪、`ctx-claude-code` 依赖 `ctx-mcp` 的例外。[概念](concepts.md)的术语表加「外部 harness」。
+- **更新** [ADR 0002](adr/0002-packages.md)：拆分表和依赖关系表加第十一个包，「实现包之间不互相依赖」注明例外，决定记录补一条。[ADR 索引](adr/index.md)、[文档索引](index.md)的「包」、[实践：yoyo](repos.md) 的包数跟上。
+- **更新** [ctx-mcp](../packages/mcp/README.md)：反方向一节写 `maxOutputChars`，Claude Code 2.1.326 作为真实的客户端验证过。
+- **更新** [README](../README.md) 和[英文版](../README.en.md)：包表和 `overrides` 加 `ctx-claude-code`。
+- **更新** [例子](../examples/README.md)：加 `claude-code.ts`（外部 harness 这种部署），写怎么跑、没装 Claude Code 时跳过、缺省用 `ctx-claude-code/testing` 的假接口、用真的模型怎么跑。
+
 ## 2026-11-16
 
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#40](https://github.com/modelctx-ai/ctx/issues/40)）：工具输出的兜底写明缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`、可配；一致性等级的 `execute` 加上执行前查输入、超长结果截断；契约测试表和工厂一段写新用例、回显工具的 `inputSchema` 要求、`maxToolOutputChars`。[ctx-protocol](../packages/protocol/README.md) 的导出表加 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`，契约一节写同样的要求；[核心包](../packages/core/README.md)写明这个常量来自协议包；[ctx-remote](../packages/remote/README.md) 的一致性模式写 `maxToolOutputChars` 和 `--max-tool-output-chars`。

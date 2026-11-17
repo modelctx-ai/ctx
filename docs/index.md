@@ -33,6 +33,7 @@ okf_version: '0.2'
 - [`@modelctx-ai/ctx-remote`](../packages/remote/README.md) - 实现：会话、执行环境、harness、编排、记忆的 HTTP 服务端和客户端
 - [`@modelctx-ai/ctx-gateway`](../packages/gateway/README.md) - 实现：本机 OpenAI 兼容网关
 - [`@modelctx-ai/ctx-otel`](../packages/otel/README.md) - 实现：从会话日志派生 OpenTelemetry 的 span
+- [`@modelctx-ai/ctx-claude-code`](../packages/claude-code/README.md) - 实现：把 Claude Code 接成 harness，轨迹实时写进日志，工具经 MCP 回到 ctx 的执行环境
 
 # 记录
 

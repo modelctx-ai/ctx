@@ -64,6 +64,29 @@ jobs:
 
       - run: node scripts/pack-smoke.mjs --dir "$RUNNER_TEMP/pack-smoke" --run-only
 
+  claude-code:
+    # ctx-claude-code 的测试和 examples/claude-code.ts 对着真的 Claude Code 跑（模型是本机的假接口，不联网、不要密钥）。
+    # 别的作业里没装 `claude`，这些用例跳过；这里装 README 写的那个版本，没装上就失败（`CTX_TEST_CLAUDE_CODE=required`）。
+    # 升级 Claude Code 先改这里。
+    name: Claude Code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: npm install --global @anthropic-ai/claude-code@2.1.326
+      - run: claude --version
+      - run: pnpm exec vp test packages/claude-code examples
+        env:
+          CTX_TEST_CLAUDE_CODE: required
+
   downstream:
     # yoyo 经 `link:../ctx/packages/*` 读这里的 `dist/`，它的 CI 检出 ctx `main` 的最新提交：
     # 这里合进一个让它编不过的改动，它那边当场就红。所以在 PR 上先试一遍：用这次的构建产物跑 yoyo 的检查和测试。

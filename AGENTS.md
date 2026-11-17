@@ -18,7 +18,7 @@
 | `pnpm examples`                     | `examples/` 里的例子用剧本模型各跑一遍（读 `dist/`，要先 `pnpm build`）；`pnpm test` 也跑它们的测试                                                                                                          |
 | `pnpm live`                         | `live/smoke.ts`：对配了密钥的真实服务跑冒烟场景，没配的跳过；`--record` 把真实响应录成 `live/fixtures/` 里的夹具。要先 `pnpm build`，要联网。不进 PR 的 CI，`live.yml` 每晚跑；录下的夹具由 `pnpm test` 重放 |
 | `pnpm smoke`                        | `scripts/pack-smoke.mjs`：`pnpm pack` 的产物在干净目录里装上、类型解析、每个入口 `import` 一遍；要先 `pnpm build`，要联网                                                                                    |
-| `pnpm release:version <版本>`       | `scripts/release.mjs`：十个包改成同一个版本，正式版本把 CHANGELOG 的「未发布」落成这一版                                                                                                                     |
+| `pnpm release:version <版本>`       | `scripts/release.mjs`：十一个包改成同一个版本，正式版本把 CHANGELOG 的「未发布」落成这一版                                                                                                                   |
 
 仓库里各包互相引用时按源码解析（`@modelctx-ai/source` 条件，见 [ADR 0002](docs/adr/0002-packages.md)），类型检查和测试不用先构建。使用方的 Node 版本和 peer dependency 写在各包 README 的「安装」里。
 

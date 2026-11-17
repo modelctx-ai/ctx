@@ -1,6 +1,6 @@
 name: Release
 
-# 打 `v<版本>` 的 tag 触发：十个包同一个版本一起发到 npm（docs/adr/0002-packages.md）。
+# 打 `v<版本>` 的 tag 触发：十一个包同一个版本一起发到 npm（docs/adr/0002-packages.md）。
 # 正式版本（v0.4.0）发到 `latest`，预发布版本（v0.4.0-next.0）发到 `next`。
 on:
   push:
@@ -38,7 +38,7 @@ jobs:
       # trusted publishing 要 npm ≥ 11.5.1
       - run: npm install -g npm@^11.5.1
 
-      # tag 和十个包的版本对得上，正式版本在 CHANGELOG 里有一节；输出 dist-tag
+      # tag 和十一个包的版本对得上，正式版本在 CHANGELOG 里有一节；输出 dist-tag
       - id: release
         run: node scripts/release.mjs check "$GITHUB_REF_NAME"
 

@@ -65,19 +65,20 @@ sequenceDiagram
 
 ## 包
 
-| 层   | 包                                                      | 作用                                                          |
-| ---- | ------------------------------------------------------- | ------------------------------------------------------------- |
-| 协议 | [`@modelctx-ai/ctx-protocol`](packages/protocol)        | 九个协议的接口、JSON 形状、纯函数、契约测试                   |
-| 实现 | [`@modelctx-ai/ctx`](packages/core)                     | 进程内参考实现，门面 `createContext()`                        |
-|      | [`@modelctx-ai/ctx-sqlite`](packages/sqlite)            | `node:sqlite` 的会话存储和记忆存储                            |
-|      | [`@modelctx-ai/ctx-models`](packages/models)            | 按配置造 `LanguageModel` 和决策、提取模型                     |
-|      | [`@modelctx-ai/ctx-memory`](packages/memory)            | 记忆：门控、召回、巩固、遗忘                                  |
-|      | [`@modelctx-ai/ctx-mcp`](packages/mcp)                  | MCP 服务器作为执行环境                                        |
-|      | [`@modelctx-ai/ctx-exec`](packages/exec)                | 本机子进程执行环境                                            |
-|      | [`@modelctx-ai/ctx-remote`](packages/remote)            | 会话、执行环境、harness、编排、记忆的 HTTP 服务端和客户端     |
-|      | [`@modelctx-ai/ctx-gateway`](packages/gateway)          | 本机 OpenAI 兼容网关，把客户端带来的历史换成 ctx 的上下文     |
-|      | [`@modelctx-ai/ctx-otel`](packages/otel)                | 从会话日志派生 OpenTelemetry 的 span                          |
-| 实践 | [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo) | 用这些包组合出来的常驻桌宠导演，见[实践：yoyo](docs/repos.md) |
+| 层   | 包                                                      | 作用                                                             |
+| ---- | ------------------------------------------------------- | ---------------------------------------------------------------- |
+| 协议 | [`@modelctx-ai/ctx-protocol`](packages/protocol)        | 九个协议的接口、JSON 形状、纯函数、契约测试                      |
+| 实现 | [`@modelctx-ai/ctx`](packages/core)                     | 进程内参考实现，门面 `createContext()`                           |
+|      | [`@modelctx-ai/ctx-sqlite`](packages/sqlite)            | `node:sqlite` 的会话存储和记忆存储                               |
+|      | [`@modelctx-ai/ctx-models`](packages/models)            | 按配置造 `LanguageModel` 和决策、提取模型                        |
+|      | [`@modelctx-ai/ctx-memory`](packages/memory)            | 记忆：门控、召回、巩固、遗忘                                     |
+|      | [`@modelctx-ai/ctx-mcp`](packages/mcp)                  | MCP 服务器作为执行环境                                           |
+|      | [`@modelctx-ai/ctx-exec`](packages/exec)                | 本机子进程执行环境                                               |
+|      | [`@modelctx-ai/ctx-remote`](packages/remote)            | 会话、执行环境、harness、编排、记忆的 HTTP 服务端和客户端        |
+|      | [`@modelctx-ai/ctx-gateway`](packages/gateway)          | 本机 OpenAI 兼容网关，把客户端带来的历史换成 ctx 的上下文        |
+|      | [`@modelctx-ai/ctx-otel`](packages/otel)                | 从会话日志派生 OpenTelemetry 的 span                             |
+|      | [`@modelctx-ai/ctx-claude-code`](packages/claude-code)  | 把 Claude Code 接成 harness：轨迹实时进日志，工具经 MCP 回到 ctx |
+| 实践 | [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo) | 用这些包组合出来的常驻桌宠导演，见[实践：yoyo](docs/repos.md)    |
 
 ## 快速开始
 
@@ -89,6 +90,7 @@ sequenceDiagram
 ```yaml
 overrides:
   '@modelctx-ai/ctx': link:../ctx/packages/core
+  '@modelctx-ai/ctx-claude-code': link:../ctx/packages/claude-code
   '@modelctx-ai/ctx-exec': link:../ctx/packages/exec
   '@modelctx-ai/ctx-gateway': link:../ctx/packages/gateway
   '@modelctx-ai/ctx-mcp': link:../ctx/packages/mcp
