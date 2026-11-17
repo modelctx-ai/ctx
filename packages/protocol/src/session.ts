@@ -331,6 +331,18 @@ export interface RunStartedData {
   readonly owner?: string;
   /** 这一轮是别的 agent 派来的（`RunRequest.parent`）。 */
   readonly parent?: RunParent;
+  /** 跑这一轮的是外部 harness（自带循环的程序的适配器）时，它是谁、它自己的会话是哪个。参考实现不写。 */
+  readonly harness?: HarnessInfo;
+}
+
+/**
+ * 外部 harness 的身份：名字（`claude-code`、`pydantic-ai`）、版本，和它自己的会话标识。自己存对话的程序（Claude Code）
+ * 把 ctx 的一个会话对到它的一个会话上，下一轮从最近一次记下的 `session` 接着跑。
+ */
+export interface HarnessInfo {
+  readonly name: string;
+  readonly version?: string;
+  readonly session?: string;
 }
 
 /** `ctx.run.ended` 的 `data`。崩溃恢复靠「有 started 没有 ended」找出断掉的运行。 */

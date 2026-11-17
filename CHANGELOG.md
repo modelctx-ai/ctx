@@ -4,6 +4,8 @@
 
 ## 未发布
 
+- **新增** `RunStartedData.harness`（`HarnessInfo`：`name`、`version?`、`session?`）：外部 harness 的适配器在 `ctx.run.started` 记它是谁、它自己的会话是哪个。参考实现不写。
+- **新增** 协议包的 `isContextOverflowText(text, status?)`：上游的原始报错文字和状态码是不是在说上下文过长（413 算，401、403、404、429 不算，其余看各服务商常见的写法）。这张表从核心包挪过来，`isContextOverflowError` 改用它，行为不变。
 - **新增** `createMcpServer` 的 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`，0 不限）：一次结果超过就截断并注明，`onResult` 收到截过的。**不兼容**：以前不截，交出超长结果的服务器现在会截到 20 万字符，要原样交出就给 0。
 
 - **新增** `describeHarnessContract` 的 `execute` 级查工具边界（[#40](https://github.com/modelctx-ai/ctx/issues/40) 剩下的一项）：不合 `inputSchema` 的输入不执行、问题作为 `{ type: 'error' }` 回给模型，改对了再调照常执行；回显一个比上限长的输入，日志里的结果截到上限以内（另留一千字符给说明）并注明省略了多少。上限的缺省值 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`（20 万字符）从核心包挪进协议包，核心包照样转出；`HarnessContractOptions.maxToolOutputChars` 给被测 harness 自己的上限，`ctx-remote` 的 `describeConformance` 和 `ctx-conformance --max-tool-output-chars` 跟着加了同名的项。**不兼容**：契约的 fixture 里回显工具的 `inputSchema` 要求 `text` 是字符串。迁移：`inputSchema` 从 `{ type: 'object' }` 改成 `{ type: 'object', properties: { text: { type: 'string' } } }`；harness 不在执行前校验输入、不截断结果的，`execute` 级的这两个用例会红。
