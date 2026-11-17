@@ -42,7 +42,10 @@ import asyncio
 from ctx_pydantic_ai import FunctionExecutor, PydanticAIHarness, RemoteExecutor, RemoteSessionStore
 
 add = FunctionExecutor('py').register(
-    {'name': 'add', 'inputSchema': {'type': 'object', 'properties': {'a': {'type': 'number'}, 'b': {'type': 'number'}}}},
+    {
+        'name': 'add',
+        'inputSchema': {'type': 'object', 'properties': {'a': {'type': 'number'}, 'b': {'type': 'number'}}},
+    },
     lambda value, context: {'type': 'json', 'value': value['a'] + value['b']},
 )
 
