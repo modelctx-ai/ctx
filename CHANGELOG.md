@@ -4,6 +4,7 @@
 
 ## 未发布
 
+- **实现** `ctx-pydantic-ai`：`AgentSpec.window` 和 `AgentSpec.context`，以前以 `invalid_request` 结束。窗口、超窗兜底（`context.overflow`）、继承父会话（`context.inherit`）照参考实现的 builder 移植：`window.maxTokens` 是整次调用的预算，先扣掉指令、工具定义和不进日志的输入，按上一轮第一步的实际用量校准；第一步的 `meta.step` 记 `estimatedInputTokens`（校准过时加 `calibration`）。`overflow` 估算超了就带 `truncate` 重新裁，还超以 `context_overflow` 结束、不调模型；不压缩，`compact` 也只裁。`context.projection` 只认 `default`，别的名字是 `not_found`。token 的估算、截短和投影移到新模块 `ctx_pydantic_ai.context`，过 harness 契约的 `context` 一级。**不兼容**：`ctx_pydantic_ai.messages` 不再有 `project`、`MISSING_RESULT`，从 `ctx_pydantic_ai.context` 取。
 - **实现** `ctx-pydantic-ai`：`permissions` 里的 `ask` 和新选项 `external`（在别处执行的执行环境的名字）。模型调用了交给别处执行的工具，这一轮写下调用后以 `requires_action` 结束，`RunResult.pending` 列出这些调用，执行方追加结果后下一轮不带输入接着跑，同参考实现；以前 `ask` 以 `invalid_request` 结束。新增 `tool_result_entry`、`pending_tool_calls`、`TOOL_RESULT_KEY_PREFIX`：协议包 `toolResultEntry`、`pendingToolCalls`、`TOOL_RESULT_KEY_PREFIX` 的 Python 版。
 - **修复** `@modelctx-ai/ctx`：`createHarness({ external })` 里绑到外部执行环境、权限又是 `deny` 的工具，以前当成等别处执行（以 `requires_action` 结束，执行方照样执行），现在和别的 `deny` 一样在 harness 这一侧回拒绝，模型看到拒绝，这一轮继续。
 

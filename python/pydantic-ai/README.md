@@ -97,7 +97,7 @@ async def ask_first(harness, store, executor) -> dict:
 | 会话身份   | 没有另一份：pydantic-ai 不存对话，每一轮的历史都从 ctx 的日志投影出来交给它（`message_history`）。`ctx.run.started` 的 `data.harness` 记 `{ name: 'pydantic-ai', version }`                                                                                                                                                                  |
 | 失败后重试 | 同参考实现：上一轮以 `error` 或 `aborted` 结束、这一轮的输入就是日志里留下的那句（或同一个 `inputKey`），不再写一遍                                                                                                                                                                                                                          |
 | 取消       | `signal`（线上是 `DELETE /runs/:runId` 或断开）交给 pydantic-ai 的 `CancellationToken`，手里的模型调用和工具停下；没等到结果的工具调用补一条错误结果（`source` 是 `harness`），`stopReason` 是 `aborted`                                                                                                                                     |
-| 上下文     | 投影照协议包 `project` 的缺省规则：最新的摘要代替它盖住的条目，工具调用和结果按组配对，事件不进上下文。不裁窗口、不压缩，不写 `summary`；别处写的 `summary` 照用                                                                                                                                                                             |
+| 上下文     | 投影照协议包 `project` 的缺省规则：最新的摘要代替它盖住的条目，工具调用和结果按组配对，事件不进上下文。窗口、超窗兜底、继承父会话照参考实现的 builder 移植，估算和截短的规则同协议包；第一步的 `meta.step` 记 `estimatedInputTokens`，下一轮按它和实际用量校准。不压缩，不写 `summary`；别处写的 `summary` 照用                              |
 | 它补的话   | pydantic-ai 让模型改了再答时补的那段话（该交结构化输出时给了文字这类，`RetryFeedbackPart`）记成 `pydantic-ai.retry` 事件，不记成用户消息；对某次工具调用的（调了不存在的工具）是那次调用的错误结果                                                                                                                                           |
 
 日志里一轮的样子（并行调了两个执行环境的工具）：
@@ -114,22 +114,23 @@ async def ask_first(harness, store, executor) -> dict:
 
 ## `AgentSpec`
 
-| 字段                       | 映射                                                                                                                                                                                                                            |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`                    | 只收名字。给了 `models` 按它找，找不到是 `not_found`；没给按 pydantic-ai 的写法推（`openai:gpt-5` 这类），推不出来是 `invalid_request`                                                                                          |
-| `instructions`             | `Agent(instructions=…)`                                                                                                                                                                                                         |
-| `tools`                    | 从工具目录里挑                                                                                                                                                                                                                  |
-| `maxSteps`                 | 模型调用的次数，缺省有工具 5、没有 1；pydantic-ai 让模型改了再答的那一次也算。用完时这一步的工具照样执行，`stopReason` 是 `max_steps`；最后一个回答是没交对的结构化输出时是 `invalid_output`                                    |
-| `output`                   | `ToolOutput(StructuredDict(schema), name='final_result')`：模型经输出工具交对象，日志里记成它交的 JSON 文字。pydantic-ai 不按 JSON Schema 查 `StructuredDict`，适配器按 schema 再查一遍，放进 `RunResult.output`                |
-| `toolChoice`               | `none`、`required`、`{ tool }` → `ModelSettings` 的 `tool_choice`；`{ tool }` 点名的工具没交出去是 `invalid_request`                                                                                                            |
-| `permissions`              | `deny` 的照样交给模型，调用时回拒绝；`ask` 的写下调用后以 `requires_action` 停下（同参考实现）                                                                                                                                  |
-| `budget`                   | 在步骤之间查，用到上限就停，`stopReason` 是 `max_budget`                                                                                                                                                                        |
-| `environment`              | 交给执行环境的 `open`                                                                                                                                                                                                           |
-| `settings`                 | `ModelSettings`：`temperature`、`maxOutputTokens` → `max_tokens`、`topP` → `top_p`、`topK` → `top_k`、`presencePenalty`、`frequencyPenalty`、`seed`、`stopSequences`、`maxRetries` → `max_retries`、`headers` → `extra_headers` |
-| `settings.timeoutMs`       | `Agent.iter(timeout=…)`：整轮的，到点以 `error` 结束，`error.type` 是 `timeout`                                                                                                                                                 |
-| `name`、`version`          | `name` 交给 `Agent(name=…)`；都记进 `ctx.run.started`                                                                                                                                                                           |
-| `window`、`context`        | 不支持：整段投影交出去                                                                                                                                                                                                          |
-| `settings.providerOptions` | 不支持                                                                                                                                                                                                                          |
+| 字段                       | 映射                                                                                                                                                                                                                                          |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                    | 只收名字。给了 `models` 按它找，找不到是 `not_found`；没给按 pydantic-ai 的写法推（`openai:gpt-5` 这类），推不出来是 `invalid_request`                                                                                                        |
+| `instructions`             | `Agent(instructions=…)`                                                                                                                                                                                                                       |
+| `tools`                    | 从工具目录里挑                                                                                                                                                                                                                                |
+| `maxSteps`                 | 模型调用的次数，缺省有工具 5、没有 1；pydantic-ai 让模型改了再答的那一次也算。用完时这一步的工具照样执行，`stopReason` 是 `max_steps`；最后一个回答是没交对的结构化输出时是 `invalid_output`                                                  |
+| `output`                   | `ToolOutput(StructuredDict(schema), name='final_result')`：模型经输出工具交对象，日志里记成它交的 JSON 文字。pydantic-ai 不按 JSON Schema 查 `StructuredDict`，适配器按 schema 再查一遍，放进 `RunResult.output`                              |
+| `toolChoice`               | `none`、`required`、`{ tool }` → `ModelSettings` 的 `tool_choice`；`{ tool }` 点名的工具没交出去是 `invalid_request`                                                                                                                          |
+| `permissions`              | `deny` 的照样交给模型，调用时回拒绝；`ask` 的写下调用后以 `requires_action` 停下（同参考实现）                                                                                                                                                |
+| `budget`                   | 在步骤之间查，用到上限就停，`stopReason` 是 `max_budget`                                                                                                                                                                                      |
+| `environment`              | 交给执行环境的 `open`                                                                                                                                                                                                                         |
+| `settings`                 | `ModelSettings`：`temperature`、`maxOutputTokens` → `max_tokens`、`topP` → `top_p`、`topK` → `top_k`、`presencePenalty`、`frequencyPenalty`、`seed`、`stopSequences`、`maxRetries` → `max_retries`、`headers` → `extra_headers`               |
+| `settings.timeoutMs`       | `Agent.iter(timeout=…)`：整轮的，到点以 `error` 结束，`error.type` 是 `timeout`                                                                                                                                                               |
+| `name`、`version`          | `name` 交给 `Agent(name=…)`；都记进 `ctx.run.started`                                                                                                                                                                                         |
+| `window`                   | 裁投影，同参考实现：`maxTokens` 是整次调用的预算，先扣掉指令、工具定义和不进日志的输入、`prompt`；`truncate` 时截短单条消息                                                                                                                   |
+| `context`                  | `inherit`：父会话的投影（`upTo` 以内）接在前面。`overflow`：估算超了就带 `truncate` 重新裁，还超以 `context_overflow` 结束、不调模型；`compact` 也只裁。`projection` 只有 `default`，别的名字是 `not_found`。没有事实来源，`facts` 收不到东西 |
+| `settings.providerOptions` | 不支持                                                                                                                                                                                                                                        |
 
 不支持的字段在场时，这一轮以 `invalid_request` 结束（`ctx.run.started`、输入照常记下，不调模型），不静默忽略。`RunRequest.prompt` 接在历史最后交给模型，不写日志。
 
@@ -188,13 +189,13 @@ async def ask_first(harness, store, executor) -> dict:
 
 ## 一致性等级
 
-过 `describeHarnessContract` 的 `trace`、`execute`、`resume`、`output`，经线上协议（`ctx-conformance` 对着 `ctx-pydantic-ai conformance`）。不跑 `context`：不做 `window` 和 `context`。
+过 `describeHarnessContract` 的全部五级：`trace`、`execute`、`resume`、`context`、`output`，经线上协议（`ctx-conformance` 对着 `ctx-pydantic-ai conformance`）。
 
 一致性模式的实例上另挂了 `/sessions` 的追加和读，给 harness 契约读写日志，不是完整的会话存储：只给 `sessions` 组件的实例请求回 400。
 
 还没做的：
 
-- `window`、`context`：裁剪、压缩、事件规则。
+- 压缩（`compact` 只裁、不写摘要）、事件规则和别的投影、事实来源。
 - 服务商内置工具，和模型产出的文件这类 pydantic-ai 自己的部分：记成 `custom` 部分（`kind` 是 `pydantic-ai.<part_kind>`），下一轮不交回给模型。
 - 不在 PyPI 上；版本跟着仓库走（`pnpm release:version` 的正式版本一起改）。
 
@@ -205,7 +206,7 @@ async def ask_first(harness, store, executor) -> dict:
 测试（`uv run pytest`）有三种：
 
 - 进程内的 harness 和 HTTP 层。
-- 协议函数（截断、投影、上下文过长的认法、筛选、`ListOptions`、等着的调用、`tool_result_entry`）对同一组输入和 TypeScript 的协议包比结果；常量和 `PROTOCOL_VERSION` 从 TypeScript 源码里读出来比。
+- 协议函数（截断、估算和截短、投影和窗口、校准、上下文过长的认法、筛选、`ListOptions`、等着的调用、`tool_result_entry`）对同一组输入和 TypeScript 的协议包比结果；常量和 `PROTOCOL_VERSION` 从 TypeScript 源码里读出来比。
 - 线上：`RemoteSessionStore`、`RemoteExecutor` 对着真的 `ctx-remote`；TypeScript 的 `createRemoteHarness` 经 `ctx-pydantic-ai serve` 跑一轮、日志写进 `ctx-remote`，`ask` 停下后用 TypeScript 的 `runPendingTools` 执行、再接着跑完；`ctx-conformance` 跑一致性测试。
 
 后两种要 node 22.18 以上和仓库根的 `pnpm install`（读各包的 `src/`，不用构建），没有就跳过；`CTX_TEST_PYDANTIC_AI=required` 时不跳、直接失败，CI 这样跑。

@@ -61,8 +61,8 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - 协议：`RunStartedData.harness`、`HarnessInfo`；`isContextOverflowText` 从核心包挪过来，核心包的 `isContextOverflowError` 改用它。
 - `ctx-mcp`：`createMcpServer` 的 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`），`onResult` 收到截过的结果。
 - `ctx-claude-code`：`createClaudeCodeHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 Claude Code 2.1.326 验证过，模型是本机的假接口；对真实的 Anthropic 接口没有验证。Claude Code 起的子代理写进子会话（2026-11-18，对 2.1.326 和 2.1.327 核实过）。
-- `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`output` 四级；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。`ask` 权限和外部执行环境（`external`）以 `requires_action` 结束（2026-11-18）。
-- 没做：pydantic-ai 的 `window` 和 `context`。
+- `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`context`、`output` 五级（`context` 一级 2026-11-18 起）；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。`ask` 权限和外部执行环境（`external`）以 `requires_action` 结束，`window`、`context` 照参考实现的 builder 移植（都是 2026-11-18）。
+- 没做：pydantic-ai 的压缩（`context.overflow` 的 `compact` 只裁）、事件规则和别的投影、事实来源。
 
 ## 决定记录
 
@@ -79,3 +79,4 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
   - 决定二：子代理最后的回答不单独转出，只在那次调用的结果里（`tool_use_result.content`），适配器补成子会话里的一条助手消息；子代理再派的子代理里面的消息 Claude Code 不转出，那一层只记输入、回答和结束。
   - 决定四：子运行的 `harness` 不带 `session`：子代理的记录挂在父会话下面，不能单独续接。
 - 2026-11-18：pydantic-ai 的 `ask` 权限和外部执行环境（`external`）实施，决定七里列着的「`ask` 权限」不再以 `invalid_request` 结束。交给别处执行的工具在 pydantic-ai 里抛 `CallDeferred`（输出类型里加 `DeferredToolRequests`），pydantic-ai 走完那一步就停下，这一轮以 `requires_action` 结束，`pending` 和参考实现一样；执行方追加结果用的 `tool_result_entry`、`pending_tool_calls` 移植到 Python，测试和 TypeScript 的比。核对时发现参考实现把绑到外部执行环境、权限是 `deny` 的工具也当成等别处执行，和协议说的「`deny` 的不执行」不符，一起改成 `deny` 优先。
+- 2026-11-18：pydantic-ai 的 `window`、`context` 实施，2026-11-17 那条里决定八的「还不裁窗口」不再成立。窗口、超窗兜底和继承父会话照参考实现的 builder 移植：`maxTokens` 是整次调用的预算，先扣掉指令、工具定义和不进日志的输入，按上一轮第一步的实际用量校准；token 的估算、截短和投影一起移植，测试对同一组输入和 TypeScript 的结果比。`context` 一级经 `ctx-conformance` 过了。还是不压缩：适配器没有写摘要用的模型，`compact` 和 builder 没有压缩时一样直接裁；`projection` 只认 `default`。
