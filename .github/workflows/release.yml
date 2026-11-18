@@ -2,6 +2,7 @@ name: Release
 
 # 打 `v<版本>` 的 tag 触发：十一个包同一个版本一起发到 npm（docs/adr/0002-packages.md）。
 # 正式版本（v0.4.0）发到 `latest`，预发布版本（v0.4.0-next.0）发到 `next`。
+# 正式版本另把 Python 的 `ctx-pydantic-ai` 发到 PyPI；两边各自检查、各自发，一边失败不拦另一边，重跑跳过已经发过的。
 on:
   push:
     tags: ['v*']
@@ -55,3 +56,85 @@ jobs:
       - run: pnpm -r publish --access public --no-git-checks --tag "$DIST_TAG"
         env:
           DIST_TAG: ${{ steps.release.outputs.dist-tag }}
+
+  python:
+    name: Build ctx-pydantic-ai
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      dist-tag: ${{ steps.release.outputs.dist-tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: pnpm
+
+      # 正式版本还核对 pyproject.toml 和 uv.lock 里的版本
+      - id: release
+        run: node scripts/release.mjs check "$GITHUB_REF_NAME"
+
+      - name: 正式版本的 tag 要在 main 上
+        if: steps.release.outputs.dist-tag == 'latest'
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      # 对照 TypeScript 的用例读各包的 src/，要装 node 的依赖
+      - run: pnpm install --frozen-lockfile
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.13'
+
+      - working-directory: python/pydantic-ai
+        run: uv run --locked pytest
+        env:
+          CTX_TEST_PYDANTIC_AI: required
+
+      - working-directory: python/pydantic-ai
+        run: uv build
+
+      # 打出来的 wheel 在干净的环境里装得上、能 import、命令行起得来；README 在 PyPI 上渲染得出来
+      - name: 冒烟检查
+        working-directory: python/pydantic-ai
+        run: |
+          uv venv "$RUNNER_TEMP/smoke"
+          VIRTUAL_ENV="$RUNNER_TEMP/smoke" uv pip install dist/*.whl
+          "$RUNNER_TEMP/smoke/bin/python" -c 'import ctx_pydantic_ai'
+          "$RUNNER_TEMP/smoke/bin/ctx-pydantic-ai" --help
+          uvx twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: python/pydantic-ai/dist/
+          if-no-files-found: error
+
+  pypi:
+    name: Publish to PyPI
+    needs: python
+    # 预发布版本不是 PEP 440 的写法，pyproject.toml 里还是上一个正式版本：只打包、检查，不发
+    if: needs.python.outputs.dist-tag == 'latest'
+    runs-on: ubuntu-latest
+    # PyPI 的 trusted publisher 认这个环境名
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ctx-pydantic-ai/
+    permissions:
+      # trusted publishing 和 attestations 都要这个；仓库里不放 PyPI 的 token。这个作业不检出代码，只发上一步打的包。
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-dist
+          path: dist/
+
+      # 已经发过的版本跳过，中途失败可以重跑
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true

@@ -2,10 +2,29 @@
 name = "ctx-pydantic-ai"
 version = "0.3.0"
 description = "把 pydantic-ai 的 Agent 接成 ctx 的 harness：轨迹实时写进 ctx 的会话日志，工具调用交给 ctx 的执行环境，经 ctx 的线上协议对外。"
-readme = "README.md"
 license = "Apache-2.0"
+# 和仓库根的 LICENSE 一样（tests/test_package.py 核对）：hatchling 只收项目目录里的文件。
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
+keywords = ["ai", "llm", "agent", "harness", "pydantic-ai", "context-engineering"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# README 在 PyPI 上显示，相对链接由下面的 fancy-pypi-readme 换成 GitHub 上的地址。
+dynamic = ["readme"]
 dependencies = ["pydantic-ai-slim>=2.69,<3", "httpx2>=2.7", "jsonschema>=4.23", "starlette>=0.46", "uvicorn>=0.34"]
+
+[project.urls]
+Homepage = "https://github.com/modelctx-ai/ctx/tree/main/python/pydantic-ai"
+Repository = "https://github.com/modelctx-ai/ctx"
+Issues = "https://github.com/modelctx-ai/ctx/issues"
+Changelog = "https://github.com/modelctx-ai/ctx/blob/main/CHANGELOG.md"
 
 [project.scripts]
 ctx-pydantic-ai = "ctx_pydantic_ai.cli:main"
@@ -14,11 +33,30 @@ ctx-pydantic-ai = "ctx_pydantic_ai.cli:main"
 dev = ["pytest>=8.3", "ruff>=0.11"]
 
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.27", "hatch-fancy-pypi-readme>=24.1"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ctx_pydantic_ai"]
+
+[tool.hatch.build.targets.sdist]
+# README 由下面的钩子读，sdist 里要有它，从 sdist 打 wheel 才读得到。
+include = ["/src", "/tests", "/README.md", "/LICENSE"]
+
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+# PyPI 不认相对链接：指到 GitHub 上 main 的同一个文件。先换指到仓库根的，再换包目录里的。
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\(\.\./\.\./([^)\s]+)\)'
+replacement = '](https://github.com/modelctx-ai/ctx/blob/main/\1)'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?://|mailto:|#)([^)\s]+)\)'
+replacement = '](https://github.com/modelctx-ai/ctx/blob/main/python/pydantic-ai/\1)'
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

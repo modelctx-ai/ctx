@@ -4,7 +4,13 @@
 
 ## 安装
 
-不在 PyPI 上，从仓库装：
+正式版本发到 PyPI，和 npm 的包同一个版本：
+
+```bash
+pip install ctx-pydantic-ai
+```
+
+第一版发出来之前，从仓库装：
 
 ```bash
 pip install "ctx-pydantic-ai @ git+https://github.com/modelctx-ai/ctx#subdirectory=python/pydantic-ai"
@@ -197,7 +203,6 @@ async def ask_first(harness, store, executor) -> dict:
 
 - 压缩（`compact` 只裁、不写摘要）、事件规则和别的投影、事实来源。
 - 服务商内置工具，和模型产出的文件这类 pydantic-ai 自己的部分：记成 `custom` 部分（`kind` 是 `pydantic-ai.<part_kind>`），下一轮不交回给模型。
-- 不在 PyPI 上；版本跟着仓库走（`pnpm release:version` 的正式版本一起改）。
 
 ## 验证
 

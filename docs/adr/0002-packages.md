@@ -124,8 +124,11 @@ Trusted publishing 只能给已经存在的包配置，所以第一次要先把�
 - `scripts/pack-smoke.mjs`（`pnpm smoke`）：每个包 `pnpm pack`，查包里的内容（有 `dist/`、`README.md`、`LICENSE`，没有 `src/` 和测试，没有残留的 `workspace:`，`exports` 指的文件都在），在干净目录里用 npm 一次装上十个 tarball，不打开源码条件用 `tsc`（`skipLibCheck: false`）把每个入口的类型解析一遍，再把每个入口 `import` 一遍、内存存储和 SQLite 存储各写读一次。
 - CI 的 `Pack smoke` 任务：上面的检查每个 PR 都跑；`import` 那一步另在 Node 22.0.0、22.13.0 上跑，按各包自己的 `engines.node` 决定跑哪些，`engines` 写低了这里会失败。
 - `.github/workflows/release.yml`：tag `v<版本>` 触发，`check`、`pnpm check`、冒烟检查都过了才 `pnpm -r publish`。正式版本的 tag 必须在 `main` 上，发到 `latest`；带 `-` 的预发布版本（`v0.4.0-next.0`）发到 `next`，给下游先试。
+- `release.yml` 的 `python`、`pypi` 两个作业（2026-11-18）：跑 Python 的测试、`uv build`，在干净的环境里装上 wheel、`import`、起命令行，`twine check --strict`；正式版本再用 PyPI 的 trusted publishing 发 `ctx-pydantic-ai`（`pypa/gh-action-pypi-publish`，带 attestations，已经发过的跳过）。发布的作业在 `pypi` 环境里，只有 `id-token: write`，不检出代码，只发上一个作业打的包。预发布的 tag 只打包、检查，不发。
 
 还没做、只能由 npm 组织的维护者做的：「发布」里的第 1、2、4 步（占位版本、每个包配 trusted publisher 指向 `release.yml`、吊销 token）。发布工作流没有对真实的 npm 验证过；第一次建议先打一个预发布 tag 走一遍。
+
+PyPI 那边只能由维护者做的：在 PyPI 加一个 pending publisher（项目 `ctx-pydantic-ai`，仓库 `modelctx-ai/ctx`，工作流 `release.yml`，环境 `pypi`）。不用先发占位版本，第一次发布时 PyPI 建项目；但 pending publisher 不占名字（2026-11-18 还没人用），配好以后尽早发。GitHub 的 `pypi` 环境第一次用到时自动建，可以加要人批准这类保护规则。发 PyPI 的作业也没有对真实的 PyPI 验证过。
 
 发一版的步骤：
 
@@ -143,3 +146,4 @@ Trusted publishing 只能给已经存在的包配置，所以第一次要先把�
 - 2026-11-16：加第十个包 `@modelctx-ai/ctx-otel`（[#46](https://github.com/modelctx-ai/ctx/issues/46)）：OpenTelemetry 的适配带进 `@opentelemetry/api`，按「带额外依赖的各成一个适配包」单独成包，不进核心包。它只依赖协议包，`@opentelemetry/api` 是 peer：应用里只有一份 OpenTelemetry API，全局的 tracer provider 才对得上。正文里「现在九个」按十个读；占位版本也要给它发。
 - 2026-11-17：加第十一个包 `@modelctx-ai/ctx-claude-code`（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：要起子进程和本机 HTTP，按「只能在 Node 上跑的各成一个适配包」单独成包。它把 `ctx-mcp` 当 peer，是「实现包之间不互相依赖」的第一个例外：MCP 服务器那一半（`createMcpServer`）只在 `ctx-mcp` 里有一份，理由见 [ADR 0010](0010-external-harness-adapters.md)。正文里的「十个」按十一个读；占位版本也要给它发。
 - 2026-11-17：加 Python 的 `ctx-pydantic-ai`（`python/pydantic-ai`，[#23](https://github.com/modelctx-ai/ctx/issues/23)）。另一种语言，不进 pnpm 的工作区、不发 npm，也还不发 PyPI；依赖由 uv 锁在 `uv.lock`，CI 单独一个作业。它不依赖任何 TypeScript 包，只认线上协议：`PROTOCOL_VERSION`、`ENTRY_VERSION` 和几个常量由测试从 TypeScript 源码里读出来比，协议函数对同一组输入和协议包比结果。版本跟着正式版本一起改（`scripts/release.mjs version` 也改它的 `pyproject.toml` 和 `uv.lock`，`check` 也核对）；预发布版本不是 PEP 440 的写法，不动它。
+- 2026-11-18：`ctx-pydantic-ai` 发 PyPI，上一条的「也还不发 PyPI」不再成立。和 npm 同一个 tag、同一个版本，只发正式版本：预发布版本不是 PEP 440 的写法，`pyproject.toml` 不跟着改。用 PyPI 的 trusted publishing，打包和发布分成两个作业，发布的作业只拿到 `id-token: write` 和打好的包（PyPA 推荐的做法）。不等 npm 那边：npm 的第一次发布要维护者先占名字，PyPI 的 pending publisher 不用，两边各自重跑。README 里的相对链接打包时换成 GitHub 上的地址（`hatch-fancy-pypi-readme`），许可证在包目录里放一份，测试核对它和仓库根的一样。
