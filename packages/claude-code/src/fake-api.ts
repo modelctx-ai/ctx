@@ -12,13 +12,20 @@ import type { JsonObject } from '@modelctx-ai/ctx-protocol';
  */
 export type FakeAnthropicStep =
   | { readonly type: 'text'; readonly text: string; readonly truncated?: boolean; readonly delayMs?: number }
-  | { readonly type: 'tool-call'; readonly id: string; readonly input: JsonObject; readonly delayMs?: number }
+  | {
+      readonly type: 'tool-call';
+      readonly id: string;
+      readonly input: JsonObject;
+      /** 这一步调哪个工具，缺省是 `FakeAnthropicApiOptions.tool`。 */
+      readonly tool?: string;
+      readonly delayMs?: number;
+    }
   | { readonly type: 'error'; readonly message: string; readonly status?: number; readonly delayMs?: number }
   /** 一条消息里先说一段话（可选），再并行调几次工具。 */
   | {
       readonly type: 'tool-calls';
       readonly text?: string;
-      readonly calls: readonly { readonly id: string; readonly input: JsonObject }[];
+      readonly calls: readonly { readonly id: string; readonly input: JsonObject; readonly tool?: string }[];
       readonly delayMs?: number;
     };
 
@@ -140,13 +147,16 @@ export async function createFakeAnthropicApi(options: FakeAnthropicApiOptions): 
         return json(res, step.status ?? 500, { type: 'error', error: { type: 'api_error', message: step.message } });
       }
       let blocks: Block[];
-      const name = tools.find((tool) => tool === wanted || tool.endsWith(`__${wanted}`)) ?? wanted;
+      const nameOf = (tool = wanted): string =>
+        tools.find((name) => name === tool || name.endsWith(`__${tool}`)) ?? tool;
       if (step.type === 'tool-call') {
-        blocks = [{ type: 'tool_use', id: step.id, name, input: step.input }];
+        blocks = [{ type: 'tool_use', id: step.id, name: nameOf(step.tool), input: step.input }];
       } else if (step.type === 'tool-calls') {
         blocks = [
           ...(step.text ? [{ type: 'text', text: step.text } as const] : []),
-          ...step.calls.map((call) => ({ type: 'tool_use', id: call.id, name, input: call.input }) as const),
+          ...step.calls.map(
+            (call) => ({ type: 'tool_use', id: call.id, name: nameOf(call.tool), input: call.input }) as const,
+          ),
         ];
       } else {
         // 要了结构化输出（`--json-schema`），Claude Code 会给一个 `StructuredOutput` 工具：剧本里的 JSON 交给它。

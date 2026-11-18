@@ -51,7 +51,15 @@ import {
   type Usage,
 } from '@modelctx-ai/ctx-protocol';
 
+import {
+  CLAUDE_CODE_EVENTS,
+  CLAUDE_CODE_HARNESS,
+  CLAUDE_CODE_MCP_SERVER,
+  INTERRUPTED,
+  MAX_CONFLICTS,
+} from './constants.ts';
 import { ClaudeProcess, probeVersion, type Exit } from './process.ts';
+import { SubagentTrace } from './subagents.ts';
 import {
   addUsages,
   assistantMessageOf,
@@ -69,20 +77,6 @@ import {
   type ResultLine,
   type UserLine,
 } from './stream-json.ts';
-
-/** 写进 `ctx.run.started` 的 `harness.name`。 */
-export const CLAUDE_CODE_HARNESS = 'claude-code';
-
-/** Claude Code 那边的 MCP 服务器名：ctx 的工具在它那里叫 `mcp__ctx__<名字>`。 */
-export const CLAUDE_CODE_MCP_SERVER = 'ctx';
-
-/** 适配器写的事件的 `kind`。 */
-export const CLAUDE_CODE_EVENTS = {
-  /** Claude Code 自己补的用户消息（输出截断后让模型接着写、催它调结构化输出的工具、中断）：`text` 是那段话。 */
-  synthetic: 'claude-code.synthetic',
-  /** Claude Code 压缩了自己的上下文：`data` 是它给的 `compact_metadata`。ctx 的日志不压缩，不写摘要。 */
-  compacted: 'claude-code.compacted',
-} as const;
 
 export interface ClaudeCodeHarnessOptions {
   /** 会话日志：生命周期事件、输入、模型的每一步、工具结果都实时写进来。 */
@@ -121,10 +115,6 @@ export interface ClaudeCodeHarness extends Harness {
 
 /** 认重试、找上一轮时最多往回读这么多条。 */
 const SCAN = 64;
-/** 写入冲突后最多重试几次。 */
-const MAX_CONFLICTS = 20;
-/** 工具调用没等到结果这一轮就结束了：补给它的错误结果（和参考实现的说法一样）。 */
-const INTERRUPTED = 'The run ended before this tool call returned; its result is unknown.';
 
 /** `ctx.run.started`、`ctx.run.ended` 和每一步的条目的 `meta.claudeCode`：Claude Code 记录里的位置。 */
 interface ClaudeMeta {
@@ -585,6 +575,8 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
     const toolName = (name: string): string => byMcpName.get(name)?.name ?? name;
     const childEnv = {
       ...env,
+      // 子代理和后台命令在这一轮里跑完：一轮到 `result` 就结束，后台的活不过这一轮，子代理的轨迹也就不全。
+      CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
       ...(settings.maxRetries !== undefined ? { CLAUDE_CODE_MAX_RETRIES: String(settings.maxRetries) } : {}),
       ...(settings.maxOutputTokens !== undefined
         ? { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(settings.maxOutputTokens) }
@@ -598,6 +590,18 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
     });
     proc.send({ type: 'user', message: { role: 'user', content } });
 
+    const claudeVersion = state.record ? await versionOf() : undefined;
+    const subagents = state.record
+      ? new SubagentTrace({
+          store,
+          root: { session: request.session, runId: state.runId },
+          agent,
+          ...(request.owner !== undefined ? { owner: request.owner } : {}),
+          ...(claudeVersion !== undefined ? { version: claudeVersion } : {}),
+          toolName,
+          executorOf: (name) => byMcpName.get(name)?.executor ?? CLAUDE_CODE_HARNESS,
+        })
+      : undefined;
     let cause: StopCause | undefined;
     const stop = (why: StopCause): void => {
       cause ??= why;
@@ -738,6 +742,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
         };
         return;
       }
+      subagents?.calls(line.message.content, undefined);
       if (current && current.id !== line.message.id) await flushAssistant();
       current ??= { id: line.message.id, ...(line.message.model ? { model: line.message.model } : {}), blocks: [] };
       current.blocks.push(...line.message.content);
@@ -767,7 +772,9 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
       }
       for (const block of toolResults) {
         const id = block.tool_use_id!;
-        const output = toolOutputOf(block, toolResults.length === 1 ? line.tool_use_result : undefined);
+        const raw = toolResults.length === 1 ? line.tool_use_result : undefined;
+        // 子代理的调用：结果换成 `ChildRunResult`，子会话里的那一轮在这里写完。
+        const output = (await subagents?.finish(id, block, raw)) ?? toolOutputOf(block, raw);
         results.set(id, {
           output,
           source: executedBy.get(id) ?? CLAUDE_CODE_HARNESS,
@@ -780,11 +787,17 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
 
     const handle = async (line: ClaudeLine): Promise<void> => {
       const uuid = (line as { uuid?: unknown }).uuid;
+      const parentCall = (line as { parent_tool_use_id?: unknown }).parent_tool_use_id;
       if ((line.type === 'assistant' || line.type === 'user') && typeof uuid === 'string') {
-        // 子 agent（`Task` 工具）里面的消息不进日志，也不算位置。
-        if (!(line as { parent_tool_use_id?: unknown }).parent_tool_use_id) tip = uuid;
+        // 子代理里面的消息进子会话，不算这一轮在 Claude Code 记录里的位置。
+        if (!parentCall) tip = uuid;
       }
-      if ((line as { parent_tool_use_id?: unknown }).parent_tool_use_id) return;
+      if (parentCall) {
+        if (typeof parentCall === 'string' && (line.type === 'assistant' || line.type === 'user')) {
+          await subagents?.line(line, parentCall);
+        }
+        return;
+      }
       switch (line.type) {
         case 'system': {
           if (line.subtype === 'init') {
@@ -796,6 +809,8 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
               (server) => server.name === CLAUDE_CODE_MCP_SERVER && server.status !== 'connected',
             );
             if (failed) logger.warn('claude code could not connect to the ctx MCP server', { status: failed.status });
+          } else if (line.subtype.startsWith('task_')) {
+            await subagents?.system(line);
           } else if (line.subtype === 'compact_boundary') {
             const data = (line as { compact_metadata?: unknown }).compact_metadata;
             await write(state, [
@@ -848,6 +863,8 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
 
     let exit: Exit | undefined;
     let failure: unknown;
+    /** 没等到结果就结束了的子代理：它的调用补的结果（`ChildRunResult`，`aborted`）。 */
+    let closed: ReadonlyMap<string, ToolOutput> | undefined;
     try {
       for await (const line of proc.lines()) {
         await handle(line);
@@ -856,6 +873,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
       }
       await flushAssistant();
       await flushResults(true);
+      closed = await subagents?.close();
     } catch (error) {
       // 写日志失败：停下 Claude Code，把错误抛给调用方（同参考实现：只有写日志失败才 reject）。
       failure = error;
@@ -926,6 +944,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
       stopReason,
       text,
       open,
+      ...(closed ? { closed } : {}),
       last: tip,
       ...(error ? { error } : {}),
       ...(usage ? { usage } : {}),
@@ -951,6 +970,8 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
       readonly stopReason: StopReason;
       readonly text: string;
       readonly open: ReadonlyMap<string, string>;
+      /** 没等到结果的子代理调用的结果，别的没等到结果的调用补 `INTERRUPTED`。 */
+      readonly closed?: ReadonlyMap<string, ToolOutput>;
       readonly last: string | undefined;
       readonly error?: ErrorInfo;
       readonly usage?: Usage;
@@ -966,7 +987,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
           type: 'tool-result',
           id,
           name,
-          output: errorOutput(INTERRUPTED),
+          output: outcome.closed?.get(id) ?? errorOutput(INTERRUPTED),
         })),
       };
       state.messages.push(message);

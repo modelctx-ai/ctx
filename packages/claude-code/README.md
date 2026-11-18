@@ -55,6 +55,7 @@ console.log(result.stopReason, result.text);
 | 取消           | `signal` 中止时先发 `interrupt` 控制消息，Claude Code 停下手里的模型调用和工具、照常给出结果；`interruptTimeoutMs` 之后还没退出就 SIGTERM，再过一样久 SIGKILL。工具执行到一半被取消时，结果是 Claude Code 给的拒绝                                                                                                                                        |
 | 上下文         | Claude Code 自己管：ctx 的日志不压缩、不投影。它压缩自己的上下文时记一条 `claude-code.compacted`（`data` 是它给的 `compact_metadata`），不写 ctx 的 `summary`；摘要文字随后作为 `claude-code.synthetic` 记下                                                                                                                                              |
 | 它补的用户消息 | 输出被截断后让模型接着写、催模型调结构化输出的工具、中断时的说明：记成 `claude-code.synthetic` 事件（`text` 是那段话），不记成用户消息                                                                                                                                                                                                                    |
+| 子代理         | `builtinTools` 里有 `Task`（发给模型时叫 `Agent`）才有，`bare` 时没有。子代理在这一轮里跑完（适配器给子进程设 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`），轨迹写进子会话 `<会话>/<工具名>/<调用 id>`，和进程内派子 agent 的缺省一样；父会话里那次调用的结果是 `ChildRunResult`，`childRunsOf` 找得到。用量各算各的                                        |
 
 日志里一轮的样子（并行调了两次 ctx 的工具）：
 
@@ -66,6 +67,19 @@ console.log(result.stopReason, result.text);
 | 4     | `tool`            | `local`   | 两个结果，按调用的顺序                                                         |
 | 5     | `assistant`       | `model`   | 回答                                                                           |
 | 6     | `ctx.run.ended`   | `harness` | `stopReason`、整轮的用量；`meta.claudeCode.last`                               |
+
+子代理在子会话里的一轮：
+
+| `seq` | 条目              | `source`      | 带着                                                                                                                                                                                     |
+| ----- | ----------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | `ctx.run.started` | `harness`     | `data.parent`：父会话、父 `runId`、那次调用的 id；`data.agent`：子代理的类型（`name`）和父运行的模型；`data.harness` 没有 `session`（子代理没有能续接的会话）；`meta.claudeCode.agentId` |
+| 2     | `user`            | `claude-code` | 父代理交给它的话                                                                                                                                                                         |
+| 3     | `assistant`       | `model`       | 每一步；`meta.step` 的 `runId` 是子运行的                                                                                                                                                |
+| 4     | `tool`            | 执行方        | 工具结果，ctx 的工具照样经 MCP 交给执行环境                                                                                                                                              |
+| 5     | `assistant`       | `model`       | 最后的回答：Claude Code 只在那次调用的结果里给，适配器补成一条                                                                                                                           |
+| 6     | `ctx.run.ended`   | `harness`     | 完成是 `end_turn`；失败是 `error`，前面有一条 `ctx.error`；被中断是 `aborted`                                                                                                            |
+
+子代理再派的子代理挂在子会话下面（`<子会话>/<工具名>/<调用 id>`）。Claude Code 不转出它里面的消息，那个会话只有输入、回答和结束。父运行结束时还没结束的子代理以 `aborted` 结束，父会话里那次调用的结果是 `aborted` 的 `ChildRunResult`。
 
 ## `AgentSpec`
 
@@ -106,21 +120,21 @@ console.log(result.stopReason, result.text);
 
 ## 选项
 
-| 选项                 | 缺省                            | 说明                                                                                          |
-| -------------------- | ------------------------------- | --------------------------------------------------------------------------------------------- |
-| `store`              | 必填                            | 会话日志                                                                                      |
-| `executors`          | 无                              | ctx 的执行环境，数组或 `{ 名字: 执行环境 }`                                                   |
-| `tools`              | 各执行环境 `tools()` 报的全部   | 工具目录；`createToolRegistry()` 建的，它自带的函数执行环境自动加进来                         |
-| `builtinTools`       | `[]`                            | Claude Code 自带的工具交出哪些                                                                |
-| `command`            | `claude`                        | 可执行文件                                                                                    |
-| `args`               | 无                              | 加在最后的命令行参数                                                                          |
-| `cwd`                | 当前目录                        | Claude Code 的工作目录，也是它存会话的依据                                                    |
-| `env`                | `process.env`                   | 子进程的环境变量                                                                              |
-| `bare`               | `false`                         | 加 `--bare`：不读用户和项目的设置、`CLAUDE.md`、钩子、插件，鉴权只认 `ANTHROPIC_API_KEY`      |
-| `maxToolOutputChars` | `DEFAULT_MAX_TOOL_OUTPUT_CHARS` | 一次 ctx 工具结果最多多少字符。Claude Code 自己也限 MCP 结果的长度（`MAX_MCP_OUTPUT_TOKENS`） |
-| `interruptTimeoutMs` | `5_000`                         | 取消后等它自己停下多久                                                                        |
-| `source`             | 不写                            | 输入条目的 `source`                                                                           |
-| `logger`             | 不记                            | 连不上 MCP 服务器、会话 id 对不上时 `warn`                                                    |
+| 选项                 | 缺省                            | 说明                                                                                                 |
+| -------------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `store`              | 必填                            | 会话日志                                                                                             |
+| `executors`          | 无                              | ctx 的执行环境，数组或 `{ 名字: 执行环境 }`                                                          |
+| `tools`              | 各执行环境 `tools()` 报的全部   | 工具目录；`createToolRegistry()` 建的，它自带的函数执行环境自动加进来                                |
+| `builtinTools`       | `[]`                            | Claude Code 自带的工具交出哪些；子代理是 `Task`                                                      |
+| `command`            | `claude`                        | 可执行文件                                                                                           |
+| `args`               | 无                              | 加在最后的命令行参数                                                                                 |
+| `cwd`                | 当前目录                        | Claude Code 的工作目录，也是它存会话的依据                                                           |
+| `env`                | `process.env`                   | 子进程的环境变量。适配器另加 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`：后台的活不过这一轮            |
+| `bare`               | `false`                         | 加 `--bare`：不读用户和项目的设置、`CLAUDE.md`、钩子、插件，鉴权只认 `ANTHROPIC_API_KEY`；没有子代理 |
+| `maxToolOutputChars` | `DEFAULT_MAX_TOOL_OUTPUT_CHARS` | 一次 ctx 工具结果最多多少字符。Claude Code 自己也限 MCP 结果的长度（`MAX_MCP_OUTPUT_TOKENS`）        |
+| `interruptTimeoutMs` | `5_000`                         | 取消后等它自己停下多久                                                                               |
+| `source`             | 不写                            | 输入条目的 `source`                                                                                  |
+| `logger`             | 不记                            | 连不上 MCP 服务器、会话 id 对不上时 `warn`                                                           |
 
 同一个实例里同一会话的记录型运行一个接一个；跨进程时第二个以 `session_busy` 结束。
 
@@ -130,23 +144,22 @@ console.log(result.stopReason, result.text);
 
 还没做的：
 
-- 子代理（`Task` 工具，`builtinTools` 里给了才有）里面的消息不进日志，`Task` 的调用和结果照常记在这个会话；协议说的「写进子会话、带 `parent`」还没做。
 - ctx 的日志里别处写的东西（应用的事件、别的 harness 跑的轮次）Claude Code 看不到：它只读自己的会话。一个 ctx 会话只给它一个 harness 跑。
 - 换了 `cwd` 或 `CLAUDE_CONFIG_DIR`、删了它的记录，下一轮以 `not_found` 结束。
 
 ## 验证
 
-用 Claude Code 2.1.326 验证过（2026-11-17）：契约测试和本包的用例起真的 `claude`，模型换成本机的假 Anthropic Messages API；stream-json 的各种行、`--resume`、`--resume-session-at`、`--no-session-persistence`、中断、`--max-turns`、`--json-schema`、MCP 经 Streamable HTTP 都对着它核实过。`--max-turns` 和 `--resume-session-at` 是它不在 `--help` 里列出的参数。对真实的 Anthropic 接口没有验证。
+用 Claude Code 2.1.326 验证过（2026-11-17）：契约测试和本包的用例起真的 `claude`，模型换成本机的假 Anthropic Messages API；stream-json 的各种行、`--resume`、`--resume-session-at`、`--no-session-persistence`、中断、`--max-turns`、`--json-schema`、MCP 经 Streamable HTTP 都对着它核实过。`--max-turns` 和 `--resume-session-at` 是它不在 `--help` 里列出的参数。子代理（`task_started`、`task_updated`、`task_notification`、带 `parent_tool_use_id` 的行、结果里的 `tool_use_result`）对 2.1.326 和 2.1.327 核实过（2026-11-18）：完成、失败、被中断、再派一层都跑过。对真实的 Anthropic 接口没有验证。
 
-本包的测试和 [`examples/claude-code.ts`](../../examples/claude-code.ts) 在装了 `claude` 时跑，没装就跳过；`CTX_TEST_CLAUDE_CODE=required` 时没装就失败，`CTX_CLAUDE_CODE_COMMAND` 换可执行文件。测试给子进程的环境变量只有 `PATH`、临时的 `HOME` 和 `CLAUDE_CONFIG_DIR`、假接口的地址和一个假的 `ANTHROPIC_API_KEY`，不读本机的设置和凭证。
+本包的测试和 [`examples/claude-code.ts`](../../examples/claude-code.ts) 在装了 `claude` 时跑，没装就跳过；`CTX_TEST_CLAUDE_CODE=required` 时没装就失败，`CTX_CLAUDE_CODE_COMMAND` 换可执行文件。测试给子进程的环境变量只有 `PATH`、临时的 `HOME`、`CLAUDE_CONFIG_DIR` 和 `TMPDIR`、假接口的地址和一个假的 `ANTHROPIC_API_KEY`，不读本机的设置和凭证；子代理的用例不加 `--bare`，读到的也只有这些临时目录。
 
 ## 导出
 
-| 导出                                            | 说明                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `createClaudeCodeHarness(options)`              | 返回 `ClaudeCodeHarness`：协议的 `Harness`，`run` 和 `stream` 都有                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `ClaudeCodeHarness`、`ClaudeCodeHarnessOptions` | 类型；选项见上                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `CLAUDE_CODE_HARNESS`                           | `claude-code`：`HarnessInfo.name`，也是自带工具结果的 `source`                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `CLAUDE_CODE_MCP_SERVER`                        | `ctx`：Claude Code 里 MCP 服务器的名字，工具叫 `mcp__ctx__<名字>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `CLAUDE_CODE_EVENTS`                            | 适配器写的事件的 `kind`：`synthetic`、`compacted`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `@modelctx-ai/ctx-claude-code/testing`          | `createFakeAnthropicApi({ script, tool? })`：本机的假 Anthropic Messages API，返回 `{ url, requests, close() }`，`url` 给 Claude Code 的 `ANTHROPIC_BASE_URL`。带工具的请求（主循环）按剧本一步一步回答，剧本的一步（`FakeAnthropicStep`）和契约测试的 `ModelScriptStep` 同形状，另有并行调用的 `tool-calls`、`delayMs`、`error` 的 `status`；要了结构化输出时 `text` 里的 JSON 交给 `StructuredOutput` 工具。`requests` 是收到的主循环请求。类型 `FakeAnthropicApi`、`FakeAnthropicApiOptions`、`FakeAnthropicRequest`、`FakeAnthropicStep` |
+| 导出                                            | 说明                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `createClaudeCodeHarness(options)`              | 返回 `ClaudeCodeHarness`：协议的 `Harness`，`run` 和 `stream` 都有                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `ClaudeCodeHarness`、`ClaudeCodeHarnessOptions` | 类型；选项见上                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `CLAUDE_CODE_HARNESS`                           | `claude-code`：`HarnessInfo.name`，也是自带工具结果的 `source`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `CLAUDE_CODE_MCP_SERVER`                        | `ctx`：Claude Code 里 MCP 服务器的名字，工具叫 `mcp__ctx__<名字>`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `CLAUDE_CODE_EVENTS`                            | 适配器写的事件的 `kind`：`synthetic`、`compacted`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `@modelctx-ai/ctx-claude-code/testing`          | `createFakeAnthropicApi({ script, tool? })`：本机的假 Anthropic Messages API，返回 `{ url, requests, close() }`，`url` 给 Claude Code 的 `ANTHROPIC_BASE_URL`。带工具的请求（主循环）按剧本一步一步回答，剧本的一步（`FakeAnthropicStep`）和契约测试的 `ModelScriptStep` 同形状，另有并行调用的 `tool-calls`、`delayMs`、`error` 的 `status`，`tool-call` 和 `tool-calls` 的每次调用可以用 `tool` 指定调哪个工具；要了结构化输出时 `text` 里的 JSON 交给 `StructuredOutput` 工具。`requests` 是收到的主循环请求。类型 `FakeAnthropicApi`、`FakeAnthropicApiOptions`、`FakeAnthropicRequest`、`FakeAnthropicStep` |
