@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -53,12 +54,19 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model, infer_model
 from pydantic_ai.usage import UsageLimits
 
+from .context import (
+    calibration_of,
+    estimate_text_tokens,
+    estimate_tokens,
+    json_text,
+    project,
+    window_of,
+)
 from .executors import Executor
 from .messages import (
     add_usage,
     assistant_message,
     finish_reason_of,
-    project,
     retry_text,
     text_of,
     to_model_messages,
@@ -155,6 +163,15 @@ class AbortSignal:
         return remove
 
 
+@dataclass
+class _Prepared:
+    """这一轮交给模型的历史（ctx 消息）、整次调用的估算 token（校准过的话乘上了倍数）、校准的倍数。"""
+
+    messages: list[dict[str, Any]]
+    tokens: int
+    calibration: float
+
+
 class _WriteFailed(Exception):
     """写日志失败：不当成模型的错误，原样抛给调用方。"""
 
@@ -196,16 +213,61 @@ def _ended_in_failure(entry: Mapping[str, Any] | None) -> bool:
     return entry['data'].get('stopReason') in ('error', 'aborted')  # type: ignore[index]
 
 
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _window_problem(window: Any) -> str | None:
+    if not isinstance(window, dict):
+        return 'AgentSpec.window must be an object.'
+    for key in ('maxMessages', 'maxTokens'):
+        if window.get(key) is not None and not _number(window[key]):
+            return f'AgentSpec.window.{key} must be a number.'
+    if window.get('truncate') is not None and not isinstance(window['truncate'], bool):
+        return 'AgentSpec.window.truncate must be a boolean.'
+    return None
+
+
+def _context_problem(context: Any) -> str | None:
+    # 说法同参考实现（`fit`、`checkLineage`）：配置可能是线上来的 JSON，不对就当请求不对，不猜。
+    if not isinstance(context, dict):
+        return 'AgentSpec.context must be an object.'
+    facts = context.get('facts')
+    if facts is not None and not isinstance(facts, (bool, dict)):
+        return 'AgentSpec.context.facts must be a boolean or an object.'
+    if context.get('projection') is not None and not isinstance(context['projection'], str):
+        return 'AgentSpec.context.projection must be a string.'
+    overflow = context.get('overflow')
+    if overflow is not None:
+        limit = overflow.get('maxTokens') if isinstance(overflow, dict) else None
+        if not (_number(limit) and math.isfinite(limit) and limit > 0):
+            return 'AgentSpec.context.overflow.maxTokens must be a positive number.'
+        if overflow.get('strategy') is not None and overflow['strategy'] not in ('compact', 'trim', 'error'):
+            return 'AgentSpec.context.overflow.strategy must be "compact", "trim" or "error".'
+    inherit = context.get('inherit')
+    if inherit is not None:
+        session = inherit.get('session') if isinstance(inherit, dict) else None
+        if not isinstance(session, str) or session == '':
+            return 'AgentSpec.context.inherit.session must be a non-empty string.'
+        upto = inherit.get('upTo')
+        if upto is not None and not (isinstance(upto, int) and not isinstance(upto, bool) and upto >= 0):
+            return 'AgentSpec.context.inherit.upTo must be a non-negative integer (a seq).'
+    return None
+
+
 def spec_problem(spec: Mapping[str, Any]) -> str | None:
     """映射不了的 ``AgentSpec`` 字段：有就以 ``invalid_request`` 结束，不静默忽略。"""
     model = spec.get('model')
     if not isinstance(model, str) or model == '':
         return 'AgentSpec.model must be a model name: the pydantic-ai adapter resolves models by name.'
-    if spec.get('window') is not None or spec.get('context') is not None:
-        return (
-            'AgentSpec.window and AgentSpec.context are not supported by the pydantic-ai adapter: '
-            'it sends the whole projected log.'
-        )
+    if spec.get('window') is not None:
+        problem = _window_problem(spec['window'])
+        if problem is not None:
+            return problem
+    if spec.get('context') is not None:
+        problem = _context_problem(spec['context'])
+        if problem is not None:
+            return problem
     choice = spec.get('toolChoice')
     if choice is not None and choice not in ('auto', 'none', 'required'):
         if not (isinstance(choice, dict) and isinstance(choice.get('tool'), str)):
@@ -581,12 +643,22 @@ class PydanticAIHarness:
             )
         if signal is not None and signal.aborted:
             return await self._end(state, 'aborted')
+        context = spec.get('context') or {}
+        projection = context.get('projection')
+        if projection is not None and projection != 'default':
+            # 只有缺省的投影（同参考实现：不认识的名字以 `not_found` 失败，不回退）。
+            error = {'message': f'Unknown projection "{projection}". Registered: default.', 'type': 'not_found'}
+            return await self._end(state, 'error', error=error)
 
+        # 输入已经在日志里时它在历史里；不写日志时它和 `prompt` 一样接在最后，都算进历史之外的预算。
+        extra = None if in_log else content
         try:
-            entries = await self._store.list(str(request['session']), types=['message', 'summary'])
-        except Exception as error:
-            raise _WriteFailed(error) from error
-        history = to_model_messages(project(entries))
+            prepared = await self._prepare(state, spec, definitions, extra, spec.get('window'))
+            if context.get('overflow') is not None:
+                prepared = await self._fit(state, spec, definitions, extra, context['overflow'], prepared)
+        except CtxError as error:
+            return await self._end(state, 'error', error=error.info())
+        history = to_model_messages(prepared.messages)
         prompt = _prompt_of(request.get('prompt')) if in_log else _prompt_of(content, request.get('prompt'))
         if prompt is None and (not history or isinstance(history[-1], ModelResponse)):
             return await self._end(
@@ -594,7 +666,79 @@ class PydanticAIHarness:
                 'error',
                 error={'message': 'Nothing to answer: give RunRequest.input or prompt.', 'type': 'invalid_request'},
             )
-        return await self._converse(state, spec, definitions, model, history, prompt)
+        return await self._converse(state, spec, definitions, model, history, prompt, prepared)
+
+    async def _prepare(
+        self,
+        state: _Run,
+        spec: Mapping[str, Any],
+        definitions: list[dict[str, Any]],
+        extra: Json,
+        window: Mapping[str, Any] | None,
+    ) -> _Prepared:
+        """组装这一轮的历史，同参考实现 builder 的 ``build``：窗口的 ``maxTokens`` 是整次调用的预算，指令、工具定义、
+        这一轮没进日志的输入和 ``prompt`` 先占掉一部分，剩下的才给历史；按上一轮的真实用量校准（只往小里收）。
+        ``context.inherit`` 的会话投影接在前面，用本会话剩下的预算。没有事实来源：不收事实。"""
+        request = state.request
+        inherit = (spec.get('context') or {}).get('inherit')
+        try:
+            entries = await self._store.list(str(request['session']), types=['message', 'summary'])
+            parent = (
+                await self._store.list(str(inherit['session']), types=['message', 'summary'])
+                if inherit is not None
+                else None
+            )
+        except Exception as error:
+            raise _WriteFailed(error) from error
+        reserve = (
+            estimate_text_tokens(spec.get('instructions') or '')
+            + (estimate_text_tokens(json_text(definitions)) if definitions else 0)
+            + _sized(extra)
+            + _sized(request.get('prompt'))
+        )
+        calibration = calibration_of(entries)
+        own = project(entries, window_of(window, reserve, calibration))
+        messages, tokens = own.messages, own.tokens
+        if parent is not None:
+            upto = inherit.get('upTo')
+            if upto is not None:
+                parent = [entry for entry in parent if entry['seq'] <= upto]
+            inherited = project(parent, window_of(window, reserve + own.tokens, calibration))
+            messages, tokens = [*inherited.messages, *own.messages], inherited.tokens + own.tokens
+        total = reserve + tokens
+        if calibration > 1:
+            total = math.ceil(total * calibration)
+        return _Prepared(messages=messages, tokens=total, calibration=calibration)
+
+    async def _fit(
+        self,
+        state: _Run,
+        spec: Mapping[str, Any],
+        definitions: list[dict[str, Any]],
+        extra: Json,
+        overflow: Mapping[str, Any],
+        prepared: _Prepared,
+    ) -> _Prepared:
+        """超窗兜底（``AgentSpec.context.overflow``）：整次调用的估算超过 ``maxTokens`` 时，按 ``strategy`` 裁剪（带
+        ``truncate`` 重新组装），还超就以 ``context_overflow`` 结束、不调模型。这个适配器不写摘要：``compact`` 直接走到裁剪，
+        和参考实现里 builder 没有 ``compact`` 时一样。"""
+        limit = overflow['maxTokens']
+        strategy = overflow.get('strategy') or 'compact'
+        if prepared.tokens <= limit:
+            return prepared
+        if strategy != 'error':
+            window = dict(spec.get('window') or {})
+            window['maxTokens'] = min(window['maxTokens'] if window.get('maxTokens') is not None else math.inf, limit)
+            window['truncate'] = True
+            prepared = await self._prepare(state, spec, definitions, extra, window)
+        if prepared.tokens > limit:
+            raise CtxError(
+                'context_overflow',
+                f'The prepared call is estimated at {prepared.tokens} tokens, over the limit of {limit}'
+                + ('.' if strategy == 'error' else ' even after trimming.'),
+                retryable=False,
+            )
+        return prepared
 
     async def _catalog(self) -> list[dict[str, Any]]:
         if self._tools is not None:
@@ -726,6 +870,7 @@ class PydanticAIHarness:
         model: Model,
         history: list[Any],
         prompt: Any,
+        prepared: _Prepared,
     ) -> dict[str, Any]:
         names = {str(definition['name']) for definition in definitions}
         output_spec = spec.get('output')
@@ -803,6 +948,8 @@ class PydanticAIHarness:
                         usage = add_usage(usage, step_usage)
                         finish = response.finish_reason
                         message = assistant_message(response, names, OUTPUT_TOOL if structured else None)
+                        # 估算只对第一步的请求成立：之后几步的请求里多了这一轮的工具调用和结果。
+                        first = step == 0
                         meta = {
                             'step': compact(
                                 {
@@ -812,6 +959,8 @@ class PydanticAIHarness:
                                     'modelId': response.model_name,
                                     'finishReason': finish_reason_of(response),
                                     'usage': step_usage,
+                                    'estimatedInputTokens': prepared.tokens if first else None,
+                                    'calibration': prepared.calibration if first and prepared.calibration > 1 else None,
                                 }
                             )
                         }
@@ -1034,6 +1183,10 @@ class PydanticAIHarness:
             )
         )
         return {**summary, 'messages': state.messages, 'recorded': state.recorded}
+
+
+def _sized(content: Json) -> int:
+    return 0 if _empty(content) else estimate_tokens({'role': 'user', 'content': content})
 
 
 def _prompt_of(*contents: Json) -> Any:

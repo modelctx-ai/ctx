@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from conftest import REPO, Evaluate
-from ctx_pydantic_ai import harness, messages, protocol
+from ctx_pydantic_ai import context, harness, protocol
 from ctx_pydantic_ai.store import _filter
 
 
@@ -31,7 +31,7 @@ def test_constants_match_the_typescript_packages() -> None:
         protocol.TOOL_RESULT_KEY_PREFIX
     )
     assert _ts_constant('packages/core/src/harness.ts', 'INTERRUPTED_TOOL_RESULT') == repr(harness.INTERRUPTED)
-    assert _ts_constant('packages/protocol/src/context.ts', 'MISSING_RESULT') == repr(messages.MISSING_RESULT)
+    assert _ts_constant('packages/protocol/src/context.ts', 'MISSING_RESULT') == repr(context.MISSING_RESULT)
     allowed = _ts_constant('packages/remote/src/server.ts', 'DEFAULT_ALLOWED_SETTINGS')
     assert re.findall(r"'([^']+)'", allowed) == list(protocol.DEFAULT_ALLOWED_SETTINGS)
 
@@ -277,7 +277,7 @@ LOGS = {
 @pytest.mark.parametrize('name', list(LOGS))
 def test_projection_matches_typescript(ts: Evaluate, name: str) -> None:
     [expected] = ts([('project', [LOGS[name]])])
-    assert messages.project(LOGS[name]) == expected
+    assert context.project(LOGS[name]).messages == expected
 
 
 FILTERS = [
@@ -385,3 +385,220 @@ def test_tool_result_entry_matches_typescript(ts: Evaluate) -> None:
     )
     assert protocol.tool_result_entry(call, output) == plain
     assert protocol.tool_result_entry(call, output, source='worker') == sourced
+
+
+TEXTS = [
+    '',
+    'hello world',
+    '你好，世界',
+    'Привет, мир',
+    '😀 emoji and 𠀀 wide',
+    'mixed 中文 and ascii 1234567890',
+    'tab\tnewline\n',
+    '\ud800 lone surrogate',
+]
+FILES = [
+    ('text/plain', {'type': 'text', 'text': '一段文字'}),
+    ('image/png', {'type': 'data', 'data': 'A' * 100}),
+    ('image/png', {'type': 'data', 'data': 'A' * 100_000}),
+    ('application/json', {'type': 'data', 'data': 'QUJD' * 50 + '=='}),
+    ('application/pdf', {'type': 'data', 'data': 'A' * 40_000 + '='}),
+    ('image/jpeg', {'type': 'url', 'url': 'https://example.com/a.jpg'}),
+    ('application/pdf', {'type': 'reference', 'reference': {'openai': 'file-1'}}),
+]
+MESSAGES = [
+    {'role': 'user', 'content': '你好'},
+    {
+        'role': 'user',
+        'content': [{'type': 'text', 'text': 'look'}, {'type': 'file', 'mediaType': FILES[1][0], 'data': FILES[1][1]}],
+    },
+    {
+        'role': 'assistant',
+        'content': [
+            {'type': 'reasoning', 'text': 'thinking…'},
+            {'type': 'text', 'text': 'calling'},
+            {
+                'type': 'tool-call',
+                'id': 'c1',
+                'name': 'echo',
+                'input': {'text': 'hi', 'n': 1.0, 'nested': [1, 2.5, None]},
+            },
+            {'type': 'tool-call', 'id': 'c2', 'name': 'echo', 'input': None},
+            {'type': 'custom', 'kind': 'x'},
+        ],
+    },
+    {
+        'role': 'tool',
+        'content': [
+            {'type': 'tool-result', 'id': 'c1', 'name': 'echo', 'output': {'type': 'text', 'text': 'ok'}},
+            {'type': 'tool-result', 'id': 'c2', 'name': 'echo', 'output': {'type': 'json', 'value': {'a': [1, 'b']}}},
+            {
+                'type': 'tool-result',
+                'id': 'c3',
+                'name': 'echo',
+                'output': {'type': 'error', 'message': 'bad', 'data': {'code': 7}},
+            },
+            {
+                'type': 'tool-result',
+                'id': 'c4',
+                'name': 'echo',
+                'output': {
+                    'type': 'content',
+                    'parts': [
+                        {'type': 'text', 'text': 'see'},
+                        {'type': 'file', 'mediaType': 'image/png', 'data': {'type': 'data', 'data': 'A' * 200}},
+                    ],
+                },
+            },
+        ],
+    },
+]
+
+
+def test_token_estimates_match_typescript(ts: Evaluate) -> None:
+    calls = [('estimateTextTokens', [text]) for text in TEXTS]
+    calls += [('estimateFileTokens', [media, data]) for media, data in FILES]
+    calls += [('estimateTokens', [message]) for message in MESSAGES]
+    expected = ts(calls)
+    actual = [context.estimate_text_tokens(text) for text in TEXTS]
+    actual += [context.estimate_file_tokens(media, data) for media, data in FILES]
+    actual += [context.estimate_tokens(message) for message in MESSAGES]
+    assert actual == expected
+
+
+LONG = ('前面一段中文，' * 40) + ('then some ascii words ' * 40) + ('😀𠀀' * 30) + '结尾'
+
+
+def test_truncation_matches_typescript(ts: Evaluate) -> None:
+    texts = [(LONG, budget) for budget in (0, 1, 10, 40, 100, 400, 10_000)] + [('😀' * 50, 9), ('a😀' * 40, 13)]
+    big = {
+        'role': 'user',
+        'content': [
+            {'type': 'text', 'text': LONG},
+            {'type': 'file', 'mediaType': 'image/png', 'data': {'type': 'data', 'data': 'A' * 100_000}},
+        ],
+    }
+    tool = {
+        'role': 'tool',
+        'content': [
+            {'type': 'tool-result', 'id': 'c1', 'name': 'echo', 'output': {'type': 'json', 'value': {'text': LONG}}},
+            {
+                'type': 'tool-result',
+                'id': 'c2',
+                'name': 'echo',
+                'output': {'type': 'error', 'message': LONG, 'retryable': True, 'data': 1},
+            },
+            {
+                'type': 'tool-result',
+                'id': 'c3',
+                'name': 'echo',
+                'output': {
+                    'type': 'content',
+                    'parts': [
+                        {'type': 'text', 'text': LONG},
+                        {'type': 'file', 'mediaType': 'text/plain', 'data': {'type': 'text', 'text': LONG}},
+                    ],
+                },
+            },
+        ],
+    }
+    calls_only = {
+        'role': 'assistant',
+        'content': [{'type': 'tool-call', 'id': 'c1', 'name': 'echo', 'input': {'text': LONG}}],
+    }
+    messages = [
+        ({'role': 'user', 'content': LONG}, 50),
+        (big, 300),
+        (big, 3_000),
+        (tool, 100),
+        (tool, 800),
+        (calls_only, 50),
+    ]
+    expected = ts(
+        [('truncateText', [text, budget]) for text, budget in texts]
+        + [('truncateMessage', [message, budget]) for message, budget in messages]
+    )
+    actual = [context.truncate_text(text, budget) for text, budget in texts]
+    actual += [context.truncate_message(message, budget) for message, budget in messages]
+    assert actual == expected
+
+
+def _turn(seq: int, text: str) -> list[dict[str, object]]:
+    return [_message(seq, 'user', f'问题 {seq}：{text}'), _message(seq + 1, 'assistant', f'回答 {seq}：{text}')]
+
+
+DIALOGUE = [entry for seq in range(1, 40, 2) for entry in _turn(seq, '一段不短的话' * 8)]
+TOOLS = [
+    _message(1, 'user', 'q' * 200),
+    _message(2, 'assistant', [{'type': 'text', 'text': 'calling'}, _call('c1')]),
+    _message(
+        3,
+        'tool',
+        [{'type': 'tool-result', 'id': 'c1', 'name': 'echo', 'output': {'type': 'text', 'text': '结果' * 400}}],
+    ),
+    _message(4, 'assistant', 'a' * 300),
+    _message(5, 'assistant', [_call('c2')]),
+    _message(6, 'user', 'next'),
+    _message(7, 'assistant', 'done'),
+]
+SUMMARIZED = [
+    _entry(1, type='summary', text='早先聊过的' * 30, covers=10),
+    *[entry for entry in DIALOGUE if entry['seq'] > 10],
+]
+WINDOWS = [
+    ('dialogue', DIALOGUE, None),
+    ('dialogue', DIALOGUE, {}),
+    ('dialogue', DIALOGUE, {'maxMessages': 5}),
+    ('dialogue', DIALOGUE, {'maxTokens': 300}),
+    ('dialogue', DIALOGUE, {'maxTokens': 300, 'maxMessages': 3}),
+    ('dialogue', DIALOGUE, {'maxTokens': 10, 'truncate': True}),
+    ('tools', TOOLS, {'maxTokens': 200}),
+    ('tools', TOOLS, {'maxTokens': 200, 'truncate': True}),
+    ('tools', TOOLS, {'maxTokens': 900, 'truncate': True}),
+    ('tools', TOOLS, {'maxMessages': 4}),
+    ('summarized', SUMMARIZED, {'maxMessages': 2}),
+    ('summarized', SUMMARIZED, {'maxTokens': 150, 'truncate': True}),
+    ('summarized', SUMMARIZED, {'maxTokens': 0, 'truncate': True}),
+]
+
+
+@pytest.mark.parametrize(
+    ('name', 'entries', 'window'), WINDOWS, ids=[f'{name}-{window}' for name, _, window in WINDOWS]
+)
+def test_windows_match_typescript(
+    ts: Evaluate, name: str, entries: list[dict[str, object]], window: dict[str, object] | None
+) -> None:
+    [expected] = ts([('projectWindow', [entries, window])])
+    projection = context.project(entries, window)
+    actual = {
+        'messages': projection.messages,
+        'tokens': projection.tokens,
+        'dropped': projection.dropped,
+        'truncated': projection.truncated,
+    }
+    assert actual == expected
+    if window and (window.get('maxMessages') is not None or window.get('maxTokens') is not None):
+        assert projection.dropped > 0 or projection.truncated > 0 or name == 'none'
+
+
+def test_calibration_and_window_budget() -> None:
+    def step(seq: int, estimated: object, actual: object, applied: object = None) -> dict[str, object]:
+        meta = {'runId': 'r', 'step': 0, 'estimatedInputTokens': estimated, 'usage': {'inputTokens': actual}}
+        if applied is not None:
+            meta['calibration'] = applied
+        return {**_message(seq, 'assistant', 'x'), 'meta': {'step': meta}}
+
+    assert context.calibration_of([]) == 1
+    assert context.calibration_of([step(1, 100, 150)]) == 1.5
+    # 样本里记着当时乘上的倍数：换算回没校准的估算再比。
+    assert context.calibration_of([step(1, 100, 150, applied=1.5)]) == 2.25
+    assert context.calibration_of([step(1, 100, 50)]) == 1
+    assert context.calibration_of([step(1, 100, 10_000)]) == context.MAX_CALIBRATION
+    assert context.calibration_of([step(1, 150, 300), step(2, 0, 10)]) == 1
+    assert context.calibration_of([step(1, 300, 1001)]) == 3.337
+    assert context.window_of({'maxTokens': 1000, 'maxMessages': 3}, reserve=100, calibration=2) == {
+        'maxTokens': 400,
+        'maxMessages': 3,
+    }
+    assert context.window_of({'maxTokens': 50}, reserve=100) == {'maxTokens': 0}
+    assert context.window_of(None) == {}

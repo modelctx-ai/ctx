@@ -4,6 +4,8 @@
 
 ## 2026-11-18
 
+- **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：「怎么对上」的上下文一行和 `AgentSpec` 的 `window`、`context` 两行写怎么裁、超窗怎么办；一致性等级改成全部五级，「还没做的」只剩压缩、事件规则和别的投影、事实来源。
+- **更新** [架构](architecture.md)：「外部 harness：pydantic-ai」的第三步写窗口、继承父会话和超窗兜底。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态加 `context` 一级，「没做」换成压缩，决定记录补一条。
 - **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：加「等确认、等别处执行」一节和例子；「怎么对上」、`AgentSpec`、`stopReason`、选项各加 `ask` 和 `external` 的一行，「还没做的」去掉 `ask`；导出加 `tool_result_entry`、`pending_tool_calls`、`TOOL_RESULT_KEY_PREFIX`；「验证」加延后的调用。
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`permissions` 写明 `deny` 优先，绑到外部执行环境的工具被拒绝时也不等别处执行。参考实现以前不是这样，这次一起改了，[架构](architecture.md)里参考实现那一节和 [`@modelctx-ai/ctx`](../packages/core/README.md) 的 README 跟着写明。
 - **更新** [架构](architecture.md)：「外部 harness：pydantic-ai」写交给别处执行的调用怎么停下。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」去掉 pydantic-ai 的 `ask`，决定记录补一条。

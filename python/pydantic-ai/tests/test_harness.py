@@ -23,7 +23,8 @@ from ctx_pydantic_ai import (
     pending_tool_calls,
     tool_result_entry,
 )
-from ctx_pydantic_ai.messages import MISSING_RESULT, text_of
+from ctx_pydantic_ai.context import MISSING_RESULT
+from ctx_pydantic_ai.messages import text_of
 from ctx_pydantic_ai.testing import ECHO_TOOL, ScriptedModel, echo_executor
 
 AGENT = {'model': 'scripted'}
@@ -326,8 +327,12 @@ def test_a_stream_left_early_is_aborted() -> None:
 
 
 UNMAPPED = [
-    ({'window': {'maxMessages': 10}}, 'AgentSpec.window and AgentSpec.context are not supported'),
-    ({'context': {'facts': {}}}, 'AgentSpec.window and AgentSpec.context are not supported'),
+    ({'window': 'big'}, 'AgentSpec.window must be an object.'),
+    ({'window': {'maxTokens': '1k'}}, 'AgentSpec.window.maxTokens must be a number.'),
+    ({'context': {'overflow': {'maxTokens': 0}}}, 'AgentSpec.context.overflow.maxTokens must be a positive number.'),
+    ({'context': {'overflow': {'maxTokens': 9, 'strategy': 'drop'}}}, 'AgentSpec.context.overflow.strategy must be'),
+    ({'context': {'inherit': {'session': ''}}}, 'AgentSpec.context.inherit.session must be a non-empty string.'),
+    ({'context': {'inherit': {'session': 'p', 'upTo': -1}}}, 'AgentSpec.context.inherit.upTo must be a non-negative'),
     ({'settings': {'providerOptions': {'openai': {}}}}, 'AgentSpec.settings.providerOptions not supported'),
     ({'settings': {'timeoutMs': 0}}, 'AgentSpec.settings.timeoutMs must be a positive number.'),
     ({'permissions': {'tools': {'echo': 'maybe'}}}, 'AgentSpec.permissions values must be'),
@@ -835,5 +840,138 @@ def test_abort_in_a_step_with_an_external_call() -> None:
             ('c2', INTERRUPTED),
         ]
         assert pending_tool_calls(log) == []
+
+    run(main)
+
+
+# ---- 窗口和上下文：AgentSpec.window、AgentSpec.context ----
+
+
+def dialogue(store: MemorySessionStore, session: str, turns: int, text: str = '一段不短的话' * 10) -> Any:
+    return store.append(
+        session,
+        [
+            {'type': 'message', 'message': {'role': role, 'content': f'{role} {turn}：{text}'}}
+            for turn in range(turns)
+            for role in ('user', 'assistant')
+        ],
+    )
+
+
+def test_the_window_limits_the_history() -> None:
+    async def main() -> None:
+        harness, store, model = setup([{'type': 'text', 'text': '好'}] * 3)
+        await dialogue(store, 'a', 10)
+        await harness.run({'session': 'a', 'agent': {**AGENT, 'window': {'maxMessages': 3}}, 'input': '接着说'})
+        # 最后三条，这一轮的输入是最后一条。
+        assert [text.split('：')[0] for text in texts(model.requests[0])] == [
+            'user:user 9',
+            'model:assistant 9',
+            'user:接着说',
+        ]
+        await harness.run({'session': 'a', 'agent': {**AGENT, 'window': {'maxTokens': 200}}, 'input': '再说'})
+        assert 1 < len(texts(model.requests[1])) < 10
+        await harness.run({'session': 'a', 'agent': {**AGENT, 'window': {}}, 'input': '全部'})
+        # 空窗口不裁：原来的二十条、前两轮各两条、这一轮的输入。
+        assert len(texts(model.requests[2])) == 10 * 2 + 2 * 2 + 1
+
+    run(main)
+
+
+def test_the_window_budget_leaves_room_for_instructions_and_tools() -> None:
+    async def main() -> None:
+        window = {'maxTokens': 600}
+        harness, store, model = setup([{'type': 'text', 'text': '好'}] * 2)
+        await dialogue(store, 'plain', 10)
+        await dialogue(store, 'long', 10)
+        await harness.run({'session': 'plain', 'agent': {**AGENT, 'window': window, 'tools': False}, 'input': '在吗'})
+        long = {**AGENT, 'window': window, 'instructions': '要求' * 200}
+        await harness.run({'session': 'long', 'agent': long, 'input': '在吗'})
+        # 指令和工具定义先占掉一部分，剩给历史的少了。
+        assert len(texts(model.requests[1])) < len(texts(model.requests[0]))
+
+    run(main)
+
+
+def test_overflow_trims_or_refuses() -> None:
+    async def main() -> None:
+        harness, store, model = setup([{'type': 'text', 'text': '好'}] * 3)
+        strict = {**AGENT, 'context': {'overflow': {'maxTokens': 1, 'strategy': 'error'}}}
+        refused = await harness.run({'session': 'e', 'agent': strict, 'input': '在吗'})
+        assert refused['stopReason'] == 'error'
+        assert refused['error']['type'] == 'context_overflow'
+        assert refused['error']['retryable'] is False
+        assert refused['error']['message'].endswith('over the limit of 1.')
+        assert roles(await store.list('e'))[-2:] == ['ctx.error', 'ctx.run.ended']
+        assert model.requests == []
+        # trim、缺省的 compact：裁到放得下再调模型，不写摘要（这个适配器不压缩）。
+        for strategy in ('trim', None):
+            session = f'long-{strategy}'
+            await dialogue(store, session, 40)
+            overflow = {'maxTokens': 1_500, **({'strategy': strategy} if strategy else {})}
+            result = await harness.run(
+                {'session': session, 'agent': {**AGENT, 'context': {'overflow': overflow}}, 'input': '接着说'}
+            )
+            assert result['stopReason'] == 'end_turn', result.get('error')
+            assert await store.list(session, types=['summary']) == []
+            assert len(texts(model.requests[-1])) < 40
+            [answer] = await store.list(session, types=['message'], last=1)
+            assert answer['meta']['step']['estimatedInputTokens'] <= 1_500
+        # 指令本身就放不下：裁到底还超，不调模型。
+        huge = {
+            **AGENT,
+            'instructions': '要求' * 2_000,
+            'context': {'overflow': {'maxTokens': 100, 'strategy': 'trim'}},
+        }
+        over = await harness.run({'session': 'huge', 'agent': huge, 'input': '在吗'})
+        assert over['error']['type'] == 'context_overflow'
+        assert over['error']['message'].endswith('even after trimming.')
+        assert len(model.requests) == 2
+
+    run(main)
+
+
+def test_the_parent_session_comes_first() -> None:
+    async def main() -> None:
+        harness, store, model = setup([{'type': 'text', 'text': '好'}] * 2)
+        await store.append(
+            'p',
+            [
+                {'type': 'message', 'message': {'role': 'user', 'content': '父会话的问题'}},
+                {'type': 'message', 'message': {'role': 'assistant', 'content': '父会话的回答'}},
+                {'type': 'message', 'message': {'role': 'user', 'content': '派出子任务之后的话'}},
+            ],
+        )
+        agent = {**AGENT, 'context': {'inherit': {'session': 'p', 'upTo': 2}}}
+        await harness.run({'session': 'p/task/1', 'agent': agent, 'input': '子任务'})
+        assert texts(model.requests[0]) == ['user:父会话的问题', 'model:父会话的回答', 'user:子任务']
+        # 子会话自己的日志里没有父会话的条目。
+        assert [entry['message']['content'] for entry in await store.list('p/task/1', types=['message'])][:1] == [
+            '子任务'
+        ]
+        await harness.run(
+            {'session': 'p/task/2', 'agent': {**AGENT, 'context': {'inherit': {'session': 'p'}}}, 'input': '再来'}
+        )
+        assert len(texts(model.requests[1])) == 4
+
+    run(main)
+
+
+def test_the_first_step_records_its_estimate_and_the_next_run_calibrates() -> None:
+    async def main() -> None:
+        harness, store, _ = setup([{'type': 'text', 'text': '好'}] * 2)
+        await harness.run({'session': 's', 'agent': AGENT, 'input': '在吗'})
+        [answer] = await store.list('s', types=['message'], last=1)
+        assert answer['meta']['step']['estimatedInputTokens'] > 0
+        assert 'calibration' not in answer['meta']['step']
+        # 上一轮实际用的输入是估算的两倍：这一轮的估算和窗口都按两倍收紧。
+        sample = {'runId': 'r0', 'step': 0, 'estimatedInputTokens': 100, 'usage': {'inputTokens': 200}}
+        await store.append(
+            'c', [{'type': 'message', 'message': {'role': 'assistant', 'content': '旧'}, 'meta': {'step': sample}}]
+        )
+        await harness.run({'session': 'c', 'agent': {**AGENT, 'window': {'maxTokens': 10_000}}, 'input': '在吗'})
+        [answer] = await store.list('c', types=['message'], last=1)
+        assert answer['meta']['step']['calibration'] == 2
+        assert answer['meta']['step']['estimatedInputTokens'] % 2 == 0
 
     run(main)

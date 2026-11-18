@@ -1,8 +1,5 @@
-"""ctx 的消息（``docs/protocol.md`` 的 ``Message``）和 pydantic-ai 的 ``ModelMessage`` 之间的转换，加上从日志投影出历史。
-
-投影照协议包 ``project`` 的缺省规则：按 ``(at, seq)`` 排，``covers`` 最大的摘要代替它盖住的条目、渲染成一条用户消息排在最前，
-事件不进上下文，助手消息和紧跟的工具结果是一组，组里的调用和结果按 ``id`` 配对（没有调用的结果去掉，没有结果的调用补一条
-错误结果）。不裁窗口。
+"""ctx 的消息（``docs/protocol.md`` 的 ``Message``）和 pydantic-ai 的 ``ModelMessage`` 之间的转换。从日志投影出历史在
+``context``。
 """
 
 from __future__ import annotations
@@ -34,12 +31,10 @@ from pydantic_ai.messages import (
     VideoUrl,
 )
 
-from .protocol import Json, error_output
+from .protocol import Json
 
 #: ``providerOptions`` 里放 pydantic-ai 自己的字段（推理的签名）用的键。
 PROVIDER_KEY = 'pydantic-ai'
-#: 日志里有调用、没有结果（协议包投影的 ``MISSING_RESULT``）。
-MISSING_RESULT = 'No result was recorded for this tool call.'
 
 
 # ---- ctx → pydantic-ai ----
@@ -123,84 +118,6 @@ def _response_parts(content: Json) -> list[ModelResponsePart]:
                 )
             )
     return parts
-
-
-def project(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """日志 → 上下文里的 ctx 消息（协议包 ``project`` 的缺省规则，不裁窗口）。"""
-    ordered = sorted(entries, key=lambda entry: (entry.get('at', 0), entry.get('seq', 0)))
-    summary: Mapping[str, Any] | None = None
-    for entry in ordered:
-        if entry.get('type') != 'summary':
-            continue
-        if (
-            summary is None
-            or entry['covers'] > summary['covers']
-            or (entry['covers'] == summary['covers'] and entry['seq'] > summary['seq'])
-        ):
-            summary = entry
-    out: list[dict[str, Any]] = []
-    if summary is not None:
-        out.append({'role': 'user', 'content': f'Summary of the earlier conversation:\n{summary.get("text", "")}'})
-    rest = [
-        dict(entry['message'])
-        for entry in ordered
-        if entry.get('type') == 'message' and (summary is None or entry['seq'] > summary['covers'])
-    ]
-    for group in _blocks(rest):
-        # 开头是工具结果的组：它的调用不在视图里（被摘要盖住了），整组不要。
-        if group[0].get('role') != 'tool':
-            out.extend(_paired(group))
-    return out
-
-
-def _blocks(messages: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """带工具调用的助手消息和紧跟的工具结果是一组。"""
-    out: list[list[dict[str, Any]]] = []
-    for message in messages:
-        if message.get('role') == 'tool' and out:
-            out[-1].append(message)
-        else:
-            out.append([message])
-    return out
-
-
-def _paired(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """一组里的工具调用和结果按 ``id`` 配对：结果找不到同组的调用就去掉，调用找不到结果就补一条错误结果。
-    服务商自己执行的调用（``providerExecuted``）不补。"""
-    first, *results = group
-    calls: dict[str, Any] = {}
-    answered: set[str] = set()
-    content = first.get('content')
-    if first.get('role') == 'assistant' and isinstance(content, list):
-        for part in content:
-            if part.get('type') == 'tool-call' and part.get('providerExecuted') is not True:
-                calls[str(part.get('id'))] = part.get('name')
-            if part.get('type') == 'tool-result':
-                answered.add(str(part.get('id')))
-    out = [first]
-    for message in results:
-        parts = message.get('content')
-        if message.get('role') != 'tool' or isinstance(parts, str):
-            out.append(message)
-            continue
-        kept = [part for part in parts or [] if part.get('type') != 'tool-result' or str(part.get('id')) in calls]
-        answered.update(str(part.get('id')) for part in kept if part.get('type') == 'tool-result')
-        if len(kept) == len(parts or []):
-            out.append(message)
-        elif kept:
-            out.append({**message, 'content': kept})
-    missing = [(call_id, name) for call_id, name in calls.items() if call_id not in answered]
-    if missing:
-        out.append(
-            {
-                'role': 'tool',
-                'content': [
-                    {'type': 'tool-result', 'id': call_id, 'name': name, 'output': error_output(MISSING_RESULT)}
-                    for call_id, name in missing
-                ],
-            }
-        )
-    return out
 
 
 def to_model_messages(messages: Sequence[Mapping[str, Any]]) -> list[ModelMessage]:

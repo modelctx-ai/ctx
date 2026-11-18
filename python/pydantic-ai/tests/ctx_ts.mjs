@@ -29,6 +29,15 @@ async function evaluate() {
     runParentProblem: protocol.runParentProblem,
     filterEntries: protocol.filterEntries,
     project: (entries) => protocol.project(entries).messages,
+    projectWindow: (entries, window) => {
+      const { messages, tokens, dropped, truncated } = protocol.project(entries, { window });
+      return { messages, tokens, dropped, truncated };
+    },
+    estimateTextTokens: protocol.estimateTextTokens,
+    estimateFileTokens: protocol.estimateFileTokens,
+    estimateTokens: protocol.estimateTokens,
+    truncateText: protocol.truncateText,
+    truncateMessage: protocol.truncateMessage,
     pendingToolCalls: protocol.pendingToolCalls,
     toolResultEntry: protocol.toolResultEntry,
   };

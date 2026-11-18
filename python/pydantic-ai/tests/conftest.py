@@ -65,7 +65,8 @@ def ts(node: str) -> Evaluate:
     """``ts([(函数名, 参数), …])``：在 TypeScript 的协议包里调这些函数，返回各自的结果。"""
 
     def evaluate(calls: Sequence[tuple[str, Sequence[Any]]]) -> list[Any]:
-        payload = json.dumps([{'fn': fn, 'args': list(args)} for fn, args in calls], ensure_ascii=False)
+        # 转义非 ASCII：参数里可以有落单的代理项（UTF-8 写不出来，JSON 的 \u 写得出来）。
+        payload = json.dumps([{'fn': fn, 'args': list(args)} for fn, args in calls])
         done = subprocess.run(
             [node, SOURCE_CONDITION, str(HELPER), 'eval'],
             input=payload,
