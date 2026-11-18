@@ -10,7 +10,7 @@ from typing import Any
 import pydantic_ai
 import pytest
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
 from ctx_pydantic_ai import (
     HARNESS_NAME,
@@ -20,8 +20,10 @@ from ctx_pydantic_ai import (
     FunctionExecutor,
     MemorySessionStore,
     PydanticAIHarness,
+    pending_tool_calls,
+    tool_result_entry,
 )
-from ctx_pydantic_ai.messages import text_of
+from ctx_pydantic_ai.messages import MISSING_RESULT, text_of
 from ctx_pydantic_ai.testing import ECHO_TOOL, ScriptedModel, echo_executor
 
 AGENT = {'model': 'scripted'}
@@ -328,7 +330,6 @@ UNMAPPED = [
     ({'context': {'facts': {}}}, 'AgentSpec.window and AgentSpec.context are not supported'),
     ({'settings': {'providerOptions': {'openai': {}}}}, 'AgentSpec.settings.providerOptions not supported'),
     ({'settings': {'timeoutMs': 0}}, 'AgentSpec.settings.timeoutMs must be a positive number.'),
-    ({'permissions': {'default': 'ask'}}, 'AgentSpec.permissions "ask" is not supported'),
     ({'permissions': {'tools': {'echo': 'maybe'}}}, 'AgentSpec.permissions values must be'),
     ({'toolChoice': {'tool': 'nope'}}, 'AgentSpec.toolChoice names tool "nope", which is not offered.'),
     ({'toolChoice': 'sometimes'}, 'AgentSpec.toolChoice must be'),
@@ -635,5 +636,204 @@ def test_tool_output_is_limited() -> None:
         assert tool['message']['content'][0]['output']['text'].startswith(
             'x' * 10 + '\n[… truncated 90 more characters'
         )
+
+    run(main)
+
+
+# ---- 交给别处执行的工具：requires_action（对照参考实现的 external.test.ts 和 agent-spec.test.ts）----
+
+LOOKUP = {
+    'name': 'lookup',
+    'description': '查内网的订单',
+    'inputSchema': {'type': 'object', 'properties': {'id': {'type': 'string'}}},
+    'executor': 'worker',
+}
+LOOKUP_CALL = {'type': 'tool-call', 'id': 'c1', 'tool': 'lookup', 'input': {'id': '42'}}
+
+
+def external_setup(
+    script: list[dict[str, Any]], *, executors: list[Any] | None = None
+) -> tuple[PydanticAIHarness, MemorySessionStore, ScriptedModel]:
+    """``lookup`` 绑在执行环境 ``worker`` 上，这个 harness 没有它的实例；``echo`` 在这里执行。"""
+    return setup(script, executors=executors, tools=[LOOKUP, {**ECHO_TOOL, 'executor': 'local'}], external=['worker'])
+
+
+def roles(entries: list[dict[str, Any]]) -> list[str]:
+    return [shape(entry)[1] for entry in entries]
+
+
+def test_an_external_call_waits_for_its_result_in_the_log() -> None:
+    async def main() -> None:
+        harness, store, model = external_setup([LOOKUP_CALL, {'type': 'text', 'text': '订单 42 已经发货了'}])
+        first = await harness.run({'session': 's', 'agent': AGENT, 'input': '订单 42 到哪了？'})
+        assert first['stopReason'] == 'requires_action'
+        assert first['pending'] == [{'id': 'c1', 'name': 'lookup', 'input': {'id': '42'}}]
+        log = await store.list('s')
+        assert roles(log) == ['ctx.run.started', 'user', 'assistant', 'ctx.run.ended']
+        assert log[-1]['data']['stopReason'] == 'requires_action'
+        assert [(item['call']['id'], item['runId'], item['seq']) for item in pending_tool_calls(log)] == [
+            ('c1', first['runId'], log[2]['seq'])
+        ]
+        # 执行方追加结果：两个都执行了也只记一条（幂等键）。
+        output = {'type': 'text', 'text': '订单 42 已发货'}
+        for _ in range(2):
+            await store.append('s', [tool_result_entry(first['pending'][0], output, source='worker')])
+        log = await store.list('s')
+        assert roles(log)[-1] == 'tool'
+        assert roles(log).count('tool') == 1
+        assert log[-1]['key'] == 'ctx.tool-result:c1'
+        assert pending_tool_calls(log) == []
+        # 下一轮不带输入接着跑：模型看到执行方给的结果。
+        second = await harness.run({'session': 's', 'agent': AGENT})
+        assert second['stopReason'] == 'end_turn'
+        assert second['text'] == '订单 42 已经发货了'
+        assert '订单 42 已发货' in str(model.requests[1])
+
+    run(main)
+
+
+def test_the_stream_ends_with_the_pending_calls() -> None:
+    async def main() -> None:
+        harness, _, _ = external_setup([LOOKUP_CALL])
+        events = [event async for event in harness.stream({'session': 's', 'agent': AGENT, 'input': '订单 42？'})]
+        assert [event['type'] for event in events if event['type'].startswith('tool.')] == ['tool.called']
+        ended = events[-1]
+        assert ended['type'] == 'run.ended'
+        assert ended['result']['stopReason'] == 'requires_action'
+        assert ended['result']['pending'] == [{'id': 'c1', 'name': 'lookup', 'input': {'id': '42'}}]
+
+    run(main)
+
+
+def test_without_a_result_the_next_run_goes_on() -> None:
+    async def main() -> None:
+        harness, store, model = external_setup([LOOKUP_CALL, {'type': 'text', 'text': '查不到'}])
+        await harness.run({'session': 's', 'agent': AGENT, 'input': '订单 42？'})
+        after = await harness.run({'session': 's', 'agent': AGENT, 'input': '算了'})
+        assert after['stopReason'] == 'end_turn'
+        assert pending_tool_calls(await store.list('s')) == []
+        # 投影给缺结果的那次调用补上「没有记录到结果」。
+        assert MISSING_RESULT in str(model.requests[1])
+
+    run(main)
+
+
+def test_a_step_with_a_local_and_an_external_call() -> None:
+    async def main() -> None:
+        both = {'type': 'tool-calls', 'calls': [LOOKUP_CALL, {'id': 'c2', 'input': {'text': 'hi'}}]}
+        harness, store, model = external_setup([both, {'type': 'text', 'text': 'never'}])
+        result = await harness.run({'session': 's', 'agent': AGENT, 'input': 'go'})
+        assert result['stopReason'] == 'requires_action'
+        assert [call['id'] for call in result['pending']] == ['c1']
+        log = await store.list('s')
+        assert [shape(entry) for entry in log] == [
+            ('event', 'ctx.run.started', 'harness'),
+            ('message', 'user', None),
+            ('message', 'assistant', 'model'),
+            ('message', 'tool', 'local'),
+            ('event', 'ctx.run.ended', 'harness'),
+        ]
+        # 在这里执行的照常记下结果；交给别处的不补「结果未知」。
+        assert [part['id'] for part in log[3]['message']['content']] == ['c2']
+        assert [item['call']['id'] for item in pending_tool_calls(log)] == ['c1']
+        assert len(model.requests) == 1
+
+    run(main)
+
+
+def test_ask_stops_until_the_app_confirms() -> None:
+    async def main() -> None:
+        calls: list[Any] = []
+        executor = FunctionExecutor('local').register(
+            ECHO_TOOL, lambda value, context: calls.append(value) or {'type': 'json', 'value': value}
+        )
+        harness, store, _ = setup(
+            [{'type': 'tool-call', 'id': 'c1', 'input': {'text': 'hi'}}, {'type': 'text', 'text': '回显好了'}],
+            executors=[executor],
+        )
+        agent = {**AGENT, 'permissions': {'default': 'ask'}}
+        first = await harness.run({'session': 's', 'agent': agent, 'input': '回显'})
+        assert first['stopReason'] == 'requires_action'
+        assert first['pending'] == [{'id': 'c1', 'name': 'echo', 'input': {'text': 'hi'}}]
+        assert calls == []
+        # 应用确认了：交给执行环境执行，把结果追加进日志，再不带输入跑一轮。
+        [call] = first['pending']
+        output = await executor.execute(call, {'session': 's', 'runId': first['runId']})
+        await store.append('s', [tool_result_entry(call, output, source='local')])
+        second = await harness.run({'session': 's', 'agent': agent})
+        assert second['stopReason'] == 'end_turn'
+        assert second['text'] == '回显好了'
+        assert calls == [{'text': 'hi'}]
+
+    run(main)
+
+
+def test_deny_comes_first_and_deferred_input_is_left_to_the_executor() -> None:
+    async def main() -> None:
+        harness, store, _ = external_setup([LOOKUP_CALL, {'type': 'text', 'text': '被拒了'}])
+        denied = {**AGENT, 'permissions': {'tools': {'lookup': 'deny'}}}
+        result = await harness.run({'session': 'a', 'agent': denied, 'input': '订单 42？'})
+        assert result['stopReason'] == 'end_turn'
+        assert 'pending' not in result
+        [refused] = [entry for entry in await store.list('a', types=['message']) if entry['message']['role'] == 'tool']
+        assert refused['message']['content'][0]['output'] == {
+            'type': 'error',
+            'message': 'Tool call "lookup" was denied by the agent\'s permissions.',
+        }
+        # 同参考实现：交给别处执行的不在这里按 `inputSchema` 查，由执行方处理。
+        harness, _, _ = external_setup([{**LOOKUP_CALL, 'input': {'id': 42}}])
+        waiting = await harness.run({'session': 'b', 'agent': AGENT, 'input': '订单 42？'})
+        assert waiting['pending'] == [{'id': 'c1', 'name': 'lookup', 'input': {'id': 42}}]
+
+    run(main)
+
+
+def test_a_structured_answer_next_to_an_external_call_waits_too() -> None:
+    async def main() -> None:
+        # 同一个回答里先交结构化输出、再调外部的工具（pydantic-ai 两种顺序都照样处理那次调用）。
+        async def stream(messages: list[Any], info: AgentInfo) -> AsyncIterator[Any]:
+            yield {
+                0: DeltaToolCall(name=info.output_tools[0].name, json_args='{"n": 1}', tool_call_id='out'),
+                1: DeltaToolCall(name='lookup', json_args='{"id": "42"}', tool_call_id='c1'),
+            }
+
+        store = MemorySessionStore()
+        model = FunctionModel(stream_function=stream)
+        harness = PydanticAIHarness(store=store, tools=[LOOKUP], external=['worker'], models={'scripted': model})
+        result = await harness.run({'session': 's', 'agent': {**AGENT, 'output': {'schema': SCHEMA}}, 'input': 'go'})
+        # 同参考实现：有等着的调用就是 requires_action，只在 end_turn 时解析回答。
+        assert result['stopReason'] == 'requires_action'
+        assert 'output' not in result
+        assert [call['id'] for call in result['pending']] == ['c1']
+
+    run(main)
+
+
+def test_abort_in_a_step_with_an_external_call() -> None:
+    async def main() -> None:
+        entered = asyncio.Event()
+
+        async def hang(value: Any, context: Mapping[str, Any]) -> dict[str, Any]:
+            entered.set()
+            await asyncio.Event().wait()
+            return {'type': 'text', 'text': 'never'}
+
+        both = {'type': 'tool-calls', 'calls': [LOOKUP_CALL, {'id': 'c2', 'input': {'text': 'hi'}}]}
+        harness, store, _ = external_setup([both], executors=[FunctionExecutor('local').register(ECHO_TOOL, hang)])
+        signal = AbortSignal()
+        task = asyncio.ensure_future(harness.run({'session': 's', 'agent': AGENT, 'input': 'go'}, signal=signal))
+        await asyncio.wait_for(entered.wait(), 5)
+        signal.abort()
+        result = await asyncio.wait_for(task, 5)
+        # 这一步没走完：两个调用都补「结果未知」，没有等着的。
+        assert result['stopReason'] == 'aborted'
+        assert 'pending' not in result
+        log = await store.list('s')
+        [filler] = [entry for entry in log if entry['type'] == 'message' and entry['message']['role'] == 'tool']
+        assert [(part['id'], part['output']['message']) for part in filler['message']['content']] == [
+            ('c1', INTERRUPTED),
+            ('c2', INTERRUPTED),
+        ]
+        assert pending_tool_calls(log) == []
 
     run(main)

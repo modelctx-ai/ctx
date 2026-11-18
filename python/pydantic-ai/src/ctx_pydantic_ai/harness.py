@@ -2,7 +2,8 @@
 
 一轮：``ctx.run.started`` → 记输入 → 从日志投影出历史交给 pydantic-ai → 每一步模型回答收齐就写助手消息（工具执行之前）、
 这一步的工具结果到齐就写 → ``ctx.run.ended``。工具调用落在 ctx 的执行环境上（``Executor.execute``），输入按 ``inputSchema``
-查、结果按上限截断，和参考实现同一套规则。pydantic-ai 不存对话：每一轮的历史都从 ctx 的日志来。
+查、结果按上限截断，和参考实现同一套规则。``ask`` 的和外部执行环境的工具不在这里执行：pydantic-ai 记下调用（``CallDeferred``），
+这一步走完就以 ``requires_action`` 结束。pydantic-ai 不存对话：每一轮的历史都从 ctx 的日志来。
 """
 
 from __future__ import annotations
@@ -17,7 +18,9 @@ import jsonschema
 import pydantic_ai
 from pydantic_ai import (
     Agent,
+    CallDeferred,
     CancellationToken,
+    DeferredToolRequests,
     RunCancelled,
     RunContext,
     RunTimedOut,
@@ -177,6 +180,10 @@ class _Run:
     outputs: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 工具结果条目的 ``source``：执行它的执行环境。
     sources: dict[str, str] = field(default_factory=dict)
+    #: 交给别处执行的调用（``ask`` 的、外部执行环境的）的 ``id``：pydantic-ai 记下它们，不执行。
+    deferred: set[str] = field(default_factory=set)
+    #: 步骤走完时还等着别处执行的调用（``ToolCall``）：这一轮以 ``requires_action`` 结束时就是 ``pending``。
+    pending: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _empty(content: Json) -> bool:
@@ -216,8 +223,6 @@ def spec_problem(spec: Mapping[str, Any]) -> str | None:
     values = [permissions.get('default'), *(permissions.get('tools') or {}).values()]
     if any(value is not None and value not in ('allow', 'ask', 'deny') for value in values):
         return 'AgentSpec.permissions values must be "allow", "ask" or "deny".'
-    if 'ask' in values:
-        return 'AgentSpec.permissions "ask" is not supported by the pydantic-ai adapter yet (no requires_action).'
     for key, value in (spec.get('budget') or {}).items():
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not value > 0:
             return f'AgentSpec.budget.{key} must be a positive number.'
@@ -300,6 +305,9 @@ class PydanticAIHarness:
     - ``models``：模型名 → pydantic-ai 的模型（函数或映射）；不给就按 pydantic-ai 的写法（``openai:gpt-5`` 这类）推。
     - ``max_tool_output_chars``：一次工具结果最多多少字符。
     - ``source``：输入条目的 ``source``。
+    - ``external``：在别处执行的执行环境的名字。绑定到它们的工具交给模型，但不在这里执行：模型调用了它们，这一轮写下调用后
+      以 ``requires_action`` 结束（``pending`` 列出这些调用），执行方把结果追加进日志（``tool_result_entry``），下一轮不带输入
+      接着跑。``permissions`` 是 ``ask`` 的工具也这样，应用确认了再让执行方执行。它们的工具定义要在 ``tools`` 里。
     """
 
     def __init__(
@@ -311,6 +319,7 @@ class PydanticAIHarness:
         models: ModelResolver | None = None,
         max_tool_output_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS,
         source: str | None = None,
+        external: Sequence[str] = (),
     ) -> None:
         self._store = store
         self._executors: dict[str, Executor] = (
@@ -320,6 +329,7 @@ class PydanticAIHarness:
         self._models = models
         self._max_output = max_tool_output_chars
         self._source = source
+        self._external = frozenset(external)
         self._tails: dict[str, asyncio.Future[None]] = {}
 
     # ---- 对外 ----
@@ -616,8 +626,14 @@ class PydanticAIHarness:
         except Exception as error:  # 不认识的服务商、缺凭证
             raise CtxError('invalid_request', f'pydantic-ai cannot make model "{resolved}": {error}') from error
 
+    def _defers(self, spec: Mapping[str, Any], definition: Mapping[str, Any]) -> bool:
+        """这个工具交给别处执行：``ask`` 的，或者绑到外部执行环境、没有被 ``deny`` 的（``deny`` 优先，同参考实现）。"""
+        permission = tool_permission(spec.get('permissions'), str(definition['name']))
+        return permission == 'ask' or (permission != 'deny' and str(definition.get('executor', '')) in self._external)
+
     def _tool(self, state: _Run, definition: Mapping[str, Any], opened: dict[str, asyncio.Task[None]]) -> Tool[Any]:
-        """一个 ctx 工具交给 pydantic-ai：输入先按 ``inputSchema`` 查（``deny`` 的直接拒绝），调用落在它的执行环境上。"""
+        """一个 ctx 工具交给 pydantic-ai：输入先按 ``inputSchema`` 查（``deny`` 的直接拒绝），调用落在它的执行环境上。
+        交给别处执行的不查输入、不执行（同参考实现，由执行方处理），只让 pydantic-ai 记下这次调用。"""
         name = str(definition['name'])
         schema = definition.get('inputSchema') or {'type': 'object'}
         validator = compile_schema(schema)
@@ -626,6 +642,7 @@ class PydanticAIHarness:
         session = str(state.request['session'])
         spec = state.request['agent']
         denied = tool_permission(spec.get('permissions'), name) == 'deny'
+        deferred = self._defers(spec, definition)
 
         def refuse(call_id: str, message: str) -> None:
             # 执行前拦下的：模型看到的是失败的工具结果（不占 pydantic-ai 的重试次数），日志里是 `{ type: 'error' }`。
@@ -637,12 +654,17 @@ class PydanticAIHarness:
             call_id = run.tool_call_id or ''
             if denied:
                 refuse(call_id, f'Tool call "{name}" was denied by the agent\'s permissions.')
+            if deferred:
+                return
             problem = schema_problem(validator, args)
             if problem is not None:
                 refuse(call_id, f'Invalid input for tool "{name}": {problem}')
 
         async def call(run: RunContext[Any], /, **args: Any) -> Any:
             call_id = run.tool_call_id or new_id()
+            if deferred:
+                state.deferred.add(call_id)
+                raise CallDeferred()
             state.sources[call_id] = source
             if executor is None:
                 output = error_output(f'Tool "{name}" has no executor "{definition.get("executor")}" in this harness.')
@@ -720,6 +742,9 @@ class PydanticAIHarness:
             if structured
             else str
         )
+        # 有交给别处执行的工具时 pydantic-ai 要 `DeferredToolRequests` 在输出类型里，才会在那一步之后停下；模型看到的不变。
+        if any(self._defers(spec, definition) for definition in definitions):
+            output_type = [output_type, DeferredToolRequests]
         agent: Agent[None, Any] = Agent(
             model,
             output_type=output_type,
@@ -811,7 +836,8 @@ class PydanticAIHarness:
                         )
                         step += 1
                     elif Agent.is_end_node(node):
-                        final = node.data.output
+                        # 停下来等别处执行的结果：调用在 `state.pending` 里，没有回答可解析。
+                        final = None if isinstance(node.data.output, DeferredToolRequests) else node.data.output
         except _WriteFailed:
             raise
         except RunTimedOut:
@@ -830,6 +856,9 @@ class PydanticAIHarness:
                 task.cancel()
 
         output: Any = None
+        # 同参考实现：有等着别处执行的调用就是 `requires_action`（同一步交了结构化输出也一样），只在 `end_turn` 时解析回答。
+        if stop is None and state.pending:
+            stop = 'requires_action'
         if stop is None:
             stop = 'max_tokens' if finish == 'length' else 'end_turn'
             if structured and stop == 'end_turn':
@@ -844,7 +873,8 @@ class PydanticAIHarness:
                     }
                 else:
                     output = final
-        return await self._end(state, stop, text=text, error=error, usage=usage, output=output)
+        pending = state.pending if stop == 'requires_action' else None
+        return await self._end(state, stop, text=text, error=error, usage=usage, output=output, pending=pending)
 
     async def _run_tools(self, state: _Run, node: Any, run: Any, calls: list[dict[str, Any]]) -> None:
         """跑这一步的工具：调用、结果按事件发出，结果到齐了按调用的顺序、按执行方分组写进日志。"""
@@ -884,6 +914,10 @@ class PydanticAIHarness:
         groups: dict[str, list[dict[str, Any]]] = {}
         for call in calls:
             if call['id'] not in results:
+                # 交给别处执行的：这一步走完了还没有结果，不补「结果未知」，等执行方追加（同参考实现）。
+                if call['id'] in state.deferred:
+                    state.open.pop(call['id'], None)
+                    state.pending.append({'id': call['id'], 'name': call['name'], 'input': call.get('input')})
                 continue
             source = state.sources.get(call['id'], 'harness')
             groups.setdefault(source, []).append(
@@ -939,8 +973,10 @@ class PydanticAIHarness:
         error: dict[str, Any] | None = None,
         usage: dict[str, int] | None = None,
         output: Any = None,
+        pending: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """收尾：没等到结果的工具调用补错误结果，出错写 ``ctx.error``，最后写 ``ctx.run.ended``。"""
+        """收尾：没等到结果的工具调用补错误结果，出错写 ``ctx.error``，最后写 ``ctx.run.ended``。等着别处执行的调用不补，
+        放在 ``pending`` 里。"""
         entries: list[dict[str, Any]] = []
         if state.open:
             message = {
@@ -977,7 +1013,15 @@ class PydanticAIHarness:
                 'stopReason': 'aborted',
             }
         summary = compact(
-            {'runId': state.run_id, 'text': text, 'stopReason': stop, 'usage': usage, 'output': output, 'error': error}
+            {
+                'runId': state.run_id,
+                'text': text,
+                'stopReason': stop,
+                'usage': usage,
+                'output': output,
+                'pending': pending or None,
+                'error': error,
+            }
         )
         state.emit(
             compact(

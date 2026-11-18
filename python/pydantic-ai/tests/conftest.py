@@ -84,10 +84,9 @@ def ts(node: str) -> Evaluate:
     return evaluate
 
 
-def ts_run(node: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """用 TypeScript 的 ``createRemoteHarness`` 跑一轮（见 ``ctx_ts.mjs run``）。"""
+def _ts_command(node: str, command: str, payload: dict[str, Any]) -> dict[str, Any]:
     done = subprocess.run(
-        [node, SOURCE_CONDITION, str(HELPER), 'run'],
+        [node, SOURCE_CONDITION, str(HELPER), command],
         input=json.dumps(payload, ensure_ascii=False),
         capture_output=True,
         text=True,
@@ -98,8 +97,18 @@ def ts_run(node: str, payload: dict[str, Any]) -> dict[str, Any]:
         check=False,
     )
     if done.returncode != 0:
-        raise AssertionError(f'ctx_ts.mjs run failed:\n{done.stderr}')
+        raise AssertionError(f'ctx_ts.mjs {command} failed:\n{done.stderr}')
     return json.loads(done.stdout)
+
+
+def ts_run(node: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """用 TypeScript 的 ``createRemoteHarness`` 跑一轮（见 ``ctx_ts.mjs run``）。"""
+    return _ts_command(node, 'run', payload)
+
+
+def ts_pending(node: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """用 TypeScript 的 ``runPendingTools`` 执行等着的调用、追加结果（见 ``ctx_ts.mjs pending``）。"""
+    return _ts_command(node, 'pending', payload)
 
 
 class Process:

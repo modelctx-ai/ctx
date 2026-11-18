@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from conftest import serve, ts_run
+from conftest import serve, ts_pending, ts_run
 from ctx_pydantic_ai import CtxError, PydanticAIHarness, RemoteExecutor, RemoteSessionStore
 from ctx_pydantic_ai.testing import ScriptedModel
 
@@ -152,6 +152,20 @@ def test_the_typescript_client_drives_serve(node: str, ctx_remote: dict[str, Any
         assert kinds[0] == 'run.started'
         assert kinds[-1] == 'run.ended'
         assert streamed['result']['stopReason'] == 'end_turn'
+        # `ask`：停下来等应用确认。应用用 `runPendingTools` 交给 ctx-remote 上的执行环境、把结果追加进会话，再不带输入跑一轮。
+        asked = {'session': 'py/serve-ask', 'agent': {'model': 'test', 'permissions': {'default': 'ask'}}}
+        waiting = ts_run(node, {'baseUrl': server.url, 'token': 'serve-token', 'request': {**asked, 'input': '用一下'}})
+        assert waiting['result']['stopReason'] == 'requires_action', waiting
+        pending = waiting['result']['pending']
+        assert [call['name'] for call in pending] == ['echo']
+        remote = {'baseUrl': ctx_remote['baseUrl'], 'token': ctx_remote['token']}
+        done = ts_pending(node, {**remote, 'session': 'py/serve-ask', 'executor': 'local'})
+        assert [item['call'] for item in done['executed']] == pending
+        assert done['remaining'] == []
+        resumed = ts_run(node, {'baseUrl': server.url, 'token': 'serve-token', 'request': asked})['result']
+        assert resumed['stopReason'] == 'end_turn', resumed
+        roles = [entry['message']['role'] for entry in resumed['recorded'] if entry['type'] == 'message']
+        assert roles == ['assistant']
         # `--model test`：别的模型名在服务端就被拒绝（400），TypeScript 的客户端抛 `RemoteError`。
         refused = ts_run(
             node,

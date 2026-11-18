@@ -5,6 +5,8 @@
 //   打印一行 `{ baseUrl, token }`，stdin 关了就退出。
 // - `run`：stdin 是 `{ baseUrl, token, request, stream? }`，用 `createRemoteHarness` 跑一轮，stdout 是 `{ result, events }`，
 //   被拒绝时是 `{ thrown: { name, message, status, type } }`。
+// - `pending`：stdin 是 `{ baseUrl, token, session, executor }`，用 `runPendingTools` 把会话里等着的调用交给 ctx-remote 上的
+//   那个执行环境、结果追加进会话，stdout 是 `{ executed, remaining }`。
 import { parseArgs } from 'node:util';
 
 const root = new URL('../../../', import.meta.url);
@@ -27,6 +29,8 @@ async function evaluate() {
     runParentProblem: protocol.runParentProblem,
     filterEntries: protocol.filterEntries,
     project: (entries) => protocol.project(entries).messages,
+    pendingToolCalls: protocol.pendingToolCalls,
+    toolResultEntry: protocol.toolResultEntry,
   };
   const calls = await stdin();
   const results = calls.map(({ fn, args }) => {
@@ -98,6 +102,17 @@ async function run() {
   process.stdout.write(JSON.stringify({ result, events }));
 }
 
+async function pending() {
+  const { runPendingTools } = await load('packages/core/src/index.ts');
+  const { createRemoteExecutor, createRemoteSessionStore } = await load('packages/remote/src/index.ts');
+  const { baseUrl, token, session, executor } = await stdin();
+  const options = { baseUrl, accessToken: token };
+  const result = await runPendingTools(createRemoteSessionStore(options), session, {
+    executor: createRemoteExecutor({ ...options, name: executor }),
+  });
+  process.stdout.write(JSON.stringify(result));
+}
+
 const { positionals, values } = parseArgs({
   allowPositionals: true,
   options: { 'max-list': { type: 'string' } },
@@ -106,7 +121,8 @@ const command = positionals[0];
 if (command === 'eval') await evaluate();
 else if (command === 'remote') await remote(values['max-list'] === undefined ? undefined : Number(values['max-list']));
 else if (command === 'run') await run();
+else if (command === 'pending') await pending();
 else {
-  console.error('usage: ctx_ts.mjs eval | remote [--max-list N] | run');
+  console.error('usage: ctx_ts.mjs eval | remote [--max-list N] | run | pending');
   process.exit(2);
 }
