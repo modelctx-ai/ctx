@@ -4,6 +4,11 @@
 
 ## 2026-11-18
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`ToolRegistry` 加 `executor?`；执行环境一节加 `Executors`、`executorMap`、`executorTools`，写明 `createMcpServer` 那一侧做的事（`open`、`permissions`）和 `listenMcpHttp`；来源的 `collectFacts` 加 `only`、`logger`；harness 一节加 `streamRun`；「失败的重试不让历史变长」末尾写明 `endedInFailure`、`repeatsFailedInput`，「一个会话最多一个未结束的运行」第 3 条末尾写明 `createSessionQueue`。这些都是从适配器里收进协议包的函数，规则本身不变。
+- **更新** [架构](architecture.md)：`createMcpServer` 一节加 `open`、`permissions`、`listenMcpHttp`、`mcpToolName`；harness 的 `executors` 写明表由 `executorMap` 建；Claude Code、pi、pydantic-ai 三节写明重试、排队、流和每轮的 MCP 服务器用的是哪几个共用的函数，排队时取消的什么都不写；实现约束里本机的 MCP HTTP 服务器从两个适配包挪到 ctx-mcp。
+- **更新** [ADR 0010](adr/0010-external-harness-adapters.md)：实施状态加一条共用的部分收进协议包和 ctx-mcp，决定记录加一条为什么这么收、修了什么。
+- **更新** [协议包](../packages/protocol/README.md)、[`ctx-mcp`](../packages/mcp/README.md)、[`ctx-claude-code`](../packages/claude-code/README.md)、[`ctx-pi`](../packages/pi/README.md)、[`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：新导出和新选项，排队时取消的写法，Python 的测试列表加「失败的重试」。
+
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：会话一节的纯函数加 `isEvent`、`runIdOf`、`ctxEventData`（`CtxEventData`）、`lastHarnessRun`，`StepMeta` 加写的一半 `stepMetaToJson`，「一个会话最多一个未结束的运行」第 2 条末尾写明 `isFenced`、`afterConflict` 就是这条规则：各个 harness 以前各写一遍，外部 harness 的三个适配器只照着做了第一种围栏。[协议包](../packages/protocol/README.md)的导出表跟着加。[架构](architecture.md)：Claude Code 和 pydantic-ai 的适配器写日志冲突时按这条规则认被围栏，以前写的是只看自己的 `ctx.run.ended`。[`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的测试一节，对照 TypeScript 的协议函数加上围栏。
 
 - **更新** [ADR 0002](adr/0002-packages.md)：「实施状态」里 `publishConfig`、`release.mjs`、冒烟检查三条不再写「十个包」：脚本按 `packages/*` 找包，加了 `ctx-claude-code`、`ctx-pi` 之后是十二个，这三条没跟着改。`release.mjs` 一条补上正式版本也改 Python 适配器的版本。

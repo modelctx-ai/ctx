@@ -116,9 +116,18 @@ await serveMcpStdio(server);
 
 - 只做工具：`initialize`、`ping`、`tools/list`、`tools/call` 和客户端的 `notifications/cancelled`（中止那次调用）。不依赖 MCP 的 SDK。协议版本认 `MCP_PROTOCOL_VERSIONS`（`2025-06-18`、`2025-03-26`、`2024-11-05`），客户端要的不在里面就回最新的。
 - 工具：`tools` 给了就交出这些定义，不给就是各执行环境 `tools()` 报的全部，同名的留第一个。调用前按 `inputSchema` 查输入（`validateInput: false` 关掉），结果超过 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`，20 万字符；0 不限）时截断并注明省略了多少（`limitToolOutput`），`onResult` 收到的是截过的：MCP 客户端不经过 harness 的那一层。
+- `open`：给了就在第一次把调用交给某个执行环境之前，用调用的会话 `open` 它（带着这里的 `environment`、`signal`，ADR 0009）；每个执行环境每个会话只开一次，打不开时它的调用都回错误，模型看得到原因。`permissions`：`deny` 的调用不执行，回拒绝（只看 `deny`）。两样都在输入检查之前。
 - 结果按 `toolOutputToMcp` 转：文字是 `text`；`json` 是它的 JSON 文字，值是对象时另放进 `structuredContent`；图片、音频是它们自己的块，别的内联文件是嵌入的资源，地址是 `resource_link`；`{ type: 'error' }` 是 `isError: true` 的结果（`retryable`、`data` 跟在信息后面），不是 JSON-RPC 错误，模型看得到。执行环境抛错也是这样。
 - `createMcpHttpHandler(server, { path?, accessToken?, allowedOrigins?, maxBodyBytes? })`：只认 `POST <path>`（缺省 `/mcp`），请求回 `application/json`，通知回 202；`GET`、`DELETE` 回 405（不开服务器发起的流，不建会话）。带 `Origin` 的请求缺省 403，给了 `accessToken` 要 `Authorization: Bearer`。客户端断开时那次调用中止。
 - `serveMcpStdio(server, { input?, output? })`：缺省 `process.stdin`、`process.stdout`，输入结束时 resolve，正在跑的调用中止。请求不排队，慢的调用不挡 `ping` 和取消。日志别写 stdout。
+- `listenMcpHttp(server, { path?, allowedOrigins?, maxBodyBytes? })`：给自己起的子进程用，在 `127.0.0.1` 的空闲端口上听 `createMcpHttpHandler`，令牌每次新生成。返回 `url`、`token`、`contacted()`（有没有带着令牌的请求进来过）和 `close()`（中止正在跑的调用、断开连接）。`mcpToolName(server, tool)` 是 Claude Code、pi 给这些工具起的名字：`mcp__<server>__<tool>`。
+
+```ts
+const listener = await listenMcpHttp(createMcpServer({ executors, tools, context: { session, runId }, open: {} }));
+// 交给子进程：listener.url，请求头 Authorization: Bearer ${listener.token}
+await listener.close();
+```
+
 - 用本包的 hub（`@ai-sdk/mcp` 的客户端）验证过 HTTP 和 stdio 两种传输；Claude Code 2.1.326 经 Streamable HTTP 验证过（2026-11-17，[`@modelctx-ai/ctx-claude-code`](../claude-code/README.md) 的测试：`initialize`、`tools/list`、`tools/call`，它还会试一次 `GET`，405 不影响）；pi 1.5.2 内置的 MCP 扩展经 Streamable HTTP 验证过（2026-11-18，[`@modelctx-ai/ctx-pi`](../pi/README.md) 的测试）。
 
 ## 导出
@@ -136,6 +145,8 @@ await serveMcpStdio(server);
 | `McpServers`、`McpServerConfig`、`StdioServerConfig`、`RemoteServerConfig`、`McpServerStatus`、`McpConnection`、`McpConnectOptions`、`McpTool`、`McpToolSet` | 类型                                                                                                                                                                                                                                                                       |
 | `createMcpServer(options)`、`McpServer`、`McpServerOptions`、`McpCallContext`                                                                                | 把执行环境包成 MCP 服务器：`handle(message, { signal? })` 处理一条 JSON-RPC 消息，`close()` 中止正在跑的调用                                                                                                                                                               |
 | `createMcpHttpHandler(server, options?)`、`McpHttpOptions`                                                                                                   | Streamable HTTP 的处理函数，挂到 `node:http` 上                                                                                                                                                                                                                            |
+| `listenMcpHttp(server, options?)`、`McpHttpListener`                                                                                                         | 在本机起一个带一次性令牌的 Streamable HTTP 服务器，给子进程连                                                                                                                                                                                                              |
+| `mcpToolName(server, tool)`                                                                                                                                  | Claude Code、pi 给 MCP 工具起的名字 `mcp__<server>__<tool>`                                                                                                                                                                                                                |
 | `serveMcpStdio(server, options?)`、`McpStdioOptions`                                                                                                         | 走 stdio                                                                                                                                                                                                                                                                   |
 | `toolOutputToMcp(output)`                                                                                                                                    | `ToolOutput` 转成 MCP 的 `CallToolResult`                                                                                                                                                                                                                                  |
 | `MCP_PROTOCOL_VERSIONS`                                                                                                                                      | 认得的 MCP 协议版本，新的在前                                                                                                                                                                                                                                              |

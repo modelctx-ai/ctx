@@ -339,4 +339,30 @@ describe('context sources', () => {
     );
     assert.deepEqual(failed.toSorted(), ['boom', 'slow']);
   });
+
+  test('only 只收这些名字，顺序按来源；没注册的名字、出错都记告警', async () => {
+    const warnings: string[] = [];
+    const facts = await collectFacts(
+      [
+        defineSource('task', () => '任务'),
+        defineSource('clip', () => '粘贴板'),
+        defineSource('boom', () => {
+          throw new Error('nope');
+        }),
+      ],
+      {
+        session: 's',
+        only: ['clip', 'ghost', 'task', 'boom'],
+        logger: { warn: (message, data) => warnings.push(`${message}${data ? ` ${JSON.stringify(data)}` : ''}`) },
+      },
+    );
+    assert.deepEqual(
+      facts.map((fact) => fact.source),
+      ['task', 'clip'],
+    );
+    assert.deepEqual(warnings, [
+      'context source "ghost" is not registered',
+      'context source "boom" failed {"error":"nope"}',
+    ]);
+  });
 });

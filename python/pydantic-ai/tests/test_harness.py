@@ -197,6 +197,52 @@ def test_runs_of_one_session_queue_up_in_one_instance() -> None:
     run(main)
 
 
+def test_a_run_aborted_while_queued_writes_nothing_and_does_not_block_the_next() -> None:
+    async def main() -> None:
+        harness, store, _ = setup([{'type': 'text', 'text': 'A'}, {'type': 'text', 'text': 'C'}], delay_ms=20)
+        signal = AbortSignal()
+        first = asyncio.ensure_future(harness.run({'session': 's', 'agent': AGENT, 'input': '一'}))
+        await asyncio.sleep(0)
+        queued = asyncio.ensure_future(harness.run({'session': 's', 'agent': AGENT, 'input': '二'}, signal=signal))
+        third = asyncio.ensure_future(harness.run({'session': 's', 'agent': AGENT, 'input': '三'}))
+        await asyncio.sleep(0)
+        signal.abort()
+        skipped = await queued
+        assert skipped['stopReason'] == 'aborted'
+        assert skipped['recorded'] == []
+        assert [(await first)['text'], (await third)['text']] == ['A', 'C']
+        users = [entry['message']['content'] for entry in await store.list('s', types=['message'])]
+        assert [content for content in users if content in ('一', '二', '三')] == ['一', '三']
+        started = [entry for entry in await store.list('s', types=['event']) if entry['kind'] == 'ctx.run.started']
+        assert len(started) == 2
+
+    run(main)
+
+
+def test_a_run_after_one_aborted_while_queued_still_waits_for_the_running_one() -> None:
+    async def main() -> None:
+        harness, _, _ = setup([{'type': 'text', 'text': 'A'}, {'type': 'text', 'text': 'C'}], delay_ms=100)
+        signal = AbortSignal()
+
+        async def queued() -> list[dict[str, Any]]:
+            request = {'session': 's', 'agent': AGENT, 'input': '二'}
+            return [event async for event in harness.stream(request, signal=signal)]
+
+        first = asyncio.ensure_future(harness.run({'session': 's', 'agent': AGENT, 'input': '一'}))
+        await asyncio.sleep(0)
+        streamed = asyncio.ensure_future(queued())
+        await asyncio.sleep(0)
+        signal.abort()
+        events = await streamed
+        assert [event['type'] for event in events] == ['run.started', 'run.ended']
+        assert events[-1]['result']['stopReason'] == 'aborted'
+        assert not first.done(), '第一个还在跑'
+        late = await harness.run({'session': 's', 'agent': AGENT, 'input': '三'})
+        assert [(await first)['text'], late['text']] == ['A', 'C']
+
+    run(main)
+
+
 def test_a_fenced_run_stops_writing() -> None:
     async def main() -> None:
         store = MemorySessionStore()

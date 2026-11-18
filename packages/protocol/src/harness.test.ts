@@ -6,14 +6,20 @@ import { describe, test } from 'vite-plus/test';
 import {
   afterConflict,
   agentSpecToJson,
+  createSessionQueue,
+  endedInFailure,
   isFenced,
   modelName,
   pendingToolCalls,
   REDACTED_HEADER,
+  repeatsFailedInput,
   stepMetaOf,
   stepMetaToJson,
+  streamRun,
   toolResultEntry,
+  type RunEvent,
   type RunPosition,
+  type RunRequest,
   type StepMeta,
 } from './harness.ts';
 import {
@@ -25,6 +31,7 @@ import {
   messageEntry,
   runEndedEntry,
   runStartedEntry,
+  summaryEntry,
   userEntry,
   type Entry,
   type ListOptions,
@@ -202,5 +209,138 @@ describe('fencing', () => {
     append(runEndedEntry({ runId: 'r1', stopReason: 'error' }));
     assert.equal(await afterConflict(store, 's', run), undefined, '被收走了');
     assert.equal(await afterConflict(store, 's', { runId: 'r2', recorded: [] }), 5);
+  });
+});
+
+describe('失败的重试', () => {
+  test('endedInFailure：最后一个生命周期事件是停在 error 或 aborted 的 ended', () => {
+    assert.equal(endedInFailure(stored([started('r1'), ended('r1', 'error')])), true);
+    assert.equal(endedInFailure(stored([started('r1'), ended('r1', 'aborted')])), true);
+    assert.equal(endedInFailure(stored([started('r1'), ended('r1', 'end_turn')])), false);
+    assert.equal(endedInFailure(stored([ended('r1', 'error'), started('r2')])), false, '下一轮已经开始');
+    assert.equal(endedInFailure([]), false);
+  });
+
+  test('repeatsFailedInput：往回跳过框架事件和没盖住它的摘要，第一条别的是同样的用户消息', () => {
+    const failed = stored([
+      started('r1'),
+      userEntry('再试一次'),
+      ended('r1', 'error'),
+      started('r2'),
+      ended('r2', 'error'),
+    ]);
+    assert.equal(repeatsFailedInput(failed, '再试一次'), true, '连着失败几轮也认');
+    assert.equal(repeatsFailedInput(failed, '换一句'), false);
+    const answered = stored([userEntry('再试一次'), assistantEntry('半句'), ended('r1', 'error')]);
+    assert.equal(repeatsFailedInput(answered, '再试一次'), false, '它后面有别的内容');
+    const covering = stored([userEntry('再试一次'), summaryEntry('摘要', 1)]);
+    assert.equal(repeatsFailedInput(covering, '再试一次'), false, '摘要盖住了它');
+    const below = stored([userEntry('早先'), userEntry('再试一次'), summaryEntry('摘要', 1)]);
+    assert.equal(repeatsFailedInput(below, '再试一次'), true, '摘要只盖住了更早的');
+  });
+
+  test('repeatsFailedInput：外部 harness 自己的事件也跳过；给了 key 只看键', () => {
+    const log = stored([userEntry('再试一次', { key: 'k1' }), eventEntry('pi.compacted'), ended('r1', 'error')]);
+    assert.equal(repeatsFailedInput(log, '再试一次'), false, '别人的事件不跳过');
+    assert.equal(repeatsFailedInput(log, '再试一次', { harness: 'pi' }), true);
+    assert.equal(repeatsFailedInput(log, '随便', { key: 'k1' }), true);
+    assert.equal(repeatsFailedInput(log, '再试一次', { key: 'k2' }), false);
+  });
+});
+
+describe('createSessionQueue', () => {
+  test('同一个会话一个接一个，别的会话不等', async () => {
+    const queue = createSessionQueue();
+    const order: string[] = [];
+    const first = await queue.enter('s');
+    const second = queue.enter('s').then((release) => {
+      order.push('second');
+      return release;
+    });
+    const other = await queue.enter('t');
+    order.push('other');
+    assert.deepEqual(order, ['other'], '第二个还在等');
+    first?.();
+    (await second)?.();
+    other?.();
+    assert.deepEqual(order, ['other', 'second']);
+  });
+
+  test('排队时 signal 中止：返回 undefined，也不挡后面的；前面没人时不看 signal', async () => {
+    const queue = createSessionQueue();
+    const first = await queue.enter('s', AbortSignal.abort());
+    assert.ok(first, '前面没人，直接开始');
+    const controller = new AbortController();
+    const second = queue.enter('s', controller.signal);
+    const turns: string[] = [];
+    const third = queue.enter('s').then((release) => {
+      turns.push('third');
+      return release;
+    });
+    controller.abort();
+    assert.equal(await second, undefined);
+    assert.deepEqual(turns, [], '第三个还在等第一个');
+    first();
+    const release = await third;
+    assert.ok(release);
+    release();
+    release();
+    assert.ok(await queue.enter('s'), '后面的照常排上');
+  });
+
+  test('排队时中止的退出以后，新来的还排在正在跑的那一个后面', async () => {
+    const queue = createSessionQueue();
+    const first = await queue.enter('s');
+    assert.ok(first);
+    const controller = new AbortController();
+    const second = queue.enter('s', controller.signal);
+    controller.abort();
+    assert.equal(await second, undefined);
+    let entered = false;
+    const late = queue.enter('s').then((release) => {
+      entered = true;
+      return release;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(entered, false, '第一个还没结束');
+    first();
+    (await late)?.();
+    assert.equal(entered, true);
+  });
+});
+
+describe('streamRun', () => {
+  const request: RunRequest = { session: 's', agent: { model: 'm' } };
+
+  test('事件按顺序交出，run 抛的错在最后抛', async () => {
+    const seen: string[] = [];
+    const stream = streamRun(request, async (_request, emit) => {
+      emit({ type: 'run.started', runId: 'r', session: 's' });
+      await Promise.resolve();
+      emit({ type: 'text.delta', runId: 'r', text: '你好' });
+      throw new Error('写日志失败');
+    });
+    await assert.rejects(async () => {
+      for await (const event of stream) seen.push(event.type);
+    }, /写日志失败/);
+    assert.deepEqual(seen, ['run.started', 'text.delta']);
+  });
+
+  test('调用方提前不读了：中止这一轮，等它结束', async () => {
+    let finished = false;
+    const outer = new AbortController();
+    const stream = streamRun({ ...request, signal: outer.signal }, async (inner, emit) => {
+      emit({ type: 'run.started', runId: 'r', session: 's' });
+      await new Promise((resolve) => inner.signal?.addEventListener('abort', resolve, { once: true }));
+      finished = true;
+    });
+    const events: RunEvent[] = [];
+    for await (const event of stream) {
+      events.push(event);
+      break;
+    }
+    assert.equal(events.length, 1);
+    assert.equal(finished, true);
+    assert.equal(outer.signal.aborted, false, '调用方的 signal 不动');
   });
 });

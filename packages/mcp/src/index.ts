@@ -801,10 +801,13 @@ export function createMcpHub(servers: McpServers, options: McpHubOptions = {}): 
 export {
   createMcpHttpHandler,
   createMcpServer,
+  listenMcpHttp,
   MCP_PROTOCOL_VERSIONS,
+  mcpToolName,
   serveMcpStdio,
   toolOutputToMcp,
   type McpCallContext,
+  type McpHttpListener,
   type McpHttpOptions,
   type McpServer,
   type McpServerOptions,

@@ -8,6 +8,7 @@ import {
   ctxEventData,
   headSeq,
   isEvent,
+  isFrameworkKind,
   messageEntry,
   runIdOf,
   type Entry,
@@ -432,6 +433,154 @@ export async function afterConflict(
     kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded, CTX_EVENTS.erased],
   });
   return isFenced(lifecycle, run) ? undefined : head;
+}
+
+// ---- 一个会话一个运行：排队、重试 ----
+
+/**
+ * 进程内的每会话串行队列：同一个 harness 实例里记录型运行一个接一个，`session_busy` 只出现在跨进程的时候。
+ * `record: false` 的运行不排。
+ */
+export interface SessionQueue {
+  /**
+   * 排进 `session` 的队，轮到时返回 `release`（这一轮结束时调，可以重复调）。前面有人、排队时 `signal` 中止，就退出队列，
+   * 返回 `undefined`：这一轮以 `aborted` 结束，什么都不写。前面没人时直接返回，不看 `signal`。
+   */
+  enter(session: string, signal?: AbortSignal): Promise<(() => void) | undefined>;
+}
+
+export function createSessionQueue(): SessionQueue {
+  /** 每个会话的队尾：最后排进来的那一轮结束的时刻。这些 promise 只 resolve，不 reject。 */
+  const tails = new Map<string, Promise<void>>();
+  return {
+    async enter(session, signal) {
+      const queued = tails.has(session);
+      const previous = tails.get(session) ?? Promise.resolve();
+      const turn = Promise.withResolvers<void>();
+      const tail = previous.then(() => turn.promise);
+      tails.set(session, tail);
+      let released = false;
+      const release = (): void => {
+        if (released) return;
+        released = true;
+        turn.resolve();
+        void tail.finally(() => {
+          if (tails.get(session) === tail) tails.delete(session);
+        });
+      };
+      if (!queued) return release;
+      if (!signal) {
+        await previous;
+        return release;
+      }
+      // 等完就摘掉监听：调用方长期复用同一个 signal 时不会越积越多。
+      let onAbort: (() => void) | undefined;
+      const aborted = new Promise<void>((resolve) => {
+        if (signal.aborted) return resolve();
+        onAbort = resolve;
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      let waited = false;
+      await Promise.race([previous.then(() => (waited = true)), aborted]);
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      if (signal.aborted || !waited) {
+        release();
+        return undefined;
+      }
+      return release;
+    },
+  };
+}
+
+/**
+ * 上一轮失败了：`lifecycle`（`kinds: [ctx.run.started, ctx.run.ended]` 读出的生命周期事件）的最后一条是
+ * `ctx.run.ended`，停在 `error` 或 `aborted`，没有产出。这一轮可能是它的重试，记输入之前看 `repeatsFailedInput`。
+ */
+export function endedInFailure(lifecycle: readonly Entry[]): boolean {
+  const stopReason = ctxEventData(lifecycle.at(-1), CTX_EVENTS.runEnded)?.stopReason;
+  return stopReason === 'error' || stopReason === 'aborted';
+}
+
+export interface RepeatOptions {
+  /** 这一轮的 `inputKey`：给了就只看 `tail` 里有没有这个键的条目。 */
+  readonly key?: string;
+  /** 外部 harness 的名字：它自己写的事件（`<harness>.*`）和框架事件一样跳过。 */
+  readonly harness?: string;
+}
+
+/**
+ * 这一轮的输入是不是失败那一轮留下的那句，是就不再记一遍：`tail` 是会话末尾的若干条（`list({ last })`），从末尾往回
+ * 跳过框架事件（`ctx.*`）和没盖住它的摘要，第一条别的条目是内容一样的用户消息才算。只在 `endedInFailure` 时有意义。
+ */
+export function repeatsFailedInput(
+  tail: readonly Entry[],
+  input: MessageContent,
+  options: RepeatOptions = {},
+): boolean {
+  if (options.key !== undefined) return tail.some((entry) => entry.key === options.key);
+  const own = options.harness === undefined ? undefined : `${options.harness}.`;
+  let covered = 0;
+  for (const entry of tail.toReversed()) {
+    if (entry.type === 'event' && (isFrameworkKind(entry.kind) || (own !== undefined && entry.kind.startsWith(own)))) {
+      continue;
+    }
+    if (entry.type === 'summary') {
+      covered = Math.max(covered, entry.covers);
+      continue;
+    }
+    return (
+      entry.type === 'message' &&
+      entry.message.role === 'user' &&
+      entry.seq > covered &&
+      JSON.stringify(entry.message.content) === JSON.stringify(input)
+    );
+  }
+  return false;
+}
+
+/**
+ * 把边跑边交出事件的一轮包成 `Harness.stream`：`run` 拿到合并了调用方 `signal` 的请求和交事件的回调。调用方提前
+ * 不读了，就中止这一轮、等它结束；`run` 抛的错在交完已有的事件之后抛出。
+ */
+export async function* streamRun(
+  request: RunRequest,
+  run: (request: RunRequest, emit: (event: RunEvent) => void) => Promise<unknown>,
+): AsyncGenerator<RunEvent> {
+  const events: RunEvent[] = [];
+  let wake: (() => void) | undefined;
+  let done = false;
+  let failure: { readonly error: unknown } | undefined;
+  const controller = new AbortController();
+  const signal = request.signal ? AbortSignal.any([request.signal, controller.signal]) : controller.signal;
+  const task = (async () => {
+    try {
+      await run({ ...request, signal }, (event) => {
+        events.push(event);
+        wake?.();
+      });
+    } catch (error) {
+      failure = { error };
+    } finally {
+      done = true;
+      wake?.();
+    }
+  })();
+  try {
+    for (;;) {
+      const event = events.shift();
+      if (event) {
+        yield event;
+        continue;
+      }
+      if (done) break;
+      await new Promise<void>((resolve) => (wake = resolve));
+      wake = undefined;
+    }
+    if (failure) throw failure.error;
+  } finally {
+    if (!done) controller.abort(new Error('Run stream closed by the consumer.'));
+    await task;
+  }
 }
 
 // ---- 父子运行 ----

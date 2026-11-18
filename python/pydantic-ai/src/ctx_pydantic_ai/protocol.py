@@ -417,6 +417,47 @@ async def after_conflict(
     return None if is_fenced(lifecycle, run_id, started=started, recorded=recorded) else head
 
 
+# ---- 失败的重试 ----
+
+
+def ended_in_failure(lifecycle: Sequence[Mapping[str, Any]]) -> bool:
+    """上一轮失败了（协议包的 ``endedInFailure``）：生命周期事件的最后一条是停在 ``error`` 或 ``aborted`` 的 ``ctx.run.ended``。"""
+    last = lifecycle[-1] if lifecycle else None
+    if not is_event(last, RUN_ENDED):
+        return False
+    data = last.get('data')  # type: ignore[union-attr]
+    return (
+        isinstance(data, dict) and isinstance(data.get('runId'), str) and data.get('stopReason') in ('error', 'aborted')
+    )
+
+
+def repeats_failed_input(
+    tail: Sequence[Mapping[str, Any]], content: Json, *, key: str | None = None, harness: str | None = None
+) -> bool:
+    """这一轮的输入是不是失败那一轮留下的那句（协议包的 ``repeatsFailedInput``）：``tail`` 是会话末尾的若干条，从末尾往回
+    跳过框架事件、``harness`` 自己的事件（``<harness>.*``）和没盖住它的摘要，第一条别的条目是内容一样的用户消息才算。
+    给了 ``key`` 只看有没有这个键的条目。
+    """
+    if key is not None:
+        return any(entry.get('key') == key for entry in tail)
+    own = None if harness is None else f'{harness}.'
+    covered = 0
+    for entry in reversed(tail):
+        kind = entry.get('kind')
+        if entry['type'] == 'event' and (is_framework_kind(kind) or (own is not None and kind.startswith(own))):
+            continue
+        if entry['type'] == 'summary':
+            covered = max(covered, int(entry['covers']))
+            continue
+        return (
+            entry['type'] == 'message'
+            and entry['message'].get('role') == 'user'
+            and entry['seq'] > covered
+            and entry['message'].get('content') == content
+        )
+    return False
+
+
 # ---- 工具调用经日志往返 ----
 
 #: ``tool_result_entry`` 的幂等键前缀（协议包的 ``TOOL_RESULT_KEY_PREFIX``）：同一次调用的结果只记一次。
