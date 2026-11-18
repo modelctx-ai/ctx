@@ -17,7 +17,7 @@
     "check": "vp check --deny-warnings && vp test && pnpm build",
     "smoke": "node scripts/pack-smoke.mjs",
     "live": "node live/smoke.ts",
-    "examples": "node examples/single-process.ts && node examples/remote-split.ts && node examples/two-processes.ts && node examples/memory.ts && node examples/move-session.ts && node examples/claude-code.ts && node examples/pydantic-ai.ts",
+    "examples": "node examples/single-process.ts && node examples/remote-split.ts && node examples/two-processes.ts && node examples/memory.ts && node examples/move-session.ts && node examples/claude-code.ts && node examples/pi.ts && node examples/pydantic-ai.ts",
     "release:version": "node scripts/release.mjs version"
   },
   "devDependencies": {

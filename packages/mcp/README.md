@@ -119,7 +119,7 @@ await serveMcpStdio(server);
 - 结果按 `toolOutputToMcp` 转：文字是 `text`；`json` 是它的 JSON 文字，值是对象时另放进 `structuredContent`；图片、音频是它们自己的块，别的内联文件是嵌入的资源，地址是 `resource_link`；`{ type: 'error' }` 是 `isError: true` 的结果（`retryable`、`data` 跟在信息后面），不是 JSON-RPC 错误，模型看得到。执行环境抛错也是这样。
 - `createMcpHttpHandler(server, { path?, accessToken?, allowedOrigins?, maxBodyBytes? })`：只认 `POST <path>`（缺省 `/mcp`），请求回 `application/json`，通知回 202；`GET`、`DELETE` 回 405（不开服务器发起的流，不建会话）。带 `Origin` 的请求缺省 403，给了 `accessToken` 要 `Authorization: Bearer`。客户端断开时那次调用中止。
 - `serveMcpStdio(server, { input?, output? })`：缺省 `process.stdin`、`process.stdout`，输入结束时 resolve，正在跑的调用中止。请求不排队，慢的调用不挡 `ping` 和取消。日志别写 stdout。
-- 用本包的 hub（`@ai-sdk/mcp` 的客户端）验证过 HTTP 和 stdio 两种传输；Claude Code 2.1.326 经 Streamable HTTP 验证过（2026-11-17，[`@modelctx-ai/ctx-claude-code`](../claude-code/README.md) 的测试：`initialize`、`tools/list`、`tools/call`，它还会试一次 `GET`，405 不影响）。pi 没有验证。
+- 用本包的 hub（`@ai-sdk/mcp` 的客户端）验证过 HTTP 和 stdio 两种传输；Claude Code 2.1.326 经 Streamable HTTP 验证过（2026-11-17，[`@modelctx-ai/ctx-claude-code`](../claude-code/README.md) 的测试：`initialize`、`tools/list`、`tools/call`，它还会试一次 `GET`，405 不影响）；pi 1.5.2 内置的 MCP 扩展经 Streamable HTTP 验证过（2026-11-18，[`@modelctx-ai/ctx-pi`](../pi/README.md) 的测试）。
 
 ## 导出
 

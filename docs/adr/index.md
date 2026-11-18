@@ -9,4 +9,4 @@
 - [ADR 0007：会话的擦除和保留期](0007-deletion-and-retention.md) - 只追加的例外：`truncate`、`remove`、`redact` 和擦除记录 `ctx.erased`，运行中的 harness 怎么看见，SQLite 的 `secure_delete` 和 `vacuum`，保留期是应用调的函数
 - [ADR 0008：工具调用经日志往返](0008-tool-calls-through-the-log.md) - 一轮可以停在「等外部执行」：`StopReason` 的 `requires_action`，结果作为 `tool` 消息追加进日志，执行方只需读写会话存储，下一轮不带输入续跑
 - [ADR 0009：云托管的前提：每会话的执行环境、凭证、主体](0009-hosted-prerequisites.md) - 每会话的执行环境进协议（`Executor.open`、`close` 和 `EnvironmentSpec`），凭证不进执行环境只给约定，`ctx-remote` 加鉴权扩展点把请求映射到主体、按主体限制会话前缀和记忆作用域
-- [ADR 0010：外部 harness 的适配：轨迹实时落日志、工具经 MCP 回到 ctx、会话一对一](0010-external-harness-adapters.md) - 自带循环的程序（Claude Code）作为 harness 接进 ctx：流式输出实时写进会话日志，ctx 的执行环境经 MCP 交给它，`ctx.run.started` 记它的身份和会话，失败重试退回到失败之前，映射不了的配置以 `invalid_request` 结束，它压缩自己的上下文时不写 `summary`
+- [ADR 0010：外部 harness 的适配：轨迹实时落日志、工具经 MCP 回到 ctx、会话一对一](0010-external-harness-adapters.md) - 自带循环的程序（Claude Code、pi）作为 harness 接进 ctx：流式输出实时写进会话日志，ctx 的执行环境经 MCP 交给它，`ctx.run.started` 记它的身份和会话，失败重试退回到失败之前，映射不了的配置以 `invalid_request` 结束，它压缩自己的上下文时不写 `summary`

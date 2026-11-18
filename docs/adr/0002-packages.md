@@ -29,6 +29,7 @@ status: stable
 | `@modelctx-ai/ctx-gateway`     | OpenAI 兼容网关                                                                                 | 本机 HTTP 服务；只有要接 OpenAI 协议客户端的应用才用                                                    |
 | `@modelctx-ai/ctx-otel`        | 从会话日志派生 OpenTelemetry 的 span                                                            | 带进 `@opentelemetry/api`；不接追踪后端的应用用不到                                                     |
 | `@modelctx-ai/ctx-claude-code` | 把 Claude Code 接成 harness                                                                     | 要起 `claude` 子进程和本机 HTTP；不用 Claude Code 的应用用不到                                          |
+| `@modelctx-ai/ctx-pi`          | 把 pi 接成 harness                                                                              | 要起 `pi` 子进程和本机 HTTP；不用 pi 的应用用不到                                                       |
 | `ctx-pydantic-ai`（Python）    | 把 pydantic-ai 的 `Agent` 接成 harness，线上协议的 Python 服务端和客户端                        | 另一种语言：在 `python/pydantic-ai`，不进 pnpm 的工作区、不发 npm，只认线上协议                         |
 
 没选一个包加子路径（`@modelctx-ai/ctx/sqlite`）：适配器的依赖要么所有人都装上，要么变成可选的 peer 让使用方自己补；各部分对 Node 版本的要求也不一样。
@@ -55,9 +56,10 @@ status: stable
 | `@modelctx-ai/ctx-gateway`     | —                                                                  | `ctx-protocol`                       |
 | `@modelctx-ai/ctx-otel`        | —                                                                  | `ctx-protocol`、`@opentelemetry/api` |
 | `@modelctx-ai/ctx-claude-code` | —                                                                  | `ctx-protocol`、`ctx-mcp`            |
+| `@modelctx-ai/ctx-pi`          | —                                                                  | `ctx-protocol`、`ctx-mcp`            |
 | `ctx-pydantic-ai`（Python）    | `pydantic-ai-slim`、`httpx2`、`jsonschema`、`starlette`、`uvicorn` | —                                    |
 
-依赖只朝一个方向：协议 ← 实现 ← 实践。实现包把协议包当 peer：应用里只有一份协议包，`SessionStore`、`Executor`、`Harness` 这些类型来自同一份。实现包之间不互相依赖（例外是 `ctx-claude-code` 把 `ctx-mcp` 当 peer，见 [ADR 0010](0010-external-harness-adapters.md)）；测试里需要一个会话存储时把 `@modelctx-ai/ctx` 列进 `devDependencies`。ctx-models、ctx-memory 把协议包和 `ai` 都当 peer：返回的 `LanguageModel`、`DecisionModel`、`ExtractionModel` 和应用用的是同一份 AI SDK、同一份协议包。仓库里对协议包的 peer 写成 `workspace:^`，同时列进 `devDependencies` 供测试和构建使用。
+依赖只朝一个方向：协议 ← 实现 ← 实践。实现包把协议包当 peer：应用里只有一份协议包，`SessionStore`、`Executor`、`Harness` 这些类型来自同一份。实现包之间不互相依赖（例外是 `ctx-claude-code`、`ctx-pi` 把 `ctx-mcp` 当 peer，见 [ADR 0010](0010-external-harness-adapters.md)）；测试里需要一个会话存储时把 `@modelctx-ai/ctx` 列进 `devDependencies`。ctx-models、ctx-memory 把协议包和 `ai` 都当 peer：返回的 `LanguageModel`、`DecisionModel`、`ExtractionModel` 和应用用的是同一份 AI SDK、同一份协议包。仓库里对协议包的 peer 写成 `workspace:^`，同时列进 `devDependencies` 供测试和构建使用。
 
 ## 源码条件
 
@@ -147,3 +149,4 @@ PyPI 那边只能由维护者做的：在 PyPI 加一个 pending publisher（项
 - 2026-11-17：加第十一个包 `@modelctx-ai/ctx-claude-code`（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：要起子进程和本机 HTTP，按「只能在 Node 上跑的各成一个适配包」单独成包。它把 `ctx-mcp` 当 peer，是「实现包之间不互相依赖」的第一个例外：MCP 服务器那一半（`createMcpServer`）只在 `ctx-mcp` 里有一份，理由见 [ADR 0010](0010-external-harness-adapters.md)。正文里的「十个」按十一个读；占位版本也要给它发。
 - 2026-11-17：加 Python 的 `ctx-pydantic-ai`（`python/pydantic-ai`，[#23](https://github.com/modelctx-ai/ctx/issues/23)）。另一种语言，不进 pnpm 的工作区、不发 npm，也还不发 PyPI；依赖由 uv 锁在 `uv.lock`，CI 单独一个作业。它不依赖任何 TypeScript 包，只认线上协议：`PROTOCOL_VERSION`、`ENTRY_VERSION` 和几个常量由测试从 TypeScript 源码里读出来比，协议函数对同一组输入和协议包比结果。版本跟着正式版本一起改（`scripts/release.mjs version` 也改它的 `pyproject.toml` 和 `uv.lock`，`check` 也核对）；预发布版本不是 PEP 440 的写法，不动它。
 - 2026-11-18：`ctx-pydantic-ai` 发 PyPI，上一条的「也还不发 PyPI」不再成立。和 npm 同一个 tag、同一个版本，只发正式版本：预发布版本不是 PEP 440 的写法，`pyproject.toml` 不跟着改。用 PyPI 的 trusted publishing，打包和发布分成两个作业，发布的作业只拿到 `id-token: write` 和打好的包（PyPA 推荐的做法）。不等 npm 那边：npm 的第一次发布要维护者先占名字，PyPI 的 pending publisher 不用，两边各自重跑。README 里的相对链接打包时换成 GitHub 上的地址（`hatch-fancy-pypi-readme`），许可证在包目录里放一份，测试核对它和仓库根的一样。
+- 2026-11-18：加第十二个包 `@modelctx-ai/ctx-pi`（[#23](https://github.com/modelctx-ai/ctx/issues/23)）：和 `ctx-claude-code` 一样要起子进程和本机 HTTP，单独成包，也把 `ctx-mcp` 当 peer（理由同上一个例外，见 [ADR 0010](0010-external-harness-adapters.md)）。不和 `ctx-claude-code` 合成一个「外部 harness」包：两个程序的命令行、事件流、会话文件各不相同，共用的只有 `ctx-mcp` 和协议包里的东西，合起来只会让用一个的应用也装上另一个的代码。正文里的「十一个」按十二个读；占位版本也要给它发。

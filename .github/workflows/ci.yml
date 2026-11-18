@@ -87,6 +87,28 @@ jobs:
         env:
           CTX_TEST_CLAUDE_CODE: required
 
+  pi:
+    # ctx-pi 的测试和 examples/pi.ts 对着真的 pi 跑（模型是本机的假接口，不联网、不要密钥）。别的作业里没装 `pi`，这些用例
+    # 跳过；这里装 README 写的那个版本，没装上就失败（`CTX_TEST_PI=required`）。pi 要 Node ≥22.19。升级 pi 先改这里。
+    name: pi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: npm install --global @earendil-works/pi-coding-agent@1.5.2
+      - run: pi --version
+      - run: pnpm exec vp test packages/pi examples
+        env:
+          CTX_TEST_PI: required
+
   pydantic-ai:
     # python/pydantic-ai：Python 写的 pydantic-ai 适配器，不在 pnpm 的工作区里，依赖照 uv.lock。
     # 要 node 的用例（对照 TypeScript 的协议包、对着 ctx-remote 跑、ctx-conformance）读各包的 src/，不用构建，

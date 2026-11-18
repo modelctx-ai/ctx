@@ -336,8 +336,8 @@ export interface RunStartedData {
 }
 
 /**
- * 外部 harness 的身份：名字（`claude-code`、`pydantic-ai`）、版本，和它自己的会话标识。自己存对话的程序（Claude Code）
- * 把 ctx 的一个会话对到它的一个会话上，下一轮从最近一次记下的 `session` 接着跑。
+ * 外部 harness 的身份：名字（`claude-code`、`pi`、`pydantic-ai`）、版本，和它自己的会话标识。自己存对话的程序（Claude
+ * Code、pi）把 ctx 的一个会话对到它的一个会话上，下一轮从最近一次记下的 `session` 接着跑。
  */
 export interface HarnessInfo {
   readonly name: string;

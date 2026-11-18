@@ -10,6 +10,7 @@
 | [`memory.ts`](memory.ts)                 | 记忆接进上下文                                  | `createMemory` 的 `gate`、`consolidate`、`source()`、`recall` 工具，按用户的作用域（`scope`）                                    |
 | [`move-session.ts`](move-session.ts)     | 搬会话：内存 → 文件 → SQLite → 远端             | `exportSession`、`importSession`、`copySession`：`seq` 重新分配之后摘要的 `covers` 仍然指对，三边的上下文一样                    |
 | [`claude-code.ts`](claude-code.ts)       | 外部 harness：Claude Code 跑循环                | `createClaudeCodeHarness`：ctx 的工具经 MCP 回到 ctx 的执行环境，轨迹实时进日志，第二轮续接它自己的会话（`HarnessInfo.session`） |
+| [`pi.ts`](pi.ts)                         | 外部 harness：pi 跑循环                         | `createPiHarness`：ctx 的工具经 MCP 回到 ctx 的执行环境，轨迹实时进日志，第二轮续接它自己的会话（`HarnessInfo.session`）         |
 | [`pydantic-ai.ts`](pydantic-ai.ts)       | 外部 harness，另一种语言：pydantic-ai（Python） | `ctx-pydantic-ai serve` 经线上协议跑，`createRemoteHarness` 连它；日志和工具在 `ctx-remote` 里，第二轮的历史从日志投影           |
 
 ## 怎么跑
@@ -34,6 +35,12 @@ CTX_EXAMPLE_BASE_URL=https://api.deepseek.com/v1 CTX_EXAMPLE_API_KEY=… CTX_EXA
 
 ```sh
 CTX_EXAMPLE_CLAUDE_MODEL=sonnet node examples/claude-code.ts
+```
+
+`pi.ts` 要装 pi（`npm install --global @earendil-works/pi-coding-agent`，`pi` 在 `PATH` 上，或 `CTX_PI_COMMAND` 指过去），没装就跳过。缺省模型是本机的假 Anthropic 接口（`@modelctx-ai/ctx-pi/testing`），pi 的代理目录、家目录和会话放在临时目录，不读本机的设置和凭证；CI 的 pi 作业装固定版本跑它。用真的模型，走本机 pi 自己的配置和登录（没有对真实服务验证）：
+
+```sh
+CTX_EXAMPLE_PI_MODEL=anthropic/claude-sonnet-4-5 node examples/pi.ts
 ```
 
 `pydantic-ai.ts` 要装 uv（`uv` 在 `PATH` 上），没装就跳过；它按 `python/pydantic-ai/uv.lock` 装好依赖再起 `ctx-pydantic-ai serve`，子进程只拿到 `PATH`、`HOME`、uv 自己的和代理、证书的环境变量。模型是 pydantic-ai 自带的 `test` 模型（把给它的工具各调一次，再用 JSON 文字报结果），不联网、不要密钥；CI 的 pydantic-ai 作业跑它。换真的模型照 [`python/pydantic-ai`](../python/pydantic-ai/README.md) 起服务（没有对真实服务验证）。
