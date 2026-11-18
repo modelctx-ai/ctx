@@ -2,6 +2,11 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-11-18
+
+- **更新** [`@modelctx-ai/ctx-claude-code`](../packages/claude-code/README.md) 的 README：「怎么对上」加子代理一行，加子会话里一轮的样子；选项里写 `Task`、`bare` 下没有子代理、适配器加的 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`；「还没做的」去掉子代理一条；「验证」加子代理对 2.1.326 和 2.1.327 的核实。
+- **更新** [架构](architecture.md)：「外部 harness：Claude Code」写子代理怎么归到子会话、什么时候写完。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」跟着改，决定记录补一条，写前台跑、补最后的回答、子运行不带 `session` 各对着哪条决定。
+
 ## 2026-11-17
 
 - **新增** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md)（Python）的 README：安装、用法（`serve` 加 `createRemoteHarness`，和在 Python 里直接用）、怎么对上（七个问题各一行，加一轮日志的样子）、`AgentSpec` 和 `stopReason` 的映射表、选项和命令行、一致性等级和还没做的、验证（pydantic-ai 2.69.0，对真实的模型服务没有验证）、导出。

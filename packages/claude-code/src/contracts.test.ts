@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createFunctionExecutor, createMemoryStore, createToolRegistry } from '@modelctx-ai/ctx';
-import { CTX_EVENTS, type AgentSpec, type Entry, type SessionStore } from '@modelctx-ai/ctx-protocol';
+import { childRunsOf, CTX_EVENTS, type AgentSpec, type Entry, type SessionStore } from '@modelctx-ai/ctx-protocol';
 import { describeHarnessContract, type ModelScript } from '@modelctx-ai/ctx-protocol/testing';
 import { afterAll, describe, test, vi } from 'vite-plus/test';
 
@@ -48,6 +48,8 @@ async function setup(
     readonly builtinTools?: readonly string[];
     /** 换掉缺省的回显执行环境：给一个工具目录。 */
     readonly tools?: ReturnType<typeof createToolRegistry>;
+    /** 缺省 `--bare`；子代理（`Task`）在 `--bare` 下没有，那些用例关掉它。 */
+    readonly bare?: boolean;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'ctx-claude-code-test-'));
@@ -75,13 +77,15 @@ async function setup(
     ...(options.tools ? { tools: options.tools } : { executors: [echo] }),
     command,
     cwd,
-    bare: true,
+    bare: options.bare ?? true,
     maxToolOutputChars,
     ...(options.builtinTools ? { builtinTools: options.builtinTools } : {}),
     env: {
       PATH: process.env['PATH'],
       HOME: home,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
+      // Claude Code 把子代理的输出文件写在临时目录：放进这个用例的目录，跑完一起删。
+      TMPDIR: root,
       ANTHROPIC_BASE_URL: api.url,
       ANTHROPIC_API_KEY: 'sk-ant-test-not-a-real-key',
       NO_PROXY: '127.0.0.1,localhost',
@@ -285,5 +289,192 @@ slow.describe('Claude Code 适配器', () => {
       (ended?.type === 'event' && (ended.data as Record<string, unknown>)['stopReason']) || undefined,
       'aborted',
     );
+  });
+});
+
+/** 条目的类型和来源：`event:<kind>`、`<role>:<source>`。 */
+function shape(entry: Entry): string {
+  if (entry.type === 'event') return `event:${entry.kind}`;
+  if (entry.type === 'message') return `${entry.message.role}:${entry.source ?? ''}`;
+  return entry.type;
+}
+
+function textOf(entry: Entry | undefined): string | undefined {
+  if (entry?.type !== 'message') return undefined;
+  const { content } = entry.message;
+  return typeof content === 'string'
+    ? content
+    : content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('');
+}
+
+/** 派子代理的一步：模型调 `Agent`（Claude Code 发给模型时这么叫，`--tools` 里叫 `Task`）。 */
+function delegate(id: string, prompt: string): FakeAnthropicStep {
+  return {
+    type: 'tool-call',
+    tool: 'Agent',
+    id,
+    input: { description: '子任务', prompt, subagent_type: 'general-purpose' },
+  };
+}
+
+// 子代理要 `Task` 工具，`--bare` 下没有：这几个用例不加 `--bare`（家目录、配置目录、工作目录照样是临时的）。
+slow.describe('Claude Code 的子代理', () => {
+  const options = { builtinTools: ['Task'], bare: false } as const;
+
+  slow.test('子代理的轨迹写进子会话，父会话那一侧那次调用的结果是 ChildRunResult', async () => {
+    const { harness, store, agent } = await setup(
+      [
+        delegate('toolu_agent_1', '回显「台北晴」'),
+        { type: 'tool-call', id: 'toolu_echo_1', input: { text: '台北晴' } },
+        { type: 'text', text: '子代理：台北晴' },
+        { type: 'text', text: '主代理：完成' },
+      ],
+      options,
+    );
+    const result = await harness.run({ session: 's', agent, input: '台北天气怎么样？' });
+    assert.equal(result.stopReason, 'end_turn', result.error?.message);
+    assert.equal(result.text, '主代理：完成');
+
+    const log = await store.list('s');
+    assert.deepEqual(log.map(shape), [
+      'event:ctx.run.started',
+      'user:',
+      'assistant:model',
+      `tool:${CLAUDE_CODE_HARNESS}`,
+      'assistant:model',
+      'event:ctx.run.ended',
+    ]);
+    const [child] = childRunsOf(log);
+    assert.equal(child?.child.session, 's/Agent/toolu_agent_1');
+    assert.equal(child?.stopReason, 'end_turn');
+    assert.equal(child?.text, '子代理：台北晴');
+    assert.equal(child?.toolCallId, 'toolu_agent_1');
+
+    const sub = await store.list(child.child.session);
+    assert.deepEqual(sub.map(shape), [
+      'event:ctx.run.started',
+      `user:${CLAUDE_CODE_HARNESS}`,
+      'assistant:model',
+      'tool:local',
+      'assistant:model',
+      'event:ctx.run.ended',
+    ]);
+    const [data] = started(sub);
+    assert.equal(data?.['runId'], child.child.runId);
+    assert.deepEqual(data?.['parent'], { session: 's', runId: result.runId, toolCallId: 'toolu_agent_1' });
+    assert.equal((data?.['agent'] as Record<string, unknown> | undefined)?.['name'], 'general-purpose');
+    const harnessInfo = data?.['harness'] as Record<string, unknown>;
+    assert.equal(harnessInfo['name'], CLAUDE_CODE_HARNESS);
+    assert.equal(harnessInfo['session'], undefined, '子代理没有能续接的会话');
+    assert.equal(textOf(sub[1]), '回显「台北晴」');
+    assert.ok(JSON.stringify(sub[3]).includes('台北晴'), '工具结果经 ctx 的执行环境');
+    assert.equal(textOf(sub[4]), '子代理：台北晴');
+    const steps = sub.flatMap((entry) => {
+      const step = entry.meta?.['step'] as Record<string, unknown> | undefined;
+      return step ? [step] : [];
+    });
+    assert.deepEqual(
+      steps.map((step) => [step['runId'], step['step']]),
+      [
+        [child.child.runId, 0],
+        [child.child.runId, 1],
+      ],
+    );
+    const ended = sub.at(-1);
+    assert.equal(ended?.type === 'event' && (ended.data as Record<string, unknown>)['stopReason'], 'end_turn');
+  });
+
+  slow.test('子代理失败：子会话以 error 结束、有 ctx.error，发起的一侧是错误结果、带 ChildRunResult', async () => {
+    const { harness, store, agent } = await setup(
+      [
+        delegate('toolu_agent_1', '做点事'),
+        { type: 'error', message: 'upstream down' },
+        { type: 'text', text: '主代理：子代理没做成' },
+      ],
+      options,
+    );
+    const result = await harness.run({ session: 's', agent, input: '开始' });
+    assert.equal(result.stopReason, 'end_turn', result.error?.message);
+    const log = await store.list('s');
+    const tool = log.find((entry) => entry.type === 'message' && entry.message.role === 'tool');
+    assert.ok(tool?.type === 'message' && Array.isArray(tool.message.content));
+    const part = tool.message.content[0];
+    assert.equal(part?.type === 'tool-result' && part.output.type, 'error');
+    const [child] = childRunsOf(log);
+    assert.equal(child?.stopReason, 'error');
+    assert.match(child?.error?.message ?? '', /upstream down/);
+    const sub = await store.list(child.child.session);
+    assert.deepEqual(sub.map(shape), [
+      'event:ctx.run.started',
+      `user:${CLAUDE_CODE_HARNESS}`,
+      'event:ctx.error',
+      'event:ctx.run.ended',
+    ]);
+  });
+
+  slow.test(
+    '子代理再派子代理：孙会话挂在子会话下面，只有输入、回答和结束（Claude Code 不转出它里面的消息）',
+    async () => {
+      const { harness, store, agent } = await setup(
+        [
+          delegate('toolu_agent_1', '再派一个'),
+          delegate('toolu_agent_2', '孙代理做事'),
+          { type: 'text', text: '孙代理：好了' },
+          { type: 'text', text: '子代理：好了' },
+          { type: 'text', text: '主代理：好了' },
+        ],
+        options,
+      );
+      const result = await harness.run({ session: 's', agent, input: '开始' });
+      assert.equal(result.stopReason, 'end_turn', result.error?.message);
+      const [child] = childRunsOf(await store.list('s'));
+      assert.equal(child?.text, '子代理：好了');
+      const sub = await store.list(child.child.session);
+      assert.deepEqual(sub.map(shape), [
+        'event:ctx.run.started',
+        `user:${CLAUDE_CODE_HARNESS}`,
+        'assistant:model',
+        `tool:${CLAUDE_CODE_HARNESS}`,
+        'assistant:model',
+        'event:ctx.run.ended',
+      ]);
+      const [grandchild] = childRunsOf(sub);
+      assert.equal(grandchild?.child.session, 's/Agent/toolu_agent_1/Agent/toolu_agent_2');
+      assert.equal(grandchild?.text, '孙代理：好了');
+      const deeper = await store.list(grandchild.child.session);
+      assert.deepEqual(deeper.map(shape), [
+        'event:ctx.run.started',
+        `user:${CLAUDE_CODE_HARNESS}`,
+        'assistant:model',
+        'event:ctx.run.ended',
+      ]);
+      assert.deepEqual(started(deeper)[0]?.['parent'], {
+        session: child.child.session,
+        runId: child.child.runId,
+        toolCallId: 'toolu_agent_2',
+      });
+      assert.equal(textOf(deeper[1]), '孙代理做事');
+    },
+  );
+
+  slow.test('父运行在子代理跑着时被取消：子会话以 aborted 结束，发起的一侧是 aborted 的 ChildRunResult', async () => {
+    const { harness, store, agent } = await setup(
+      [delegate('toolu_agent_1', '慢慢做'), { type: 'text', text: '太慢了', delayMs: 20_000 }],
+      options,
+    );
+    const controller = new AbortController();
+    const session = 's/Agent/toolu_agent_1';
+    void (async () => {
+      // 子会话开始了再取消。
+      while ((await store.list(session)).length === 0) await new Promise((resolve) => setTimeout(resolve, 50));
+      controller.abort();
+    })();
+    const result = await harness.run({ session: 's', agent, input: '开始', signal: controller.signal });
+    assert.equal(result.stopReason, 'aborted');
+    const [child] = childRunsOf(await store.list('s'));
+    assert.equal(child?.child.session, session);
+    assert.equal(child?.stopReason, 'aborted');
+    const ended = (await store.list(session)).at(-1);
+    assert.equal(ended?.type === 'event' && (ended.data as Record<string, unknown>)['stopReason'], 'aborted');
   });
 });

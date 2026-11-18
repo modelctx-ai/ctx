@@ -60,9 +60,9 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 
 - 协议：`RunStartedData.harness`、`HarnessInfo`；`isContextOverflowText` 从核心包挪过来，核心包的 `isContextOverflowError` 改用它。
 - `ctx-mcp`：`createMcpServer` 的 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`），`onResult` 收到截过的结果。
-- `ctx-claude-code`：`createClaudeCodeHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 Claude Code 2.1.326 验证过，模型是本机的假接口；对真实的 Anthropic 接口没有验证。
+- `ctx-claude-code`：`createClaudeCodeHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 Claude Code 2.1.326 验证过，模型是本机的假接口；对真实的 Anthropic 接口没有验证。Claude Code 起的子代理写进子会话（2026-11-18，对 2.1.326 和 2.1.327 核实过）。
 - `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`output` 四级；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。
-- 没做：子代理的轨迹写进子会话；pydantic-ai 的 `ask` 权限、`window` 和 `context`。
+- 没做：pydantic-ai 的 `ask` 权限、`window` 和 `context`。
 
 ## 决定记录
 
@@ -74,3 +74,7 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
   - 决定二：pydantic-ai 让模型改了再答时补的话（`RetryFeedbackPart`）记成 `pydantic-ai.retry` 事件。
   - 决定八：上下文由 ctx 投影，但还不裁窗口、不压缩，`window`、`context` 以 `invalid_request` 结束；不跑 `context` 一级。
   - 线上协议的服务端（`POST /runs` 的心跳、NDJSON、取消、`Host` 和 `Origin` 的检查）用 Python 再写了一份，一致性模式只给 harness；`PROTOCOL_VERSION`、`ENTRY_VERSION` 和截断、配对用的常量由测试从 TypeScript 源码里读出来比。
+- 2026-11-18：Claude Code 起的子代理（`Task` 工具）写进子会话，「代价」里最后一条不再成立。照协议的父子运行：子会话名同进程内派子 agent 的缺省（`<发起方的会话>/<工具名>/<调用 id>`），`ctx.run.started` 带 `parent`，发起方那次调用的结果是 `ChildRunResult`。和决定正文的关系：
+  - 决定二：子代理在前台跑才有完整的轨迹，适配器给 Claude Code 设 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`。缺省时子代理在后台跑，`Task` 立刻返回「已启动」，这一轮先结束，子代理的轨迹落在这一轮之外。后台命令（`Bash` 的 `run_in_background`）一起关掉：一轮到 `result` 就结束进程，它们本来就活不过这一轮。
+  - 决定二：子代理最后的回答不单独转出，只在那次调用的结果里（`tool_use_result.content`），适配器补成子会话里的一条助手消息；子代理再派的子代理里面的消息 Claude Code 不转出，那一层只记输入、回答和结束。
+  - 决定四：子运行的 `harness` 不带 `session`：子代理的记录挂在父会话下面，不能单独续接。

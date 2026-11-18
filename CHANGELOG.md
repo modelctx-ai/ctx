@@ -4,6 +4,9 @@
 
 ## 未发布
 
+- **实现** `ctx-claude-code`：Claude Code 起的子代理（`Task` 工具，`builtinTools` 里给了才有）写进子会话 `<发起方的会话>/<工具名>/<调用 id>`：`ctx.run.started` 带 `parent`，然后是它收到的输入、每一步、最后的回答、`ctx.run.ended`；发起方那次调用的结果换成 `ChildRunResult`（`childRunsOf` 找得到），以前只在父会话里记 Claude Code 给的那段文字、子代理里面的消息丢掉。子代理再派的子代理也有子会话，只有输入、回答和结束。子进程的环境加 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`：子代理和后台命令在这一轮里跑完。
+- **新增** `@modelctx-ai/ctx-claude-code/testing` 的 `FakeAnthropicStep`：`tool-call` 和 `tool-calls` 的每次调用可以用 `tool` 指定调哪个工具。
+
 - **新增** Python 的 pydantic-ai 适配器 `ctx-pydantic-ai`（[`python/pydantic-ai`](python/pydantic-ai/README.md)，[#23](https://github.com/modelctx-ai/ctx/issues/23) 的第二个适配器，[ADR 0010](docs/adr/0010-external-harness-adapters.md)）：`PydanticAIHarness(store=, executors=, tools=, models=, max_tool_output_chars=, source=)` 把 pydantic-ai 2.69 的 `Agent` 接成协议的 `Harness`（`run`、`stream`）。历史每轮从 ctx 的日志投影，每一步实时写回去，工具调用落在 ctx 的执行环境上；`create_app` 把它挂成线上入口（`GET /protocol`、`POST /runs`、`DELETE /runs/:runId`），TypeScript 一侧用 `createRemoteHarness` 连。另有线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`，进程内的 `MemorySessionStore`、`FunctionExecutor`，命令行 `ctx-pydantic-ai serve --remote <ctx-remote 的地址>` 和 `ctx-pydantic-ai conformance`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`output`；`window`、`context`、`ask` 权限、`settings.providerOptions` 以 `invalid_request` 结束。不在 PyPI 上。
 - **新增** 例子 `examples/pydantic-ai.ts`：`ctx-remote`（会话和执行环境）、`ctx-pydantic-ai serve`、编排器各在一处，没装 uv 就跳过；`pnpm examples` 也跑它。
 - **实现** `scripts/release.mjs`：`version` 的正式版本一起改 `python/pydantic-ai` 的 `pyproject.toml` 和 `uv.lock`，`check` 也核对它们；预发布版本不是 PEP 440 的写法，不动。
