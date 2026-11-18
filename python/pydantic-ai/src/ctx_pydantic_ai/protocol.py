@@ -25,6 +25,7 @@ DEFAULT_MAX_TOOL_OUTPUT_CHARS = 200_000
 RUN_STARTED = 'ctx.run.started'
 RUN_ENDED = 'ctx.run.ended'
 CTX_ERROR = 'ctx.error'
+CTX_ERASED = 'ctx.erased'
 
 #: 远端的 ``agent.settings`` 缺省收的键（``ctx-remote`` 的 ``DEFAULT_ALLOWED_SETTINGS``）。
 DEFAULT_ALLOWED_SETTINGS = (
@@ -342,6 +343,78 @@ def is_event(entry: Mapping[str, Any] | None, kind: str) -> bool:
 def run_id_of(entry: Mapping[str, Any]) -> Json:
     data = entry.get('data')
     return data.get('runId') if entry.get('type') == 'event' and isinstance(data, dict) else None
+
+
+# ---- 写日志：围栏 ----
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _erased_data(entry: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """``ctx.erased`` 的 ``data``（协议包的 ``ctxEventData(entry, CTX_EVENTS.erased)``）：``op``、``count`` 不对时没有。"""
+    data = entry.get('data')
+    if not is_event(entry, CTX_ERASED) or not isinstance(data, dict):
+        return None
+    if data.get('op') not in ('truncate', 'remove', 'redact') or not _number(data.get('count')):
+        return None
+    return data
+
+
+def is_erased(data: Mapping[str, Any], seq: int) -> bool:
+    """一条擦除记录动没动 ``seq`` 这一条（协议包的 ``isErased``）：``truncate`` 看 ``upTo``，``remove``、``redact`` 看 ``seqs``。"""
+    if data.get('op') == 'truncate':
+        up_to = data.get('upTo')
+        return _number(up_to) and seq <= up_to
+    seqs = data.get('seqs')
+    return isinstance(seqs, list) and all(_number(item) for item in seqs) and seq in seqs
+
+
+def is_fenced(
+    lifecycle: Sequence[Mapping[str, Any]],
+    run_id: str,
+    *,
+    started: int | None,
+    recorded: Sequence[Mapping[str, Any]],
+) -> bool:
+    """围栏（协议包的 ``isFenced``）：``lifecycle`` 是这一轮的 ``ctx.run.started`` 起的生命周期事件和擦除记录。自己的
+    ``runId`` 已经有 ``ctx.run.ended``、自己的 ``ctx.run.started`` 不在了、有 ``ctx.erased`` 动了这一轮写的条目，都是被围栏。
+    """
+    mine = [entry for entry in lifecycle if run_id_of(entry) == run_id]
+    if any(is_event(entry, RUN_ENDED) for entry in mine):
+        return True
+    if started is not None and not any(entry['seq'] == started for entry in mine):
+        return True
+    for entry in lifecycle:
+        data = _erased_data(entry)
+        if data is not None and any(is_erased(data, written['seq']) for written in recorded):
+            return True
+    return False
+
+
+async def head_seq(store: Any, session: str) -> int:
+    """会话最后一条的 ``seq``，空会话是 0（协议包的 ``headSeq``）。"""
+    tail = await store.list(session, last=1)
+    return int(tail[-1]['seq']) if tail else 0
+
+
+async def after_conflict(
+    store: Any,
+    session: str,
+    run_id: str,
+    *,
+    started: int | None,
+    recorded: Sequence[Mapping[str, Any]],
+) -> int | None:
+    """带 ``expect_seq`` 的写入冲突之后（协议包的 ``afterConflict``）：先读末尾，再读这一轮的 ``ctx.run.started`` 起的生命周期
+    事件和擦除记录。被围栏返回 ``None``，否则返回新的末尾。``started`` 还没有时只读末尾。
+    """
+    head = await head_seq(store, session)
+    if started is None:
+        return head
+    lifecycle = await store.list(session, after=started - 1, kinds=[RUN_STARTED, RUN_ENDED, CTX_ERASED])
+    return None if is_fenced(lifecycle, run_id, started=started, recorded=recorded) else head
 
 
 # ---- 工具调用经日志往返 ----

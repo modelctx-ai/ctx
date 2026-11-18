@@ -88,17 +88,18 @@ from .protocol import (
     CtxError,
     Entry,
     Json,
+    after_conflict,
     agent_spec_to_json,
     compact,
     error_output,
     event_entry,
+    head_seq,
     is_context_overflow_text,
     is_event,
     is_framework_kind,
     limit_tool_output,
     message_entry,
     new_id,
-    run_id_of,
     run_parent_problem,
     select_tools,
     tool_permission,
@@ -198,6 +199,8 @@ class _Run:
     recorded: list[Entry] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
     head: int | None = None
+    #: 这一轮的 ``ctx.run.started`` 的 ``seq``：围栏认它。
+    started: int | None = None
     fenced: bool = False
     #: 写下了调用、还没有结果的工具调用：``id`` → 名字。
     open: dict[str, str] = field(default_factory=dict)
@@ -537,7 +540,7 @@ class PydanticAIHarness:
     # ---- 日志 ----
 
     async def _write(self, state: _Run, entries: Sequence[Mapping[str, Any]]) -> list[Entry]:
-        """带着读到的末尾写；中间别人写了就接在新的末尾后面，给这一轮写了 ended（被围栏）就不再写。"""
+        """带着读到的末尾写；中间别人写了就接在新的末尾后面，被围栏（``after_conflict``）就不再写。"""
         if not state.record or not entries or state.fenced:
             return []
         session = str(state.request['session'])
@@ -548,14 +551,15 @@ class PydanticAIHarness:
                 if error.type != 'conflict' or conflicts >= _MAX_CONFLICTS:
                     raise _WriteFailed(error) from error
                 try:
-                    after = await self._store.list(session, after=state.head or 0)
+                    head = await after_conflict(
+                        self._store, session, state.run_id, started=state.started, recorded=state.recorded
+                    )
                 except Exception as cause:
                     raise _WriteFailed(cause) from cause
-                if any(is_event(entry, RUN_ENDED) and run_id_of(entry) == state.run_id for entry in after):
+                if head is None:
                     state.fenced = True
                     return []
-                if after:
-                    state.head = after[-1]['seq']
+                state.head = head
                 continue
             except Exception as error:
                 raise _WriteFailed(error) from error
@@ -564,10 +568,6 @@ class PydanticAIHarness:
                 state.head = written[-1]['seq']
             return written
         return []
-
-    async def _head(self, session: str) -> int:
-        tail = await self._store.list(session, last=1)
-        return int(tail[-1]['seq']) if tail else 0
 
     async def _repeats_failed_input(self, session: str, content: Json, key: str | None) -> bool:
         """这一轮的输入是不是上一轮失败时留下的那句（同参考实现）：它之后只有框架和这个适配器写的事件、没盖住它的摘要。"""
@@ -599,7 +599,7 @@ class PydanticAIHarness:
         key = request.get('inputKey')
         for conflicts in range(_MAX_CONFLICTS + 1):
             try:
-                head = await self._head(session)
+                head = await head_seq(self._store, session)
                 lifecycle = await self._store.list(session, kinds=[RUN_STARTED, RUN_ENDED], last=_SCAN)
             except Exception as error:
                 raise _WriteFailed(error) from error
@@ -636,6 +636,7 @@ class PydanticAIHarness:
             except Exception as error:
                 raise _WriteFailed(error) from error
             state.recorded.extend(written)
+            state.started = written[-1]['seq'] if written else None
             state.head = written[-1]['seq'] if written else head
             return repeated and key is None
         return None

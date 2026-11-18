@@ -9,16 +9,20 @@ import { join } from 'node:path';
 
 import { createMcpHttpHandler, createMcpServer, type McpServer } from '@modelctx-ai/ctx-mcp';
 import {
+  afterConflict,
   agentSpecToJson,
   checkJsonSchema,
   collectFacts,
   CTX_EVENTS,
   ctxErrorEntry,
+  ctxEventData,
   errorOutput,
   eventEntry,
   headSeq,
   isConflict,
+  isEvent,
   isFrameworkKind,
+  lastHarnessRun,
   messageEntry,
   renderFacts,
   runEndedEntry,
@@ -26,6 +30,7 @@ import {
   runStartedEntry,
   selectTools,
   silentLogger,
+  stepMetaToJson,
   toolPermission,
   userEntry,
   type AgentSpec,
@@ -154,20 +159,14 @@ interface RunState {
   readonly emit: (event: RunEvent) => void;
   readonly recorded: Entry[];
   readonly messages: Message[];
+  /** 这一轮的 `ctx.run.started` 的 `seq`：围栏认它。 */
+  started?: number;
   head: number | undefined;
   fenced: boolean;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isEvent(entry: Entry | undefined, kind: string): entry is Extract<Entry, { type: 'event' }> {
-  return entry?.type === 'event' && entry.kind === kind;
-}
-
-function runIdOf(entry: Entry): unknown {
-  return entry.type === 'event' && isObject(entry.data) ? entry.data['runId'] : undefined;
 }
 
 function claudeMeta(entry: Entry | undefined): ClaudeMeta {
@@ -243,26 +242,8 @@ function contextProblem(context: AgentSpec['context']): string | undefined {
   return undefined;
 }
 
-/** 上一轮由这个适配器跑的运行：它的 `ctx.run.started`、`ctx.run.ended`（还没结束就没有）。 */
-function previousRun(lifecycle: readonly Entry[]) {
-  for (let index = lifecycle.length - 1; index >= 0; index -= 1) {
-    const started = lifecycle[index]!;
-    if (!isEvent(started, CTX_EVENTS.runStarted) || !isObject(started.data)) continue;
-    const harness = started.data['harness'];
-    if (!isObject(harness) || harness['name'] !== CLAUDE_CODE_HARNESS || typeof harness['session'] !== 'string')
-      continue;
-    const runId = started.data['runId'];
-    const ended = lifecycle
-      .slice(index + 1)
-      .find((entry) => isEvent(entry, CTX_EVENTS.runEnded) && runIdOf(entry) === runId);
-    return { started, ended, session: harness['session'] };
-  }
-  return undefined;
-}
-
 function endedInFailure(entry: Entry | undefined): boolean {
-  if (!isEvent(entry, CTX_EVENTS.runEnded) || !isObject(entry.data)) return false;
-  const { stopReason } = entry.data;
+  const stopReason = ctxEventData(entry, CTX_EVENTS.runEnded)?.stopReason;
   return stopReason === 'error' || stopReason === 'aborted';
 }
 
@@ -314,13 +295,13 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
         return;
       } catch (error) {
         if (!isConflict(error) || conflicts >= MAX_CONFLICTS) throw error;
-        // 这一轮中间别人写了东西（应用的事件）：给这一轮写了 ended（被围栏）就不再写，否则接在新的末尾后面。
-        const after = await store.list(session, { after: state.head ?? 0 });
-        if (after.some((entry) => isEvent(entry, CTX_EVENTS.runEnded) && runIdOf(entry) === state.runId)) {
+        // 这一轮中间别人写了东西：被围栏（`afterConflict`）就不再写，否则接在新的末尾后面。
+        const head = await afterConflict(store, session, state);
+        if (head === undefined) {
           state.fenced = true;
           return;
         }
-        state.head = after.at(-1)?.seq ?? state.head;
+        state.head = head;
       }
     }
   }
@@ -363,7 +344,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
       const lifecycle = await store.list(session, { kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded], last: SCAN });
       const last = lifecycle.at(-1);
       if (state.record && isEvent(last, CTX_EVENTS.runStarted)) return 'busy';
-      const previous = previousRun(lifecycle);
+      const previous = lastHarnessRun(lifecycle, CLAUDE_CODE_HARNESS);
       const failed = endedInFailure(last);
       const repeated = state.record && hasInput && failed && (await repeatsFailedInput(session, input!, inputKey));
       const position = previous && (claudeMeta(previous.ended).last ?? claudeMeta(previous.started).resumeAt);
@@ -398,6 +379,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
       try {
         const written = await store.append(session, [started], { expectSeq: head });
         state.recorded.push(...written);
+        state.started = written.at(-1)?.seq;
         state.head = written.at(-1)?.seq ?? head;
         return { plan, repeated: repeated && inputKey === undefined };
       } catch (error) {
@@ -757,7 +739,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
       await write(state, [
         messageEntry(assistant, {
           source: 'model',
-          meta: { step: meta as unknown as JsonObject, ...metaOf({ uuid: message.uuid }) },
+          meta: { step: stepMetaToJson(meta), ...metaOf({ uuid: message.uuid }) },
         }),
       ]);
       calls = message.blocks.flatMap((block) => {

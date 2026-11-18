@@ -1,5 +1,6 @@
 import type { Message, MessageContent } from './message.ts';
-import type { RunParent, StopReason, Usage } from './harness.ts';
+import type { StopReason, Usage } from './harness.ts';
+import { definedFields, isJsonObject, usageFromJson } from './json.ts';
 import { CtxError, type JsonObject, type JsonValue } from './types.ts';
 
 interface EntryBase {
@@ -323,6 +324,29 @@ export const CTX_EVENTS = {
 
 export type CtxEventKind = (typeof CTX_EVENTS)[keyof typeof CTX_EVENTS];
 
+/**
+ * 子运行的来处：父会话、父运行，和父会话里派它的那次工具调用。父会话那一侧，那次调用的结果是 `ChildRunResult`
+ * （`childRunOutput`），两边各记一半，从哪边都找得到另一边。
+ */
+export interface RunParent {
+  readonly session: string;
+  readonly runId: string;
+  readonly toolCallId?: string;
+}
+
+/** `parent` 的形状不对时说明哪里不对，对就是 `undefined`。harness 和 remote 服务端用它校验。 */
+export function runParentProblem(parent: unknown): string | undefined {
+  if (parent === undefined) return undefined;
+  if (typeof parent !== 'object' || parent === null || Array.isArray(parent))
+    return 'RunRequest.parent must be an object';
+  const { session, runId, toolCallId } = parent as Record<string, unknown>;
+  if (typeof session !== 'string' || session === '') return 'RunRequest.parent.session must be a non-empty string';
+  if (typeof runId !== 'string' || runId === '') return 'RunRequest.parent.runId must be a non-empty string';
+  if (toolCallId !== undefined && typeof toolCallId !== 'string')
+    return 'RunRequest.parent.toolCallId must be a string';
+  return undefined;
+}
+
 /** `ctx.run.started` 的 `data`。`agent` 是 `AgentSpec` 的可序列化部分（见 `agentSpecToJson`）。 */
 export interface RunStartedData {
   readonly runId: string;
@@ -404,17 +428,27 @@ export interface RedactedData {
   readonly role?: string;
 }
 
+/** 框架事件的 `kind` 和它的 `data`：`runStartedEntry` 这些按它写，`ctxEventData(entry, kind)` 按它读。 */
+export interface CtxEventData {
+  readonly 'ctx.run.started': RunStartedData;
+  readonly 'ctx.run.ended': RunEndedData;
+  readonly 'ctx.compacted': CompactedData;
+  readonly 'ctx.error': CtxErrorData;
+  readonly 'ctx.unreadable': UnreadableData;
+  readonly 'ctx.erased': ErasedData;
+  readonly 'ctx.redacted': RedactedData;
+}
+
 export function isFrameworkKind(kind: string): boolean {
   return kind.startsWith('ctx.');
 }
 
-/** 去掉值为 `undefined` 的字段：可选字段不给时不出现在 JSON 里。 */
-function defined(data: object): JsonValue {
-  return Object.fromEntries(Object.entries(data).filter(([, value]) => value !== undefined));
-}
-
-function ctxEvent(kind: CtxEventKind, data: object, options: EntryOptions | undefined): NewEventEntry {
-  return eventEntry(kind, { ...options, data: defined(data) });
+function ctxEvent<K extends CtxEventKind>(
+  kind: K,
+  data: CtxEventData[K],
+  options: EntryOptions | undefined,
+): NewEventEntry {
+  return eventEntry(kind, { ...options, data: definedFields(data) });
 }
 
 export function runStartedEntry(data: RunStartedData, options?: EntryOptions): NewEventEntry {
@@ -436,4 +470,136 @@ export function ctxErrorEntry(data: CtxErrorData, options?: EntryOptions): NewEv
 /** 擦除记录，存储实现用；`source` 缺省是 `store`。 */
 export function erasedEntry(data: ErasedData, options?: EntryOptions): NewEventEntry {
   return ctxEvent(CTX_EVENTS.erased, data, { source: 'store', ...options });
+}
+
+// ---- 读框架事件 ----
+
+/** 是不是 `kind` 这种事件。只收窄到这个 `kind`：不是的那一支里别的事件照样在。 */
+export function isEvent<K extends string>(
+  entry: Entry | undefined,
+  kind: K,
+): entry is EventEntry & { readonly kind: K } {
+  return entry?.type === 'event' && entry.kind === kind;
+}
+
+/**
+ * 事件 `data` 里的 `runId`：`ctx.run.started`、`ctx.run.ended`、`ctx.error` 都带，认一条事件是哪一轮的用它。
+ * 不是事件、没有或不是字符串时返回 `undefined`。
+ */
+export function runIdOf(entry: Entry | undefined): string | undefined {
+  if (entry?.type !== 'event' || !isJsonObject(entry.data)) return undefined;
+  const runId = entry.data['runId'];
+  return typeof runId === 'string' ? runId : undefined;
+}
+
+function harnessInfoOf(value: JsonValue | undefined): HarnessInfo | undefined {
+  if (!isJsonObject(value)) return undefined;
+  const { name, version, session } = value;
+  if (typeof name !== 'string') return undefined;
+  return {
+    name,
+    ...(typeof version === 'string' ? { version } : {}),
+    ...(typeof session === 'string' ? { session } : {}),
+  };
+}
+
+function runParentOf(value: JsonValue | undefined): RunParent | undefined {
+  if (!isJsonObject(value) || runParentProblem(value) !== undefined) return undefined;
+  const { session, runId, toolCallId } = value;
+  if (typeof session !== 'string' || typeof runId !== 'string') return undefined;
+  return { session, runId, ...(typeof toolCallId === 'string' ? { toolCallId } : {}) };
+}
+
+function isEraseOp(value: JsonValue | undefined): value is EraseOp {
+  return value === 'truncate' || value === 'remove' || value === 'redact';
+}
+
+/** 每种框架事件的 `data` 怎么读：必填字段不对返回 `undefined`，可选字段只留类型对的。 */
+const READERS: { readonly [K in CtxEventKind]: (data: JsonObject) => CtxEventData[K] | undefined } = {
+  [CTX_EVENTS.runStarted]: ({ runId, agent, owner, parent, harness }) => {
+    if (typeof runId !== 'string') return undefined;
+    const from = runParentOf(parent);
+    const info = harnessInfoOf(harness);
+    return {
+      runId,
+      // 旧日志、别的实现写的可能没有：和缺了一样当作空的。
+      agent: isJsonObject(agent) ? agent : {},
+      ...(typeof owner === 'string' ? { owner } : {}),
+      ...(from ? { parent: from } : {}),
+      ...(info ? { harness: info } : {}),
+    };
+  },
+  [CTX_EVENTS.runEnded]: ({ runId, stopReason, usage }) =>
+    typeof runId === 'string' && typeof stopReason === 'string'
+      ? { runId, stopReason: stopReason as StopReason, ...(isJsonObject(usage) ? { usage: usageFromJson(usage) } : {}) }
+      : undefined,
+  [CTX_EVENTS.compacted]: ({ covers, summaryId }) =>
+    typeof covers === 'number' && typeof summaryId === 'string' ? { covers, summaryId } : undefined,
+  [CTX_EVENTS.error]: ({ runId, message, type }) =>
+    typeof message === 'string'
+      ? {
+          ...(typeof runId === 'string' ? { runId } : {}),
+          message,
+          ...(typeof type === 'string' ? { type } : {}),
+        }
+      : undefined,
+  [CTX_EVENTS.unreadable]: ({ v, type, error }) => {
+    if (!isJsonObject(error)) return undefined;
+    const { type: errorType, message } = error;
+    if (typeof errorType !== 'string' || typeof message !== 'string') return undefined;
+    return {
+      ...(typeof v === 'number' ? { v } : {}),
+      ...(typeof type === 'string' ? { type } : {}),
+      error: { type: errorType, message },
+    };
+  },
+  [CTX_EVENTS.erased]: ({ op, upTo, seqs, count }) => {
+    if (!isEraseOp(op) || typeof count !== 'number') return undefined;
+    return {
+      op,
+      ...(typeof upTo === 'number' ? { upTo } : {}),
+      ...(Array.isArray(seqs) && seqs.every((seq): seq is number => typeof seq === 'number') ? { seqs } : {}),
+      count,
+    };
+  },
+  [CTX_EVENTS.redacted]: ({ type, role }) => ({
+    ...(typeof type === 'string' ? { type } : {}),
+    ...(typeof role === 'string' ? { role } : {}),
+  }),
+};
+
+/**
+ * 读一条框架事件的 `data`：`entry` 是 `kind` 这种事件、`data` 是对象、必填字段的类型对，就按 `CtxEventData[kind]` 给出，
+ * 否则 `undefined`。可选字段只留类型对的（`parent` 按 `runParentProblem`），别的键不带；`ctx.run.started` 的 `agent`
+ * 缺了或不是对象时给 `{}`；`stopReason` 只查是字符串，比这一版新的值原样给出。
+ */
+export function ctxEventData<K extends CtxEventKind>(entry: Entry | undefined, kind: K): CtxEventData[K] | undefined {
+  if (!isEvent(entry, kind) || !isJsonObject(entry.data)) return undefined;
+  return READERS[kind](entry.data);
+}
+
+/** 最近一轮由名叫 `name` 的外部 harness 跑的运行：它的 `ctx.run.started`、`ctx.run.ended`（还没结束就没有）和记下的 `harness.session`。 */
+export interface HarnessRun {
+  readonly started: EventEntry;
+  readonly ended?: EventEntry;
+  /** 外部 harness 自己的会话标识（`HarnessInfo.session`）。 */
+  readonly session: string;
+}
+
+/**
+ * 自己存对话的外部 harness（Claude Code、pi）从哪个会话接着跑：`lifecycle` 是一个会话的 `ctx.run.started`、`ctx.run.ended`，
+ * 按 `seq` 排好；从后往前找第一条 `harness.name` 是 `name`、记下了 `harness.session` 的 `ctx.run.started`。没有返回 `undefined`。
+ */
+export function lastHarnessRun(lifecycle: readonly Entry[], name: string): HarnessRun | undefined {
+  for (let index = lifecycle.length - 1; index >= 0; index -= 1) {
+    const started = lifecycle[index];
+    const data = ctxEventData(started, CTX_EVENTS.runStarted);
+    const session = data?.harness?.name === name ? data.harness.session : undefined;
+    if (!isEvent(started, CTX_EVENTS.runStarted) || data === undefined || session === undefined) continue;
+    const ended = lifecycle
+      .slice(index + 1)
+      .find((entry): entry is EventEntry => isEvent(entry, CTX_EVENTS.runEnded) && runIdOf(entry) === data.runId);
+    return { started, ...(ended ? { ended } : {}), session };
+  }
+  return undefined;
 }

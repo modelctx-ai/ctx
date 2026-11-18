@@ -1,29 +1,32 @@
 import {
+  afterConflict,
   agentSpecToJson,
   CONTEXT_OVERFLOW,
   CTX_EVENTS,
   checkJsonSchema,
   CtxError,
   ctxErrorEntry,
+  ctxEventData,
   estimateTextTokens,
   estimateTokens,
   headSeq,
   isConflict,
-  isErased,
+  isEvent,
   isFrameworkKind,
   errorOutput,
   messageEntry,
   runEndedEntry,
+  runIdOf,
   runParentProblem,
   runStartedEntry,
   silentLogger,
+  stepMetaToJson,
   toolPermission,
   userEntry,
   type BuildRequest,
   type CompactOptions,
   type ContextBuilder,
   type Entry,
-  type ErasedData,
   type ErrorInfo,
   type Executor,
   type Harness,
@@ -341,7 +344,7 @@ function stepMeta(
     ...(estimate ? { estimatedInputTokens: estimate.tokens } : {}),
     ...(estimate?.calibration !== undefined ? { calibration: estimate.calibration } : {}),
   };
-  return { step: meta as unknown as JsonObject };
+  return { step: stepMetaToJson(meta) };
 }
 
 function stopReasonOf(finishReason: FinishReason, steps: number, maxSteps: number): StopReason {
@@ -397,9 +400,7 @@ function estimateCall(call: PreparedCall, tools: readonly ToolDefinition[]): num
 
 /** 会话里最后一个生命周期事件是 `ctx.run.ended`，而且停在 `error` 或 `aborted`：上一轮失败了，没有产出。 */
 function endedInFailure(lifecycle: readonly Entry[]): boolean {
-  const last = lifecycle.at(-1);
-  if (last?.type !== 'event' || last.kind !== CTX_EVENTS.runEnded) return false;
-  const stopReason = (last.data as { stopReason?: unknown } | undefined)?.stopReason;
+  const stopReason = ctxEventData(lifecycle.at(-1), CTX_EVENTS.runEnded)?.stopReason;
   return stopReason === 'error' || stopReason === 'aborted';
 }
 
@@ -611,29 +612,9 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
           return await append(state, entries, state.head);
         } catch (error) {
           if (!isConflict(error) || state.head === undefined || conflicts >= MAX_CONFLICTS) throw error;
-          // 先读末尾再读生命周期事件：中间若又有人写，下一次写入会再冲突，再查一遍。
-          const head = await headSeq(store, state.request.session);
-          const lifecycle = await store.list(state.request.session, {
-            after: state.started !== undefined ? state.started - 1 : state.head,
-            kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded, CTX_EVENTS.erased],
-          });
-          const mine = lifecycle.filter(
-            (entry) =>
-              (entry.type === 'event' ? (entry.data as { runId?: unknown } | undefined)?.runId : undefined) ===
-              state.runId,
-          );
-          if (mine.some((entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.runEnded)) throw new Fenced();
-          // 自己的 started 不在了：会话在这一轮中途被清掉。接着写会把删掉的会话写回来。
-          if (state.started !== undefined && !mine.some((entry) => entry.seq === state.started)) throw new Fenced();
-          // 这一轮自己写的条目被删或被涂改了：接着写会把针对已删内容的产出记回去。删的是更早的历史就不管。
-          const erasures = lifecycle.flatMap((entry) =>
-            entry.type === 'event' && entry.kind === CTX_EVENTS.erased && typeof entry.data === 'object' && entry.data
-              ? [entry.data as unknown as ErasedData]
-              : [],
-          );
-          if (erasures.some((erased) => state.recorded.some((entry) => isErased(erased, entry.seq)))) {
-            throw new Fenced();
-          }
+          // 自己的 ended、自己的 started 不在了、自己写的条目被删被涂改：被围栏。都不是就带新的末尾重试。
+          const head = await afterConflict(store, state.request.session, state);
+          if (head === undefined) throw new Fenced();
           state.head = head;
         }
       }
@@ -1421,12 +1402,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       if (result.error) yield { type: 'error', runId, message: result.error.message };
       const { messages: _messages, recorded, ...summary } = result;
       const last = recorded.at(-1);
-      const ended =
-        last?.type === 'event' &&
-        last.kind === CTX_EVENTS.runEnded &&
-        (last.data as { runId?: unknown } | undefined)?.runId === runId
-          ? last.seq
-          : undefined;
+      const ended = isEvent(last, CTX_EVENTS.runEnded) && runIdOf(last) === runId ? last.seq : undefined;
       yield { type: 'run.ended', runId, result: summary, ...(ended !== undefined ? { seq: ended } : {}) };
     } finally {
       if (!completed) {

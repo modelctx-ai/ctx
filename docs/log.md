@@ -4,6 +4,8 @@
 
 ## 2026-11-18
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：会话一节的纯函数加 `isEvent`、`runIdOf`、`ctxEventData`（`CtxEventData`）、`lastHarnessRun`，`StepMeta` 加写的一半 `stepMetaToJson`，「一个会话最多一个未结束的运行」第 2 条末尾写明 `isFenced`、`afterConflict` 就是这条规则：各个 harness 以前各写一遍，外部 harness 的三个适配器只照着做了第一种围栏。[协议包](../packages/protocol/README.md)的导出表跟着加。[架构](architecture.md)：Claude Code 和 pydantic-ai 的适配器写日志冲突时按这条规则认被围栏，以前写的是只看自己的 `ctx.run.ended`。[`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的测试一节，对照 TypeScript 的协议函数加上围栏。
+
 - **更新** [ADR 0002](adr/0002-packages.md)：「实施状态」里 `publishConfig`、`release.mjs`、冒烟检查三条不再写「十个包」：脚本按 `packages/*` 找包，加了 `ctx-claude-code`、`ctx-pi` 之后是十二个，这三条没跟着改。`release.mjs` 一条补上正式版本也改 Python 适配器的版本。
 
 - **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：「怎么对上」的上下文一行和 `AgentSpec` 的 `context` 一行写超窗时怎么压缩，选项加 `summary_model`，导出加 `ctx_pydantic_ai.compact`，「还没做的」去掉压缩，「验证」和测试加写摘要的调用和对照参考实现的压缩。[架构](architecture.md)：「外部 harness：pydantic-ai」的签名和第三步跟着改。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」去掉压缩，决定记录补一条，写它和决定八为什么不冲突、摘要用哪个模型。

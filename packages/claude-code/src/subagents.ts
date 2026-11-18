@@ -15,6 +15,7 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  afterConflict,
   agentSpecToJson,
   childRunOutput,
   CONTEXT_OVERFLOW,
@@ -25,9 +26,11 @@ import {
   headSeq,
   isConflict,
   isContextOverflowText,
+  isEvent,
   messageEntry,
   runEndedEntry,
   runStartedEntry,
+  stepMetaToJson,
   userEntry,
   type AgentSpec,
   type Entry,
@@ -107,7 +110,11 @@ interface Child {
   readonly prompt?: string;
   head: number | undefined;
   fenced: boolean;
-  started: boolean;
+  /** `#start` 来过了（写没写成都算）。 */
+  opened: boolean;
+  /** 子会话上这一轮的 `ctx.run.started` 的 `seq`，和这一轮写进子会话的条目：围栏认它们。 */
+  started?: number;
+  readonly recorded: Entry[];
   hasInput: boolean;
   step: number;
   current?: Pending;
@@ -124,15 +131,6 @@ interface Child {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isRunEnded(entry: Entry, runId: string): boolean {
-  return (
-    entry.type === 'event' &&
-    entry.kind === CTX_EVENTS.runEnded &&
-    isObject(entry.data) &&
-    entry.data['runId'] === runId
-  );
 }
 
 function metaOf(uuid: string | undefined): JsonObject {
@@ -337,7 +335,8 @@ export class SubagentTrace {
       ...(line?.prompt !== undefined ? { prompt: line.prompt } : {}),
       head: undefined,
       fenced: false,
-      started: false,
+      opened: false,
+      recorded: [],
       hasInput: false,
       step: 0,
       calls: [],
@@ -350,8 +349,8 @@ export class SubagentTrace {
   }
 
   async #start(child: Child): Promise<void> {
-    if (child.started) return;
-    child.started = true;
+    if (child.opened) return;
+    child.opened = true;
     const { agent, owner, version } = this.#options;
     const spec: AgentSpec = { ...(child.agentType ? { name: child.agentType } : {}), model: agent.model };
     await this.#write(child, [
@@ -366,6 +365,7 @@ export class SubagentTrace {
         { source: 'harness', ...(child.agentId ? { meta: { claudeCode: { agentId: child.agentId } } } : {}) },
       ),
     ]);
+    child.started = child.recorded.find((entry) => isEvent(entry, CTX_EVENTS.runStarted))?.seq;
   }
 
   async #write(child: Child, entries: readonly NewEntry[]): Promise<void> {
@@ -375,17 +375,18 @@ export class SubagentTrace {
       try {
         const head = child.head ?? (await headSeq(store, child.session));
         const written = await store.append(child.session, entries, { expectSeq: head });
+        child.recorded.push(...written);
         child.head = written.at(-1)?.seq ?? head;
         return;
       } catch (error) {
         if (!isConflict(error) || conflicts >= MAX_CONFLICTS) throw error;
-        // 子会话里别人写了东西：给这一轮写了 ended（被围栏）就不再写，否则接在新的末尾后面。
-        const after = await store.list(child.session, { after: child.head ?? 0 });
-        if (after.some((entry) => isRunEnded(entry, child.runId))) {
+        // 子会话里别人写了东西：被围栏（`afterConflict`）就不再写，否则接在新的末尾后面。
+        const head = await afterConflict(store, child.session, child);
+        if (head === undefined) {
           child.fenced = true;
           return;
         }
-        child.head = after.at(-1)?.seq ?? child.head;
+        child.head = head;
       }
     }
   }
@@ -398,7 +399,7 @@ export class SubagentTrace {
       ...(finishReason ? { finishReason } : {}),
       ...(usage ? { usage } : {}),
     };
-    return meta as unknown as JsonObject;
+    return stepMetaToJson(meta);
   }
 
   async #flushAssistant(child: Child): Promise<void> {

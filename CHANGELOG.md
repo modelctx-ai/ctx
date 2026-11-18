@@ -4,6 +4,10 @@
 
 ## 未发布
 
+- **新增** 协议包读框架事件的纯函数：`isEvent(entry, kind)`（只收窄到这个 `kind`）、`runIdOf(entry)`、`ctxEventData(entry, kind)`，按新类型 `CtxEventData`（框架事件的 `kind` 到 `data` 的类型）读回 `data`：必填字段不对返回 `undefined`，可选字段只留类型对的，`ctx.run.started` 的 `agent` 缺了给 `{}`；`lastHarnessRun(lifecycle, name)`（结果是 `HarnessRun`）找外部 harness 最近一轮记下的 `harness.session`；`stepMetaToJson(meta)` 把 `StepMeta` 写成 `meta.step`。核心包、`ctx-otel`、`ctx-remote`、`ctx-claude-code`、`ctx-pi` 改用它们，不再各自把 `data` 转成猜的类型。`stepMetaOf` 也只留类型对的可选字段，以前原样给出。
+- **新增** 协议包的围栏：`isFenced(lifecycle, run)`、`afterConflict(store, session, run)`、`RunPosition`，是协议层「一个会话最多一个未结束的运行」第 2 条：自己的 `runId` 已经有 `ctx.run.ended`、自己的 `ctx.run.started` 不在了、擦除动了这一轮写的条目，都是被围栏。参考实现的 harness 改用它，行为不变。
+- **修复** `ctx-claude-code`（连同子代理的子会话）、`ctx-pi`、`ctx-pydantic-ai`：写日志冲突时以前只认「自己的 `runId` 已经有 `ctx.run.ended`」，会话在这一轮中途被 `clear`、被 `truncate` 删到了这一轮、或者擦除动了这一轮写的条目时，要么接着写（把删掉的内容写回来），要么冲突到上限、以写日志失败结束。现在照协议用 `afterConflict` 认被围栏，以 `aborted` 结束、不再写；只删了这一轮之前的历史的照常跑。
+
 - **实现** `ctx-pydantic-ai`：`AgentSpec.context.overflow` 的 `compact`（缺省的策略）先压缩，以前和 `trim` 一样只裁。照参考实现 builder 的 `compactDetailed` 移植：最近 `keep` 条（缺省 12，至少 1）原样留着，更早的写成纯文本的记录，按 `maxInputTokens` 分段交给摘要模型，每段落一个检查点，追加 `summary`（`source` 是 `model`）和 `ctx.compacted`（`source` 是 `context`），再重新组装；压完还超、摘要模型出错、摘要被截断，接着裁剪；`record: false` 的运行不压缩。新选项 `summary_model`（名字或 pydantic-ai 的 `Model`，缺省这一轮的模型），新模块 `ctx_pydantic_ai.compact`（`compact_session` 和同参考实现的常量）；`overflow.compact` 的各项类型不对以 `invalid_request` 结束。**行为变化**：缺省的策略现在会调摘要模型、往日志里追加摘要，只要裁剪就给 `strategy: 'trim'`；裁到底还超时的报错和参考实现一样，以 `even after compaction and trimming.` 结尾。
 
 - **实现** `ctx-claude-code`、`ctx-pi`：`AgentSpec.context.facts`，以前和整个 `context` 一起以 `invalid_request` 结束。新选项 `sources`（`ContextSource` 的数组，例如记忆的 `memory.source()`）和 `sourceTimeoutMs`（缺省 2 秒）：每轮记下输入之后收一次，挑来源（`facts.sources`）、加标题（`facts.heading`）、`facts: false`、出错和超时只告警都同参考实现的 builder；事实接在指令后面（`--append-system-prompt`），不进程序自己的会话，也不写日志。`context` 的其余各项和 `facts.placement: 'prompt'` 仍以 `invalid_request` 结束。
