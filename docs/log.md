@@ -4,6 +4,9 @@
 
 ## 2026-11-18
 
+- **更新** [记忆](memory.md)：「接进其余组件」加一段，写自己管上下文的 harness（Claude Code、pi）怎么接记忆：会话、工具、上下文三个接点各走哪条约定，事实放在哪、为什么不放进 `prompt`，提示缓存的代价。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态加 `context.facts`，决定记录补一条，回答 #19 留下的这个问题。
+- **更新** [`ctx-claude-code`](../packages/claude-code/README.md)、[`ctx-pi`](../packages/pi/README.md) 的 README：`AgentSpec` 表拆出 `context.facts` 一行，选项加 `sources`、`sourceTimeoutMs`，「怎么对上」的上下文一行写事实放在哪。[架构](architecture.md)里两个适配器的签名和第二步跟着改。[ctx-memory](../packages/memory/README.md) 的用法加一段指过去，[例子](../examples/README.md)加 `memory-pi.ts`。
+
 - **新增** [`@modelctx-ai/ctx-pi`](../packages/pi/README.md) 的 README：用法、怎么对上（七个问题加输入检查、`record: false`、对话框各一行，加一轮日志的样子）、`AgentSpec` 和 `stopReason` 的映射表、选项、一致性等级和还没做的、验证过的版本、导出。
 - **更新** [ADR 0010](adr/0010-external-harness-adapters.md)：描述、标签、实施状态和范围加 pi，决定记录补一条，写它和 Claude Code 不一样的地方（MCP 服务器经扩展给、参数换回原样再查、步数和预算由扩展叫停、退回用 `navigateTree`、结构化输出写进提示）各对着哪条决定。[ADR 索引](adr/index.md)的描述跟着改。
 - **更新** [ADR 0002](adr/0002-packages.md)：拆分表和依赖关系表加第十二个包，「实现包之间不互相依赖」的例外加上 `ctx-pi`，决定记录补一条，写为什么不和 `ctx-claude-code` 合成一个包。

@@ -5,7 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createFunctionExecutor, createMemoryStore, createToolRegistry } from '@modelctx-ai/ctx';
-import { CTX_EVENTS, type AgentSpec, type Entry, type SessionStore } from '@modelctx-ai/ctx-protocol';
+import {
+  CTX_EVENTS,
+  type AgentSpec,
+  type ContextSource,
+  type Entry,
+  type Logger,
+  type SessionStore,
+} from '@modelctx-ai/ctx-protocol';
 import { describeHarnessContract, type ModelScript } from '@modelctx-ai/ctx-protocol/testing';
 import { afterAll, describe, test, vi } from 'vite-plus/test';
 
@@ -65,6 +72,9 @@ async function setup(
     readonly bare?: boolean;
     /** 执行环境被调到时记一笔。 */
     readonly calls?: string[];
+    /** 上下文来源：拿到这次的会话日志。 */
+    readonly sources?: (store: SessionStore) => readonly ContextSource[];
+    readonly logger?: Logger;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'ctx-pi-test-'));
@@ -101,6 +111,8 @@ async function setup(
     bare: options.bare ?? true,
     maxToolOutputChars,
     ...(options.builtinTools ? { builtinTools: options.builtinTools } : {}),
+    ...(options.sources ? { sources: options.sources(store) } : {}),
+    ...(options.logger ? { logger: options.logger } : {}),
     env: {
       PATH: process.env['PATH'],
       HOME: home,
@@ -393,6 +405,97 @@ slow.describe('pi 适配器', () => {
     }
     assert.equal(api.requests.length, 0);
     assert.equal(ended(await store.list('s'))?.['stopReason'], 'error');
+  });
+
+  slow.test(
+    '上下文来源：记下输入之后收，事实接在指令后面；不进日志、不进 pi 的会话；facts 挑来源、加标题，false 不收',
+    async () => {
+      const warnings: string[] = [];
+      const logger: Logger = { warn: (message) => warnings.push(message) };
+      const { api, harness, store, agent } = await setup(
+        [
+          { type: 'text', text: '一' },
+          { type: 'text', text: '二' },
+          { type: 'text', text: '三' },
+        ],
+        {
+          logger,
+          sources: (log) => [
+            {
+              // 和记忆的来源一样：按会话最后一条用户消息取。
+              name: 'notes',
+              async collect({ session }) {
+                const last = (await log.list(session)).findLast(
+                  (entry) => entry.type === 'message' && entry.message.role === 'user',
+                );
+                return last?.type === 'message' ? `ctx-fact：${JSON.stringify(last.message.content)}` : null;
+              },
+            },
+            { name: 'other', collect: () => 'ctx-other-fact' },
+            {
+              name: 'broken',
+              collect: () => {
+                throw new Error('boom');
+              },
+            },
+          ],
+        },
+      );
+      const instructions = 'ctx-instructions-marker';
+      const first = await harness.run({ session: 's', agent: { ...agent, instructions }, input: '第一轮' });
+      assert.equal(first.stopReason, 'end_turn', first.error?.message);
+      const system = api.requests[0]?.system ?? '';
+      assert.match(system, /ctx-fact："第一轮"/, '来源看得到这一轮的输入');
+      assert.match(system, /ctx-other-fact/);
+      assert.ok(system.indexOf(instructions) < system.indexOf('ctx-fact'), '事实接在指令后面');
+      assert.ok(warnings.includes('context source "broken" failed'), '出错的来源只告警');
+
+      const second = await harness.run({
+        session: 's',
+        agent: { ...agent, context: { facts: { sources: ['notes', 'missing'], heading: 'ctx-heading：' } } },
+        input: '第二轮',
+      });
+      assert.equal(second.stopReason, 'end_turn', second.error?.message);
+      assert.match(api.requests[1]?.system ?? '', /ctx-heading：\nctx-fact："第二轮"/);
+      assert.doesNotMatch(api.requests[1]?.system ?? '', /ctx-other-fact/);
+      assert.ok(warnings.includes('context source "missing" is not registered'));
+
+      const third = await harness.run({
+        session: 's',
+        agent: { ...agent, context: { facts: false } },
+        input: '第三轮',
+      });
+      assert.equal(third.stopReason, 'end_turn', third.error?.message);
+      assert.doesNotMatch(api.requests[2]?.system ?? '', /ctx-fact|ctx-other-fact/);
+      // 事实只在那一次的系统提示里：pi 的会话（第三轮交给模型的历史）和 ctx 的日志里都没有。
+      assert.match(JSON.stringify(api.requests[2]?.messages), /第一轮/);
+      assert.doesNotMatch(JSON.stringify(api.requests[2]?.messages), /ctx-fact|ctx-other-fact/);
+      assert.doesNotMatch(JSON.stringify(await store.list('s')), /ctx-fact|ctx-other-fact/);
+    },
+  );
+
+  slow.test('AgentSpec.context 只认 facts，事实不能放进 prompt：别的以 invalid_request 结束，不调模型', async () => {
+    const { api, harness, agent } = await setup([{ type: 'text', text: '不该说' }], {
+      sources: () => [{ name: 'notes', collect: () => 'ctx-fact' }],
+    });
+    const cases: [AgentSpec['context'], RegExp][] = [
+      [{ projection: 'default' }, /context\.projection/],
+      [{ facts: true, overflow: { maxTokens: 1000 } }, /context\.overflow/],
+      [{ facts: { placement: 'prompt' } }, /placement "prompt"/],
+    ];
+    for (const [context, message] of cases) {
+      const result = await harness.run({ session: 's', agent: { ...agent, context }, input: '在吗' });
+      assert.equal(result.stopReason, 'error');
+      assert.equal(result.error?.type, 'invalid_request');
+      assert.match(result.error?.message ?? '', message);
+    }
+    const windowed = await harness.run({
+      session: 's',
+      agent: { ...agent, window: { maxMessages: 4 } },
+      input: '在吗',
+    });
+    assert.equal(windowed.error?.type, 'invalid_request');
+    assert.equal(api.requests.length, 0);
   });
 
   slow.test('中途取消：中断 pi，以 aborted 结束，日志里有 ctx.run.ended', async () => {

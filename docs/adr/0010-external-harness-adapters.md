@@ -63,6 +63,7 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - `ctx-claude-code`：`createClaudeCodeHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 Claude Code 2.1.326 验证过，模型是本机的假接口；对真实的 Anthropic 接口没有验证。Claude Code 起的子代理写进子会话（2026-11-18，对 2.1.326 和 2.1.327 核实过）。
 - `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`context`、`output` 五级（`context` 一级 2026-11-18 起）；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。`ask` 权限和外部执行环境（`external`）以 `requires_action` 结束，`window`、`context` 照参考实现的 builder 移植（都是 2026-11-18）。
 - `ctx-pi`：`createPiHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 pi 1.5.2 验证过（2026-11-18），模型是本机的假 Anthropic 接口；对真实的模型服务没有验证。CI 装同一个版本跑。
+- `ctx-claude-code`、`ctx-pi` 收上下文来源（`sources`），`AgentSpec.context.facts` 映射得上（2026-11-18）；记忆接进这两个 harness 的例子是 [`examples/memory-pi.ts`](../../examples/memory-pi.ts)。
 - 没做：pydantic-ai 的压缩（`context.overflow` 的 `compact` 只裁）、事件规则和别的投影、事实来源；pi 的扩展加进上下文的消息（`custom_message`）和插话（`steer`、`follow_up`）不进日志。
 
 ## 决定记录
@@ -89,3 +90,8 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
   - 决定七：pi 没有结构化输出，`output` 的 schema 写进系统提示，最后的回答按 schema 查，不合的以 `invalid_output` 结束。`settings.maxRetries` 只认 `0`（关掉 pi 的自动重试）：重试几次是 pi 自己的设置，RPC 里改不了。
   - 决定八：pi 压缩自己的上下文时记 `pi.compacted`，摘要放在这条事件的 `text` 里：pi 不把摘要当成一条消息交出来，不另记程序补的消息。
   - `record: false`：新会话不存（`--no-session`），接着跑的在一份副本上跑（`--fork`），跑完删掉副本，pi 的会话不变。
+- 2026-11-18：Claude Code、pi 的适配器收上下文来源（`sources`、`sourceTimeoutMs`），`AgentSpec.context.facts` 不再以 `invalid_request` 结束。这回答了 #19 留下的问题：记忆的 `source()` 怎么接进自己管上下文的 harness。和决定正文的关系：
+  - 决定七：`context` 里只有 `facts` 映射得上，`projection`、`overflow`、`inherit` 照旧以 `invalid_request` 结束。来源每轮在记下输入之后收一次：记忆按会话最后一条用户消息召回，要看得到这一轮说的话，所以只能由适配器收，应用在提交之前收拿到的是上一轮的话。挑法、超时、出错只告警都同参考实现的 builder，事实渲染好接在指令后面，经 `--append-system-prompt` 交出去：每次起进程都重新给，不进程序自己的会话，也不写日志，和 `ContextSource` 说的「只在这一次调用里出现」对得上。`placement: 'prompt'` 不支持：放进这一轮的用户消息，就留在程序的会话里了。
+  - 决定八不变：历史还是程序自己的，ctx 不投影、不写 `summary`，不跑 `context` 一级。
+  - 记忆的另外两半不用改：`gate`、`consolidate` 读适配器实时写下的日志（决定二），`recall` 工具是 ctx 的执行环境，经 MCP 交出去（决定三）。
+  - 代价：事实每轮不同，系统提示也就每轮不同，程序对历史的提示缓存命中不了；参考实现把事实接在指令后面时也一样。在乎缓存的不给来源，只交 `recall` 工具。

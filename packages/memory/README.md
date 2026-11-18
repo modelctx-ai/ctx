@@ -47,6 +47,8 @@ await memory.consolidate(); // 夜里
 
 `createMemoryStore` 和核心包里的会话存储 `createMemoryStore` 同名：前者造 `MemoryStore`，后者造 `SessionStore`，同时用时改名导入。
 
+自己管上下文的 harness（`ctx-claude-code`、`ctx-pi`）不用 builder：`memory.source()` 给适配器的 `sources`（每轮记下输入之后收，接在系统提示后面），`memory` 给它的 `executors`（`recall` 经 MCP 交出去），`gate`、`consolidate` 照常读适配器写下的日志。见[记忆](../../docs/memory.md#接进其余组件)和 [`examples/memory-pi.ts`](../../examples/memory-pi.ts)。
+
 没有 System One 服务时：
 
 ```ts

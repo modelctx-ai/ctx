@@ -8,7 +8,7 @@
 //
 //   CTX_EXAMPLE_CLAUDE_MODEL=sonnet node examples/claude-code.ts
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -24,13 +24,22 @@ import { isMain, type Log } from './model.ts';
 
 const command = process.env.CTX_CLAUDE_CODE_COMMAND ?? 'claude';
 
-/** 装没装 Claude Code：`claude --version` 跑得通。 */
+/** 装没装 Claude Code：`claude --version` 跑得通。子进程只拿到这几个环境变量，家目录和配置目录是临时的。 */
 export function claudeCodeInstalled(): boolean {
+  const home = mkdtempSync(path.join(tmpdir(), 'ctx-example-claude-code-version-'));
+  const env = {
+    PATH: process.env.PATH,
+    HOME: home,
+    CLAUDE_CONFIG_DIR: path.join(home, '.claude'),
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  };
   try {
-    execFileSync(command, ['--version'], { stdio: 'ignore', timeout: 30_000 });
+    execFileSync(command, ['--version'], { stdio: 'ignore', timeout: 30_000, env, cwd: home });
     return true;
   } catch {
     return false;
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 }
 
