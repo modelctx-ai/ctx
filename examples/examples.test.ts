@@ -4,6 +4,7 @@ import { describe, test } from 'vite-plus/test';
 
 import { claudeCodeInstalled, main as claudeCode } from './claude-code.ts';
 import { main as memory } from './memory.ts';
+import { main as memoryPi } from './memory-pi.ts';
 import { main as moveSession } from './move-session.ts';
 import { main as pi, piInstalled } from './pi.ts';
 import { main as pydanticAI, uvInstalled } from './pydantic-ai.ts';
@@ -92,6 +93,21 @@ describe('examples', () => {
       assert.ok(result.sessions[0]);
       assert.equal(result.sessions[1], result.sessions[0]);
       assert.deepEqual(result.toolSources, ['local', 'local']);
+    },
+  );
+
+  test.skipIf(!hasPi)(
+    'memory-pi：pi 跑的会话照样进记忆，记忆经来源和 recall 工具回到 pi',
+    { timeout: 120_000 },
+    async () => {
+      const result = await memoryPi(quiet);
+      assert.ok(result);
+      assert.equal(result.notes, 1);
+      assert.equal(result.facts, 1);
+      assert.ok(result.injected, '第二个会话的系统提示里有画像');
+      assert.equal(result.recallSource, 'memory');
+      assert.ok(result.recalled, 'recall 查到的事实回到了模型');
+      assert.match(result.answer, /不放花生/);
     },
   );
 

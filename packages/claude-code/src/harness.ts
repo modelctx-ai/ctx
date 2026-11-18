@@ -11,6 +11,7 @@ import { createMcpHttpHandler, createMcpServer, type McpServer } from '@modelctx
 import {
   agentSpecToJson,
   checkJsonSchema,
+  collectFacts,
   CTX_EVENTS,
   ctxErrorEntry,
   errorOutput,
@@ -19,6 +20,7 @@ import {
   isConflict,
   isFrameworkKind,
   messageEntry,
+  renderFacts,
   runEndedEntry,
   runParentProblem,
   runStartedEntry,
@@ -27,6 +29,7 @@ import {
   toolPermission,
   userEntry,
   type AgentSpec,
+  type ContextSource,
   type Entry,
   type ErrorInfo,
   type Executor,
@@ -104,6 +107,14 @@ export interface ClaudeCodeHarnessOptions {
   readonly maxToolOutputChars?: number;
   /** 取消后等 Claude Code 自己停下的时间，过了就结束进程。缺省 5 秒。 */
   readonly interruptTimeoutMs?: number;
+  /**
+   * 上下文来源（`ContextSource`，例如记忆的 `memory.source()`）：每轮记下输入之后收一次，收到的事实接在指令后面
+   * （`--append-system-prompt`：每轮的系统提示，不进 Claude Code 自己的会话，也不写日志）。`AgentSpec.context.facts`
+   * 选用哪些、加不加标题，`false` 不收。
+   */
+  readonly sources?: readonly ContextSource[];
+  /** 单个来源最多等多久，缺省 2 秒（同参考实现的 builder）。 */
+  readonly sourceTimeoutMs?: number;
   /** 输入条目的 `source`。 */
   readonly source?: string;
   readonly logger?: Logger;
@@ -178,9 +189,9 @@ function specProblem(agent: AgentSpec): string | undefined {
   if (typeof agent.model !== 'string' || agent.model === '') {
     return 'AgentSpec.model must be a model name: Claude Code takes the model by name (--model).';
   }
-  if (agent.window !== undefined || agent.context !== undefined) {
-    return 'AgentSpec.window and AgentSpec.context are not supported: Claude Code manages its own context.';
-  }
+  if (agent.window !== undefined) return 'AgentSpec.window is not supported: Claude Code manages its own context.';
+  const context = contextProblem(agent.context);
+  if (context !== undefined) return context;
   if (agent.toolChoice !== undefined && agent.toolChoice !== 'auto') {
     return 'AgentSpec.toolChoice is not supported by Claude Code; only "auto".';
   }
@@ -205,6 +216,29 @@ function specProblem(agent: AgentSpec): string | undefined {
   }
   if (agent.output !== undefined && !isObject(agent.output.schema)) {
     return 'AgentSpec.output.schema must be a JSON Schema object.';
+  }
+  return undefined;
+}
+
+/**
+ * `AgentSpec.context` 只认 `facts`：历史、窗口、压缩是 Claude Code 自己的。事实只能接在指令后面：放进 `prompt` 就成了
+ * 这一轮的用户消息，留在 Claude Code 自己的会话里，不再是「只在这一次调用里出现」。
+ */
+function contextProblem(context: AgentSpec['context']): string | undefined {
+  if (context === undefined) return undefined;
+  if (!isObject(context)) return 'AgentSpec.context must be an object.';
+  const others = Object.entries(context)
+    .filter(([key, value]) => key !== 'facts' && value !== undefined)
+    .map(([key]) => key);
+  if (others.length > 0) {
+    return `AgentSpec.context.${others.join(', ')} not supported: Claude Code manages its own context; only context.facts.`;
+  }
+  const { facts } = context;
+  if (facts !== undefined && typeof facts !== 'boolean' && !isObject(facts)) {
+    return 'AgentSpec.context.facts must be a boolean or an object.';
+  }
+  if (isObject(facts) && facts['placement'] === 'prompt') {
+    return 'AgentSpec.context.facts.placement "prompt" is not supported: the prompt would stay in Claude Code\'s own session. Facts go after the instructions.';
   }
   return undefined;
 }
@@ -238,6 +272,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
   const command = options.command ?? 'claude';
   const env = options.env ?? process.env;
   const grace = options.interruptTimeoutMs ?? 5_000;
+  const sources = options.sources ?? [];
   const executors = new Map<string, Executor>(
     Array.isArray(options.executors)
       ? (options.executors as readonly Executor[]).map((executor) => [executor.name, executor])
@@ -440,14 +475,42 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
         type: 'invalid_request',
       });
     }
+    // 输入已经在日志里：来源（记忆按会话最后一条用户消息召回）看得到这一轮说的话。
+    const facts = await factsFor(request);
     if (signal?.aborted) return fail({ message: 'The run was aborted.' }, 'aborted');
 
     const mcp = definitions.length > 0 ? await serveTools(state, definitions) : undefined;
     try {
-      return await converse(state, plan, definitions, builtins, content, mcp?.configPath);
+      return await converse(state, plan, definitions, builtins, content, mcp?.configPath, facts);
     } finally {
       await mcp?.close();
     }
+  }
+
+  /** 这一轮的事实：按 `AgentSpec.context.facts` 挑来源、收（同参考实现的 builder），渲染好的文字，接在指令后面。 */
+  async function factsFor(request: RunRequest): Promise<string | undefined> {
+    const spec = request.agent.context?.facts;
+    if (spec === false || sources.length === 0) return undefined;
+    const { sources: names, heading } = typeof spec === 'object' ? spec : {};
+    let chosen = sources;
+    if (names) {
+      const wanted = new Set(names);
+      chosen = sources.filter((source) => wanted.has(source.name));
+      for (const name of wanted) {
+        if (!sources.some((source) => source.name === name)) logger.warn(`context source "${name}" is not registered`);
+      }
+    }
+    if (chosen.length === 0) return undefined;
+    const collected = await collectFacts(chosen, {
+      session: request.session,
+      ...(request.signal ? { signal: request.signal } : {}),
+      ...(options.sourceTimeoutMs !== undefined ? { timeoutMs: options.sourceTimeoutMs } : {}),
+      onError: (source, error) =>
+        logger.warn(`context source "${source}" failed`, {
+          error: error instanceof Error ? error.message : String(error),
+        }),
+    });
+    return collected.length > 0 ? renderFacts(collected, heading) : undefined;
   }
 
   /** 这一轮的 MCP 服务器：只听本机、带一次性的令牌；第一次把调用交给某个执行环境之前 `open` 这个会话（ADR 0009）。 */
@@ -524,8 +587,13 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
     definitions: readonly ToolDefinition[],
     builtins: readonly string[],
     configPath: string | undefined,
+    facts: string | undefined,
   ): string[] {
     const { agent } = state.request;
+    // 事实接在指令后面（同参考实现 builder 的缺省 `factsPlacement`），空行隔开。
+    const instructions = [agent.instructions, facts]
+      .filter((part) => part !== undefined && part.trim() !== '')
+      .join('\n\n');
     const allowed = [
       ...definitions.map((definition) => mcpToolName(CLAUDE_CODE_MCP_SERVER, definition.name)),
       ...builtins,
@@ -550,7 +618,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
       ...(allowed.length > 0 ? ['--allowedTools', allowed.join(',')] : []),
       '--model',
       agent.model as string,
-      ...(agent.instructions ? ['--append-system-prompt', agent.instructions] : []),
+      ...(instructions ? ['--append-system-prompt', instructions] : []),
       '--max-turns',
       String(maxSteps),
       ...(agent.output ? ['--json-schema', JSON.stringify(agent.output.schema)] : []),
@@ -565,6 +633,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
     builtins: readonly string[],
     content: readonly AnthropicBlock[],
     configPath: string | undefined,
+    facts: string | undefined,
   ): Promise<RunResult> {
     const { request } = state;
     const { agent } = request;
@@ -584,7 +653,7 @@ export function createClaudeCodeHarness(options: ClaudeCodeHarnessOptions): Clau
     };
     const proc = new ClaudeProcess({
       command,
-      args: argsFor(state, plan, definitions, builtins, configPath),
+      args: argsFor(state, plan, definitions, builtins, configPath, facts),
       env: childEnv,
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
     });

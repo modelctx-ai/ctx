@@ -105,6 +105,14 @@ flowchart LR
 | 模型    | `DecisionModel`、`ExtractionModel` 和 `LanguageModel` 并列，`ctx-models` 按配置造                                        |
 | 网关    | `withContext` 的视图不含记忆；要给右键对话也带上，在 builder 的来源里加 `memory`                                         |
 
+自己管上下文的 harness（Claude Code、pi，[ADR 0010](adr/0010-external-harness-adapters.md)）不用 builder，记忆照样接得上，三个接点各走各的约定：
+
+- 会话：适配器把每一步实时写进同一份日志，`gate`、`consolidate` 照常读，不管这一轮是谁跑的。程序自己补的话（`claude-code.synthetic`、`pi.compacted`）是事件，缺省的 `gate.entries` 只读消息，不进笔记。
+- 工具：`Memory` 给适配器的 `executors`，`recall` 经 MCP 交给程序，调用回到记忆。
+- 上下文：`memory.source()` 给适配器的 `sources`。适配器每轮记下输入之后收一次（召回要看得到这一轮说的话），接在指令后面经 `--append-system-prompt` 交出去：每轮重新给，不进程序自己的会话，也不写日志。`AgentSpec.context.facts` 照样按名字选用、加标题；`placement: 'prompt'` 不支持，放进这一轮的用户消息就留在程序的会话里了。事实每轮不同，系统提示也就每轮不同，程序对历史的提示缓存命中不了（参考实现把事实接在指令后面时也一样）；在乎缓存的只交 `recall` 工具。
+
+pydantic-ai 的适配器从日志投影历史，接点和参考实现一样，只是 Python 那边还没有上下文来源，记忆只能经 `recall` 工具。例子见 [`examples/memory-pi.ts`](../examples/memory-pi.ts)。
+
 ## 预算
 
 一天 40 轮对话的量级：

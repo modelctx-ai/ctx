@@ -55,7 +55,7 @@ console.log(result.stopReason, result.text);
 | 失败后重试      | 上一轮以 `error` 或 `aborted` 结束、这一轮带同样的输入（或同一个 `inputKey`）重试时，先退回到失败那一轮开始的位置（扩展注册一个名字随机的命令，`navigateTree` 过去，不写摘要），失败那一轮的输入不会在 pi 的上下文里出现两次（记录文件里分出一支，不改原来的）。第一轮就失败的换一个新会话。换了一句话就照常接着跑，失败那一轮留在上下文里                                                                                                        |
 | 取消            | `signal` 中止时发 RPC 的 `abort`，pi 停下手里的模型调用和工具、照常结束这一轮；`interruptTimeoutMs` 之后还没退出就 SIGTERM，再过一样久 SIGKILL                                                                                                                                                                                                                                                                                                    |
 | 步数和预算      | pi 没有步数的上限：扩展数步，调了工具的一步结束时（`turn_end`）步数到了 `maxSteps` 或整轮超了 `budget` 就叫停（`ctx.abort()`），pi 不再调模型                                                                                                                                                                                                                                                                                                     |
-| 上下文          | pi 自己管：ctx 的日志不压缩、不投影。它压缩自己的上下文时记一条 `pi.compacted`（`text` 是它写的摘要，`data` 是起因和前后的 token 数），不写 ctx 的 `summary`                                                                                                                                                                                                                                                                                      |
+| 上下文          | pi 自己管：ctx 的日志不压缩、不投影。它压缩自己的上下文时记一条 `pi.compacted`（`text` 是它写的摘要，`data` 是起因和前后的 token 数），不写 ctx 的 `summary`。上下文来源（`sources`，例如 `memory.source()`）每轮记下输入之后收一次，事实接在指令后面，同参考实现的缺省放法；不进 pi 自己的会话，也不写日志                                                                                                                                       |
 | `record: false` | 什么都不写：新开的会话不存（`--no-session`）；接着跑的在一份副本上跑（`--fork`），模型看得到上一轮，跑完副本删掉，pi 的会话不变                                                                                                                                                                                                                                                                                                                   |
 | 对话框          | 扩展要人回答的对话框（`select`、`confirm`、`input`、`editor`）一律回取消；提示（`notify`）的警告和错误交给 `logger`                                                                                                                                                                                                                                                                                                                               |
 
@@ -72,23 +72,24 @@ console.log(result.stopReason, result.text);
 
 ## `AgentSpec`
 
-| 字段                        | 映射                                                                                                                                     |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `model`                     | `--model`：`提供方/模型`，或给 `provider` 选项；pi 的写法都行（`:<思考等级>` 后缀、模糊匹配）。找不到时 pi 不起来，以 `error` 结束       |
-| `instructions`              | `--append-system-prompt`（写进临时文件）：接在 pi 自己的系统提示后面                                                                     |
-| `tools`                     | 从工具目录里挑交给它的 ctx 工具                                                                                                          |
-| `maxSteps`                  | 扩展数步，缺省有工具 5、没有 1。用完时这一步的工具照样执行，`stopReason` 是 `max_steps`                                                  |
-| `output`                    | pi 没有结构化输出：schema 写进系统提示，要它最后只回一个 JSON；最后的回答（可以包在一个代码块里）按 schema 查一遍放进 `RunResult.output` |
-| `permissions`               | `allow` 的交出去；`deny` 的也交出去，调用时回拒绝（同参考实现），扩展和 MCP 服务器两边都拦                                               |
-| `budget`                    | 扩展在步骤之间查：这一步调了工具、整轮超了，就叫停，`stopReason` 是 `max_budget`                                                         |
-| `environment`               | 交给执行环境的 `open`                                                                                                                    |
-| `settings.maxRetries`       | 只认 `0`：`set_auto_retry` 关掉 pi 的自动重试。重试几次是 pi 自己的设置（`settings.json` 的 `retry.maxRetries`）                         |
-| `settings.timeoutMs`        | 到点中断，以 `error` 结束，`error.type` 是 `timeout`                                                                                     |
-| `name`、`version`           | 只记进 `ctx.run.started`                                                                                                                 |
-| `window`、`context`         | 不支持：上下文是 pi 自己的                                                                                                               |
-| `toolChoice`（`auto` 以外） | 不支持                                                                                                                                   |
-| `permissions` 里的 `ask`    | 不支持：整轮在 pi 里跑完，没有 `requires_action`                                                                                         |
-| `settings` 的其余各项       | 不支持：`maxOutputTokens`、`temperature` 这些 pi 从模型的配置里取                                                                        |
+| 字段                           | 映射                                                                                                                                                                                                                              |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `model`                        | `--model`：`提供方/模型`，或给 `provider` 选项；pi 的写法都行（`:<思考等级>` 后缀、模糊匹配）。找不到时 pi 不起来，以 `error` 结束                                                                                                |
+| `instructions`                 | `--append-system-prompt`（写进临时文件）：接在 pi 自己的系统提示后面                                                                                                                                                              |
+| `tools`                        | 从工具目录里挑交给它的 ctx 工具                                                                                                                                                                                                   |
+| `maxSteps`                     | 扩展数步，缺省有工具 5、没有 1。用完时这一步的工具照样执行，`stopReason` 是 `max_steps`                                                                                                                                           |
+| `output`                       | pi 没有结构化输出：schema 写进系统提示，要它最后只回一个 JSON；最后的回答（可以包在一个代码块里）按 schema 查一遍放进 `RunResult.output`                                                                                          |
+| `permissions`                  | `allow` 的交出去；`deny` 的也交出去，调用时回拒绝（同参考实现），扩展和 MCP 服务器两边都拦                                                                                                                                        |
+| `budget`                       | 扩展在步骤之间查：这一步调了工具、整轮超了，就叫停，`stopReason` 是 `max_budget`                                                                                                                                                  |
+| `environment`                  | 交给执行环境的 `open`                                                                                                                                                                                                             |
+| `settings.maxRetries`          | 只认 `0`：`set_auto_retry` 关掉 pi 的自动重试。重试几次是 pi 自己的设置（`settings.json` 的 `retry.maxRetries`）                                                                                                                  |
+| `settings.timeoutMs`           | 到点中断，以 `error` 结束，`error.type` 是 `timeout`                                                                                                                                                                              |
+| `name`、`version`              | 只记进 `ctx.run.started`                                                                                                                                                                                                          |
+| `context.facts`                | 有 `sources` 时每轮收一次：`sources` 按名字选用、`heading` 加标题、`false` 不收（同参考实现的 builder）。事实接在指令后面（`--append-system-prompt`），`placement: 'prompt'` 不支持：放进这一轮的用户消息就留在 pi 自己的会话里了 |
+| `window`、`context` 的其余各项 | 不支持：历史是 pi 自己的                                                                                                                                                                                                          |
+| `toolChoice`（`auto` 以外）    | 不支持                                                                                                                                                                                                                            |
+| `permissions` 里的 `ask`       | 不支持：整轮在 pi 里跑完，没有 `requires_action`                                                                                                                                                                                  |
+| `settings` 的其余各项          | 不支持：`maxOutputTokens`、`temperature` 这些 pi 从模型的配置里取                                                                                                                                                                 |
 
 不支持的字段在场时，这一轮以 `invalid_request` 结束（`ctx.run.started`、输入照常记下，不起 pi），不静默忽略。`RunRequest.prompt` 接在输入后面一起交给 pi：不写 ctx 的日志，但会留在 pi 自己的会话里。输入里内联的图片交给 pi（`prompt` 的 `images`），文字文件内联成文字，别的文件（PDF、给的是地址的图片）pi 的提示放不下，换成一句说明。输入以 `/` 开头时照 pi 的规则展开提示模板和技能（`bare` 时不加载它们）。
 
@@ -127,6 +128,8 @@ console.log(result.stopReason, result.text);
 | `maxToolOutputChars` | `DEFAULT_MAX_TOOL_OUTPUT_CHARS` | 一次 ctx 工具结果最多多少字符                                                                                                                                                         |
 | `interruptTimeoutMs` | `5_000`                         | 取消后等它自己停下多久                                                                                                                                                                |
 | `source`             | 不写                            | 输入条目的 `source`                                                                                                                                                                   |
+| `sources`            | 不给                            | 上下文来源，见 `AgentSpec` 的 `context.facts`                                                                                                                                         |
+| `sourceTimeoutMs`    | `2_000`                         | 单个来源最多等多久，超时就当它这次没有内容                                                                                                                                            |
 | `logger`             | 不记                            | pi 的警告提示、扩展的错误、压缩失败时 `warn`                                                                                                                                          |
 
 同一个实例里同一会话的记录型运行一个接一个；跨进程时第二个以 `session_busy` 结束。

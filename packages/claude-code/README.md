@@ -44,18 +44,18 @@ console.log(result.stopReason, result.text);
 
 ## 怎么对上
 
-| 问题           | 做法                                                                                                                                                                                                                                                                                                                                                      |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 轨迹从哪拿     | `--output-format stream-json --include-partial-messages` 的输出，边读边写：一条助手消息收齐（`message_stop`）就写，工具执行之前就在日志里；一步的工具结果到齐就写。文字和推理的增量只进 `stream` 的事件                                                                                                                                                   |
-| 工具怎么接     | 每轮起一个只听 `127.0.0.1`、带一次性令牌的 MCP 服务器（`createMcpServer`），配置写进只有自己读得到的临时文件交给 `--mcp-config`（加 `--strict-mcp-config`，不读别处配的 MCP 服务器）。工具在 Claude Code 里叫 `mcp__ctx__<名字>`，日志里换回原名；输入检查、结果截断（`maxToolOutputChars`）在 MCP 服务器里做；第一次交给某个执行环境之前 `open` 这个会话 |
-| 自带的工具     | `builtinTools` 列出的才交出去（`--tools`），缺省一个都不交。调用和结果照常记进日志，工具结果条目的 `source` 是 `claude-code`；经 ctx 执行的是执行环境的名字                                                                                                                                                                                               |
-| 会话身份       | ctx 的一个会话对着 Claude Code 的一个会话。`ctx.run.started` 的 `data.harness` 记 `{ name: 'claude-code', version, session }`，下一轮按最近一次记下的 `session` `--resume`；第一轮 `--session-id` 开新的                                                                                                                                                  |
-| 位置           | `meta.claudeCode` 记 Claude Code 记录里的位置：`ctx.run.started` 的 `resumeAt`（从哪一条接着跑），`ctx.run.ended` 的 `last`（结束时的最后一条），每一步的条目的 `uuid`                                                                                                                                                                                    |
-| 失败后重试     | 上一轮以 `error` 或 `aborted` 结束、这一轮带同样的输入（或同一个 `inputKey`）重试时，`--resume-session-at` 退回到失败那一轮开始的位置，失败那一轮的输入不会在 Claude Code 的上下文里出现两次（记录文件里分出一支，不改原来的）。换了一句话就照常接着跑，失败那一轮留在上下文里                                                                            |
-| 取消           | `signal` 中止时先发 `interrupt` 控制消息，Claude Code 停下手里的模型调用和工具、照常给出结果；`interruptTimeoutMs` 之后还没退出就 SIGTERM，再过一样久 SIGKILL。工具执行到一半被取消时，结果是 Claude Code 给的拒绝                                                                                                                                        |
-| 上下文         | Claude Code 自己管：ctx 的日志不压缩、不投影。它压缩自己的上下文时记一条 `claude-code.compacted`（`data` 是它给的 `compact_metadata`），不写 ctx 的 `summary`；摘要文字随后作为 `claude-code.synthetic` 记下                                                                                                                                              |
-| 它补的用户消息 | 输出被截断后让模型接着写、催模型调结构化输出的工具、中断时的说明：记成 `claude-code.synthetic` 事件（`text` 是那段话），不记成用户消息                                                                                                                                                                                                                    |
-| 子代理         | `builtinTools` 里有 `Task`（发给模型时叫 `Agent`）才有，`bare` 时没有。子代理在这一轮里跑完（适配器给子进程设 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`），轨迹写进子会话 `<会话>/<工具名>/<调用 id>`，和进程内派子 agent 的缺省一样；父会话里那次调用的结果是 `ChildRunResult`，`childRunsOf` 找得到。用量各算各的                                        |
+| 问题           | 做法                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 轨迹从哪拿     | `--output-format stream-json --include-partial-messages` 的输出，边读边写：一条助手消息收齐（`message_stop`）就写，工具执行之前就在日志里；一步的工具结果到齐就写。文字和推理的增量只进 `stream` 的事件                                                                                                                                                              |
+| 工具怎么接     | 每轮起一个只听 `127.0.0.1`、带一次性令牌的 MCP 服务器（`createMcpServer`），配置写进只有自己读得到的临时文件交给 `--mcp-config`（加 `--strict-mcp-config`，不读别处配的 MCP 服务器）。工具在 Claude Code 里叫 `mcp__ctx__<名字>`，日志里换回原名；输入检查、结果截断（`maxToolOutputChars`）在 MCP 服务器里做；第一次交给某个执行环境之前 `open` 这个会话            |
+| 自带的工具     | `builtinTools` 列出的才交出去（`--tools`），缺省一个都不交。调用和结果照常记进日志，工具结果条目的 `source` 是 `claude-code`；经 ctx 执行的是执行环境的名字                                                                                                                                                                                                          |
+| 会话身份       | ctx 的一个会话对着 Claude Code 的一个会话。`ctx.run.started` 的 `data.harness` 记 `{ name: 'claude-code', version, session }`，下一轮按最近一次记下的 `session` `--resume`；第一轮 `--session-id` 开新的                                                                                                                                                             |
+| 位置           | `meta.claudeCode` 记 Claude Code 记录里的位置：`ctx.run.started` 的 `resumeAt`（从哪一条接着跑），`ctx.run.ended` 的 `last`（结束时的最后一条），每一步的条目的 `uuid`                                                                                                                                                                                               |
+| 失败后重试     | 上一轮以 `error` 或 `aborted` 结束、这一轮带同样的输入（或同一个 `inputKey`）重试时，`--resume-session-at` 退回到失败那一轮开始的位置，失败那一轮的输入不会在 Claude Code 的上下文里出现两次（记录文件里分出一支，不改原来的）。换了一句话就照常接着跑，失败那一轮留在上下文里                                                                                       |
+| 取消           | `signal` 中止时先发 `interrupt` 控制消息，Claude Code 停下手里的模型调用和工具、照常给出结果；`interruptTimeoutMs` 之后还没退出就 SIGTERM，再过一样久 SIGKILL。工具执行到一半被取消时，结果是 Claude Code 给的拒绝                                                                                                                                                   |
+| 上下文         | Claude Code 自己管：ctx 的日志不压缩、不投影。它压缩自己的上下文时记一条 `claude-code.compacted`（`data` 是它给的 `compact_metadata`），不写 ctx 的 `summary`；摘要文字随后作为 `claude-code.synthetic` 记下。上下文来源（`sources`，例如 `memory.source()`）每轮记下输入之后收一次，事实接在指令后面，同参考实现的缺省放法；不进 Claude Code 自己的会话，也不写日志 |
+| 它补的用户消息 | 输出被截断后让模型接着写、催模型调结构化输出的工具、中断时的说明：记成 `claude-code.synthetic` 事件（`text` 是那段话），不记成用户消息                                                                                                                                                                                                                               |
+| 子代理         | `builtinTools` 里有 `Task`（发给模型时叫 `Agent`）才有，`bare` 时没有。子代理在这一轮里跑完（适配器给子进程设 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`），轨迹写进子会话 `<会话>/<工具名>/<调用 id>`，和进程内派子 agent 的缺省一样；父会话里那次调用的结果是 `ChildRunResult`，`childRunsOf` 找得到。用量各算各的                                                   |
 
 日志里一轮的样子（并行调了两次 ctx 的工具）：
 
@@ -83,24 +83,25 @@ console.log(result.stopReason, result.text);
 
 ## `AgentSpec`
 
-| 字段                        | 映射                                                                                                               |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `model`                     | `--model`，只收名字（Claude Code 的别名也行）                                                                      |
-| `instructions`              | `--append-system-prompt`：接在 Claude Code 自己的系统提示后面                                                      |
-| `tools`                     | 从工具目录里挑交给它的 ctx 工具                                                                                    |
-| `maxSteps`                  | `--max-turns`，缺省有工具 5、没有 1。用完时这一步的工具照样执行，`stopReason` 是 `max_steps`                       |
-| `output`                    | `--json-schema`：Claude Code 加一个 `StructuredOutput` 工具，交上来的对象再按 schema 查一遍放进 `RunResult.output` |
-| `permissions`               | `allow` 的交出去并 `--allowedTools`；`deny` 的不交出去（参考实现交给模型、调用时回拒绝）                           |
-| `budget`                    | 在步骤之间查：这一步调了工具、整轮超了，就中断，`stopReason` 是 `max_budget`                                       |
-| `environment`               | 交给执行环境的 `open`                                                                                              |
-| `settings.maxRetries`       | 环境变量 `CLAUDE_CODE_MAX_RETRIES`                                                                                 |
-| `settings.maxOutputTokens`  | 环境变量 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`                                                                           |
-| `settings.timeoutMs`        | 到点中断，以 `error` 结束，`error.type` 是 `timeout`                                                               |
-| `name`、`version`           | 只记进 `ctx.run.started`                                                                                           |
-| `window`、`context`         | 不支持：上下文是 Claude Code 自己的                                                                                |
-| `toolChoice`（`auto` 以外） | 不支持                                                                                                             |
-| `permissions` 里的 `ask`    | 不支持：整轮在 Claude Code 里跑完，没有 `requires_action`                                                          |
-| `settings` 的其余各项       | 不支持                                                                                                             |
+| 字段                           | 映射                                                                                                                                                                                                                                       |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `model`                        | `--model`，只收名字（Claude Code 的别名也行）                                                                                                                                                                                              |
+| `instructions`                 | `--append-system-prompt`：接在 Claude Code 自己的系统提示后面                                                                                                                                                                              |
+| `tools`                        | 从工具目录里挑交给它的 ctx 工具                                                                                                                                                                                                            |
+| `maxSteps`                     | `--max-turns`，缺省有工具 5、没有 1。用完时这一步的工具照样执行，`stopReason` 是 `max_steps`                                                                                                                                               |
+| `output`                       | `--json-schema`：Claude Code 加一个 `StructuredOutput` 工具，交上来的对象再按 schema 查一遍放进 `RunResult.output`                                                                                                                         |
+| `permissions`                  | `allow` 的交出去并 `--allowedTools`；`deny` 的不交出去（参考实现交给模型、调用时回拒绝）                                                                                                                                                   |
+| `budget`                       | 在步骤之间查：这一步调了工具、整轮超了，就中断，`stopReason` 是 `max_budget`                                                                                                                                                               |
+| `environment`                  | 交给执行环境的 `open`                                                                                                                                                                                                                      |
+| `settings.maxRetries`          | 环境变量 `CLAUDE_CODE_MAX_RETRIES`                                                                                                                                                                                                         |
+| `settings.maxOutputTokens`     | 环境变量 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`                                                                                                                                                                                                   |
+| `settings.timeoutMs`           | 到点中断，以 `error` 结束，`error.type` 是 `timeout`                                                                                                                                                                                       |
+| `name`、`version`              | 只记进 `ctx.run.started`                                                                                                                                                                                                                   |
+| `context.facts`                | 有 `sources` 时每轮收一次：`sources` 按名字选用、`heading` 加标题、`false` 不收（同参考实现的 builder）。事实接在指令后面（`--append-system-prompt`），`placement: 'prompt'` 不支持：放进这一轮的用户消息就留在 Claude Code 自己的会话里了 |
+| `window`、`context` 的其余各项 | 不支持：历史是 Claude Code 自己的                                                                                                                                                                                                          |
+| `toolChoice`（`auto` 以外）    | 不支持                                                                                                                                                                                                                                     |
+| `permissions` 里的 `ask`       | 不支持：整轮在 Claude Code 里跑完，没有 `requires_action`                                                                                                                                                                                  |
+| `settings` 的其余各项          | 不支持                                                                                                                                                                                                                                     |
 
 不支持的字段在场时，这一轮以 `invalid_request` 结束（`ctx.run.started`、输入照常记下，不起 Claude Code），不静默忽略。`RunRequest.prompt` 接在输入后面一起交给 Claude Code：不写 ctx 的日志，但会留在 Claude Code 自己的会话里。
 
@@ -134,6 +135,8 @@ console.log(result.stopReason, result.text);
 | `maxToolOutputChars` | `DEFAULT_MAX_TOOL_OUTPUT_CHARS` | 一次 ctx 工具结果最多多少字符。Claude Code 自己也限 MCP 结果的长度（`MAX_MCP_OUTPUT_TOKENS`）        |
 | `interruptTimeoutMs` | `5_000`                         | 取消后等它自己停下多久                                                                               |
 | `source`             | 不写                            | 输入条目的 `source`                                                                                  |
+| `sources`            | 不给                            | 上下文来源，见 `AgentSpec` 的 `context.facts`                                                        |
+| `sourceTimeoutMs`    | `2_000`                         | 单个来源最多等多久，超时就当它这次没有内容                                                           |
 | `logger`             | 不记                            | 连不上 MCP 服务器、会话 id 对不上时 `warn`                                                           |
 
 同一个实例里同一会话的记录型运行一个接一个；跨进程时第二个以 `session_busy` 结束。
