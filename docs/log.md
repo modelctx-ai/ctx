@@ -4,6 +4,8 @@
 
 ## 2026-11-18
 
+- **更新** [ADR 0002](adr/0002-packages.md)：「实施状态」里 `publishConfig`、`release.mjs`、冒烟检查三条不再写「十个包」：脚本按 `packages/*` 找包，加了 `ctx-claude-code`、`ctx-pi` 之后是十二个，这三条没跟着改。`release.mjs` 一条补上正式版本也改 Python 适配器的版本。
+
 - **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：「怎么对上」的上下文一行和 `AgentSpec` 的 `context` 一行写超窗时怎么压缩，选项加 `summary_model`，导出加 `ctx_pydantic_ai.compact`，「还没做的」去掉压缩，「验证」和测试加写摘要的调用和对照参考实现的压缩。[架构](architecture.md)：「外部 harness：pydantic-ai」的签名和第三步跟着改。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」去掉压缩，决定记录补一条，写它和决定八为什么不冲突、摘要用哪个模型。
 
 - **更新** [记忆](memory.md)：「接进其余组件」加一段，写自己管上下文的 harness（Claude Code、pi）怎么接记忆：会话、工具、上下文三个接点各走哪条约定，事实放在哪、为什么不放进 `prompt`，提示缓存的代价。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态加 `context.facts`，决定记录补一条，回答 #19 留下的这个问题。
