@@ -8,12 +8,15 @@ import type { AddressInfo } from 'node:net';
 
 import {
   CTX_EVENTS,
+  ctxEventData,
   DEFAULT_MEMORY_SCOPE,
   ENTRY_VERSION,
   isConflict,
+  isEvent,
   PROTOCOL_SCHEMA,
   PROTOCOL_VERSION,
   type ProtocolInfo,
+  runIdOf,
   runParentProblem,
   silentLogger,
   type Entry,
@@ -42,7 +45,6 @@ import {
   type SourceRef,
   type StopReason,
   type ToolCall,
-  type Usage,
 } from '@modelctx-ai/ctx-protocol';
 
 import { openApiDocument } from './openapi.ts';
@@ -660,11 +662,10 @@ function textOf(message: Message | undefined): string {
 async function resultFromLog(store: SessionStore, session: string, runId: string): Promise<RunResult | undefined> {
   const marks = await store.list(session, { kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded] });
   const mark = (kind: string): Entry | undefined =>
-    marks.find(
-      (entry) => entry.type === 'event' && entry.kind === kind && isObject(entry.data) && entry.data['runId'] === runId,
-    );
+    marks.find((entry) => isEvent(entry, kind) && runIdOf(entry) === runId);
   const ended = mark(CTX_EVENTS.runEnded);
-  if (ended?.type !== 'event' || !isObject(ended.data)) return undefined;
+  const end = ctxEventData(ended, CTX_EVENTS.runEnded);
+  if (ended === undefined || end === undefined) return undefined;
   const recorded: Entry[] = [];
   for (let after = (mark(CTX_EVENTS.runStarted)?.seq ?? ended.seq) - 1; after < ended.seq;) {
     const page = await store.list(session, { after, limit: 500 });
@@ -676,16 +677,11 @@ async function resultFromLog(store: SessionStore, session: string, runId: string
   const messages = recorded.flatMap((entry) =>
     entry.type === 'message' && entry.source === 'model' ? [entry.message] : [],
   );
-  const failure = recorded.find(
-    (entry) =>
-      entry.type === 'event' &&
-      entry.kind === CTX_EVENTS.error &&
-      isObject(entry.data) &&
-      entry.data['runId'] === runId,
+  const failure = ctxEventData(
+    recorded.find((entry) => isEvent(entry, CTX_EVENTS.error) && runIdOf(entry) === runId),
+    CTX_EVENTS.error,
   );
-  const stopReason = ended.data['stopReason'] as StopReason;
-  const usage = ended.data['usage'] as Usage | undefined;
-  const info = failure?.type === 'event' && isObject(failure.data) ? failure.data : undefined;
+  const { stopReason, usage } = end;
   return {
     runId,
     text: textOf(messages.findLast((message) => message.role === 'assistant')),
@@ -696,8 +692,8 @@ async function resultFromLog(store: SessionStore, session: string, runId: string
     ...(stopReason === 'error'
       ? {
           error: {
-            message: typeof info?.['message'] === 'string' ? info['message'] : 'The run failed.',
-            ...(typeof info?.['type'] === 'string' ? { type: info['type'] } : {}),
+            message: failure?.message ?? 'The run failed.',
+            ...(failure?.type !== undefined ? { type: failure.type } : {}),
           },
         }
       : {}),

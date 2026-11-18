@@ -377,6 +377,40 @@ def test_pending_tool_calls_match_typescript(ts: Evaluate, name: str) -> None:
     assert protocol.pending_tool_calls(PENDING[name]) == expected
 
 
+def _erased(seq: int, op: str, **data: Any) -> dict[str, Any]:
+    return {'seq': seq, 'type': 'event', 'kind': 'ctx.erased', 'data': {'op': op, **data}}
+
+
+#: 这一轮的 started 在 seq 5，写了 5、6、7；每一例是这一轮的 started 起的生命周期事件和擦除记录。
+FENCES = {
+    '没人动': [_started(5, 'r1')],
+    '别的运行结束了': [_started(5, 'r1'), _ended(8, 'r0', 'error')],
+    '自己被收走了': [_started(5, 'r1'), _ended(8, 'r1', 'error')],
+    'started 不在了': [],
+    '删的是更早的历史': [_started(5, 'r1'), _erased(8, 'truncate', upTo=4, count=4)],
+    '删到了这一轮': [_erased(8, 'truncate', upTo=6, count=6)],
+    'remove 了这一轮的一条': [_started(5, 'r1'), _erased(8, 'remove', seqs=[2, 7], count=2)],
+    'redact 了这一轮的一条': [_started(5, 'r1'), _erased(8, 'redact', seqs=[6], count=1)],
+    'remove 了别处的': [_started(5, 'r1'), _erased(8, 'remove', seqs=[2, 9], count=2)],
+    '擦除记录不认识': [_started(5, 'r1'), _erased(8, 'shred', seqs=[6], count=1)],
+    '没有 count': [_started(5, 'r1'), _erased(8, 'redact', seqs=[6])],
+    'upTo 不是数': [_started(5, 'r1'), _erased(8, 'truncate', upTo='9', count=9)],
+    'seqs 里有别的': [_started(5, 'r1'), _erased(8, 'remove', seqs=[6, 'x'], count=2)],
+}
+
+
+@pytest.mark.parametrize('name', list(FENCES))
+def test_fencing_matches_typescript(ts: Evaluate, name: str) -> None:
+    run = {'runId': 'r1', 'started': 5, 'recorded': [{'seq': 5}, {'seq': 6}, {'seq': 7}]}
+    [expected] = ts([('isFenced', [FENCES[name], run])])
+    assert protocol.is_fenced(FENCES[name], 'r1', started=5, recorded=run['recorded']) is expected
+
+
+def test_fencing_without_a_started_seq_only_looks_at_ended_and_erasures() -> None:
+    assert protocol.is_fenced([], 'r1', started=None, recorded=[]) is False
+    assert protocol.is_fenced([_ended(3, 'r1', 'error')], 'r1', started=None, recorded=[]) is True
+
+
 def test_tool_result_entry_matches_typescript(ts: Evaluate) -> None:
     call = {'id': 'c1', 'name': 'lookup', 'input': {'id': '42'}}
     output = {'type': 'text', 'text': '订单 42 已发货'}

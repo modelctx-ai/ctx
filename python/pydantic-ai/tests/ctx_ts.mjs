@@ -44,6 +44,7 @@ async function evaluate() {
     truncateMessage: protocol.truncateMessage,
     pendingToolCalls: protocol.pendingToolCalls,
     toolResultEntry: protocol.toolResultEntry,
+    isFenced: protocol.isFenced,
   };
   const calls = await stdin();
   const results = calls.map(({ fn, args }) => {

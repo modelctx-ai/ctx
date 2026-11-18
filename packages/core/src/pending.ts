@@ -1,5 +1,6 @@
 import {
   CTX_EVENTS,
+  ctxEventData,
   DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   limitToolOutput,
   pendingToolCalls,
@@ -40,10 +41,7 @@ export async function runPendingTools(
   options: RunPendingToolsOptions,
 ): Promise<PendingToolsResult> {
   const [last] = await store.list(session, { kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded], last: 1 });
-  const waiting =
-    last?.type === 'event' &&
-    last.kind === CTX_EVENTS.runEnded &&
-    (last.data as { stopReason?: unknown } | undefined)?.stopReason === 'requires_action';
+  const waiting = ctxEventData(last, CTX_EVENTS.runEnded)?.stopReason === 'requires_action';
   if (!waiting) return { executed: [], remaining: [] };
   const [started] = await store.list(session, { kinds: [CTX_EVENTS.runStarted], last: 1 });
   const entries = await store.list(session, { after: (started?.seq ?? 1) - 1 });

@@ -1,10 +1,10 @@
 import {
   CTX_EVENTS,
+  ctxEventData,
   headSeq,
   isConflict,
   messageEntry,
   runEndedEntry,
-  runParentProblem,
   silentLogger,
   type AgentSpec,
   type Entry,
@@ -64,12 +64,6 @@ export interface OrchestratorOptions {
 
 export interface LocalOrchestrator extends Orchestrator {
   events(options?: { readonly signal?: AbortSignal }): AsyncIterable<OrchestratorEvent>;
-}
-
-/** `ctx.run.started` 里形状对的 `parent`。 */
-function parentOf(data: unknown): { parent?: RunParent } {
-  const parent = (data as { parent?: unknown } | undefined)?.parent;
-  return parent !== undefined && runParentProblem(parent) === undefined ? { parent: parent as RunParent } : {};
 }
 
 interface Run {
@@ -273,12 +267,11 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
             kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded],
             last: 1,
           });
-          if (last?.type !== 'event' || last.kind !== CTX_EVENTS.runStarted) continue;
-          const data = last.data as { runId?: unknown; owner?: unknown } | undefined;
-          const runId = data?.runId;
-          if (typeof runId !== 'string') continue;
+          const data = ctxEventData(last, CTX_EVENTS.runStarted);
+          if (last === undefined || data === undefined) continue;
+          const { runId } = data;
           // 别的实例的运行不归这个编排器收。
-          if ((typeof data?.owner === 'string' ? data.owner : undefined) !== options.owner) continue;
+          if (data.owner !== options.owner) continue;
           // 这个编排器自己正在跑的不算断掉。
           if (runs.has(runId)) continue;
           // 写 ended 时带这个末尾：读和写之间会话有新条目，说明那个运行在动。只有找到断点的会话才多读这两次。
@@ -301,9 +294,9 @@ export function createOrchestrator(options: OrchestratorOptions): LocalOrchestra
           const agent = await options.resume?.({
             session,
             runId,
-            agent: ((data as { agent?: unknown }).agent ?? {}) as JsonObject,
+            agent: data.agent,
             interrupted: open.size,
-            ...parentOf(data),
+            ...(data.parent ? { parent: data.parent } : {}),
           });
           if (agent === undefined || closed) {
             recovered.push({ session, runId });

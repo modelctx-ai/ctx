@@ -2,8 +2,22 @@ import type { LanguageModel } from 'ai';
 
 import type { Message, MessageContent } from './message.ts';
 import type { ContextSpec, PreparedCall, WindowOptions } from './context.ts';
-import { CTX_EVENTS, messageEntry, type Entry, type EntryOptions, type NewMessageEntry } from './session.ts';
+import { isErased } from './erase.ts';
+import {
+  CTX_EVENTS,
+  ctxEventData,
+  headSeq,
+  isEvent,
+  messageEntry,
+  runIdOf,
+  type Entry,
+  type EntryOptions,
+  type NewMessageEntry,
+  type RunParent,
+  type SessionStore,
+} from './session.ts';
 import type { EnvironmentSpec, ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
+import { definedFields, isJsonObject, usageFromJson } from './json.ts';
 import type { Awaitable, ErrorInfo, JsonObject, JsonValue } from './types.ts';
 
 /**
@@ -154,29 +168,6 @@ export interface RunRequest {
 }
 
 /**
- * 子运行的来处：父会话、父运行，和父会话里派它的那次工具调用。父会话那一侧，那次调用的结果是 `ChildRunResult`
- * （`childRunOutput`），两边各记一半，从哪边都找得到另一边。
- */
-export interface RunParent {
-  readonly session: string;
-  readonly runId: string;
-  readonly toolCallId?: string;
-}
-
-/** `parent` 的形状不对时说明哪里不对，对就是 `undefined`。harness 和 remote 服务端用它校验。 */
-export function runParentProblem(parent: unknown): string | undefined {
-  if (parent === undefined) return undefined;
-  if (typeof parent !== 'object' || parent === null || Array.isArray(parent))
-    return 'RunRequest.parent must be an object';
-  const { session, runId, toolCallId } = parent as Record<string, unknown>;
-  if (typeof session !== 'string' || session === '') return 'RunRequest.parent.session must be a non-empty string';
-  if (typeof runId !== 'string' || runId === '') return 'RunRequest.parent.runId must be a non-empty string';
-  if (toolCallId !== undefined && typeof toolCallId !== 'string')
-    return 'RunRequest.parent.toolCallId must be a string';
-  return undefined;
-}
-
-/**
  * 一轮为什么停：`end_turn` 模型自己停下，`max_steps` 到了步数上限，`max_tokens` 输出被 `maxOutputTokens` 截断，
  * `max_budget` 超了 `AgentSpec.budget`（在步骤之间停下），
  * `requires_action` 留下了要在别处执行的工具调用（`RunResult.pending`），等结果追加进日志后不带输入再跑一轮接着走，
@@ -228,12 +219,30 @@ export interface StepMeta {
   readonly calibration?: number;
 }
 
-/** 条目 `meta.step` 里的 `StepMeta`；不是 harness 写的步骤消息时返回 `undefined`。 */
+/**
+ * 条目 `meta.step` 里的 `StepMeta`；不是 harness 写的步骤消息（`runId` 不是字符串、`step` 不是数）时返回 `undefined`。
+ * 可选字段只留类型对的。
+ */
 export function stepMetaOf(entry: Entry): StepMeta | undefined {
-  const step = entry.meta?.['step'];
-  if (typeof step !== 'object' || step === null || Array.isArray(step)) return undefined;
-  const { runId, step: index } = step as Record<string, unknown>;
-  return typeof runId === 'string' && typeof index === 'number' ? (step as unknown as StepMeta) : undefined;
+  const meta = entry.meta?.['step'];
+  if (!isJsonObject(meta)) return undefined;
+  const { runId, step, provider, modelId, finishReason, usage, estimatedInputTokens, calibration } = meta;
+  if (typeof runId !== 'string' || typeof step !== 'number') return undefined;
+  return {
+    runId,
+    step,
+    ...(typeof provider === 'string' ? { provider } : {}),
+    ...(typeof modelId === 'string' ? { modelId } : {}),
+    ...(typeof finishReason === 'string' ? { finishReason } : {}),
+    ...(isJsonObject(usage) ? { usage: usageFromJson(usage) } : {}),
+    ...(typeof estimatedInputTokens === 'number' ? { estimatedInputTokens } : {}),
+    ...(typeof calibration === 'number' ? { calibration } : {}),
+  };
+}
+
+/** `StepMeta` 写成条目 `meta.step` 的 JSON，没给的字段不出现：`messageEntry(message, { meta: { step: stepMetaToJson(meta) } })`。 */
+export function stepMetaToJson(meta: StepMeta): JsonObject {
+  return definedFields({ ...meta, usage: meta.usage && definedFields(meta.usage) });
 }
 
 export interface RunResult {
@@ -334,15 +343,16 @@ export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
   let open = new Map<string, PendingToolCall>();
   let run: { runId: string; calls: Map<string, PendingToolCall> } | undefined;
   for (const entry of entries) {
-    if (entry.type === 'event' && (entry.kind === CTX_EVENTS.runStarted || entry.kind === CTX_EVENTS.runEnded)) {
-      const data = (entry.data ?? {}) as { runId?: unknown; stopReason?: unknown };
-      if (typeof data.runId !== 'string') continue;
+    if (isEvent(entry, CTX_EVENTS.runStarted) || isEvent(entry, CTX_EVENTS.runEnded)) {
+      const runId = runIdOf(entry);
+      if (runId === undefined) continue;
       if (entry.kind === CTX_EVENTS.runStarted) {
-        run = { runId: data.runId, calls: new Map() };
+        run = { runId, calls: new Map() };
         continue;
       }
       // 这一轮停下来等结果：它留下的调用等待中；别的结束方式让之前等着的都作废。
-      open = data.stopReason === 'requires_action' && run?.runId === data.runId ? new Map(run.calls) : new Map();
+      const waiting = ctxEventData(entry, CTX_EVENTS.runEnded)?.stopReason === 'requires_action';
+      open = waiting && run?.runId === runId ? new Map(run.calls) : new Map();
       run = undefined;
       continue;
     }
@@ -376,6 +386,52 @@ export function toolResultEntry(
     { role: 'tool', content: [{ type: 'tool-result', id: call.id, name: call.name, output }] },
     { key: `${TOOL_RESULT_KEY_PREFIX}${call.id}`, ...options },
   );
+}
+
+// ---- 写日志：围栏 ----
+
+/** 一轮在日志里留下的位置：`isFenced`、`afterConflict` 按它认。 */
+export interface RunPosition {
+  readonly runId: string;
+  /** 这一轮的 `ctx.run.started` 的 `seq`；还没写进去时没有。 */
+  readonly started?: number;
+  /** 这一轮写进日志的条目（只看 `seq`）。 */
+  readonly recorded: readonly Pick<Entry, 'seq'>[];
+}
+
+/**
+ * 围栏：`lifecycle` 是这一轮的 `ctx.run.started` 起的生命周期事件和擦除记录（`kinds: [ctx.run.started, ctx.run.ended,
+ * ctx.erased]`）。自己的 `runId` 已经有 `ctx.run.ended`（被当作断掉的运行收走了）、自己的 `ctx.run.started` 不在了
+ * （会话被清掉，或者删到了它）、有 `ctx.erased` 动了这一轮写的条目（`isErased`，`redact` 也算），都是被围栏：这一轮停下，
+ * 不再写 `ctx.run.ended`、`ctx.error` 和产出。
+ */
+export function isFenced(lifecycle: readonly Entry[], run: RunPosition): boolean {
+  const mine = lifecycle.filter((entry) => runIdOf(entry) === run.runId);
+  if (mine.some((entry) => isEvent(entry, CTX_EVENTS.runEnded))) return true;
+  if (run.started !== undefined && !mine.some((entry) => entry.seq === run.started)) return true;
+  return lifecycle.some((entry) => {
+    const erased = ctxEventData(entry, CTX_EVENTS.erased);
+    return erased !== undefined && run.recorded.some((written) => isErased(erased, written.seq));
+  });
+}
+
+/**
+ * 这一轮带 `expectSeq` 的写入冲突了：先读末尾，再读这一轮的 `ctx.run.started` 起的生命周期事件和擦除记录。被围栏
+ * （`isFenced`）返回 `undefined`；否则返回新的末尾，带着它重试——别人只是写了应用事件，或者删的是这一轮之前的历史。
+ * 两次读之间又有人写，下一次写入会再冲突，再查一遍。`started` 还没有时没有能围栏的，只读末尾。
+ */
+export async function afterConflict(
+  store: Pick<SessionStore, 'list'>,
+  session: string,
+  run: RunPosition,
+): Promise<number | undefined> {
+  const head = await headSeq(store, session);
+  if (run.started === undefined) return head;
+  const lifecycle = await store.list(session, {
+    after: run.started - 1,
+    kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded, CTX_EVENTS.erased],
+  });
+  return isFenced(lifecycle, run) ? undefined : head;
 }
 
 // ---- 父子运行 ----

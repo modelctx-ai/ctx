@@ -232,6 +232,68 @@ def test_a_fenced_run_stops_writing() -> None:
     run(main)
 
 
+def _erase(store: MemorySessionStore, how: str, before: int) -> Any:
+    """``clear``、``truncate`` 的样子：删掉条目，``truncate`` 追加一条擦除记录。末尾是最后一条还在的条目，清空了就是 0。"""
+
+    async def erase() -> None:
+        log = store._sessions['s']
+        if how == 'clear':
+            log.clear()
+            store._heads['s'] = 0
+            return
+        up_to = log[-1]['seq'] if how == 'truncate' else before
+        count = sum(1 for entry in log if entry['seq'] <= up_to)
+        log[:] = [entry for entry in log if entry['seq'] > up_to]
+        await store.append(
+            's',
+            [
+                {
+                    'type': 'event',
+                    'kind': 'ctx.erased',
+                    'source': 'store',
+                    'data': {'op': 'truncate', 'upTo': up_to, 'count': count},
+                }
+            ],
+        )
+
+    return erase
+
+
+@pytest.mark.parametrize(('how', 'stop'), [('clear', 'aborted'), ('truncate', 'aborted'), ('earlier', 'end_turn')])
+def test_erasing_this_run_while_it_runs_fences_it(how: str, stop: str) -> None:
+    async def main() -> None:
+        store = MemorySessionStore()
+        erase: list[Any] = []
+
+        async def wipe(value: Any, context: Mapping[str, Any]) -> dict[str, Any]:
+            # 别处在这一轮中途清掉了会话，或者删到了这一轮写的条目；只删更早的历史不算。
+            await erase[0]()
+            return {'type': 'text', 'text': '删掉了'}
+
+        executor = FunctionExecutor('local').register(ECHO_TOOL, wipe)
+        model = ScriptedModel(
+            [
+                {'type': 'text', 'text': '上一轮'},
+                {'type': 'tool-call', 'id': 'c1', 'input': {'text': 'x'}},
+                {'type': 'text', 'text': '好了'},
+            ]
+        )
+        harness = PydanticAIHarness(store=store, executors=[executor], models={'scripted': model})
+        first = await harness.run({'session': 's', 'agent': AGENT, 'input': '先说一句'})
+        erase.append(_erase(store, how, first['recorded'][-1]['seq']))
+        result = await harness.run({'session': 's', 'agent': AGENT, 'input': '删掉'})
+        assert result['stopReason'] == stop
+        kinds = [entry.get('kind', entry['type']) for entry in await store.list('s')]
+        if how == 'clear':
+            assert kinds == []
+        elif how == 'truncate':
+            assert kinds == ['ctx.erased']
+        else:
+            assert kinds[-1] == 'ctx.run.ended'
+
+    run(main)
+
+
 def test_abort_while_a_tool_runs() -> None:
     async def main() -> None:
         entered = asyncio.Event()

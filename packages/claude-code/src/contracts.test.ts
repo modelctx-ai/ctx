@@ -8,6 +8,7 @@ import { createFunctionExecutor, createMemoryStore, createToolRegistry } from '@
 import {
   childRunsOf,
   CTX_EVENTS,
+  headSeq,
   type AgentSpec,
   type ContextSource,
   type Entry,
@@ -261,6 +262,46 @@ slow.describe('Claude Code 适配器', () => {
       const tool = (await store.list('s')).find((entry) => entry.type === 'message' && entry.message.role === 'tool');
       assert.equal(tool?.source, tools.executor.name);
       assert.ok(JSON.stringify(tool).includes('挑出来的'));
+    },
+  );
+
+  slow.test(
+    '这一轮中途会话被清掉、删到了这一轮写的条目：被围栏，以 aborted 结束，不再写；只删更早的历史照常跑',
+    async () => {
+      const cases = [
+        ['clear', (store: SessionStore) => store.clear('s'), 'aborted'],
+        ['truncate', async (store: SessionStore) => store.truncate('s', await headSeq(store, 's')), 'aborted'],
+        // 只删上一轮的条目：这一轮的 started 还在。
+        ['earlier', (store: SessionStore, before: number) => store.truncate('s', before), 'end_turn'],
+      ] as const;
+      for (const [name, erase, stopReason] of cases) {
+        let wipe: (() => Promise<unknown>) | undefined;
+        const tools = createToolRegistry();
+        tools.executor.register(
+          { name: 'echo', inputSchema: { type: 'object', properties: { text: { type: 'string' } } } },
+          async () => {
+            await wipe?.();
+            return { type: 'text', text: '删掉了' };
+          },
+        );
+        tools.add(tools.executor.definition('echo')!);
+        const { harness, store, agent } = await setup(
+          [
+            { type: 'text', text: '上一轮' },
+            { type: 'tool-call', id: 'call-1', input: { text: 'x' } },
+            { type: 'text', text: '好了' },
+          ],
+          { tools },
+        );
+        const before = (await harness.run({ session: 's', agent, input: '先说一句' })).recorded.at(-1)!.seq;
+        wipe = () => erase(store, before);
+        const result = await harness.run({ session: 's', agent, input: '删掉' });
+        assert.equal(result.stopReason, stopReason, `${name}: ${result.error?.message ?? ''}`);
+        const kinds = (await store.list('s')).map((entry) => (entry.type === 'event' ? entry.kind : entry.type));
+        if (name === 'clear') assert.deepEqual(kinds, [], '会话不会被写回来');
+        if (name === 'truncate') assert.deepEqual(kinds, [CTX_EVENTS.erased], '只剩擦除记录');
+        if (name === 'earlier') assert.equal(kinds.at(-1), CTX_EVENTS.runEnded);
+      }
     },
   );
 

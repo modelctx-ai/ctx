@@ -14,11 +14,13 @@ import {
 } from '@opentelemetry/api';
 import {
   CTX_EVENTS,
+  ctxEventData,
+  isEvent,
+  runIdOf,
   stepMetaOf,
   type Entry,
   type JsonObject,
   type SessionStore,
-  type StopReason,
   type Usage,
 } from '@modelctx-ai/ctx-protocol';
 
@@ -57,12 +59,6 @@ interface OpenRun {
   readonly started: Entry;
   readonly agent: JsonObject;
   readonly entries: Entry[];
-}
-
-function dataOf(entry: Entry): Record<string, unknown> {
-  return entry.type === 'event' && typeof entry.data === 'object' && entry.data !== null && !Array.isArray(entry.data)
-    ? entry.data
-    : {};
 }
 
 function usageAttributes(usage: Usage | undefined): Attributes {
@@ -139,9 +135,9 @@ function stepSpan(entries: readonly Entry[], index: number, start: number, agent
 }
 
 function runSpan(run: OpenRun, ended: Entry, session: string): SpanRecord {
-  const data = dataOf(ended);
-  const stopReason = typeof data['stopReason'] === 'string' ? (data['stopReason'] as StopReason) : undefined;
-  const usage = data['usage'] as Usage | undefined;
+  const data = ctxEventData(ended, CTX_EVENTS.runEnded);
+  const stopReason = data?.stopReason;
+  const usage = data?.usage;
   const { entries, agent } = run;
   const steps: SpanRecord[] = [];
   // 一步的模型调用从它前面那条条目（输入、上一步的工具结果）写下时算起。
@@ -150,8 +146,8 @@ function runSpan(run: OpenRun, ended: Entry, session: string): SpanRecord {
     if (stepMetaOf(entry)?.runId === run.runId) steps.push(stepSpan(entries, index, last, agent));
     last = entry.at;
   }
-  const failure = entries.findLast((entry) => entry.type === 'event' && entry.kind === CTX_EVENTS.error);
-  const message = failure ? dataOf(failure)['message'] : undefined;
+  const failure = entries.findLast((entry) => isEvent(entry, CTX_EVENTS.error));
+  const message = ctxEventData(failure, CTX_EVENTS.error)?.message;
   const name = typeof agent['name'] === 'string' ? agent['name'] : undefined;
   const model = modelOf(agent);
   return {
@@ -185,17 +181,13 @@ export function deriveSpans(entries: readonly Entry[], options: DeriveOptions = 
   let upTo = options.after ?? 0;
   let open: OpenRun | undefined;
   for (const entry of entries) {
-    if (entry.type === 'event' && entry.kind === CTX_EVENTS.runStarted) {
-      const data = dataOf(entry);
-      const runId = data['runId'];
-      open =
-        typeof runId === 'string'
-          ? { runId, started: entry, agent: (data['agent'] ?? {}) as JsonObject, entries: [] }
-          : undefined;
+    if (isEvent(entry, CTX_EVENTS.runStarted)) {
+      const data = ctxEventData(entry, CTX_EVENTS.runStarted);
+      open = data ? { runId: data.runId, started: entry, agent: data.agent, entries: [] } : undefined;
       continue;
     }
-    if (entry.type === 'event' && entry.kind === CTX_EVENTS.runEnded) {
-      if (open && dataOf(entry)['runId'] === open.runId) {
+    if (isEvent(entry, CTX_EVENTS.runEnded)) {
+      if (open && runIdOf(entry) === open.runId) {
         runs.push(runSpan(open, entry, options.session ?? entry.session));
         upTo = entry.seq;
       }

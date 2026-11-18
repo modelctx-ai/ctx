@@ -212,7 +212,7 @@ async def ask_first(harness, store, executor) -> dict:
 测试（`uv run pytest`）有三种：
 
 - 进程内的 harness 和 HTTP 层。
-- 协议函数（截断、估算和截短、投影和窗口、校准、上下文过长的认法、筛选、`ListOptions`、等着的调用、`tool_result_entry`）对同一组输入和 TypeScript 的协议包比结果；压缩对同一组日志、同一个剧本的摘要模型和参考实现 builder 的 `compactDetailed` 比切点、每次交给模型的记录、写下的摘要和 `ctx.compacted`；常量和 `PROTOCOL_VERSION` 从 TypeScript 源码里读出来比。
+- 协议函数（截断、估算和截短、投影和窗口、校准、上下文过长的认法、筛选、`ListOptions`、等着的调用、`tool_result_entry`、围栏）对同一组输入和 TypeScript 的协议包比结果；压缩对同一组日志、同一个剧本的摘要模型和参考实现 builder 的 `compactDetailed` 比切点、每次交给模型的记录、写下的摘要和 `ctx.compacted`；常量和 `PROTOCOL_VERSION` 从 TypeScript 源码里读出来比。
 - 线上：`RemoteSessionStore`、`RemoteExecutor` 对着真的 `ctx-remote`；TypeScript 的 `createRemoteHarness` 经 `ctx-pydantic-ai serve` 跑一轮、日志写进 `ctx-remote`，`ask` 停下后用 TypeScript 的 `runPendingTools` 执行、再接着跑完；`ctx-conformance` 跑一致性测试。
 
 后两种要 node 22.18 以上和仓库根的 `pnpm install`（读各包的 `src/`，不用构建），没有就跳过；`CTX_TEST_PYDANTIC_AI=required` 时不跳、直接失败，CI 这样跑。

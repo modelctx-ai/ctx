@@ -18,6 +18,7 @@ import { eraseEntries, isErased, type Erasure } from './erase.ts';
 import {
   CTX_EVENTS,
   assistantEntry,
+  ctxEventData,
   erasedEntry,
   eventEntry,
   filterEntries,
@@ -25,10 +26,10 @@ import {
   headSeq,
   isConflict,
   messageEntry,
+  runIdOf,
   summaryEntry,
   userEntry,
   type Entry,
-  type ErasedData,
   type NewEntry,
   type SessionStore,
 } from './session.ts';
@@ -93,10 +94,10 @@ function batch(tag: string): NewEntry[] {
   return [1, 2, 3, 4].map((n) => userEntry(`${tag}${n}`));
 }
 
-/** 会话里的擦除记录（`ctx.erased`）的 `data`，按写入顺序。 */
-async function erasures(store: SessionStore, session: string): Promise<ErasedData[]> {
+/** 会话里的擦除记录（`ctx.erased`）的 `data`，原样，按写入顺序。 */
+async function erasures(store: SessionStore, session: string): Promise<(JsonValue | undefined)[]> {
   const records = await store.list(session, { kinds: [CTX_EVENTS.erased] });
-  return records.flatMap((entry) => (entry.type === 'event' ? [entry.data as unknown as ErasedData] : []));
+  return records.flatMap((entry) => (entry.type === 'event' ? [entry.data] : []));
 }
 
 /** 去掉擦除记录之后的条目：只看应用自己写的。 */
@@ -982,8 +983,8 @@ export function describeSessionStoreContract(
         assert.equal(await erase(), 1);
         await assert.rejects(store.append('s', [userEntry('旧前提')], { expectSeq: head }), isConflict);
         const [record] = await store.list('s', { after: head, kinds: [CTX_EVENTS.erased] });
-        assert.ok(record?.type === 'event', '重读就看得到擦除记录');
-        const data = record.data as unknown as ErasedData;
+        const data = ctxEventData(record, CTX_EVENTS.erased);
+        assert.ok(data, '重读就看得到擦除记录');
         assert.deepEqual(
           written.map((entry) => entry.seq).filter((seq) => isErased(data, seq)),
           touched,
@@ -2136,9 +2137,7 @@ export function describeOrchestratorContract(
         await Promise.all(handles.map((handle) => handle.done));
         const order = (await store.list('s')).flatMap((entry) =>
           entry.type === 'event' && (entry.kind === CTX_EVENTS.runStarted || entry.kind === CTX_EVENTS.runEnded)
-            ? [
-                `${entry.kind === CTX_EVENTS.runStarted ? 'start' : 'end'}:${(entry.data as JsonObject)['runId'] as string}`,
-              ]
+            ? [`${entry.kind === CTX_EVENTS.runStarted ? 'start' : 'end'}:${runIdOf(entry)}`]
             : [],
         );
         assert.deepEqual(
