@@ -121,9 +121,9 @@ Trusted publishing 只能给已经存在的包配置，所以第一次要先把�
 
 已经有的（2026-11-15）：
 
-- 十个包的 `publishConfig`（`access: public`、`provenance: true`）、`files: ["dist"]`、`workspace:^`。
-- `scripts/release.mjs`：`version <版本>` 把十个包改成同一个版本，正式版本顺带把 `CHANGELOG.md` 的「未发布」落成 `## <版本> - <日期>`；`check <tag>` 核对 tag 和各包版本、正式版本在 `CHANGELOG.md` 里有一节，给出 dist-tag。
-- `scripts/pack-smoke.mjs`（`pnpm smoke`）：每个包 `pnpm pack`，查包里的内容（有 `dist/`、`README.md`、`LICENSE`，没有 `src/` 和测试，没有残留的 `workspace:`，`exports` 指的文件都在），在干净目录里用 npm 一次装上十个 tarball，不打开源码条件用 `tsc`（`skipLibCheck: false`）把每个入口的类型解析一遍，再把每个入口 `import` 一遍、内存存储和 SQLite 存储各写读一次。
+- `packages/*` 下每个包的 `publishConfig`（`access: public`、`provenance: true`）、`files: ["dist"]`、`workspace:^`。
+- `scripts/release.mjs`：`version <版本>` 把 `packages/*` 下的包改成同一个版本，正式版本顺带把 `CHANGELOG.md` 的「未发布」落成 `## <版本> - <日期>`，并改 `python/pydantic-ai` 的 `pyproject.toml` 和 `uv.lock`；`check <tag>` 核对 tag 和各包版本、正式版本在 `CHANGELOG.md` 里有一节，给出 dist-tag。
+- `scripts/pack-smoke.mjs`（`pnpm smoke`）：每个包 `pnpm pack`，查包里的内容（有 `dist/`、`README.md`、`LICENSE`，没有 `src/` 和测试，没有残留的 `workspace:`，`exports` 指的文件都在），在干净目录里用 npm 一次装上所有 tarball，不打开源码条件用 `tsc`（`skipLibCheck: false`）把每个入口的类型解析一遍，再把每个入口 `import` 一遍、内存存储和 SQLite 存储各写读一次。
 - CI 的 `Pack smoke` 任务：上面的检查每个 PR 都跑；`import` 那一步另在 Node 22.0.0、22.13.0 上跑，按各包自己的 `engines.node` 决定跑哪些，`engines` 写低了这里会失败。
 - `.github/workflows/release.yml`：tag `v<版本>` 触发，`check`、`pnpm check`、冒烟检查都过了才 `pnpm -r publish`。正式版本的 tag 必须在 `main` 上，发到 `latest`；带 `-` 的预发布版本（`v0.4.0-next.0`）发到 `next`，给下游先试。
 - `release.yml` 的 `python`、`pypi` 两个作业（2026-11-18）：跑 Python 的测试、`uv build`，在干净的环境里装上 wheel、`import`、起命令行，`twine check --strict`；正式版本再用 PyPI 的 trusted publishing 发 `ctx-pydantic-ai`（`pypa/gh-action-pypi-publish`，带 attestations，已经发过的跳过）。发布的作业在 `pypi` 环境里，只有 `id-token: write`，不检出代码，只发上一个作业打的包。预发布的 tag 只打包、检查，不发。
