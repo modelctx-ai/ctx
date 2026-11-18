@@ -1,17 +1,17 @@
 ---
 type: Decision Record
 title: 'ADR 0010：外部 harness 的适配：轨迹实时落日志、工具经 MCP 回到 ctx、会话一对一'
-description: '自带循环的程序（Claude Code）作为 harness 接进 ctx：流式输出实时写进会话日志，ctx 的执行环境经 MCP 交给它，`ctx.run.started` 记它的身份和会话，失败重试退回到失败之前，映射不了的配置以 `invalid_request` 结束，它压缩自己的上下文时不写 `summary`'
-tags: [adr, harness, adapter, claude-code, mcp]
+description: '自带循环的程序（Claude Code、pi）作为 harness 接进 ctx：流式输出实时写进会话日志，ctx 的执行环境经 MCP 交给它，`ctx.run.started` 记它的身份和会话，失败重试退回到失败之前，映射不了的配置以 `invalid_request` 结束，它压缩自己的上下文时不写 `summary`'
+tags: [adr, harness, adapter, claude-code, pi, mcp]
 status: stable
 ---
 
 # ADR 0010：外部 harness 的适配：轨迹实时落日志、工具经 MCP 回到 ctx、会话一对一
 
 - 状态：已采纳
-- 实施状态：Claude Code、pydantic-ai（Python）已实施，未发布
+- 实施状态：Claude Code、pydantic-ai（Python）、pi 已实施，未发布
 - 日期：2026-11-17
-- 范围：`ctx-protocol`（`RunStartedData.harness`、`HarnessInfo`、`isContextOverflowText`）、`ctx-mcp`（`createMcpServer` 的 `maxOutputChars`）、新包 `ctx-claude-code`、Python 的 `ctx-pydantic-ai`（`python/pydantic-ai`）
+- 范围：`ctx-protocol`（`RunStartedData.harness`、`HarnessInfo`、`isContextOverflowText`）、`ctx-mcp`（`createMcpServer` 的 `maxOutputChars`）、新包 `ctx-claude-code`、`ctx-pi`、Python 的 `ctx-pydantic-ai`（`python/pydantic-ai`）
 - 依据：issue #23
 
 ## 背景
@@ -62,7 +62,8 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - `ctx-mcp`：`createMcpServer` 的 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`），`onResult` 收到截过的结果。
 - `ctx-claude-code`：`createClaudeCodeHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 Claude Code 2.1.326 验证过，模型是本机的假接口；对真实的 Anthropic 接口没有验证。Claude Code 起的子代理写进子会话（2026-11-18，对 2.1.326 和 2.1.327 核实过）。
 - `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`context`、`output` 五级（`context` 一级 2026-11-18 起）；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。`ask` 权限和外部执行环境（`external`）以 `requires_action` 结束，`window`、`context` 照参考实现的 builder 移植（都是 2026-11-18）。
-- 没做：pydantic-ai 的压缩（`context.overflow` 的 `compact` 只裁）、事件规则和别的投影、事实来源。
+- `ctx-pi`：`createPiHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 pi 1.5.2 验证过（2026-11-18），模型是本机的假 Anthropic 接口；对真实的模型服务没有验证。CI 装同一个版本跑。
+- 没做：pydantic-ai 的压缩（`context.overflow` 的 `compact` 只裁）、事件规则和别的投影、事实来源；pi 的扩展加进上下文的消息（`custom_message`）和插话（`steer`、`follow_up`）不进日志。
 
 ## 决定记录
 
@@ -80,3 +81,11 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
   - 决定四：子运行的 `harness` 不带 `session`：子代理的记录挂在父会话下面，不能单独续接。
 - 2026-11-18：pydantic-ai 的 `ask` 权限和外部执行环境（`external`）实施，决定七里列着的「`ask` 权限」不再以 `invalid_request` 结束。交给别处执行的工具在 pydantic-ai 里抛 `CallDeferred`（输出类型里加 `DeferredToolRequests`），pydantic-ai 走完那一步就停下，这一轮以 `requires_action` 结束，`pending` 和参考实现一样；执行方追加结果用的 `tool_result_entry`、`pending_tool_calls` 移植到 Python，测试和 TypeScript 的比。核对时发现参考实现把绑到外部执行环境、权限是 `deny` 的工具也当成等别处执行，和协议说的「`deny` 的不执行」不符，一起改成 `deny` 优先。
 - 2026-11-18：pydantic-ai 的 `window`、`context` 实施，2026-11-17 那条里决定八的「还不裁窗口」不再成立。窗口、超窗兜底和继承父会话照参考实现的 builder 移植：`maxTokens` 是整次调用的预算，先扣掉指令、工具定义和不进日志的输入，按上一轮第一步的实际用量校准；token 的估算、截短和投影一起移植，测试对同一组输入和 TypeScript 的结果比。`context` 一级经 `ctx-conformance` 过了。还是不压缩：适配器没有写摘要用的模型，`compact` 和 builder 没有压缩时一样直接裁；`projection` 只认 `default`。
+- 2026-11-18：pi 的适配器实施（`ctx-pi`，对 pi 1.5.2 核实过）：第二个进程级的 harness，验证决定二到决定八不只是 Claude Code 一家的形状。pi 的 RPC 模式（`pi --mode rpc`）在 stdin、stdout 上收发一行一条的 JSON 命令和事件；`-e` 加载的扩展能注册 MCP 服务器、在执行前改写或拦下工具调用、在一步结束时叫停、注册命令。和 Claude Code 不一样的地方，决定正文不变：
+  - 决定三：MCP 服务器不经命令行给，由这一轮的扩展用 `registerMcpServer` 交给 pi 内置的 MCP 扩展，`--tools` 只列这一轮交出去的工具。pi 的 `mcp.json` 里有同名的服务器时它优先，调用会落到别处：适配器看模型第一次回答之前 MCP 服务器有没有收到带令牌的请求，没有就以 `error` 结束。
+  - 决定三：pi 执行工具之前把参数照 schema 转一遍（数字当字符串、可选属性的 `null` 当没给），不合 schema 的输入就查不出来了。扩展在 `message_end` 记下模型给的原样，`tool_call` 时把 ctx 的工具的参数换回去，输入检查还在 ctx 的 MCP 服务器里做，日志里记的调用就是执行的那一个。`deny` 的工具照样交出去、调用时回拒绝（同参考实现），扩展和 MCP 服务器两边都拦。
+  - 决定四、五：位置是 pi 会话里条目的 id（`meta.pi` 的 `resumeAt`、`last`），续接用 `--session-id`。退回不靠命令行参数：扩展注册一个名字随机的命令，`navigateTree` 到失败那一轮开始的位置，不写摘要；记录文件里分出一支，原来的不改。
+  - 决定六：pi 没有步数的上限。`maxSteps` 和 `budget` 由扩展在调了工具的一步结束时（`turn_end`）叫停（`ctx.abort()`），pi 不再调模型；停止原因由适配器按步数和用量定成 `max_steps`、`max_budget`，不是 `aborted`。扩展要人回答的对话框一律回取消：整轮没有人在场。
+  - 决定七：pi 没有结构化输出，`output` 的 schema 写进系统提示，最后的回答按 schema 查，不合的以 `invalid_output` 结束。`settings.maxRetries` 只认 `0`（关掉 pi 的自动重试）：重试几次是 pi 自己的设置，RPC 里改不了。
+  - 决定八：pi 压缩自己的上下文时记 `pi.compacted`，摘要放在这条事件的 `text` 里：pi 不把摘要当成一条消息交出来，不另记程序补的消息。
+  - `record: false`：新会话不存（`--no-session`），接着跑的在一份副本上跑（`--fork`），跑完删掉副本，pi 的会话不变。

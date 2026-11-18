@@ -9,6 +9,7 @@
     "@modelctx-ai/ctx-mcp": "workspace:^",
     "@modelctx-ai/ctx-memory": "workspace:^",
     "@modelctx-ai/ctx-models": "workspace:^",
+    "@modelctx-ai/ctx-pi": "workspace:^",
     "@modelctx-ai/ctx-protocol": "workspace:^",
     "@modelctx-ai/ctx-remote": "workspace:^",
     "@modelctx-ai/ctx-sqlite": "workspace:^",

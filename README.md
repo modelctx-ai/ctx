@@ -78,6 +78,7 @@ sequenceDiagram
 |      | [`@modelctx-ai/ctx-gateway`](packages/gateway)          | 本机 OpenAI 兼容网关，把客户端带来的历史换成 ctx 的上下文        |
 |      | [`@modelctx-ai/ctx-otel`](packages/otel)                | 从会话日志派生 OpenTelemetry 的 span                             |
 |      | [`@modelctx-ai/ctx-claude-code`](packages/claude-code)  | 把 Claude Code 接成 harness：轨迹实时进日志，工具经 MCP 回到 ctx |
+|      | [`@modelctx-ai/ctx-pi`](packages/pi)                    | 把 pi 接成 harness：轨迹实时进日志，工具经 MCP 回到 ctx          |
 |      | [`ctx-pydantic-ai`](python/pydantic-ai)（Python）       | 把 pydantic-ai 的 `Agent` 接成 harness，经线上协议对外           |
 | 实践 | [modelctx-ai/yoyo](https://github.com/modelctx-ai/yoyo) | 用这些包组合出来的常驻桌宠导演，见[实践：yoyo](docs/repos.md)    |
 
@@ -98,6 +99,7 @@ overrides:
   '@modelctx-ai/ctx-memory': link:../ctx/packages/memory
   '@modelctx-ai/ctx-models': link:../ctx/packages/models
   '@modelctx-ai/ctx-otel': link:../ctx/packages/otel
+  '@modelctx-ai/ctx-pi': link:../ctx/packages/pi
   '@modelctx-ai/ctx-protocol': link:../ctx/packages/protocol
   '@modelctx-ai/ctx-remote': link:../ctx/packages/remote
   '@modelctx-ai/ctx-sqlite': link:../ctx/packages/sqlite

@@ -44,6 +44,9 @@ importers:
       '@modelctx-ai/ctx-models':
         specifier: workspace:^
         version: link:../packages/models
+      '@modelctx-ai/ctx-pi':
+        specifier: workspace:^
+        version: link:../packages/pi
       '@modelctx-ai/ctx-protocol':
         specifier: workspace:^
         version: link:../packages/protocol
@@ -197,6 +200,18 @@ importers:
       '@opentelemetry/sdk-trace-base':
         specifier: ^2.0.0
         version: 2.12.0(@opentelemetry/api@1.9.1)
+
+  packages/pi:
+    devDependencies:
+      '@modelctx-ai/ctx':
+        specifier: workspace:^
+        version: link:../core
+      '@modelctx-ai/ctx-mcp':
+        specifier: workspace:^
+        version: link:../mcp
+      '@modelctx-ai/ctx-protocol':
+        specifier: workspace:^
+        version: link:../protocol
 
   packages/protocol:
     devDependencies:

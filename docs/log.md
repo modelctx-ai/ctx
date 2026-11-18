@@ -4,6 +4,12 @@
 
 ## 2026-11-18
 
+- **新增** [`@modelctx-ai/ctx-pi`](../packages/pi/README.md) 的 README：用法、怎么对上（七个问题加输入检查、`record: false`、对话框各一行，加一轮日志的样子）、`AgentSpec` 和 `stopReason` 的映射表、选项、一致性等级和还没做的、验证过的版本、导出。
+- **更新** [ADR 0010](adr/0010-external-harness-adapters.md)：描述、标签、实施状态和范围加 pi，决定记录补一条，写它和 Claude Code 不一样的地方（MCP 服务器经扩展给、参数换回原样再查、步数和预算由扩展叫停、退回用 `navigateTree`、结构化输出写进提示）各对着哪条决定。[ADR 索引](adr/index.md)的描述跟着改。
+- **更新** [ADR 0002](adr/0002-packages.md)：拆分表和依赖关系表加第十二个包，「实现包之间不互相依赖」的例外加上 `ctx-pi`，决定记录补一条，写为什么不和 `ctx-claude-code` 合成一个包。
+- **更新** [架构](architecture.md)：Harness 一节加「外部 harness：pi」，写一轮的七步和取消；工具与 MCP 一节、实现约束跟着加 pi。[概念](concepts.md)的术语表、[协议层](protocol.md)和[英文译本](en/protocol.md)的「外部 harness 的身份」加 pi。
+- **更新** [README](../README.md) 和[英文版](../README.en.md)：包表和 `overrides` 加 `ctx-pi`。[文档索引](index.md)的「包」、[实践：yoyo](repos.md)的包数跟着改。[ctx-mcp](../packages/mcp/README.md)：pi 1.5.2 作为真实的客户端验证过。[例子](../examples/README.md)：加 `pi.ts`。[AGENTS.md](../AGENTS.md)：`release:version` 改的包数。
+
 - **更新** [ADR 0002](adr/0002-packages.md)：实施状态加发 PyPI 的两个作业和维护者要在 PyPI 上配的 pending publisher，决定记录补一条：只发正式版本、打包和发布分开、不等 npm。[`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：安装写 `pip install ctx-pydantic-ai`，「还没做的」去掉不在 PyPI 上。[AGENTS.md](../AGENTS.md)：发布一条写上 PyPI。
 - **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：「怎么对上」的上下文一行和 `AgentSpec` 的 `window`、`context` 两行写怎么裁、超窗怎么办；一致性等级改成全部五级，「还没做的」只剩压缩、事件规则和别的投影、事实来源。
 - **更新** [架构](architecture.md)：「外部 harness：pydantic-ai」的第三步写窗口、继承父会话和超窗兜底。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态加 `context` 一级，「没做」换成压缩，决定记录补一条。

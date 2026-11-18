@@ -19,7 +19,7 @@
 | `pnpm live`                                   | `live/smoke.ts`：对配了密钥的真实服务跑冒烟场景，没配的跳过；`--record` 把真实响应录成 `live/fixtures/` 里的夹具。要先 `pnpm build`，要联网。不进 PR 的 CI，`live.yml` 每晚跑；录下的夹具由 `pnpm test` 重放                                                    |
 | `pnpm smoke`                                  | `scripts/pack-smoke.mjs`：`pnpm pack` 的产物在干净目录里装上、类型解析、每个入口 `import` 一遍；要先 `pnpm build`，要联网                                                                                                                                       |
 | `uv run pytest`（在 `python/pydantic-ai` 里） | Python 的 pydantic-ai 适配器的测试；对照 TypeScript 的、对着 `ctx-remote` 跑的和一致性测试要 node 和仓库根的 `pnpm install`（读 `src/`，不用构建），没有就跳过，`CTX_TEST_PYDANTIC_AI=required` 时失败。lint 和格式是 `uv run ruff check`、`uv run ruff format` |
-| `pnpm release:version <版本>`                 | `scripts/release.mjs`：十一个包改成同一个版本，正式版本连 Python 的适配器一起改，并把 CHANGELOG 的「未发布」落成这一版                                                                                                                                          |
+| `pnpm release:version <版本>`                 | `scripts/release.mjs`：十二个包改成同一个版本，正式版本连 Python 的适配器一起改，并把 CHANGELOG 的「未发布」落成这一版                                                                                                                                          |
 
 仓库里各包互相引用时按源码解析（`@modelctx-ai/source` 条件，见 [ADR 0002](docs/adr/0002-packages.md)），类型检查和测试不用先构建。使用方的 Node 版本和 peer dependency 写在各包 README 的「安装」里。
 

@@ -5,6 +5,7 @@ import { describe, test } from 'vite-plus/test';
 import { claudeCodeInstalled, main as claudeCode } from './claude-code.ts';
 import { main as memory } from './memory.ts';
 import { main as moveSession } from './move-session.ts';
+import { main as pi, piInstalled } from './pi.ts';
 import { main as pydanticAI, uvInstalled } from './pydantic-ai.ts';
 import { main as remoteSplit } from './remote-split.ts';
 import { main as singleProcess } from './single-process.ts';
@@ -17,6 +18,12 @@ function quiet(): void {}
 const hasClaudeCode = claudeCodeInstalled();
 if (!hasClaudeCode && process.env['CTX_TEST_CLAUDE_CODE'] === 'required') {
   throw new Error('CTX_TEST_CLAUDE_CODE=required but Claude Code is not installed.');
+}
+
+// pi.ts 要装 pi：没装就跳过，`CTX_TEST_PI=required`（CI 的 pi 作业）时没装就失败。
+const hasPi = piInstalled();
+if (!hasPi && process.env['CTX_TEST_PI'] === 'required') {
+  throw new Error('CTX_TEST_PI=required but pi is not installed.');
 }
 
 // pydantic-ai.ts 要装 uv：没装就跳过，`CTX_TEST_PYDANTIC_AI=required`（CI 的 pydantic-ai 作业）时没装就失败。
@@ -63,6 +70,21 @@ describe('examples', () => {
     { timeout: 120_000 },
     async () => {
       const result = await claudeCode(quiet);
+      assert.ok(result);
+      assert.match(result.answers[0]!, /带把伞/);
+      assert.match(result.answers[1]!, /不用带伞/);
+      assert.equal(result.sessions.length, 2);
+      assert.ok(result.sessions[0]);
+      assert.equal(result.sessions[1], result.sessions[0]);
+      assert.deepEqual(result.toolSources, ['local', 'local']);
+    },
+  );
+
+  test.skipIf(!hasPi)(
+    'pi：pi 跑循环，ctx 的工具经 MCP 回到 ctx，第二轮续接它自己的会话',
+    { timeout: 120_000 },
+    async () => {
+      const result = await pi(quiet);
       assert.ok(result);
       assert.match(result.answers[0]!, /带把伞/);
       assert.match(result.answers[1]!, /不用带伞/);

@@ -662,7 +662,7 @@ interface Harness {
   - `context`：用 `ContextBuilder` 组装上下文（`agent.context` 的投影名和事实、`context.overflow`）。自己管上下文的 harness 不跑这一项。
   - `output`：`AgentSpec.output` 的结构化输出和 `version`。
     参考实现全过；`ctx-conformance --harness-levels` 对一个地址按等级跑。
-- **外部 harness 的身份。** 适配器在 `ctx.run.started` 写 `harness`（`HarnessInfo`）：`name`（`claude-code`、`pydantic-ai`）、`version`、它自己的会话 `session`。自己存对话的程序把 ctx 的一个会话对到它的一个会话上，下一轮从最近一次记下的 `session` 接着跑；它记录里的位置这类只有适配器用的东西放条目的 `meta`。不存对话的框架每一轮从 ctx 的日志投影历史，不写 `session`。参考实现不写。已有的适配器：`ctx-claude-code`（TypeScript）和 `ctx-pydantic-ai`（Python，经线上协议对外），都过 `trace`、`execute`、`resume`、`output`，做法和取舍见 [ADR 0010](adr/0010-external-harness-adapters.md)。
+- **外部 harness 的身份。** 适配器在 `ctx.run.started` 写 `harness`（`HarnessInfo`）：`name`（`claude-code`、`pi`、`pydantic-ai`）、`version`、它自己的会话 `session`。自己存对话的程序把 ctx 的一个会话对到它的一个会话上，下一轮从最近一次记下的 `session` 接着跑；它记录里的位置这类只有适配器用的东西放条目的 `meta`。不存对话的框架每一轮从 ctx 的日志投影历史，不写 `session`。参考实现不写。已有的适配器：`ctx-claude-code`、`ctx-pi`（TypeScript）和 `ctx-pydantic-ai`（Python，经线上协议对外），都过 `trace`、`execute`、`resume`、`output`，做法和取舍见 [ADR 0010](adr/0010-external-harness-adapters.md)。
 - `Hooks` 是 harness 实现的构造参数，不在 `RunRequest` 里：它们是函数，不能跨边界。
 - 权限确认是 `beforeTool` 的一种实现：返回 `{ allow: false }` 时工具结果是一条错误，模型会看到原因，这一轮继续。
 - 参考实现基于 AI SDK 的 `generateText` / `streamText`：把选中的 `ToolDefinition` 包成 AI SDK 工具，`execute` 转给执行环境。
