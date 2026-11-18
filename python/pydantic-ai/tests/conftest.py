@@ -85,7 +85,7 @@ def ts(node: str) -> Evaluate:
     return evaluate
 
 
-def _ts_command(node: str, command: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _ts_command(node: str, command: str, payload: Any) -> Any:
     done = subprocess.run(
         [node, SOURCE_CONDITION, str(HELPER), command],
         input=json.dumps(payload, ensure_ascii=False),
@@ -110,6 +110,11 @@ def ts_run(node: str, payload: dict[str, Any]) -> dict[str, Any]:
 def ts_pending(node: str, payload: dict[str, Any]) -> dict[str, Any]:
     """用 TypeScript 的 ``runPendingTools`` 执行等着的调用、追加结果（见 ``ctx_ts.mjs pending``）。"""
     return _ts_command(node, 'pending', payload)
+
+
+def ts_compact(node: str, cases: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """用 TypeScript 的 builder 把每一组条目压一次（见 ``ctx_ts.mjs compact``）。"""
+    return _ts_command(node, 'compact', list(cases))
 
 
 class Process:

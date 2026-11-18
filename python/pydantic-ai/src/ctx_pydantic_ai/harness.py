@@ -9,9 +9,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,6 +31,7 @@ from pydantic_ai import (
     ToolFailed,
     ToolOutput,
 )
+from pydantic_ai.direct import model_request
 from pydantic_ai.exceptions import (
     ModelAPIError,
     ModelContextWindowExceededError,
@@ -40,6 +42,7 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    ModelRequest,
     ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
@@ -50,10 +53,13 @@ from pydantic_ai.messages import (
     ThinkingPart,
     ThinkingPartDelta,
     ToolReturnPart,
+    UserPromptPart,
 )
 from pydantic_ai.models import Model, infer_model
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 
+from .compact import Summarize, compact_session
 from .context import (
     calibration_of,
     estimate_text_tokens,
@@ -107,6 +113,8 @@ RETRY_EVENT = 'pydantic-ai.retry'
 OUTPUT_TOOL = 'final_result'
 #: 工具调用没等到结果这一轮就结束了：补给它的错误结果（和参考实现的说法一样）。
 INTERRUPTED = 'The run ended before this tool call returned; its result is unknown.'
+
+_log = logging.getLogger(__name__)
 
 #: 认重试、找上一轮时最多往回读这么多条。
 _SCAN = 64
@@ -228,6 +236,18 @@ def _window_problem(window: Any) -> str | None:
     return None
 
 
+def _compact_problem(options: Any) -> str | None:
+    """``AgentSpec.context.overflow.compact``：``OverflowCompactSpec`` 的几项，类型不对就当请求不对。"""
+    if not isinstance(options, dict):
+        return 'AgentSpec.context.overflow.compact must be an object.'
+    for key in ('keep', 'minimum', 'maxInputTokens', 'maxOutputTokens', 'timeoutMs'):
+        if options.get(key) is not None and not _number(options[key]):
+            return f'AgentSpec.context.overflow.compact.{key} must be a number.'
+    if options.get('instructions') is not None and not isinstance(options['instructions'], str):
+        return 'AgentSpec.context.overflow.compact.instructions must be a string.'
+    return None
+
+
 def _context_problem(context: Any) -> str | None:
     # 说法同参考实现（`fit`、`checkLineage`）：配置可能是线上来的 JSON，不对就当请求不对，不猜。
     if not isinstance(context, dict):
@@ -244,6 +264,10 @@ def _context_problem(context: Any) -> str | None:
             return 'AgentSpec.context.overflow.maxTokens must be a positive number.'
         if overflow.get('strategy') is not None and overflow['strategy'] not in ('compact', 'trim', 'error'):
             return 'AgentSpec.context.overflow.strategy must be "compact", "trim" or "error".'
+        if overflow.get('compact') is not None:
+            problem = _compact_problem(overflow['compact'])
+            if problem is not None:
+                return problem
     inherit = context.get('inherit')
     if inherit is not None:
         session = inherit.get('session') if isinstance(inherit, dict) else None
@@ -358,6 +382,49 @@ def error_info_of(error: BaseException) -> dict[str, Any]:
     return {'message': message, 'type': 'pydantic_ai'}
 
 
+async def _until_aborted(request: Awaitable[ModelResponse], signal: AbortSignal | None) -> ModelResponse:
+    """等一次模型调用；``signal`` 取消了就取消它，抛 ``CtxError('aborted')``。"""
+    if signal is None:
+        return await request
+    task = asyncio.ensure_future(request)
+    remove = signal.add_listener(task.cancel)
+    try:
+        return await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if signal.aborted and (current is None or current.cancelling() == 0):
+            raise CtxError('aborted', 'The run was aborted while compacting.') from None
+        raise
+    finally:
+        remove()
+
+
+def _summarizer(model: Model, signal: AbortSignal | None) -> Summarize:
+    """摘要模型的一次调用：``model_request``（不经 ``Agent``，没有工具），温度 0，输出上限是 ``max_tokens``，还剩的时间是
+    ``request_timeout``。上下文过长（认法同模型调用的错误）换成 ``CtxError('context_overflow')``。"""
+
+    async def summarize(
+        instructions: str, prompt: str, max_output_tokens: int, timeout_ms: float | None
+    ) -> tuple[str, str | None]:
+        settings: ModelSettings = {'temperature': 0, 'max_tokens': max_output_tokens}
+        if timeout_ms is not None:
+            settings['request_timeout'] = timeout_ms / 1000
+        request = ModelRequest(parts=[UserPromptPart(prompt)], instructions=instructions)
+        try:
+            response = await _until_aborted(model_request(model, [request], model_settings=settings), signal)
+        except CtxError:
+            raise
+        except Exception as error:
+            info = error_info_of(error)
+            if info['type'] == 'context_overflow':
+                raise CtxError('context_overflow', info['message'], retryable=False) from error
+            raise
+        text = ''.join(part.content for part in response.parts if isinstance(part, TextPart))
+        return text, response.finish_reason
+
+    return summarize
+
+
 class PydanticAIHarness:
     """协议的 ``Harness``：``run`` 返回 ``RunResult``，``stream`` 给出 ``RunEvent``（都是线上形状的 ``dict``）。
 
@@ -370,6 +437,7 @@ class PydanticAIHarness:
     - ``external``：在别处执行的执行环境的名字。绑定到它们的工具交给模型，但不在这里执行：模型调用了它们，这一轮写下调用后
       以 ``requires_action`` 结束（``pending`` 列出这些调用），执行方把结果追加进日志（``tool_result_entry``），下一轮不带输入
       接着跑。``permissions`` 是 ``ask`` 的工具也这样，应用确认了再让执行方执行。它们的工具定义要在 ``tools`` 里。
+    - ``summary_model``：超窗兜底压缩时写摘要的模型，名字（按 ``models`` 找）或 pydantic-ai 的模型；不给就用这一轮的模型。
     """
 
     def __init__(
@@ -382,6 +450,7 @@ class PydanticAIHarness:
         max_tool_output_chars: int = DEFAULT_MAX_TOOL_OUTPUT_CHARS,
         source: str | None = None,
         external: Sequence[str] = (),
+        summary_model: Model | str | None = None,
     ) -> None:
         self._store = store
         self._executors: dict[str, Executor] = (
@@ -392,6 +461,7 @@ class PydanticAIHarness:
         self._max_output = max_tool_output_chars
         self._source = source
         self._external = frozenset(external)
+        self._summary_model = summary_model
         self._tails: dict[str, asyncio.Future[None]] = {}
 
     # ---- 对外 ----
@@ -655,9 +725,12 @@ class PydanticAIHarness:
         try:
             prepared = await self._prepare(state, spec, definitions, extra, spec.get('window'))
             if context.get('overflow') is not None:
-                prepared = await self._fit(state, spec, definitions, extra, context['overflow'], prepared)
+                prepared = await self._fit(state, spec, definitions, extra, context['overflow'], prepared, model)
         except CtxError as error:
             return await self._end(state, 'error', error=error.info())
+        # 压缩要调模型，可能等了一阵：这时取消了就不再调这一轮的模型。
+        if signal is not None and signal.aborted:
+            return await self._end(state, 'aborted')
         history = to_model_messages(prepared.messages)
         prompt = _prompt_of(request.get('prompt')) if in_log else _prompt_of(content, request.get('prompt'))
         if prompt is None and (not history or isinstance(history[-1], ModelResponse)):
@@ -718,15 +791,27 @@ class PydanticAIHarness:
         extra: Json,
         overflow: Mapping[str, Any],
         prepared: _Prepared,
+        model: Model,
     ) -> _Prepared:
-        """超窗兜底（``AgentSpec.context.overflow``）：整次调用的估算超过 ``maxTokens`` 时，按 ``strategy`` 裁剪（带
-        ``truncate`` 重新组装），还超就以 ``context_overflow`` 结束、不调模型。这个适配器不写摘要：``compact`` 直接走到裁剪，
-        和参考实现里 builder 没有 ``compact`` 时一样。"""
+        """超窗兜底（``AgentSpec.context.overflow``），同参考实现的 ``fit``：整次调用的估算超过 ``maxTokens`` 时，``compact``
+        （缺省）先压缩，写下了摘要就重新组装；压完还超、压缩没做成，再裁剪（带 ``truncate`` 重新组装）。``trim`` 只裁剪，
+        ``error`` 什么都不做。还超就以 ``context_overflow`` 结束、不调模型。不写日志的运行（``record`` 是 false）不压缩：
+        压缩要追加摘要，而它一条都不该写。"""
         limit = overflow['maxTokens']
         strategy = overflow.get('strategy') or 'compact'
         if prepared.tokens <= limit:
             return prepared
-        if strategy != 'error':
+        if strategy == 'compact' and state.record:
+            written = False
+            try:
+                written = await self._compact(state, overflow.get('compact') or {}, model)
+            except Exception as error:  # noqa: BLE001 - 压缩没做成（摘要模型出错、超时）不拦这一轮：接着裁剪
+                if state.signal is not None and state.signal.aborted:
+                    return prepared
+                _log.warning('compaction failed while the context is over its limit; trimming instead: %s', error)
+            if written:
+                prepared = await self._prepare(state, spec, definitions, extra, spec.get('window'))
+        if strategy != 'error' and prepared.tokens > limit:
             window = dict(spec.get('window') or {})
             window['maxTokens'] = min(window['maxTokens'] if window.get('maxTokens') is not None else math.inf, limit)
             window['truncate'] = True
@@ -735,10 +820,26 @@ class PydanticAIHarness:
             raise CtxError(
                 'context_overflow',
                 f'The prepared call is estimated at {prepared.tokens} tokens, over the limit of {limit}'
-                + ('.' if strategy == 'error' else ' even after trimming.'),
+                + ('.' if strategy == 'error' else ' even after compaction and trimming.'),
                 retryable=False,
             )
         return prepared
+
+    async def _compact(self, state: _Run, options: Mapping[str, Any], model: Model) -> bool:
+        """压缩一次（``compact_session``），返回有没有写下摘要。摘要模型是 ``summary_model``，不给就用这一轮的模型。
+        ``keep`` 至少是 1：这一轮刚记下的输入不能进摘要，模型要原样看到它。"""
+        chosen = dict(options)
+        if chosen.get('keep') is not None:
+            chosen['keep'] = max(1, chosen['keep'])
+        chosen_model = self._summary_model
+        if chosen_model is None:
+            chosen_model = model
+        elif isinstance(chosen_model, str):
+            chosen_model = self._model(chosen_model)
+        summarize = _summarizer(chosen_model, state.signal)
+        session = str(state.request['session'])
+        result = await compact_session(self._store, session, summarize, chosen, signal=state.signal)
+        return 'summary' in result
 
     async def _catalog(self) -> list[dict[str, Any]]:
         if self._tools is not None:
