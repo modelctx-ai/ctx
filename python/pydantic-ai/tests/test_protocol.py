@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 import pytest
 
@@ -26,6 +27,9 @@ def test_constants_match_the_typescript_packages() -> None:
         == protocol.DEFAULT_MAX_TOOL_OUTPUT_CHARS
     )
     assert _ts_constant('packages/protocol/src/harness.ts', 'REDACTED_HEADER') == repr(protocol.REDACTED_HEADER)
+    assert _ts_constant('packages/protocol/src/harness.ts', 'TOOL_RESULT_KEY_PREFIX') == repr(
+        protocol.TOOL_RESULT_KEY_PREFIX
+    )
     assert _ts_constant('packages/core/src/harness.ts', 'INTERRUPTED_TOOL_RESULT') == repr(harness.INTERRUPTED)
     assert _ts_constant('packages/protocol/src/context.ts', 'MISSING_RESULT') == repr(messages.MISSING_RESULT)
     allowed = _ts_constant('packages/remote/src/server.ts', 'DEFAULT_ALLOWED_SETTINGS')
@@ -313,3 +317,71 @@ def test_list_filters_match_typescript(ts: Evaluate) -> None:
         for options in FILTERS
     ]
     assert actual == expected
+
+
+def _started(seq: int, run_id: Any) -> dict[str, Any]:
+    return {'seq': seq, 'type': 'event', 'kind': 'ctx.run.started', 'data': {'runId': run_id}}
+
+
+def _ended(seq: int, run_id: str, stop: str) -> dict[str, Any]:
+    return {'seq': seq, 'type': 'event', 'kind': 'ctx.run.ended', 'data': {'runId': run_id, 'stopReason': stop}}
+
+
+def _calls(seq: int, *ids: str, executed: bool = False) -> dict[str, Any]:
+    parts = [{'type': 'tool-call', 'id': call, 'name': 'lookup', 'input': {'id': call}} for call in ids]
+    if executed:
+        parts = [{**part, 'providerExecuted': True} for part in parts]
+    return {'seq': seq, 'type': 'message', 'message': {'role': 'assistant', 'content': parts}}
+
+
+def _result(seq: int, call: str) -> dict[str, Any]:
+    output = {'type': 'text', 'text': 'ok'}
+    part = {'type': 'tool-result', 'id': call, 'name': 'lookup', 'output': output}
+    return {'seq': seq, 'type': 'message', 'message': {'role': 'tool', 'content': [part]}}
+
+
+PENDING = {
+    '停下来等结果': [_started(1, 'r1'), _calls(2, 'c1', 'c2'), _ended(3, 'r1', 'requires_action')],
+    '结果追加了一个': [_started(1, 'r1'), _calls(2, 'c1', 'c2'), _ended(3, 'r1', 'requires_action'), _result(4, 'c2')],
+    '同一步里执行了的不算': [
+        _started(1, 'r1'),
+        _calls(2, 'c1', 'c2'),
+        _result(3, 'c1'),
+        _ended(4, 'r1', 'requires_action'),
+    ],
+    '服务商执行的不算': [_started(1, 'r1'), _calls(2, 'c1', executed=True), _ended(3, 'r1', 'requires_action')],
+    '别的结束方式作废': [
+        _started(1, 'r1'),
+        _calls(2, 'c1'),
+        _ended(3, 'r1', 'requires_action'),
+        _started(4, 'r2'),
+        _ended(5, 'r2', 'end_turn'),
+    ],
+    '下一轮还没结束': [_started(1, 'r1'), _calls(2, 'c1'), _ended(3, 'r1', 'requires_action'), _started(4, 'r2')],
+    'runId 对不上': [_started(1, 'r1'), _calls(2, 'c1'), _ended(3, 'r2', 'requires_action')],
+    '没有 runId 的事件和文字消息': [
+        _started(1, 'r1'),
+        _started(2, None),
+        {'seq': 3, 'type': 'message', 'message': {'role': 'user', 'content': 'hi'}},
+        {'seq': 4, 'type': 'event', 'kind': 'ctx.run.ended', 'data': 'r1'},
+        _calls(5, 'c1'),
+        _ended(6, 'r1', 'requires_action'),
+    ],
+    '轮外的调用不算': [_calls(1, 'c0'), _started(2, 'r1'), _ended(3, 'r1', 'requires_action')],
+}
+
+
+@pytest.mark.parametrize('name', list(PENDING))
+def test_pending_tool_calls_match_typescript(ts: Evaluate, name: str) -> None:
+    [expected] = ts([('pendingToolCalls', [PENDING[name]])])
+    assert protocol.pending_tool_calls(PENDING[name]) == expected
+
+
+def test_tool_result_entry_matches_typescript(ts: Evaluate) -> None:
+    call = {'id': 'c1', 'name': 'lookup', 'input': {'id': '42'}}
+    output = {'type': 'text', 'text': '订单 42 已发货'}
+    plain, sourced = ts(
+        [('toolResultEntry', [call, output]), ('toolResultEntry', [call, output, {'source': 'worker'}])]
+    )
+    assert protocol.tool_result_entry(call, output) == plain
+    assert protocol.tool_result_entry(call, output, source='worker') == sourced

@@ -5,7 +5,7 @@ description: 'English translation of the protocol layer: what the nine protocols
 tags: [protocol, specification, en]
 status: stable
 translation_of: ../protocol.md
-synced: 2026-11-17
+synced: 2026-11-18
 ---
 
 # Protocol layer
@@ -628,7 +628,7 @@ interface Harness {
   - `version`: the application's own version label, recorded as it is in `ctx.run.started`, so looking back you know which version a run used.
   - `output`: structured output. The final answer is generated against `schema` (with constrained decoding when the provider supports it), parsed, checked with `checkJsonSchema` and put in `RunResult.output`; when it is not JSON or does not match the schema the run ends in `error` with `error.type` `invalid_output` (`retryable: false`). It is parsed only on `end_turn`: a run that stopped at tool calls (`requires_action`, `max_steps`, `max_budget`) has no answer to parse.
   - `toolChoice`: `auto`, `none`, `required`, or `{ tool }` naming one; naming a tool not among this run's tools is `invalid_request`. Ignored when there are no tools.
-  - `permissions`: `allow`, `ask` or `deny` per tool name (`default` is `allow` by default; the pure function `toolPermission(permissions, name)` gives a tool's permission). A `deny` tool is not run, the model sees the refusal, and the run continues; an `ask` tool behaves like an externally executed tool: the call is written and the run stops with `requires_action`; once the application approves, it lets the executor run it and appends the result, and if not, it appends an error result (`toolResultEntry(call, errorOutput(...))`), then runs again without input. `Hooks.beforeTool` is called as usual after `allow`.
+  - `permissions`: `allow`, `ask` or `deny` per tool name (`default` is `allow` by default; the pure function `toolPermission(permissions, name)` gives a tool's permission). A `deny` tool is not run, the model sees the refusal, and the run continues, even when it is bound to an external executor (`deny` comes first); an `ask` tool behaves like an externally executed tool: the call is written and the run stops with `requires_action`; once the application approves, it lets the executor run it and appends the result, and if not, it appends an error result (`toolResultEntry(call, errorOutput(...))`), then runs again without input. `Hooks.beforeTool` is called as usual after `allow`.
   - `budget`: `maxTotalTokens` (the sum of every step's `totalTokens`, or input plus output when missing) and `maxDurationMs` (wall clock). Checked only between steps: once over, no further step is taken and `stopReason` is `max_budget`; a model call or tool in progress is not interrupted, so use `settings.timeoutMs` for a hard limit. Cost limits are not here: price lists are the application's business, computed from the usage in `meta.step`.
   - `environment`: the execution environment this agent needs, handed by the harness as it is to the executors' `open` (see "Executors" above). Recorded in `ctx.run.started`.
   - When these values are wrong (a budget that is not positive, a permission that is not one of the three, an `output.schema` that is not an object), the run ends in `invalid_request`. A harness that does not support one of them must not silently ignore it: it either ends in `invalid_request` or says so in its conformance level.

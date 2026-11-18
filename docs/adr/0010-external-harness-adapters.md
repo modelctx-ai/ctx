@@ -61,8 +61,8 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - 协议：`RunStartedData.harness`、`HarnessInfo`；`isContextOverflowText` 从核心包挪过来，核心包的 `isContextOverflowError` 改用它。
 - `ctx-mcp`：`createMcpServer` 的 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`），`onResult` 收到截过的结果。
 - `ctx-claude-code`：`createClaudeCodeHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 Claude Code 2.1.326 验证过，模型是本机的假接口；对真实的 Anthropic 接口没有验证。Claude Code 起的子代理写进子会话（2026-11-18，对 2.1.326 和 2.1.327 核实过）。
-- `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`output` 四级；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。
-- 没做：pydantic-ai 的 `ask` 权限、`window` 和 `context`。
+- `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`output` 四级；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。`ask` 权限和外部执行环境（`external`）以 `requires_action` 结束（2026-11-18）。
+- 没做：pydantic-ai 的 `window` 和 `context`。
 
 ## 决定记录
 
@@ -78,3 +78,4 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
   - 决定二：子代理在前台跑才有完整的轨迹，适配器给 Claude Code 设 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`。缺省时子代理在后台跑，`Task` 立刻返回「已启动」，这一轮先结束，子代理的轨迹落在这一轮之外。后台命令（`Bash` 的 `run_in_background`）一起关掉：一轮到 `result` 就结束进程，它们本来就活不过这一轮。
   - 决定二：子代理最后的回答不单独转出，只在那次调用的结果里（`tool_use_result.content`），适配器补成子会话里的一条助手消息；子代理再派的子代理里面的消息 Claude Code 不转出，那一层只记输入、回答和结束。
   - 决定四：子运行的 `harness` 不带 `session`：子代理的记录挂在父会话下面，不能单独续接。
+- 2026-11-18：pydantic-ai 的 `ask` 权限和外部执行环境（`external`）实施，决定七里列着的「`ask` 权限」不再以 `invalid_request` 结束。交给别处执行的工具在 pydantic-ai 里抛 `CallDeferred`（输出类型里加 `DeferredToolRequests`），pydantic-ai 走完那一步就停下，这一轮以 `requires_action` 结束，`pending` 和参考实现一样；执行方追加结果用的 `tool_result_entry`、`pending_tool_calls` 移植到 Python，测试和 TypeScript 的比。核对时发现参考实现把绑到外部执行环境、权限是 `deny` 的工具也当成等别处执行，和协议说的「`deny` 的不执行」不符，一起改成 `deny` 优先。

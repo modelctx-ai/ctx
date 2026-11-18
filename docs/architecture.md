@@ -492,7 +492,7 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
    每一步的助手消息带 `meta.step`（`StepMeta`）：工具执行前写下的那条取模型调用结束时的 `provider`、`modelId`（服务商响应里的）、`finishReason`、用量，步骤结束时写的取 `StepResult` 的同几项。用量的缓存和推理取 AI SDK 的 `inputTokenDetails.cacheReadTokens`、`cacheWriteTokens` 和 `outputTokenDetails.reasoningTokens`。
 7. `ctx.run.ended`（`stopReason`、`usage`）。中途出错或被取消时，写下了调用、没等到结果的工具调用先补一条错误结果（`The run ended before this tool call returned; its result is unknown.`），再写 `ctx.error` 和 `ctx.run.ended`；已经写下的步骤留着。
 
-`AgentSpec` 的几项交给 AI SDK：`output` 是 `Output.object({ schema: jsonSchema(...) })`，`toolChoice` 原样（`{ tool }` 换成 `{ type: 'tool', toolName }`），`budget` 是 `stopWhen` 里和 `stepCountIs` 并列的一个停止条件（记下是它让循环停的）。回答的解析不靠 AI SDK：`generateText` 自己解析失败时抛 `NoObjectGeneratedError`，`errorInfo` 把它映射成 `invalid_output`；流式时 harness 在结束时自己 `JSON.parse` 最后的文字、按 `checkJsonSchema` 校验，两条路的结果一样。`permissions` 在 `setup` 里用：`ask` 的工具和 `external` 的一样包成不带 `execute` 的，`deny` 的分发直接回一条错误，不进 `beforeTool`。
+`AgentSpec` 的几项交给 AI SDK：`output` 是 `Output.object({ schema: jsonSchema(...) })`，`toolChoice` 原样（`{ tool }` 换成 `{ type: 'tool', toolName }`），`budget` 是 `stopWhen` 里和 `stepCountIs` 并列的一个停止条件（记下是它让循环停的）。回答的解析不靠 AI SDK：`generateText` 自己解析失败时抛 `NoObjectGeneratedError`，`errorInfo` 把它映射成 `invalid_output`；流式时 harness 在结束时自己 `JSON.parse` 最后的文字、按 `checkJsonSchema` 校验，两条路的结果一样。`permissions` 在 `setup` 里用：`ask` 的工具和 `external` 的一样包成不带 `execute` 的，`deny` 的分发直接回一条错误，不进 `beforeTool`。`deny` 优先：绑到 `external` 的工具被拒绝时照样包成带 `execute` 的，在这一侧回拒绝。
 
 `stopReason`：模型自己停下是 `end_turn`；最后一步留下了外部执行（或等确认）的工具调用是 `requires_action`；`budget` 让循环停下是 `max_budget`；步数用完还想调工具是 `max_steps`；被 `maxOutputTokens` 截断是 `max_tokens`；`signal` 中止是 `aborted`；其他错误是 `error`，另记一条 `ctx.error`。出错和取消都照常返回 `RunResult` 并写 `ctx.run.ended`，只有写日志失败才 reject。`record: false` 一条都不写。
 
@@ -583,14 +583,14 @@ tools.add(tools.executor.definition('research')!);
 
 ### 外部 harness：pydantic-ai（Python）
 
-`PydanticAIHarness(store=, executors=, tools=, models=, max_tool_output_chars=, source=)`（[`python/pydantic-ai`](../python/pydantic-ai/README.md)，Python 包 `ctx-pydantic-ai`）把 pydantic-ai 的 `Agent` 接成协议的 `Harness`，`create_app` 把它挂成线上入口（`GET /protocol`、`POST /runs`、`DELETE /runs/:runId`），TypeScript 一侧用 `createRemoteHarness` 连（[ADR 0010](adr/0010-external-harness-adapters.md)）。日志和工具一般在 `ctx-remote` 里，`RemoteSessionStore`、`RemoteExecutor` 是线上协议的 Python 客户端。一轮：
+`PydanticAIHarness(store=, executors=, tools=, models=, max_tool_output_chars=, source=, external=)`（[`python/pydantic-ai`](../python/pydantic-ai/README.md)，Python 包 `ctx-pydantic-ai`）把 pydantic-ai 的 `Agent` 接成协议的 `Harness`，`create_app` 把它挂成线上入口（`GET /protocol`、`POST /runs`、`DELETE /runs/:runId`），TypeScript 一侧用 `createRemoteHarness` 连（[ADR 0010](adr/0010-external-harness-adapters.md)）。日志和工具一般在 `ctx-remote` 里，`RemoteSessionStore`、`RemoteExecutor` 是线上协议的 Python 客户端。一轮：
 
 1. 查忙、认重试、带 `expectSeq` 写 `ctx.run.started`（`harness: { name: 'pydantic-ai', version }`，不写 `session`）、记输入：和参考实现同一套规则，照着移植。
 2. 查 `AgentSpec`：映射不了的字段以 `invalid_request` 结束（`spec_problem`），按 `AgentSpec.tools` 从目录里挑工具，按名字找模型（`models`，没给就是 pydantic-ai 的 `infer_model`）。
 3. 读会话的消息和摘要，按协议包 `project` 的缺省规则投影，转成 `message_history`。输入已经在日志里时只把 `prompt` 交给 `Agent.iter`，否则交输入加 `prompt`。
-4. 每轮建一个 `Agent`：ctx 的工具各包成一个 `Tool.from_schema`，`args_validator` 先看权限、按 `inputSchema` 查，不过就 `ToolFailed`；函数体交给执行环境（第一次交给某个执行环境之前 `open`），结果按上限截断。结构化输出是名为 `final_result` 的 `ToolOutput(StructuredDict(schema))`；`settings` 映射成 `ModelSettings`，`timeoutMs` 给 `Agent.iter(timeout=)`，`signal` 接到 `CancellationToken`；`UsageLimits(request_limit=None)`，步数由适配器数。
-5. 一个节点一个节点地走。模型请求的节点：先把 pydantic-ai 补的话（`RetryFeedbackPart`）写成 `pydantic-ai.retry`，查步数和预算，再流式读出增量。工具节点：写这一步的助手消息（带 `meta.step`），流式跑工具，结果到齐按调用的顺序、按执行方分组写成 `tool` 消息。
-6. 收尾同参考实现：没等到结果的工具调用补错误结果，出错写 `ctx.error`，最后写 `ctx.run.ended`；给了 `output` 时按 schema 再查一遍最后交上的对象。写日志冲突时读末尾之后的条目，自己的 `runId` 已经有 `ctx.run.ended` 就是被围栏，不再写。
+4. 每轮建一个 `Agent`：ctx 的工具各包成一个 `Tool.from_schema`，`args_validator` 先看权限、按 `inputSchema` 查，不过就 `ToolFailed`；函数体交给执行环境（第一次交给某个执行环境之前 `open`），结果按上限截断。交给别处执行的（`ask` 的，和绑到 `external` 里执行环境的，`deny` 优先）不查输入，函数体抛 `CallDeferred`，输出类型里加上 `DeferredToolRequests`，pydantic-ai 走完那一步就停下。结构化输出是名为 `final_result` 的 `ToolOutput(StructuredDict(schema))`；`settings` 映射成 `ModelSettings`，`timeoutMs` 给 `Agent.iter(timeout=)`，`signal` 接到 `CancellationToken`；`UsageLimits(request_limit=None)`，步数由适配器数。
+5. 一个节点一个节点地走。模型请求的节点：先把 pydantic-ai 补的话（`RetryFeedbackPart`）写成 `pydantic-ai.retry`，查步数和预算，再流式读出增量。工具节点：写这一步的助手消息（带 `meta.step`），流式跑工具，结果到齐按调用的顺序、按执行方分组写成 `tool` 消息。交给别处执行的调用这一步走完还没有结果，记成等着的，不算「没等到结果」。
+6. 收尾同参考实现：没等到结果的工具调用补错误结果，出错写 `ctx.error`，最后写 `ctx.run.ended`；有等着的调用就以 `requires_action` 结束，`pending` 是它们（同一步交了结构化输出也一样，不解析）；给了 `output` 时按 schema 再查一遍最后交上的对象。写日志冲突时读末尾之后的条目，自己的 `runId` 已经有 `ctx.run.ended` 就是被围栏，不再写。
 
 服务端（Starlette）照 `ctx-remote` 的约定：结果出来之前先发响应头、隔一段时间写一个换行，`?stream=1` 是 NDJSON，取消先于运行到达时记下，断开即中止；`Host` 只认监听地址，带 `Origin` 的请求一律 403。一致性模式（`create_conformance_app`）只给 harness 契约用。
 

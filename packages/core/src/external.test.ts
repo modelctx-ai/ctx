@@ -101,6 +101,21 @@ describe('工具调用经日志往返', () => {
     );
   });
 
+  test('deny 优先：绑到外部执行环境、权限是 deny 的工具不等别处执行，模型看到拒绝，这一轮继续', async () => {
+    const { store, harness, calls } = setup();
+    const model = createScriptedModel(script, { tool: 'lookup' });
+    const result = await harness.run({
+      session: 's',
+      agent: { model, permissions: { tools: { lookup: 'deny' } } },
+      input: '订单 42？',
+    });
+    assert.equal(result.stopReason, 'end_turn');
+    assert.equal(result.pending, undefined);
+    assert.match(JSON.stringify(model.doGenerateCalls[1]!.prompt), /denied by the agent's permissions/);
+    assert.deepEqual(pendingToolCalls(await store.list('s')), []);
+    assert.deepEqual(calls, []);
+  });
+
   test('结果没来，下一轮照常跑完：之前等着的不再算等待中', async () => {
     const { store, harness } = setup();
     const model = createScriptedModel([...script.slice(0, 1), { type: 'text', text: '查不到' }], { tool: 'lookup' });

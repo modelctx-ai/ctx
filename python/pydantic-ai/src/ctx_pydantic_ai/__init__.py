@@ -10,7 +10,15 @@ from .harness import (
     PydanticAIHarness,
     spec_problem,
 )
-from .protocol import DEFAULT_MAX_TOOL_OUTPUT_CHARS, ENTRY_VERSION, PROTOCOL_VERSION, CtxError
+from .protocol import (
+    DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+    ENTRY_VERSION,
+    PROTOCOL_VERSION,
+    TOOL_RESULT_KEY_PREFIX,
+    CtxError,
+    pending_tool_calls,
+    tool_result_entry,
+)
 from .server import CONFORMANCE_PATH, create_app, create_conformance_app
 from .store import MemorySessionStore, RemoteSessionStore, SessionStore
 
@@ -23,6 +31,7 @@ __all__ = [
     'OUTPUT_TOOL',
     'PROTOCOL_VERSION',
     'RETRY_EVENT',
+    'TOOL_RESULT_KEY_PREFIX',
     'AbortSignal',
     'CtxError',
     'Executor',
@@ -34,5 +43,7 @@ __all__ = [
     'SessionStore',
     'create_app',
     'create_conformance_app',
+    'pending_tool_calls',
     'spec_problem',
+    'tool_result_entry',
 ]

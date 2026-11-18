@@ -1,4 +1,5 @@
-"""ctx 线上协议在 Python 这边用到的部分：版本、错误、条目、工具结果的截断、上下文过长的认法、工具筛选。
+"""ctx 线上协议在 Python 这边用到的部分：版本、错误、条目、工具结果的截断、上下文过长的认法、工具筛选、
+等着别处执行的工具调用。
 
 形状以 ``docs/protocol.md`` 为准，字段名和线上一样（驼峰）。这里的函数和协议包（``@modelctx-ai/ctx-protocol``）里同名的
 TypeScript 函数一一对应。
@@ -341,3 +342,56 @@ def is_event(entry: Mapping[str, Any] | None, kind: str) -> bool:
 def run_id_of(entry: Mapping[str, Any]) -> Json:
     data = entry.get('data')
     return data.get('runId') if entry.get('type') == 'event' and isinstance(data, dict) else None
+
+
+# ---- 工具调用经日志往返 ----
+
+#: ``tool_result_entry`` 的幂等键前缀（协议包的 ``TOOL_RESULT_KEY_PREFIX``）：同一次调用的结果只记一次。
+TOOL_RESULT_KEY_PREFIX = 'ctx.tool-result:'
+
+
+def tool_result_entry(
+    call: Mapping[str, Any],
+    output: Mapping[str, Any],
+    *,
+    source: str | None = None,
+    meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """别处执行完一次工具调用，追加回会话的 ``tool`` 消息（协议包的 ``toolResultEntry``），带幂等键 ``ctx.tool-result:<id>``。"""
+    part = {'type': 'tool-result', 'id': call['id'], 'name': call['name'], 'output': dict(output)}
+    return message_entry(
+        {'role': 'tool', 'content': [part]}, source=source, key=f'{TOOL_RESULT_KEY_PREFIX}{call["id"]}', meta=meta
+    )
+
+
+def pending_tool_calls(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """等着别处执行、还没有结果的工具调用（协议包的 ``pendingToolCalls``），每个是 ``{ call, runId, seq }``：以
+    ``requires_action`` 结束的那一轮留下的调用，去掉后面已经追加了结果的。之后又有运行以别的原因结束，之前留下的就不再算。
+    条目按 ``seq`` 排好；服务商执行的调用不算。"""
+    waiting: dict[str, dict[str, Any]] = {}
+    run_id: str | None = None
+    calls: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        if entry.get('type') == 'event' and entry.get('kind') in (RUN_STARTED, RUN_ENDED):
+            data = entry.get('data')
+            data = data if isinstance(data, dict) else {}
+            if not isinstance(data.get('runId'), str):
+                continue
+            if entry['kind'] == RUN_STARTED:
+                run_id, calls = data['runId'], {}
+                continue
+            # 这一轮停下来等结果：它留下的调用等待中；别的结束方式让之前等着的都作废。
+            waiting = dict(calls) if data.get('stopReason') == 'requires_action' and run_id == data['runId'] else {}
+            run_id, calls = None, {}
+            continue
+        content = entry['message'].get('content') if entry.get('type') == 'message' else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if part.get('type') == 'tool-call' and part.get('providerExecuted') is not True and run_id is not None:
+                call = {'id': part['id'], 'name': part['name'], 'input': part.get('input')}
+                calls[part['id']] = {'call': call, 'runId': run_id, 'seq': entry['seq']}
+            elif part.get('type') == 'tool-result':
+                waiting.pop(part['id'], None)
+                calls.pop(part['id'], None)
+    return list(waiting.values())

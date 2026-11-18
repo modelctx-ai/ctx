@@ -877,8 +877,11 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       }
       return runDispatch(call, definition, execution);
     };
-    const deferred = (definition: ToolDefinition): boolean =>
-      external.has(definition.executor) || toolPermission(permissions, definition.name) === 'ask';
+    // `deny` 优先：绑到外部执行环境的工具被拒绝时也在这里回拒绝，不等别处执行。
+    const deferred = (definition: ToolDefinition): boolean => {
+      const permission = toolPermission(permissions, definition.name);
+      return permission === 'ask' || (permission !== 'deny' && external.has(definition.executor));
+    };
     return {
       model,
       prepared,
