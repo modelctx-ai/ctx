@@ -1,30 +1,31 @@
-import type {
-  AgentSpec,
-  CallSettings,
-  CompactOptions,
-  CompactResult,
-  ContextSource,
-  Entry,
-  Executor,
-  Fact,
-  Harness,
-  Hooks,
-  ListOptions,
-  Logger,
-  MessageContent,
-  NewEntry,
-  OverflowSpec,
-  PreparedCall,
-  Projection,
-  ProjectionOptions,
-  RunEvent,
-  RunRequest,
-  SessionStore,
-  StopReason,
-  SummaryEntry,
-  ToolFilter,
-  ToolRegistry,
-  WindowOptions,
+import {
+  executorMap,
+  type AgentSpec,
+  type CallSettings,
+  type CompactOptions,
+  type CompactResult,
+  type ContextSource,
+  type Entry,
+  type Executor,
+  type Fact,
+  type Harness,
+  type Hooks,
+  type ListOptions,
+  type Logger,
+  type MessageContent,
+  type NewEntry,
+  type OverflowSpec,
+  type PreparedCall,
+  type Projection,
+  type ProjectionOptions,
+  type RunEvent,
+  type RunRequest,
+  type SessionStore,
+  type StopReason,
+  type SummaryEntry,
+  type ToolFilter,
+  type ToolRegistry,
+  type WindowOptions,
 } from '@modelctx-ai/ctx-protocol';
 import type { generateText, LanguageModel, ModelMessage, ToolSet, UserContent } from 'ai';
 
@@ -32,7 +33,7 @@ import { assemble, createContextBuilder, type FactsPlacement, type LocalContextB
 import { createFunctionExecutor, type FunctionExecutor } from './executor.ts';
 import { createHarnessRuntime, type GenerateTextResult, type StreamTextResult } from './harness.ts';
 import { fromUserContent, toModelMessages } from './messages.ts';
-import { executorMap, toToolSet, type LocalToolRegistry } from './tools.ts';
+import { toToolSet, type LocalToolRegistry } from './tools.ts';
 
 export type { GenerateTextResult, StreamTextResult } from './harness.ts';
 export type ProviderOptions = NonNullable<Parameters<typeof generateText>[0]['providerOptions']>;

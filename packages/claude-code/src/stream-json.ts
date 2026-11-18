@@ -197,11 +197,6 @@ export function finishReasonOf(stop: string | null | undefined): string | undefi
   }
 }
 
-/** MCP 工具在 Claude Code 里的名字：`mcp__<服务器>__<工具>`。 */
-export function mcpToolName(server: string, tool: string): string {
-  return `mcp__${server}__${tool}`;
-}
-
 /** 一条助手消息的内容块换成协议的部件；`toolName` 把 MCP 的名字换回 ctx 的工具名。 */
 export function assistantMessageOf(
   blocks: readonly AnthropicBlock[],

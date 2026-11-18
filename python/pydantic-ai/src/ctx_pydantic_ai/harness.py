@@ -91,15 +91,16 @@ from .protocol import (
     after_conflict,
     agent_spec_to_json,
     compact,
+    ended_in_failure,
     error_output,
     event_entry,
     head_seq,
     is_context_overflow_text,
     is_event,
-    is_framework_kind,
     limit_tool_output,
     message_entry,
     new_id,
+    repeats_failed_input,
     run_parent_problem,
     select_tools,
     tool_permission,
@@ -214,14 +215,30 @@ class _Run:
     pending: list[dict[str, Any]] = field(default_factory=list)
 
 
+async def _waited(previous: asyncio.Future[None], signal: AbortSignal | None) -> bool:
+    """排队：等前一个结束。等的时候 ``signal`` 取消了返回 ``False``。"""
+    if signal is None:
+        await asyncio.shield(previous)
+        return True
+    aborted: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    remove = signal.add_listener(lambda: aborted.done() or aborted.set_result(None))
+    try:
+        await asyncio.wait([previous, aborted], return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        remove()
+    return not signal.aborted
+
+
+def _skipped(request: Mapping[str, Any], emit: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    """排队时取消的一轮：以 ``aborted`` 结束，什么都没写。流里照样先 ``run.started`` 后 ``run.ended``。"""
+    run_id = str(request.get('runId') or new_id())
+    emit({'type': 'run.started', 'runId': run_id, 'session': request.get('session')})
+    emit({'type': 'run.ended', 'runId': run_id, 'result': {'runId': run_id, 'text': '', 'stopReason': 'aborted'}})
+    return {'runId': run_id, 'text': '', 'messages': [], 'recorded': [], 'stopReason': 'aborted'}
+
+
 def _empty(content: Json) -> bool:
     return content is None or (isinstance(content, (str, list)) and len(content) == 0)
-
-
-def _ended_in_failure(entry: Mapping[str, Any] | None) -> bool:
-    if not is_event(entry, RUN_ENDED) or not isinstance(entry.get('data'), dict):  # type: ignore[union-attr]
-        return False
-    return entry['data'].get('stopReason') in ('error', 'aborted')  # type: ignore[index]
 
 
 def _number(value: Any) -> bool:
@@ -509,7 +526,9 @@ class PydanticAIHarness:
     async def _queued(
         self, request: Mapping[str, Any], emit: Callable[[dict[str, Any]], None], signal: AbortSignal | None
     ) -> dict[str, Any]:
-        """同一个实例里同一会话的记录型运行一个接一个（同参考实现），``session_busy`` 只出现在跨进程的时候。"""
+        """同一个实例里同一会话的记录型运行一个接一个（同参考实现），``session_busy`` 只出现在跨进程的时候。排队时
+        ``signal`` 取消了，这一轮以 ``aborted`` 结束，什么都不写。
+        """
         if request.get('record') is False:
             return await self._unwrapped(request, emit, signal)
         session = str(request.get('session'))
@@ -517,17 +536,22 @@ class PydanticAIHarness:
         mine: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._tails[session] = mine
         try:
-            if previous is not None:
-                await asyncio.shield(previous)
+            if previous is not None and not await _waited(previous, signal):
+                return _skipped(request, emit)
             return await self._unwrapped(request, emit, signal)
         finally:
-            # 前一个还没结束（这一个在排队时被取消）就等它结束再放行后面的。
+            # 前一个还没结束（这一个在排队时被取消）就等它结束再放行后面的，队尾也到那时才摘：
+            # 早摘了，后来的看不到前一个还在跑，会和它同时开始。
+            def release(_: object = None) -> None:
+                if not mine.done():
+                    mine.set_result(None)
+                if self._tails.get(session) is mine:
+                    del self._tails[session]
+
             if previous is None or previous.done():
-                mine.set_result(None)
+                release()
             else:
-                previous.add_done_callback(lambda _: mine.done() or mine.set_result(None))
-            if self._tails.get(session) is mine:
-                del self._tails[session]
+                previous.add_done_callback(release)
 
     async def _unwrapped(
         self, request: Mapping[str, Any], emit: Callable[[dict[str, Any]], None], signal: AbortSignal | None
@@ -570,26 +594,9 @@ class PydanticAIHarness:
         return []
 
     async def _repeats_failed_input(self, session: str, content: Json, key: str | None) -> bool:
-        """这一轮的输入是不是上一轮失败时留下的那句（同参考实现）：它之后只有框架和这个适配器写的事件、没盖住它的摘要。"""
+        """这一轮的输入是不是上一轮失败时留下的那句（``repeats_failed_input``，同参考实现）：这个适配器写的事件也跳过。"""
         tail = await self._store.list(session, last=_SCAN)
-        if key is not None:
-            return any(entry.get('key') == key for entry in tail)
-        covered = 0
-        for entry in reversed(tail):
-            if entry['type'] == 'event' and (
-                is_framework_kind(entry['kind']) or entry['kind'].startswith(f'{HARNESS_NAME}.')
-            ):
-                continue
-            if entry['type'] == 'summary':
-                covered = max(covered, int(entry['covers']))
-                continue
-            return (
-                entry['type'] == 'message'
-                and entry['message'].get('role') == 'user'
-                and entry['seq'] > covered
-                and entry['message'].get('content') == content
-            )
-        return False
+        return repeats_failed_input(tail, content, key=key, harness=HARNESS_NAME)
 
     async def _start(self, state: _Run) -> bool | None:
         """查会话忙不忙、认重试，带着读到的末尾写 ``ctx.run.started``，冲突就重来。忙时返回 ``None``，否则返回输入要不要跳过。"""
@@ -610,7 +617,7 @@ class PydanticAIHarness:
                 return False
             repeated = (
                 not _empty(content)
-                and _ended_in_failure(last)
+                and ended_in_failure(lifecycle)
                 and await self._repeats_failed_input(session, content, key)
             )
             parent = request.get('parent')

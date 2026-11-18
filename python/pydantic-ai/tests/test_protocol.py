@@ -411,6 +411,61 @@ def test_fencing_without_a_started_seq_only_looks_at_ended_and_erasures() -> Non
     assert protocol.is_fenced([_ended(3, 'r1', 'error')], 'r1', started=None, recorded=[]) is True
 
 
+def _user(seq: int, content: Any, **extra: Any) -> dict[str, Any]:
+    return {'seq': seq, 'type': 'message', 'message': {'role': 'user', 'content': content}, **extra}
+
+
+ENDINGS = {
+    '停在 error': [_started(1, 'r1'), _ended(2, 'r1', 'error')],
+    '停在 aborted': [_started(1, 'r1'), _ended(2, 'r1', 'aborted')],
+    '答完了': [_started(1, 'r1'), _ended(2, 'r1', 'end_turn')],
+    '下一轮开始了': [_ended(1, 'r1', 'error'), _started(2, 'r2')],
+    '没有 runId': [{'seq': 1, 'type': 'event', 'kind': 'ctx.run.ended', 'data': {'stopReason': 'error'}}],
+    '空的': [],
+}
+
+
+@pytest.mark.parametrize('name', list(ENDINGS))
+def test_ended_in_failure_matches_typescript(ts: Evaluate, name: str) -> None:
+    [expected] = ts([('endedInFailure', [ENDINGS[name]])])
+    assert protocol.ended_in_failure(ENDINGS[name]) is expected
+
+
+#: 每一例是会话末尾的条目、这一轮的输入和选项（``key``、``harness``）。
+RETRIES: dict[str, tuple[list[dict[str, Any]], Any, dict[str, Any]]] = {
+    '连着失败': ([_started(1, 'r1'), _user(2, '再试'), _ended(3, 'r1', 'error'), _ended(4, 'r2', 'error')], '再试', {}),
+    '换了一句': ([_user(1, '再试'), _ended(2, 'r1', 'error')], '换一句', {}),
+    '后面有回答': ([_user(1, '再试'), _calls(2, 'c1'), _ended(3, 'r1', 'error')], '再试', {}),
+    '摘要盖住了': ([_user(1, '再试'), {'seq': 2, 'type': 'summary', 'text': '摘要', 'covers': 1}], '再试', {}),
+    '摘要只盖住更早的': (
+        [_user(1, '早先'), _user(2, '再试'), {'seq': 3, 'type': 'summary', 'text': '摘要', 'covers': 1}],
+        '再试',
+        {},
+    ),
+    '内容是部件': (
+        [_user(1, [{'type': 'text', 'text': '看图'}]), _ended(2, 'r1', 'error')],
+        [{'type': 'text', 'text': '看图'}],
+        {},
+    ),
+    '别人的事件挡着': ([_user(1, '再试'), {'seq': 2, 'type': 'event', 'kind': 'pi.compacted'}], '再试', {}),
+    '自己的事件跳过': (
+        [_user(1, '再试'), {'seq': 2, 'type': 'event', 'kind': 'pydantic-ai.retry'}],
+        '再试',
+        {'harness': 'pydantic-ai'},
+    ),
+    '有这个键': ([_user(1, '甲', key='k1'), _ended(2, 'r1', 'error')], '乙', {'key': 'k1'}),
+    '没有这个键': ([_user(1, '甲', key='k1'), _ended(2, 'r1', 'error')], '甲', {'key': 'k2'}),
+    '空的': ([], '再试', {}),
+}
+
+
+@pytest.mark.parametrize('name', list(RETRIES))
+def test_repeats_failed_input_matches_typescript(ts: Evaluate, name: str) -> None:
+    tail, content, options = RETRIES[name]
+    [expected] = ts([('repeatsFailedInput', [tail, content, options])])
+    assert protocol.repeats_failed_input(tail, content, **options) is expected
+
+
 def test_tool_result_entry_matches_typescript(ts: Evaluate) -> None:
     call = {'id': 'c1', 'name': 'lookup', 'input': {'id': '42'}}
     output = {'type': 'text', 'text': '订单 42 已发货'}

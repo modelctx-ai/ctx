@@ -4,6 +4,10 @@
 
 ## 未发布
 
+- **新增** 协议包里给 harness 共用的几样，以前核心包、`ctx-claude-code`、`ctx-pi` 各写一份（Python 的 `ctx-pydantic-ai` 照着移植的那份也对齐，测试和 TypeScript 比）：`Executors`（从核心包挪过来，核心包照旧转出）、`executorMap(executors, registry?)`、`executorTools(executors)`，`ToolRegistry` 加可选的 `executor`（注册表自带的执行环境，以前各个 harness 按形状猜）；`endedInFailure(lifecycle)`、`repeatsFailedInput(tail, input, { key?, harness? })`（`RepeatOptions`）是「失败的重试不让历史变长」那一条；`createSessionQueue()`（`SessionQueue`）是进程内每会话的串行队列；`streamRun(request, run)` 把边跑边交出事件的一轮包成 `stream`；`collectFacts` 加 `only`（按名字挑来源）和 `logger`（出错、超时、没注册的名字记告警）。
+- **新增** `ctx-mcp`：`createMcpServer` 的 `open`（第一次把调用交给某个执行环境之前 `open` 调用的会话，ADR 0009）和 `permissions`（`deny` 的不执行，回拒绝）；`listenMcpHttp(server, options?)` 在本机起一个带一次性令牌的 HTTP 服务器（`McpHttpListener`：`url`、`token`、`contacted()`、`close()`）；`mcpToolName(server, tool)`。`ctx-claude-code`、`ctx-pi` 每轮的 MCP 服务器改用它们，不再自己包执行环境、起 HTTP 服务器。
+- **修复** `ctx-claude-code`、`ctx-pi`、`ctx-pydantic-ai`：同一个实例里排队等同一会话前一轮的运行，`signal` 在排队时中止，以前照样等到轮到它、写下 `ctx.run.started`、输入和 `ctx.run.ended`；现在照协议直接以 `aborted` 结束，什么都不写，也不挡后面的运行；`stream` 里和参考实现一样先 `run.started` 后 `run.ended`。
+
 - **新增** 协议包读框架事件的纯函数：`isEvent(entry, kind)`（只收窄到这个 `kind`）、`runIdOf(entry)`、`ctxEventData(entry, kind)`，按新类型 `CtxEventData`（框架事件的 `kind` 到 `data` 的类型）读回 `data`：必填字段不对返回 `undefined`，可选字段只留类型对的，`ctx.run.started` 的 `agent` 缺了给 `{}`；`lastHarnessRun(lifecycle, name)`（结果是 `HarnessRun`）找外部 harness 最近一轮记下的 `harness.session`；`stepMetaToJson(meta)` 把 `StepMeta` 写成 `meta.step`。核心包、`ctx-otel`、`ctx-remote`、`ctx-claude-code`、`ctx-pi` 改用它们，不再各自把 `data` 转成猜的类型。`stepMetaOf` 也只留类型对的可选字段，以前原样给出。
 - **新增** 协议包的围栏：`isFenced(lifecycle, run)`、`afterConflict(store, session, run)`、`RunPosition`，是协议层「一个会话最多一个未结束的运行」第 2 条：自己的 `runId` 已经有 `ctx.run.ended`、自己的 `ctx.run.started` 不在了、擦除动了这一轮写的条目，都是被围栏。参考实现的 harness 改用它，行为不变。
 - **修复** `ctx-claude-code`（连同子代理的子会话）、`ctx-pi`、`ctx-pydantic-ai`：写日志冲突时以前只认「自己的 `runId` 已经有 `ctx.run.ended`」，会话在这一轮中途被 `clear`、被 `truncate` 删到了这一轮、或者擦除动了这一轮写的条目时，要么接着写（把删掉的内容写回来），要么冲突到上限、以写日志失败结束。现在照协议用 `afterConflict` 认被围栏，以 `aborted` 结束、不再写；只删了这一轮之前的历史的照常跑。

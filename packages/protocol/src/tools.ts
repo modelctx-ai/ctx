@@ -77,6 +77,8 @@ export interface ToolRegistry {
   list(): ToolDefinition[];
   /** 同 `selectTools(list(), filter)`，缺省全部。 */
   select(filter?: ToolFilter): ToolDefinition[];
+  /** 注册表自带的执行环境（参考实现 `addTool` 的函数放在这里）：harness 把它和自己的 `executors` 一起用（`executorMap`）。 */
+  readonly executor?: Executor;
 }
 
 // ---- 执行 ----
@@ -157,6 +159,31 @@ export interface Executor {
 export interface ExecutorSessionOptions {
   readonly environment?: EnvironmentSpec;
   readonly signal?: AbortSignal;
+}
+
+/** 执行环境的集合：数组按各自的 `name`，对象按键。 */
+export type Executors = readonly Executor[] | Readonly<Record<string, Executor>>;
+
+/** 按名字查的执行环境；`registry` 自带的（`ToolRegistry.executor`）也加进来，同名的以 `executors` 为准。 */
+export function executorMap(
+  executors: Executors | undefined,
+  registry?: Pick<ToolRegistry, 'executor'>,
+): Map<string, Executor> {
+  const map = new Map<string, Executor>(
+    Array.isArray(executors)
+      ? (executors as readonly Executor[]).map((executor) => [executor.name, executor])
+      : Object.entries((executors ?? {}) as Readonly<Record<string, Executor>>),
+  );
+  const own = registry?.executor;
+  if (own && !map.has(own.name)) map.set(own.name, own);
+  return map;
+}
+
+/** 各执行环境 `tools()` 报的工具定义：按执行环境的顺序，同名的只留第一个。 */
+export async function executorTools(executors: Iterable<Executor>): Promise<ToolDefinition[]> {
+  const listed = await Promise.all([...executors].map(async (executor) => (await executor.tools?.()) ?? []));
+  const seen = new Set<string>();
+  return listed.flat().filter((definition) => !seen.has(definition.name) && seen.add(definition.name));
 }
 
 /**

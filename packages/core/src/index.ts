@@ -14,7 +14,6 @@ export {
   createToolRegistry,
   dispatchTo,
   toToolSet,
-  type Executors,
   type LocalToolRegistry,
   type ToolDispatch,
   type ToolMeta,

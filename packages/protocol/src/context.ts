@@ -10,7 +10,7 @@ import {
 import type { ModelRef } from './harness.ts';
 import { estimateTokens, truncateMessage } from './tokens.ts';
 import type { ToolDefinition } from './tools.ts';
-import type { Awaitable } from './types.ts';
+import type { Awaitable, Logger } from './types.ts';
 
 // ---- 来源和事实 ----
 
@@ -40,6 +40,10 @@ export function defineSource(name: string, collect: ContextSource['collect']): C
 export interface CollectOptions extends SourceContext {
   /** 单个来源最多等多久，超时就当它这次没有内容。 */
   readonly timeoutMs?: number;
+  /** 只收这些名字的来源（`FactsSpec.sources`），顺序还按 `sources`。 */
+  readonly only?: readonly string[];
+  /** 来源出错、超时，`only` 里有没注册的名字，都记一条告警。 */
+  readonly logger?: Logger;
   readonly onError?: (source: string, error: unknown) => void;
 }
 
@@ -56,16 +60,28 @@ function withTimeout<T>(work: Promise<T>, ms: number, name: string): Promise<T> 
 /** 并行收集。某个来源出错或超时只影响它自己，顺序按来源列表。 */
 export async function collectFacts(sources: readonly ContextSource[], options: CollectOptions): Promise<Fact[]> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const { logger } = options;
+  let chosen = sources;
+  if (options.only) {
+    const wanted = new Set(options.only);
+    chosen = sources.filter((source) => wanted.has(source.name));
+    for (const name of wanted) {
+      if (!sources.some((source) => source.name === name)) logger?.warn(`context source "${name}" is not registered`);
+    }
+  }
   const context: SourceContext = options.signal
     ? { session: options.session, signal: options.signal }
     : { session: options.session };
   const results = await Promise.all(
-    sources.map(async (source): Promise<Fact | null> => {
+    chosen.map(async (source): Promise<Fact | null> => {
       try {
         const text = await withTimeout(Promise.resolve(source.collect(context)), timeoutMs, source.name);
         const trimmed = typeof text === 'string' ? text.trim() : '';
         return trimmed ? { source: source.name, text: trimmed } : null;
       } catch (error) {
+        logger?.warn(`context source "${source.name}" failed`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
         options.onError?.(source.name, error);
         return null;
       }

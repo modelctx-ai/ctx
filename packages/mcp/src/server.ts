@@ -1,25 +1,31 @@
 // 另一半：把 ctx 的执行环境包成 MCP 服务器，给自带循环的程序（Claude Code、pi 这类进程级的 harness）用（#23）。
 // 不依赖 MCP 的 SDK：JSON-RPC 只有 initialize、ping、tools/list、tools/call 和取消，传输是 stdio（一行一条）和
 // Streamable HTTP（只回 JSON，不开 SSE 流）。
-import type { IncomingMessage, ServerResponse } from 'node:http';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { createInterface } from 'node:readline';
-import { timingSafeEqual } from 'node:crypto';
 
 import {
   checkJsonSchema,
   DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   errorOutput,
+  executorMap,
   limitToolOutput,
   silentLogger,
+  toolPermission,
   type Awaitable,
   type ExecutionContext,
   type Executor,
+  type Executors,
+  type ExecutorSessionOptions,
   type JsonObject,
   type JsonValue,
   type Logger,
   type ToolCall,
   type ToolDefinition,
   type ToolOutput,
+  type ToolPermissions,
 } from '@modelctx-ai/ctx-protocol';
 
 /** 认得的 MCP 协议版本，新的在前。客户端要的版本在里面就用它，不在就回第一个。 */
@@ -30,7 +36,7 @@ export type McpCallContext = Omit<ExecutionContext, 'signal'>;
 
 export interface McpServerOptions {
   /** 工具按定义的 `executor` 找执行环境。 */
-  readonly executors: readonly Executor[] | Readonly<Record<string, Executor>>;
+  readonly executors: Executors;
   /** 交出去的工具；不给就是各个执行环境 `tools()` 报的全部。同名的只留第一个。 */
   readonly tools?: readonly ToolDefinition[];
   /** 调用记在哪个会话、哪一轮（`ExecutionContext`）。函数时每次调用取一次。 */
@@ -47,6 +53,13 @@ export interface McpServerOptions {
    * 和输入检查一样是 harness 那一层的兜底：调用方不经过 harness。`onResult` 收到的是截过的。
    */
   readonly maxOutputChars?: number;
+  /**
+   * 第一次把调用交给某个执行环境之前，用调用的会话（`context` 的 `session`）`open` 它，带着这里的选项（ADR 0009）；
+   * 每个执行环境每个会话只开一次，打不开时它的调用都回错误，模型看得到原因。不给就不 `open`。
+   */
+  readonly open?: ExecutorSessionOptions;
+  /** `deny` 的调用不执行，回拒绝（`toolPermission`，只看 `deny`）。 */
+  readonly permissions?: ToolPermissions;
   /** 每次调用结束以后调，适配器用它把经 ctx 执行的调用记进日志。抛错只记告警，不影响结果。 */
   readonly onResult?: (call: ToolCall, output: ToolOutput, context: McpCallContext) => Awaitable<void>;
   readonly logger?: Logger;
@@ -79,11 +92,6 @@ function messageOf(error: unknown): string {
 
 function rpcError(id: RequestId | null, code: number, message: string): JsonObject {
   return { jsonrpc: '2.0', id, error: { code, message } };
-}
-
-function executorTable(executors: McpServerOptions['executors']): Map<string, Executor> {
-  if (Array.isArray(executors)) return new Map((executors as readonly Executor[]).map((item) => [item.name, item]));
-  return new Map(Object.entries(executors as Readonly<Record<string, Executor>>));
 }
 
 /** 内联文件的 MCP 写法：图片、音频是它们自己的块，别的是嵌入的资源。 */
@@ -153,11 +161,32 @@ export function toolOutputToMcp(output: ToolOutput): JsonObject {
  * 模型要看得到。用 `serveMcpStdio` 或 `createMcpHttpHandler` 接上传输。
  */
 export function createMcpServer(options: McpServerOptions): McpServer {
-  const executors = executorTable(options.executors);
+  const executors = executorMap(options.executors);
   const logger = options.logger ?? silentLogger;
   const validate = options.validateInput !== false;
   const maxOutputChars = options.maxOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
   const running = new Map<RequestId, AbortController>();
+  /** 会话、执行环境 → 那一次 `open`。 */
+  const opened = new Map<string, Promise<void>>();
+
+  /** 交给 `executor` 之前先 `open` 会话：打开了返回 `undefined`，打不开返回给模型看的错误。 */
+  async function prepare(executor: Executor, session: string, tool: string): Promise<ToolOutput | undefined> {
+    if (!options.open || !executor.open) return undefined;
+    const key = `${session}\u0000${executor.name}`;
+    try {
+      let opening = opened.get(key);
+      if (!opening) {
+        opening = executor.open(session, options.open);
+        opened.set(key, opening);
+      }
+      await opening;
+      return undefined;
+    } catch (error) {
+      return errorOutput(
+        `Executor "${executor.name}" could not prepare session "${session}" for tool "${tool}": ${messageOf(error)}`,
+      );
+    }
+  }
 
   async function definitions(): Promise<ToolDefinition[]> {
     const listed =
@@ -177,6 +206,32 @@ export function createMcpServer(options: McpServerOptions): McpServer {
     return typeof options.context === 'function' ? options.context() : options.context;
   }
 
+  /** 交给执行环境执行；HTTP 断开、客户端取消、服务器关掉时中止。结果按 `maxOutputChars` 截断。 */
+  async function execute(
+    id: RequestId,
+    executor: Executor,
+    toolCall: ToolCall,
+    context: McpCallContext,
+    signal: AbortSignal | undefined,
+  ): Promise<ToolOutput> {
+    const controller = new AbortController();
+    const abort = (): void => controller.abort(signal?.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) abort();
+    running.set(id, controller);
+    try {
+      return limitToolOutput(
+        await executor.execute(toolCall, { ...context, signal: controller.signal }),
+        maxOutputChars,
+      );
+    } catch (error) {
+      return errorOutput(`Executor "${executor.name}" failed: ${messageOf(error)}`);
+    } finally {
+      running.delete(id);
+      signal?.removeEventListener('abort', abort);
+    }
+  }
+
   async function call(
     id: RequestId,
     params: Record<string, unknown>,
@@ -192,29 +247,17 @@ export function createMcpServer(options: McpServerOptions): McpServer {
     let output: ToolOutput;
     const problems = validate ? checkJsonSchema(definition.inputSchema, input) : [];
     const executor = executors.get(definition.executor);
-    if (problems.length > 0) {
+    if (options.permissions && toolPermission(options.permissions, name) === 'deny') {
+      output = errorOutput(`Tool call "${name}" was denied by the agent's permissions.`);
+    } else if (problems.length > 0) {
       output = errorOutput(`Invalid input for tool ${name}: ${problems.join('; ')}`);
     } else if (!executor) {
       output = errorOutput(
         `Tool ${name} is bound to executor "${definition.executor}", which this server does not have.`,
       );
     } else {
-      const controller = new AbortController();
-      const abort = (): void => controller.abort(signal?.reason);
-      signal?.addEventListener('abort', abort, { once: true });
-      if (signal?.aborted) abort();
-      running.set(id, controller);
-      try {
-        output = limitToolOutput(
-          await executor.execute(toolCall, { ...context, signal: controller.signal }),
-          maxOutputChars,
-        );
-      } catch (error) {
-        output = errorOutput(`Executor "${executor.name}" failed: ${messageOf(error)}`);
-      } finally {
-        running.delete(id);
-        signal?.removeEventListener('abort', abort);
-      }
+      output =
+        (await prepare(executor, context.session, name)) ?? (await execute(id, executor, toolCall, context, signal));
     }
     try {
       await options.onResult?.(toolCall, output, context);
@@ -408,4 +451,54 @@ export function createMcpHttpHandler(
     if (res.destroyed) return;
     reply(res, response === undefined ? 202 : 200, response);
   };
+}
+
+/** `listenMcpHttp` 起的本机服务器。 */
+export interface McpHttpListener {
+  /** `http://127.0.0.1:<端口><path>`。 */
+  readonly url: string;
+  /** 请求要带的令牌（`Authorization: Bearer <token>`），每次 `listenMcpHttp` 新生成。 */
+  readonly token: string;
+  /** 带着令牌的请求进来过没有：程序连上了没有。 */
+  contacted(): boolean;
+  /** 中止正在跑的调用（`server.close()`），断开连接，不再监听。 */
+  close(): Promise<void>;
+}
+
+/**
+ * 在本机（`127.0.0.1`）的空闲端口上听 Streamable HTTP（`createMcpHttpHandler`），带一次性的令牌：给自己起的子进程
+ * （Claude Code、pi）连，用完就关。别的选项同 `createMcpHttpHandler`。
+ */
+export async function listenMcpHttp(
+  server: McpServer,
+  options: Omit<McpHttpOptions, 'accessToken'> = {},
+): Promise<McpHttpListener> {
+  const path = options.path ?? '/mcp';
+  const token = randomBytes(24).toString('base64url');
+  const handler = createMcpHttpHandler(server, { ...options, path, accessToken: token });
+  let contacted = false;
+  const http = createServer((req, res) => {
+    if (bearerMatches(req, token)) contacted = true;
+    void handler(req, res);
+  });
+  await new Promise<void>((resolve, reject) => {
+    http.once('error', reject);
+    http.listen(0, '127.0.0.1', () => resolve());
+  });
+  const { port } = http.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}${path}`,
+    token,
+    contacted: () => contacted,
+    async close() {
+      server.close();
+      http.closeAllConnections();
+      await new Promise<void>((resolve) => http.close(() => resolve()));
+    },
+  };
+}
+
+/** Claude Code、pi 给 MCP 服务器的工具起的名字：`mcp__<server>__<tool>`。 */
+export function mcpToolName(server: string, tool: string): string {
+  return `mcp__${server}__${tool}`;
 }

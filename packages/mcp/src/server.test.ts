@@ -13,6 +13,8 @@ import { createMcpHub } from './index.ts';
 import {
   createMcpHttpHandler,
   createMcpServer,
+  listenMcpHttp,
+  mcpToolName,
   serveMcpStdio,
   toolOutputToMcp,
   type McpCallContext,
@@ -178,6 +180,90 @@ describe('createMcpServer：把执行环境包成 MCP 服务器', () => {
     const unlimited = createMcpServer({ executors: [box()], context: { session: 's' }, maxOutputChars: 0 });
     const full = resultOf(await call(unlimited)) as { content: { text: string }[] };
     assert.equal(full.content[0]?.text, long);
+  });
+
+  test('open：第一次交给执行环境之前打开调用的会话，每个会话一次；打不开（连同步抛错）时它的调用都回错误；deny 的不执行也不打开', async () => {
+    const opened: string[] = [];
+    const sandbox = box();
+    const flaky = createFunctionExecutor('flaky').register({ name: 'probe', inputSchema: { type: 'object' } }, () => ({
+      type: 'text',
+      text: '跑了',
+    }));
+    const strict = createFunctionExecutor('strict').register({ name: 'pick', inputSchema: { type: 'object' } }, () => ({
+      type: 'text',
+      text: '跑了',
+    }));
+    let session = 's1';
+    const server = createMcpServer({
+      executors: [
+        { ...sandbox, name: 'box', open: async (name) => void opened.push(`box:${name}`) },
+        {
+          ...flaky,
+          name: 'flaky',
+          open: async (name, options) => {
+            opened.push(`flaky:${name}:${String(options?.environment?.image)}`);
+            throw new Error('没有这个镜像');
+          },
+        },
+        {
+          ...strict,
+          name: 'strict',
+          open: () => {
+            throw new Error('同步抛的');
+          },
+        },
+      ],
+      tools: [...(await sandbox.tools()), ...(await flaky.tools()), ...(await strict.tools())],
+      context: () => ({ session }),
+      open: { environment: { image: 'node:24' } },
+      permissions: { tools: { broken: 'deny' } },
+    });
+    const call = async (name: string, args: JsonObject = {}) => {
+      const result = resultOf(
+        await server.handle({ jsonrpc: '2.0', id: name, method: 'tools/call', params: { name, arguments: args } }),
+      ) as { content: { text: string }[]; isError?: boolean };
+      return result.content[0]?.text ?? '';
+    };
+    assert.equal(await call('broken'), 'Tool call "broken" was denied by the agent\'s permissions.');
+    assert.deepEqual(opened, [], '拒绝的调用不打开会话');
+    assert.equal(await call('echo', { text: '一' }), '一');
+    assert.equal(await call('echo', { text: '二' }), '二');
+    session = 's2';
+    assert.equal(await call('echo', { text: '三' }), '三');
+    assert.match(await call('probe'), /Executor "flaky" could not prepare session "s2" for tool "probe": 没有这个镜像/);
+    assert.match(await call('probe'), /没有这个镜像/);
+    assert.match(await call('pick'), /Executor "strict" could not prepare session "s2" for tool "pick": 同步抛的/);
+    assert.deepEqual(opened, ['box:s1', 'box:s2', 'flaky:s2:node:24']);
+  });
+
+  test('listenMcpHttp：本机的空闲端口、一次性的令牌，contacted 认带令牌的请求，close 之后连不上', async () => {
+    const server = createMcpServer({ executors: [box()], context: { session: 's' } });
+    const listener = await listenMcpHttp(server);
+    const ping = (token?: string) =>
+      fetch(listener.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
+      });
+    try {
+      assert.match(listener.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+      assert.ok(listener.token.length >= 32);
+      assert.equal((await ping()).status, 401);
+      assert.equal((await ping('wrong')).status, 401);
+      assert.equal(listener.contacted(), false, '没带对令牌的不算');
+      assert.equal((await ping(listener.token)).status, 200);
+      assert.equal(listener.contacted(), true);
+    } finally {
+      await listener.close();
+    }
+    await assert.rejects(ping(listener.token));
+    const again = await listenMcpHttp(server);
+    assert.notEqual(again.token, listener.token, '每次新生成');
+    await again.close();
+  });
+
+  test('mcpToolName：Claude Code、pi 给 MCP 工具起的名字', () => {
+    assert.equal(mcpToolName('ctx', 'weather'), 'mcp__ctx__weather');
   });
 
   test('JSON-RPC：版本协商、ping、不认识的方法、通知不回话、客户端取消正在跑的调用', async () => {

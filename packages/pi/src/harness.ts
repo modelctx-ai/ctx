@@ -3,42 +3,44 @@
 // 步数和预算、退回）写进一个扩展交给 pi（`extension.ts`）。
 import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { createServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { createMcpHttpHandler, createMcpServer, type McpServer } from '@modelctx-ai/ctx-mcp';
+import { createMcpServer, listenMcpHttp, mcpToolName, type McpHttpListener } from '@modelctx-ai/ctx-mcp';
 import {
   afterConflict,
   agentSpecToJson,
   checkJsonSchema,
   collectFacts,
+  createSessionQueue,
   CTX_EVENTS,
   ctxErrorEntry,
-  ctxEventData,
+  endedInFailure,
   errorOutput,
   eventEntry,
+  executorMap,
+  executorTools,
   headSeq,
   isConflict,
   isEvent,
-  isFrameworkKind,
   lastHarnessRun,
   messageEntry,
   renderFacts,
+  repeatsFailedInput,
   runEndedEntry,
   runParentProblem,
   runStartedEntry,
   selectTools,
   silentLogger,
   stepMetaToJson,
+  streamRun,
   toolPermission,
   userEntry,
   type AgentSpec,
   type ContextSource,
   type Entry,
   type ErrorInfo,
-  type Executor,
+  type Executors,
   type Harness,
   type JsonObject,
   type JsonValue,
@@ -70,7 +72,6 @@ import {
   finishReasonOf,
   isAssistant,
   isObject,
-  mcpToolName,
   promptOf,
   textOf,
   toolCallsOf,
@@ -89,7 +90,7 @@ export interface PiHarnessOptions {
   /** 会话日志：生命周期事件、输入、模型的每一步、工具结果都实时写进来。 */
   readonly store: SessionStore;
   /** ctx 的执行环境：ctx 的工具经 MCP 交给 pi，调用由它们执行。 */
-  readonly executors?: readonly Executor[] | Readonly<Record<string, Executor>>;
+  readonly executors?: Executors;
   /**
    * 工具目录：`AgentSpec.tools` 从这里挑，定义的 `executor` 指向 `executors` 里的一个；`createToolRegistry()` 建的注册表
    * 自带的函数执行环境自动加进来。不给就是各执行环境 `tools()` 报的全部。
@@ -183,14 +184,6 @@ interface RunState {
   fenced: boolean;
 }
 
-interface Served {
-  readonly url: string;
-  readonly token: string;
-  /** pi 带着令牌连过来过没有。 */
-  contacted(): boolean;
-  close(): Promise<void>;
-}
-
 function piMeta(entry: Entry | undefined): PiMeta {
   const meta = entry?.meta?.['pi'];
   return isObject(meta) ? meta : {};
@@ -203,10 +196,6 @@ function metaOf(meta: { readonly [K in keyof PiMeta]?: string | undefined }): Js
 
 function isEmpty(content: MessageContent | undefined): boolean {
   return content === undefined || content.length === 0;
-}
-
-function denied(name: string): string {
-  return `Tool call "${name}" was denied by the agent's permissions.`;
 }
 
 /** 映射不了的 `AgentSpec` 字段：有就以 `invalid_request` 结束，不静默忽略。 */
@@ -270,11 +259,6 @@ function contextProblem(context: AgentSpec['context']): string | undefined {
   return undefined;
 }
 
-function endedInFailure(entry: Entry | undefined): boolean {
-  const stopReason = ctxEventData(entry, CTX_EVENTS.runEnded)?.stopReason;
-  return stopReason === 'error' || stopReason === 'aborted';
-}
-
 /** `AgentSpec.output`：pi 没有结构化输出，schema 写进系统提示，最后的回答按它解析。 */
 function outputInstructions(output: NonNullable<AgentSpec['output']>): string {
   return [
@@ -304,28 +288,14 @@ export function createPiHarness(options: PiHarnessOptions): PiHarness {
   const env = options.env ?? process.env;
   const grace = options.interruptTimeoutMs ?? 5_000;
   const sources = options.sources ?? [];
-  const executors = new Map<string, Executor>(
-    Array.isArray(options.executors)
-      ? (options.executors as readonly Executor[]).map((executor) => [executor.name, executor])
-      : Object.entries((options.executors ?? {}) as Readonly<Record<string, Executor>>),
-  );
   // `createToolRegistry()` 建的注册表自带函数执行环境：和参考实现一样自动带上。
-  const own = (options.tools as { executor?: unknown } | undefined)?.executor;
-  if (isObject(own) && typeof own['name'] === 'string' && typeof own['execute'] === 'function') {
-    const executor = own as unknown as Executor;
-    if (!executors.has(executor.name)) executors.set(executor.name, executor);
-  }
+  const executors = executorMap(options.executors, options.tools);
   let version: Promise<string | undefined> | undefined;
   const versionOf = (): Promise<string | undefined> =>
     (version ??= probeVersion({ command, env, ...(options.cwd !== undefined ? { cwd: options.cwd } : {}) }));
 
   async function catalog(): Promise<ToolDefinition[]> {
-    if (options.tools) return options.tools.list();
-    const listed = (
-      await Promise.all([...executors.values()].map(async (executor) => (await executor.tools?.()) ?? []))
-    ).flat();
-    const seen = new Set<string>();
-    return listed.filter((definition) => !seen.has(definition.name) && seen.add(definition.name));
+    return options.tools ? options.tools.list() : executorTools(executors.values());
   }
 
   // ---- 日志 ----
@@ -357,27 +327,14 @@ export function createPiHarness(options: PiHarnessOptions): PiHarness {
   }
 
   /**
-   * 这一轮的输入是不是上一轮失败时留下的那句（同参考实现）：上一轮以 `error` 或 `aborted` 结束，日志里它之后只有框架和
-   * 这个适配器写的事件、没盖住它的摘要。给了 `inputKey` 的看最近的条目里有没有这个键。
+   * 这一轮的输入是不是上一轮失败时留下的那句（`repeatsFailedInput`，同参考实现）：这个适配器写的事件和框架事件一样跳过，
+   * 给了 `inputKey` 的看最近的条目里有没有这个键。
    */
-  async function repeatsFailedInput(session: string, input: MessageContent, key: string | undefined): Promise<boolean> {
-    const tail = await store.list(session, { last: SCAN });
-    if (key !== undefined) return tail.some((entry) => entry.key === key);
-    let covered = 0;
-    for (const entry of tail.toReversed()) {
-      if (entry.type === 'event' && (isFrameworkKind(entry.kind) || entry.kind.startsWith(`${PI_HARNESS}.`))) continue;
-      if (entry.type === 'summary') {
-        covered = Math.max(covered, entry.covers);
-        continue;
-      }
-      return (
-        entry.type === 'message' &&
-        entry.message.role === 'user' &&
-        entry.seq > covered &&
-        JSON.stringify(entry.message.content) === JSON.stringify(input)
-      );
-    }
-    return false;
+  async function repeatsFailed(session: string, input: MessageContent, key: string | undefined): Promise<boolean> {
+    return repeatsFailedInput(await store.list(session, { last: SCAN }), input, {
+      harness: PI_HARNESS,
+      ...(key !== undefined ? { key } : {}),
+    });
   }
 
   /**
@@ -394,8 +351,8 @@ export function createPiHarness(options: PiHarnessOptions): PiHarness {
       const last = lifecycle.at(-1);
       if (state.record && isEvent(last, CTX_EVENTS.runStarted)) return 'busy';
       const previous = lastHarnessRun(lifecycle, PI_HARNESS);
-      const failed = endedInFailure(last);
-      const repeated = state.record && hasInput && failed && (await repeatsFailedInput(session, input!, inputKey));
+      const failed = endedInFailure(lifecycle);
+      const repeated = state.record && hasInput && failed && (await repeatsFailed(session, input!, inputKey));
       const position = previous && (piMeta(previous.ended).last ?? piMeta(previous.started).resumeAt);
       let plan: Plan;
       if (repeated && previous && previous.ended === last) {
@@ -509,87 +466,35 @@ export function createPiHarness(options: PiHarnessOptions): PiHarness {
   async function factsFor(request: RunRequest): Promise<string | undefined> {
     const spec = request.agent.context?.facts;
     if (spec === false || sources.length === 0) return undefined;
-    const { sources: names, heading } = typeof spec === 'object' ? spec : {};
-    let chosen = sources;
-    if (names) {
-      const wanted = new Set(names);
-      chosen = sources.filter((source) => wanted.has(source.name));
-      for (const name of wanted) {
-        if (!sources.some((source) => source.name === name)) logger.warn(`context source "${name}" is not registered`);
-      }
-    }
-    if (chosen.length === 0) return undefined;
-    const collected = await collectFacts(chosen, {
+    const { sources: only, heading } = typeof spec === 'object' ? spec : {};
+    const collected = await collectFacts(sources, {
       session: request.session,
       ...(request.signal ? { signal: request.signal } : {}),
       ...(options.sourceTimeoutMs !== undefined ? { timeoutMs: options.sourceTimeoutMs } : {}),
-      onError: (source, error) =>
-        logger.warn(`context source "${source}" failed`, {
-          error: error instanceof Error ? error.message : String(error),
-        }),
+      ...(only ? { only } : {}),
+      logger,
     });
     return collected.length > 0 ? renderFacts(collected, heading) : undefined;
   }
 
-  /** 这一轮的 MCP 服务器：只听本机、带一次性的令牌；第一次把调用交给某个执行环境之前 `open` 这个会话（ADR 0009）。 */
-  async function serveTools(state: RunState, definitions: readonly ToolDefinition[]): Promise<Served> {
-    const { session, agent } = state.request;
-    const environment = agent.environment;
-    const opened = new Map<string, Promise<void>>();
-    const wrapped = [...executors.values()].map((executor): Executor => ({
-      name: executor.name,
-      async execute(call, context) {
-        if (toolPermission(agent.permissions, call.name) === 'deny') return errorOutput(denied(call.name));
-        if (executor.open) {
-          let opening = opened.get(executor.name);
-          if (!opening) {
-            opening = executor.open(session, {
-              ...(environment ? { environment } : {}),
-              ...(state.request.signal ? { signal: state.request.signal } : {}),
-            });
-            opened.set(executor.name, opening);
-          }
-          try {
-            await opening;
-          } catch (error) {
-            return errorOutput(
-              `Executor "${executor.name}" could not prepare session "${session}" for tool "${call.name}": ${error instanceof Error ? error.message : String(error)}`,
-            );
-          }
-        }
-        return executor.execute(call, context);
-      },
-    }));
-    const server: McpServer = createMcpServer({
-      executors: wrapped,
-      tools: definitions,
-      context: { session, runId: state.runId },
-      name: 'ctx',
-      ...(options.maxToolOutputChars !== undefined ? { maxOutputChars: options.maxToolOutputChars } : {}),
-      logger,
-    });
-    const token = randomBytes(24).toString('base64url');
-    const handler = createMcpHttpHandler(server, { accessToken: token });
-    let contacted = false;
-    const http: Server = createServer((req, res) => {
-      if (req.headers.authorization === `Bearer ${token}`) contacted = true;
-      void handler(req, res);
-    });
-    await new Promise<void>((resolve, reject) => {
-      http.once('error', reject);
-      http.listen(0, '127.0.0.1', () => resolve());
-    });
-    const { port } = http.address() as AddressInfo;
-    return {
-      url: `http://127.0.0.1:${port}/mcp`,
-      token,
-      contacted: () => contacted,
-      async close() {
-        server.close();
-        http.closeAllConnections();
-        await new Promise<void>((resolve) => http.close(() => resolve()));
-      },
-    };
+  /**
+   * 这一轮的 MCP 服务器（`listenMcpHttp`）：只听本机、带一次性的令牌；第一次把调用交给某个执行环境之前 `open` 这个会话
+   * （ADR 0009）。`deny` 的工具照样交出去，调用时回拒绝（同参考实现）：扩展在 pi 里拦，这里也拦。
+   */
+  async function serveTools(state: RunState, definitions: readonly ToolDefinition[]): Promise<McpHttpListener> {
+    const { session, agent, signal } = state.request;
+    return listenMcpHttp(
+      createMcpServer({
+        executors: [...executors.values()],
+        tools: definitions,
+        context: { session, runId: state.runId },
+        name: 'ctx',
+        open: { ...(agent.environment ? { environment: agent.environment } : {}), ...(signal ? { signal } : {}) },
+        ...(agent.permissions ? { permissions: agent.permissions } : {}),
+        ...(options.maxToolOutputChars !== undefined ? { maxOutputChars: options.maxToolOutputChars } : {}),
+        logger,
+      }),
+    );
   }
 
   function argsFor(
@@ -635,7 +540,7 @@ export function createPiHarness(options: PiHarnessOptions): PiHarness {
     definitions: readonly ToolDefinition[],
     builtins: readonly string[],
     prompt: PiPrompt,
-    mcp: Served | undefined,
+    mcp: McpHttpListener | undefined,
     facts: string | undefined,
   ): Promise<RunResult> {
     const { agent } = state.request;
@@ -699,7 +604,7 @@ export function createPiHarness(options: PiHarnessOptions): PiHarness {
       readonly maxSteps: number;
       readonly rewind: string | undefined;
       readonly prompt: PiPrompt;
-      readonly mcp: Served | undefined;
+      readonly mcp: McpHttpListener | undefined;
     },
   ): Promise<RunResult> {
     const { request } = state;
@@ -1160,63 +1065,27 @@ export function createPiHarness(options: PiHarnessOptions): PiHarness {
 
   // ---- 排队和流 ----
 
-  /** 同一个实例里同一会话的记录型运行一个接一个（同参考实现），`session_busy` 只出现在跨进程的时候。 */
-  const tails = new Map<string, Promise<void>>();
+  /** 同一个实例里同一会话的记录型运行一个接一个（`createSessionQueue`，同参考实现），`session_busy` 只出现在跨进程的时候。 */
+  const queue = createSessionQueue();
   async function queued(request: RunRequest, emit: (event: RunEvent) => void): Promise<RunResult> {
     if (request.record === false) return execute(request, emit);
-    const previous = tails.get(request.session) ?? Promise.resolve();
-    let release!: () => void;
-    const mine = new Promise<void>((resolve) => (release = resolve));
-    const tail = previous.then(() => mine);
-    tails.set(request.session, tail);
-    await previous;
+    const release = await queue.enter(request.session, request.signal);
+    if (!release) {
+      // 排队时取消了：以 `aborted` 结束，什么都不写。流里照样先 `run.started` 后 `run.ended`（同参考实现）。
+      const runId = request.runId ?? randomUUID();
+      emit({ type: 'run.started', runId, session: request.session });
+      emit({ type: 'run.ended', runId, result: { runId, text: '', stopReason: 'aborted' } });
+      return { runId, text: '', messages: [], recorded: [], stopReason: 'aborted' };
+    }
     try {
       return await execute(request, emit);
     } finally {
       release();
-      if (tails.get(request.session) === tail) tails.delete(request.session);
     }
   }
 
   return {
     run: (request) => queued(request, () => {}),
-    async *stream(request) {
-      const events: RunEvent[] = [];
-      let wake: (() => void) | undefined;
-      let done = false;
-      let failure: unknown;
-      const controller = new AbortController();
-      const signal = request.signal ? AbortSignal.any([request.signal, controller.signal]) : controller.signal;
-      const task = (async () => {
-        try {
-          await queued({ ...request, signal }, (event) => {
-            events.push(event);
-            wake?.();
-          });
-        } catch (error) {
-          failure = error;
-        } finally {
-          done = true;
-          wake?.();
-        }
-      })();
-      try {
-        for (;;) {
-          const event = events.shift();
-          if (event) {
-            yield event;
-            continue;
-          }
-          if (done) break;
-          await new Promise<void>((resolve) => (wake = resolve));
-          wake = undefined;
-        }
-        if (failure !== undefined) throw failure;
-      } finally {
-        // 调用方提前停了：停下这一轮。
-        if (!done) controller.abort();
-        await task;
-      }
-    },
+    stream: (request) => streamRun(request, queued),
   };
 }

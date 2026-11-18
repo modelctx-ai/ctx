@@ -346,7 +346,7 @@ interface Projection {
 ```
 
 - 参考实现 = 投影规则（事件渲染、摘要渲染、消息改写、窗口）+ 来源 + 压缩，就是今天 `createContext` 里的 `prepare`、`view`、`compact`。
-- 投影、来源收集、token 估算和截短是纯函数，放在协议包：`project(entries, options)`、`projectSession(store, session, options)`、`latestSummary`、`defaultSummaryMessage`、`collectFacts(sources, { session, timeoutMs?, onError? })`、`renderFacts`、`defineSource`、`estimateTokens`、`estimateTextTokens`、`estimateFileTokens`、`truncateText`、`truncateMessage`。语义见[架构](architecture.md#投影)。
+- 投影、来源收集、token 估算和截短是纯函数，放在协议包：`project(entries, options)`、`projectSession(store, session, options)`、`latestSummary`、`defaultSummaryMessage`、`collectFacts(sources, { session, timeoutMs?, only?, logger?, onError? })`（`only` 按名字挑来源，`logger` 记出错、超时和没注册的名字）、`renderFacts`、`defineSource`、`estimateTokens`、`estimateTextTokens`、`estimateFileTokens`、`truncateText`、`truncateMessage`。语义见[架构](architecture.md#投影)。
 - 长会话不必整段读出来：`projectSession` 读生效的摘要和它之后的条目再投影，结果和读出来再 `project` 一样，但有窗口时只读够用的尾部。按 `seq` 读最后 N 条（`last`），用 `atAfter` 补上写得更早、`at` 却排在这 N 条之后的条目，这样读到的是投影顺序里完整的一段尾巴；窗口把开头可能不完整的那组（同类事件合成的一组被切开，或者工具结果的调用在更前面）和后面至少一个完整的组都挤掉了，就说明更早的部分不会再进窗口，否则读 4 倍那么多再来。没有窗口（或者是 `{}`）时读整段。参考实现的 `view`、`build` 用它。
 - 投影的输出是模型接口收得下的消息序列，不管日志里是什么样、窗口裁在哪：工具结果找不到对应的调用（调用被裁掉了、或者本来就没有）就去掉；工具调用没有结果（运行断在中间）就补一条错误结果（`No result was recorded for this tool call.`），服务商自己执行的调用（`providerExecuted`）除外；窗口裁剪之后，开头不留孤立的工具结果，没有摘要时也不以助手消息开头（接着裁到下一条用户消息）。
 - 窗口的两处配置：请求里的 `window`（`BuildRequest`、`ViewOptions`、`AgentSpec`）给了就**整个换掉** builder 配置的上限，`{}` 表示不裁剪；`estimate` 是函数、过不了线，始终用 builder 的。`build` 的 `maxTokens` 管的是整次调用：指令、事实、工具定义、`input`、`prompt` 的估算先从里面扣掉，剩下的才是历史的预算；`view` 没有这些，`maxTokens` 就是历史的预算。
@@ -390,6 +390,7 @@ interface ToolRegistry {
   get(name: string): ToolDefinition | undefined;
   list(): ToolDefinition[]; // 按加入的顺序
   select(filter?: ToolFilter): ToolDefinition[]; // 同 selectTools(list(), filter)
+  executor?: Executor; // 注册表自带的执行环境（参考实现放 addTool 的函数），harness 和自己的执行环境一起用
 }
 ```
 
@@ -459,9 +460,10 @@ interface EnvironmentSpec {
   - **输出**由执行环境截断或分页，再交给模型：它知道怎么截才有用（命令输出留头尾、文件按行分页）。harness 另兜一层底：一次结果超过上限（可配，缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`，20 万字符）时截断并注明省略了多少，免得哪个执行环境忘了就把上下文塞满。纯函数 `limitToolOutput(output, maxChars)`：文字和错误信息直接截，`json` 序列化后超了换成截断的文字，`content` 各段合起来算、放不下的内联文件换成一句说明。
 - 和 AI SDK 互转：`toolOutputToAiSdk(output)` 得到工具结果的 `output`（`text`、`json`、`error-text`、`error-json`、`content`），`toolOutputFromAiSdk` 转回来。协议 → AI SDK → 协议不丢信息：只有文字的错误是 `error-text`，带 `retryable` 或 `data` 的是 `error-json` 的 `{ message, retryable?, data? }`；`URL` 规范化会改写法时原串放进 `originalUrl`。反方向：二进制变 base64，已弃用的 `image-data`、`file-url` 等换成 `file`，`execution-denied` 变成错误，任意形状的 `error-json` 整个放进 `data`，`providerOptions` 和 `custom` 分段丢掉。
 - `errorOutput(message, { retryable?, data? })` 构造错误结果。
+- `Executors` 是执行环境的集合：数组按各自的 `name`，对象按键。`executorMap(executors, registry?)` 给出按名字查的表，注册表自带的（`ToolRegistry.executor`）也加进来，同名的以 `executors` 为准；`executorTools(executors)` 是各执行环境 `tools()` 报的定义，同名的只留第一个。
 - **每会话的执行环境（[ADR 0009](adr/0009-hosted-prerequisites.md)）。** `provision`、`dispose` 管整个执行环境，`open`、`close` 管一个会话：每个会话一个容器、一个工作目录。harness 在一轮里第一次把调用交给某个执行环境之前调一次它的 `open(session, { environment: agent.environment })`；`open` 抛错时这一轮交给它的调用都得到错误结果，模型看得到原因，这一轮照常往下走。会话什么时候结束由应用决定，框架不猜：应用调各个执行环境的 `close`（参考实现的 `closeExecutorSessions(executors, session)`）。闲置回收是执行环境自己的策略。`EnvironmentSpec` 满足不了（没有那个镜像、不支持白名单、要的变量没配）时 `open` 抛 `invalid_request`，不静默降级。
 - **凭证不进执行环境。** 凭证不出现在 `ToolCall`、`ExecutionContext`、`AgentSpec` 里，日志里也就没有；`EnvironmentSpec.env` 只有变量的名字。需要凭证的工具放在 harness 这一侧执行（函数执行环境、MCP 服务器），模型生成的代码碰不到；一定要在沙箱里用的，由部署方在出口替换：沙箱里只有占位符，出站代理换成真的。交给子进程的环境变量模型生成的代码读得到。
-- 实现：进程内函数（核心包）、MCP 服务器（`ctx-mcp`）、本机子进程（`ctx-exec`，`sessionCwd` 时每个会话一个工作目录）、HTTP 远端（`ctx-remote`）。反方向：`ctx-mcp` 的 `createMcpServer` 把执行环境包成 MCP 服务器（stdio 或 Streamable HTTP），自带循环的程序经它调 ctx 的工具。
+- 实现：进程内函数（核心包）、MCP 服务器（`ctx-mcp`）、本机子进程（`ctx-exec`，`sessionCwd` 时每个会话一个工作目录）、HTTP 远端（`ctx-remote`）。反方向：`ctx-mcp` 的 `createMcpServer` 把执行环境包成 MCP 服务器（stdio 或 Streamable HTTP），自带循环的程序经它调 ctx 的工具；调用方不经过 harness，所以输入检查、结果截断、执行前 `open` 会话（`open`）和 `deny`（`permissions`）都在它这边做。`listenMcpHttp` 在本机起一个带一次性令牌的 HTTP 服务器，给自己起的子进程连。
 - 远端执行环境有两种接法：harness 调它（它是服务），或它从 harness 领工作（它是只需出站连接的 worker，像 Managed Agents 的自托管沙箱）。协议相同，`ctx-remote` 先做前者。
 
 ## Harness
@@ -620,6 +622,7 @@ interface Harness {
 - 一轮里 harness 做的事：`ctx.run.started` → 记输入 → `ContextBuilder.build` →（配了 `context.overflow` 时）超窗检查 → 调模型 → 对每个工具调用：`beforeTool` → 找到绑定的执行环境 → `execute` → `afterTool` → 工具结果回到模型，直到停下 → `ctx.run.ended`。
 - **每一步即时落日志。** 产出不等这一轮结束：模型这一步要调工具时，调用（助手消息）在工具执行之前写下；步骤结束时写这一步剩下的（工具结果，或者没有工具调用时的助手消息）；最后写 `ctx.run.ended`。每次写入都带 `expectSeq`。所以进程在任何时刻崩掉，日志里都有已经做完的步骤，至少有「调用已发出、结果未知」。这一轮半路结束（出错、被取消）时，已经写下的步骤留着；写下了调用、还没等到结果的工具调用先补一条错误结果，再写 `ctx.error` 和 `ctx.run.ended`。
 - 模型出错、被取消也写 `ctx.run.ended`，`run` 照常返回，`stopReason` 和 `error` 说明原因；只有写日志本身失败才 reject。远端调用方因此总拿到同一种形状。
+- `stream` 交出 `RunEvent`：调用方提前不读了，这一轮就中止。`streamRun(request, run)` 把边跑边交出事件的一轮（`run(request, emit)`）包成 `stream`，中止、等它结束和抛错都按这一条。
 - **`AgentSpec` 里只能用 JSON 表达的能力**，换一个 harness、过一次 remote 都还在（#47）：
   - `version`：应用自己的版本标识，原样记进 `ctx.run.started`，回看时知道这一轮跑的是哪一版。
   - `output`：结构化输出。最后的回答按 `schema` 生成（服务商支持的话约束解码）、解析、按 `checkJsonSchema` 校验，放在 `RunResult.output`；不是 JSON 或不合 schema 时这一轮以 `error` 结束，`error.type` 是 `invalid_output`（`retryable: false`）。只在 `end_turn` 时解析：停在工具调用（`requires_action`、`max_steps`、`max_budget`）的没有回答可解析。
@@ -635,11 +638,11 @@ interface Harness {
   3. 还超（指令、工具定义、`input` 本身就放不下），或者 `strategy: 'error'`：这一轮不调模型，以 `stopReason: 'error'`、`error.type: 'context_overflow'`（`retryable: false`）结束，照常写 `ctx.error` 和 `ctx.run.ended`。
      配置全是 JSON，随 `agent.context` 过线、记进 `ctx.run.started`；`maxTokens` 不是正数、`strategy` 不认识时这一轮以 `invalid_request` 结束。检查只在第一次调模型之前做：工具步骤里长出来的上下文靠工具结果的长度上限和下面的错误映射兜着。
 - **上下文过长的错误。** 服务商拒绝一次调用、说上下文超过了模型的窗口时，harness 把它映射成 `stopReason: 'error'`、`error.type: 'context_overflow'`、`retryable: false`（`ctx.error` 的 `type` 同样），`statusCode`、`responseBody` 照旧带着。不另加 `StopReason`：它和 `session_busy`、`not_found` 一样是「这一轮没跑成」的一种，已有的 `stopReason === 'error'` 分支（编排器的 `failed`、远端的状态码）都不用改，要区分的看 `error.type`。纯函数 `isContextOverflow(error)` 只看 `type`，`CtxError`、`ErrorInfo`、远端客户端转出来的错误都认；常量 `CONTEXT_OVERFLOW`。`isContextOverflowText(text, status?)` 认上游的原始报错：HTTP 413 算，401、403、404、429 不算，其余看文字里有没有各服务商常见的错误码和消息。AI SDK 没有专门的错误类型，参考实现拿接口错误的消息和响应正文交给它（见[架构](architecture.md#harness)），外部 harness 的适配器拿程序转出来的报错交给它，**各服务商的错误形状没有对真实服务验证**；认不出来的照旧是 `api_call`。应用看到 `context_overflow` 之后的下一步：`compactDetailed` 压缩再重试，或者给 agent 配上 `context.overflow`。
-- **失败的重试不让历史变长。** 输入在调模型之前就写进日志，这一轮失败了它也留着。重试有两种认法：给了 `inputKey` 的由存储按键去重；没给的，harness 看上一轮是不是以 `error` 或 `aborted` 结束、日志里最后一条不是框架写的条目是不是同样内容的用户消息（它后面只有 `ctx.*` 事件和没盖住它的摘要），是就不再记一遍，`recorded` 里也没有它。上一轮成功了、换了一句话、两轮之间应用写过别的条目，都照常记。以前不带 `inputKey` 的重试每失败一次历史就长一条，上下文过长时越重试越长。
+- **失败的重试不让历史变长。** 输入在调模型之前就写进日志，这一轮失败了它也留着。重试有两种认法：给了 `inputKey` 的由存储按键去重；没给的，harness 看上一轮是不是以 `error` 或 `aborted` 结束、日志里最后一条不是框架写的条目是不是同样内容的用户消息（它后面只有 `ctx.*` 事件和没盖住它的摘要），是就不再记一遍，`recorded` 里也没有它。上一轮成功了、换了一句话、两轮之间应用写过别的条目，都照常记。以前不带 `inputKey` 的重试每失败一次历史就长一条，上下文过长时越重试越长。纯函数 `endedInFailure(lifecycle)` 认上一轮失败，`repeatsFailedInput(tail, input, { key?, harness? })` 认这一句是不是失败那一轮留下的；外部 harness 给 `harness`，它自己写的事件（`<harness>.*`）也跳过。
 - **一个会话最多一个未结束的运行，跨进程也成立**（只对 `record` 不为 `false` 的运行；`record: false` 的运行不碰日志，不占会话，不会遇到 `session_busy`，也不会被 `recover` 看到）：
   1. 开始：读最后一个生命周期事件（`list({ kinds: [ctx.run.started, ctx.run.ended], last: 1 })`）。是 `started` 就说明有未结束的运行，`run` 以 `ErrorInfo.type: 'session_busy'`（`retryable: true`）结束，不写任何东西；否则带 `expectSeq` 追加 `ctx.run.started`，冲突就重读重判。
   2. 运行中：每次写入带 `expectSeq`（本轮上一次写入之后的末尾）。冲突时读自己的 `ctx.run.started` 起的生命周期事件和擦除记录（`kinds: [ctx.run.started, ctx.run.ended, ctx.erased]`）：自己的 `runId` 已经有 `ctx.run.ended`，说明被别人当作断掉的运行收走了；自己的 `ctx.run.started` 不在了，说明会话中途被 `clear` 了，或者 `truncate`、`remove` 删到了它；有 `ctx.erased` 动了这一轮自己写的条目（`isErased`，`redact` 也算），说明这一轮的输入或产出被删了。三种都是被围栏，停下，`stopReason: 'aborted'`，不再写 `ctx.run.ended`、`ctx.error` 和产出——针对已删内容的回答不会写回来。都不是就只是别人写了应用事件，或者擦除的是这一轮之前的历史、别人在这期间写的条目，用新的末尾重试。已经建好的上下文不重建：这一轮的模型仍然看得到被擦除的更早的内容，要一并挡住就先取消这一轮再删。纯函数 `isFenced(lifecycle, run)` 是这条规则（`run` 是 `RunPosition`：`runId`、`started`、`recorded`），`afterConflict(store, session, run)` 连读带判：被围栏返回 `undefined`，否则返回新的末尾。
-  3. 同一个 harness 实例自己维护一条进程内的每会话串行队列（只排 `record` 不为 `false` 的运行）：同一进程里的第二个运行等前一个结束再开始，所以 `session_busy` 只会在跨进程或别的 harness 实例上出现。排队时 `signal` 中止，这一轮直接以 `aborted` 结束，什么都不写。队列只是少打一次冲突；编排器自己的队列保留，两层串行不冲突。
+  3. 同一个 harness 实例自己维护一条进程内的每会话串行队列（只排 `record` 不为 `false` 的运行）：同一进程里的第二个运行等前一个结束再开始，所以 `session_busy` 只会在跨进程或别的 harness 实例上出现。排队时 `signal` 中止，这一轮直接以 `aborted` 结束，什么都不写。队列只是少打一次冲突；编排器自己的队列保留，两层串行不冲突。`createSessionQueue()` 是这条队列：`enter(session, signal?)` 轮到时返回 `release`，排队时中止返回 `undefined`。
   4. 进程崩溃留下的未结束运行会让该会话一直 `session_busy`，直到有编排器 `recover` 它。**所以用 `record` 缺省（写日志）的应用，进程启动时要先 `recover()` 再接新的 `submit`。** 不写日志的运行没有这个要求。
   5. 续跑：`recover` 给断掉的运行写下了调用、没有结果的工具调用补一条错误结果（「这一轮在工具返回之前结束了，结果未知」），和 `ctx.run.ended` 一批写；要续跑的，在同一个会话上提交一轮不带新输入的运行，模型从日志里看到已经做完的步骤和那条错误结果，接着往下走。已经有结果的工具不会再执行；结果未知的那次由模型决定要不要重试，有副作用的工具应当自己幂等。
   6. `RunRequest.owner` 写进 `ctx.run.started` 的 `owner`（编排器按自己的 `owner` 填）。

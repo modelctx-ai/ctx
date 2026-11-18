@@ -176,10 +176,6 @@ interface Rolling {
   covers(count: number): number | undefined;
 }
 
-function messageOf(error: unknown): unknown {
-  return error instanceof Error ? error.message : error;
-}
-
 export function isEmptyContent(content: MessageContent | undefined): boolean {
   if (content === undefined) return true;
   return typeof content === 'string' ? content.trim() === '' : content.length === 0;
@@ -391,20 +387,12 @@ export function createContextBuilder(options: ContextBuilderOptions): LocalConte
   }
 
   function facts(session: string, signal?: AbortSignal, factsOptions: { readonly sources?: readonly string[] } = {}) {
-    let chosen = sources;
-    if (factsOptions.sources) {
-      const names = new Set(factsOptions.sources);
-      chosen = sources.filter((source) => names.has(source.name));
-      for (const name of names) {
-        if (!sources.some((source) => source.name === name)) logger.warn(`context source "${name}" is not registered`);
-      }
-    }
-    if (chosen.length === 0) return Promise.resolve<Fact[]>([]);
-    return collectFacts(chosen, {
+    return collectFacts(sources, {
       session,
       ...(signal ? { signal } : {}),
       ...(options.sourceTimeoutMs !== undefined ? { timeoutMs: options.sourceTimeoutMs } : {}),
-      onError: (source, error) => logger.warn(`context source "${source}" failed`, { error: messageOf(error) }),
+      ...(factsOptions.sources ? { only: factsOptions.sources } : {}),
+      logger,
     });
   }
 

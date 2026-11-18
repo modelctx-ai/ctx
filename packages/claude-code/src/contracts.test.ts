@@ -449,6 +449,36 @@ slow.describe('Claude Code 适配器', () => {
       'aborted',
     );
   });
+
+  slow.test('排队时取消：以 aborted 结束，什么都不写，也不挡后面的运行；流里先 run.started 后 run.ended', async () => {
+    const { harness, store, agent } = await setup([
+      { type: 'text', text: '一' },
+      { type: 'text', text: '三' },
+    ]);
+    const first = harness.run({ session: 's', agent, input: '一' });
+    const controller = new AbortController();
+    const queued = harness.run({ session: 's', agent, input: '二', signal: controller.signal });
+    const streamed = (async () => {
+      const events: string[] = [];
+      for await (const event of harness.stream({ session: 's', agent, input: '二', signal: controller.signal })) {
+        events.push(event.type === 'run.ended' ? `run.ended:${event.result.stopReason}` : event.type);
+      }
+      return events;
+    })();
+    const third = harness.run({ session: 's', agent, input: '三' });
+    controller.abort();
+    const skipped = await queued;
+    assert.equal(skipped.stopReason, 'aborted');
+    assert.deepEqual(skipped.recorded, []);
+    assert.deepEqual(await streamed, ['run.started', 'run.ended:aborted']);
+    assert.deepEqual([(await first).text, (await third).text], ['一', '三']);
+    const log = await store.list('s');
+    assert.deepEqual(log.filter((entry) => entry.type === 'message' && entry.message.role === 'user').map(textOf), [
+      '一',
+      '三',
+    ]);
+    assert.equal(started(log).length, 2);
+  });
 });
 
 /** 条目的类型和来源：`event:<kind>`、`<role>:<source>`。 */

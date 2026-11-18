@@ -4,20 +4,22 @@ import {
   CONTEXT_OVERFLOW,
   CTX_EVENTS,
   checkJsonSchema,
+  createSessionQueue,
   CtxError,
   ctxErrorEntry,
-  ctxEventData,
+  endedInFailure,
   estimateTextTokens,
   estimateTokens,
   headSeq,
   isConflict,
   isEvent,
-  isFrameworkKind,
   errorOutput,
+  executorMap,
   messageEntry,
   runEndedEntry,
   runIdOf,
   runParentProblem,
+  repeatsFailedInput,
   runStartedEntry,
   silentLogger,
   stepMetaToJson,
@@ -28,7 +30,7 @@ import {
   type ContextBuilder,
   type Entry,
   type ErrorInfo,
-  type Executor,
+  type Executors,
   type Harness,
   type Hooks,
   type InheritSpec,
@@ -74,14 +76,7 @@ import {
 import { isEmptyContent, resolveModel } from './builder.ts';
 import { isContextOverflowError } from './errors.ts';
 import { fromModelMessages, toModelMessages } from './messages.ts';
-import {
-  dispatchTo,
-  executorMap,
-  toToolSet,
-  type Executors,
-  type LocalToolRegistry,
-  type ToolDispatch,
-} from './tools.ts';
+import { dispatchTo, toToolSet, type LocalToolRegistry, type ToolDispatch } from './tools.ts';
 
 export type GenerateTextResult = Awaited<ReturnType<typeof generateText>>;
 export type StreamTextResult = ReturnType<typeof streamText>;
@@ -398,19 +393,8 @@ function estimateCall(call: PreparedCall, tools: readonly ToolDefinition[]): num
   );
 }
 
-/** 会话里最后一个生命周期事件是 `ctx.run.ended`，而且停在 `error` 或 `aborted`：上一轮失败了，没有产出。 */
-function endedInFailure(lifecycle: readonly Entry[]): boolean {
-  const stopReason = ctxEventData(lifecycle.at(-1), CTX_EVENTS.runEnded)?.stopReason;
-  return stopReason === 'error' || stopReason === 'aborted';
-}
-
 /** 认重试时最多往回读这么多条；失败的那句输入之后写得比这多，就不认了，输入照常记。 */
 const RETRY_SCAN = 64;
-
-function hasExecutor(tools: ToolRegistry | undefined): tools is ToolRegistry & { readonly executor: Executor } {
-  const candidate = (tools as { executor?: unknown } | undefined)?.executor;
-  return typeof candidate === 'object' && candidate !== null && typeof (candidate as Executor).execute === 'function';
-}
 
 /**
  * 把调用方的 `signal` 接到一个自己的控制器上：调用方中止或自己提前结束都能取消模型调用。
@@ -534,9 +518,8 @@ function fenced(state: RunState): RunResult {
 export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   const { store, context, tools, hooks = {} } = options;
   const logger = options.logger ?? silentLogger;
-  const executors = executorMap(options.executors);
+  const executors = executorMap(options.executors, tools);
   const external = new Set(options.external ?? []);
-  if (hasExecutor(tools) && !executors.has(tools.executor.name)) executors.set(tools.executor.name, tools.executor);
   const base = dispatchTo([...executors.values()]);
   /** `addTool` 加进注册表的工具自己校验输入。 */
   const selfValidated = (name: string): boolean => {
@@ -668,30 +651,12 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   }
 
   /**
-   * 这一轮的输入是不是上一轮失败时留下的那句。上一轮以 `error` 或 `aborted` 结束、没有产出，它（或者更早失败的一轮）
-   * 记下的输入还在日志里；这一轮带着一模一样的输入来，就是重试：不再记一遍，不然每失败一次历史就长一条
-   * （上下文过长时越重试越长）。只在那句输入之后没有别的内容时才认：它后面只有框架事件（`ctx.*`）和没盖住它的摘要。
-   * 给了 `inputKey` 的不走这里，由存储按键去重。
+   * 这一轮是上一轮失败后的重试、输入就是它留下的那句（`repeatsFailedInput`）：不再记一遍，不然每失败一次历史就长一条
+   * （上下文过长时越重试越长）。给了 `inputKey` 的不走这里，由存储按键去重。
    */
-  async function repeatsFailedInput(state: RunState, input: MessageContent): Promise<boolean> {
-    if (!state.afterFailure) return false;
-    const tail = await store.list(state.request.session, { last: RETRY_SCAN });
-    let covered = 0;
-    // 从末尾往回找最后一条不是框架写的条目：失败的轮次只留下 `ctx.*` 事件，连着失败几轮也一样跳过去。
-    for (const entry of tail.toReversed()) {
-      if (entry.type === 'event' && isFrameworkKind(entry.kind)) continue;
-      if (entry.type === 'summary') {
-        covered = Math.max(covered, entry.covers);
-        continue;
-      }
-      return (
-        entry.type === 'message' &&
-        entry.message.role === 'user' &&
-        entry.seq > covered &&
-        JSON.stringify(entry.message.content) === JSON.stringify(input)
-      );
-    }
-    return false;
+  async function isRetry(state: RunState, input: MessageContent): Promise<boolean> {
+    if (!state.afterFailure || state.request.inputKey !== undefined) return false;
+    return repeatsFailedInput(await store.list(state.request.session, { last: RETRY_SCAN }), input);
   }
 
   /** 压缩一次，返回有没有写下摘要。builder 自己没配摘要模型（`no_model`）时用这一轮的模型。 */
@@ -778,8 +743,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     const input = isEmptyContent(request.input) ? undefined : request.input;
     if (state.record && input !== undefined) {
       const source = options.source !== undefined ? { source: options.source } : {};
-      const repeated = request.inputKey === undefined && (await repeatsFailedInput(state, input));
-      if (!repeated) {
+      if (!(await isRetry(state, input))) {
         await write(state, [userEntry(input, { ...source, ...(request.inputKey ? { key: request.inputKey } : {}) })]);
       }
     }
@@ -1115,54 +1079,16 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     };
   }
 
-  /** 进程内每会话一条队列，队尾是前一个记录型运行结束的时刻。队列里的 promise 永远 resolve，不会 reject。 */
-  const tails = new Map<string, Promise<void>>();
+  const queue = createSessionQueue();
 
   /**
-   * 排进这个会话的队：同一个 harness 里记录型运行（`record` 不为 `false`）一个接一个，第二个等前一个结束再开始，
-   * 所以 `session_busy` 只会出现在跨进程（或别的 harness 实例）的时候。`record: false` 不排。
-   * 前面有人在跑、自己在排队时 `signal` 中止，就退出队列，返回 `undefined`，调用方以 `aborted` 结束，什么都没写。
-   * 返回的 `release` 在运行结束时调；可以重复调。
+   * 排进这个会话的队（`createSessionQueue`）：同一个 harness 里记录型运行一个接一个，`record: false` 不排。排队时
+   * `signal` 中止返回 `undefined`，调用方以 `aborted` 结束，什么都不写；没人排在前面就直接开始，`signal` 已经中止的
+   * 运行照常写 started 和 ended（见契约）。
    */
   async function enter(state: RunState): Promise<(() => void) | undefined> {
     if (!state.record) return () => {};
-    const { session } = state.request;
-    const { signal } = state.request;
-    const queued = tails.has(session);
-    const previous = tails.get(session) ?? Promise.resolve();
-    const turn = Promise.withResolvers<void>();
-    const tail = previous.then(() => turn.promise);
-    tails.set(session, tail);
-    let released = false;
-    const release = (): void => {
-      if (released) return;
-      released = true;
-      turn.resolve();
-      void tail.finally(() => {
-        if (tails.get(session) === tail) tails.delete(session);
-      });
-    };
-    // 没人排在前面就直接开始：`signal` 已经中止的运行照常写 started 和 ended（见契约）。
-    if (!queued) return release;
-    if (signal) {
-      // 等完就摘掉监听：调用方长期复用同一个 signal 时不会越积越多。
-      let onAbort: (() => void) | undefined;
-      const aborted = new Promise<void>((resolve) => {
-        if (signal.aborted) return resolve();
-        onAbort = resolve;
-        signal.addEventListener('abort', onAbort, { once: true });
-      });
-      let waited = false;
-      await Promise.race([previous.then(() => (waited = true)), aborted]);
-      if (onAbort) signal.removeEventListener('abort', onAbort);
-      if (signal.aborted || !waited) {
-        release();
-        return undefined;
-      }
-    } else {
-      await previous;
-    }
-    return release;
+    return queue.enter(state.request.session, state.request.signal);
   }
 
   async function run(request: RunRequest, extras: RunExtras = {}): Promise<RunOutcome> {

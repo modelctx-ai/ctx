@@ -171,11 +171,6 @@ export function finishReasonOf(stop: PiStopReason | undefined): string | undefin
   }
 }
 
-/** MCP 工具在 pi 里的名字：`mcp__<服务器>__<工具>`。 */
-export function mcpToolName(server: string, tool: string): string {
-  return `mcp__${server}__${tool}`;
-}
-
 /** 一条助手消息换成协议的：空的文字不要；推理的签名放进 `providerOptions.pi`；`toolName` 把 MCP 的名字换回 ctx 的工具名。 */
 export function assistantMessageOf(message: PiAssistantMessage, toolName: (name: string) => string): AssistantMessage {
   const parts: AssistantPart[] = [];

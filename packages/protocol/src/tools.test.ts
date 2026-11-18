@@ -5,12 +5,15 @@ import { describe, test } from 'vite-plus/test';
 import {
   checkJsonSchema,
   errorOutput,
+  executorMap,
+  executorTools,
   isValidToolName,
   limitToolOutput,
   selectTools,
   toolOutputFromAiSdk,
   toolOutputToAiSdk,
   type AiSdkToolOutput,
+  type Executor,
   type ToolDefinition,
   type ToolOutput,
 } from './tools.ts';
@@ -22,10 +25,42 @@ const tool = (name: string, extra: Partial<ToolDefinition> = {}): ToolDefinition
   ...extra,
 });
 
+function executor(name: string, tools?: readonly ToolDefinition[]): Executor {
+  return {
+    name,
+    ...(tools ? { tools: async () => [...tools] } : {}),
+    execute: async () => ({ type: 'text', text: name }),
+  };
+}
+
 describe('tool names', () => {
   test('各家接口的共同限制：[a-zA-Z0-9_-]，最多 64 个', () => {
     for (const ok of ['weather', 'fs__read_file', 'a-b_C9', 'x'.repeat(64)]) assert.ok(isValidToolName(ok), ok);
     for (const bad of ['', 'a b', 'a.b', '天气', 'x'.repeat(65)]) assert.ok(!isValidToolName(bad), bad);
+  });
+});
+
+describe('executors', () => {
+  test('executorMap：数组按 name，对象按键；注册表自带的加进来，同名的以 executors 为准', () => {
+    const local = executor('local');
+    assert.deepEqual([...executorMap([executor('a'), executor('b')]).keys()], ['a', 'b']);
+    assert.deepEqual([...executorMap({ x: executor('a') }).keys()], ['x']);
+    assert.deepEqual([...executorMap(undefined, { executor: local }).keys()], ['local']);
+    const mine = executor('local');
+    assert.equal(executorMap([mine], { executor: local }).get('local'), mine);
+    assert.equal(executorMap([], {}).size, 0);
+  });
+
+  test('executorTools：按执行环境的顺序，同名的只留第一个，没有 tools() 的跳过', async () => {
+    const listed = await executorTools([
+      executor('a', [tool('read', { executor: 'a' }), tool('write', { executor: 'a' })]),
+      executor('quiet'),
+      executor('b', [tool('read', { executor: 'b' }), tool('list', { executor: 'b' })]),
+    ]);
+    assert.deepEqual(
+      listed.map((definition) => `${definition.executor}:${definition.name}`),
+      ['a:read', 'a:write', 'b:list'],
+    );
   });
 });
 

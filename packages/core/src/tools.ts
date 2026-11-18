@@ -2,6 +2,7 @@ import {
   checkJsonSchema,
   DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   errorOutput,
+  executorMap,
   isValidToolName,
   limitToolOutput,
   selectTools,
@@ -9,7 +10,7 @@ import {
   toolOutputToAiSdk,
   type AddToolOptions,
   type ExecutionContext,
-  type Executor,
+  type Executors,
   type JsonObject,
   type JsonValue,
   type ToolCall,
@@ -21,15 +22,6 @@ import {
 import { asSchema, dynamicTool, jsonSchema, type Tool, type ToolResultPart, type ToolSet } from 'ai';
 
 import { createFunctionExecutor, type FunctionExecutor, type ToolFunction } from './executor.ts';
-
-/** 执行环境的集合：数组按各自的 `name`，对象按键。 */
-export type Executors = readonly Executor[] | Readonly<Record<string, Executor>>;
-
-export function executorMap(executors: Executors | undefined): Map<string, Executor> {
-  if (!executors) return new Map();
-  if (Array.isArray(executors)) return new Map(executors.map((executor: Executor) => [executor.name, executor]));
-  return new Map(Object.entries(executors));
-}
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

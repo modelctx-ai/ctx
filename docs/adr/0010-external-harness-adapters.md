@@ -64,6 +64,7 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`context`、`output` 五级（`context` 一级 2026-11-18 起）；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。`ask` 权限和外部执行环境（`external`）以 `requires_action` 结束，`window`、`context` 照参考实现的 builder 移植，超窗时先压缩（都是 2026-11-18）。
 - `ctx-pi`：`createPiHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 pi 1.5.2 验证过（2026-11-18），模型是本机的假 Anthropic 接口；对真实的模型服务没有验证。CI 装同一个版本跑。
 - `ctx-claude-code`、`ctx-pi` 收上下文来源（`sources`），`AgentSpec.context.facts` 映射得上（2026-11-18）；记忆接进这两个 harness 的例子是 [`examples/memory-pi.ts`](../../examples/memory-pi.ts)。
+- 两个进程级适配器一样的部分收进协议包（`executorMap`、`executorTools`、`endedInFailure`、`repeatsFailedInput`、`createSessionQueue`、`streamRun`，`collectFacts` 的 `only`、`logger`）和 `ctx-mcp`（`createMcpServer` 的 `open`、`permissions`，`listenMcpHttp`、`mcpToolName`），核心包也改用协议包里的那几样（2026-11-18）。
 - 没做：pydantic-ai 的事件规则和别的投影、事实来源；pi 的扩展加进上下文的消息（`custom_message`）和插话（`steer`、`follow_up`）不进日志。
 
 ## 决定记录
@@ -98,3 +99,8 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - 2026-11-18：pydantic-ai 的压缩实施，`window`、`context` 那一条里的「还是不压缩」不再成立。`context.overflow` 的 `compact` 照参考实现 harness 的 `fit` 和 builder 的 `compactDetailed` 移植：切点、记录的写法、分段滚动摘要、检查点，压缩没做成时接着裁剪，`record: false` 不压缩，都一样；测试对同一组日志、同一个剧本的摘要模型和 TypeScript 比切点、每段交给模型的记录、写下的摘要和 `ctx.compacted`。和决定正文的关系：
   - 决定八不受影响：它说的是程序压缩自己的上下文。pydantic-ai 的历史本来就是 ctx 的投影（2026-11-17 那条的决定四），摘要由 ctx 这一侧写、投影时代替它盖住的条目，正是 `summary` 的本义，和参考实现写的一样。
   - 写摘要的模型：新选项 `summary_model`，不给就用这一轮的模型，同参考实现的 harness 在 builder 没配模型时的做法。调用走 `pydantic_ai.direct.model_request`，不经 `Agent`：没有工具，不进这一轮的步数和用量。
+- 2026-11-18：两个进程级适配器里一样的代码收进协议包和 `ctx-mcp`，决定九和 [ADR 0002](0002-packages.md) 里「共用的只有 `ctx-mcp` 和协议包里的东西」从此照字面成立。决定正文不变：
+  - 协议的规则（认重试、每会话排队、按名字挑来源、执行环境的表）放协议包：参考实现也用，Python 的移植和它们比；`ToolRegistry` 加可选的 `executor`，注册表自带的执行环境不再按形状猜。
+  - 每轮的 MCP 服务器放 `ctx-mcp`：决定三说输入检查、结果截断、执行前 `open` 都在 ctx 这边做，`createMcpServer` 本来就做前两样，`open` 和 `deny` 一起挪进去（`open`、`permissions` 两个选项），本机、一次性令牌的 HTTP 服务器是 `listenMcpHttp`。`node:http` 留在 `ctx-mcp`，不进协议包。
+  - 适配器只留各自程序的部分：命令行、事件流、会话里的位置、扩展。不另建一个「外部 harness」包：理由同 ADR 0002 那一条，用一个的应用不该装上另一个的代码。
+  - 核对时发现两个适配器和 Python 的队列都没照协议做「排队时 `signal` 中止，以 `aborted` 结束，什么都不写」：它们等到轮到自己才看 `signal`，写下 `ctx.run.started`、输入和 `ctx.run.ended`。改用 `createSessionQueue` 之后和参考实现一样。
