@@ -4,6 +4,7 @@
 
 ## 2026-11-18
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`permissions` 写明 `deny` 优先，绑到外部执行环境的工具被拒绝时也不等别处执行。参考实现以前不是这样，这次一起改了，[架构](architecture.md)里参考实现那一节和 [`@modelctx-ai/ctx`](../packages/core/README.md) 的 README 跟着写明。
 - **更新** [`@modelctx-ai/ctx-claude-code`](../packages/claude-code/README.md) 的 README：「怎么对上」加子代理一行，加子会话里一轮的样子；选项里写 `Task`、`bare` 下没有子代理、适配器加的 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`；「还没做的」去掉子代理一条；「验证」加子代理对 2.1.326 和 2.1.327 的核实。
 - **更新** [架构](architecture.md)：「外部 harness：Claude Code」写子代理怎么归到子会话、什么时候写完。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」跟着改，决定记录补一条，写前台跑、补最后的回答、子运行不带 `session` 各对着哪条决定。
 

@@ -4,6 +4,8 @@
 
 ## 未发布
 
+- **修复** `@modelctx-ai/ctx`：`createHarness({ external })` 里绑到外部执行环境、权限又是 `deny` 的工具，以前当成等别处执行（以 `requires_action` 结束，执行方照样执行），现在和别的 `deny` 一样在 harness 这一侧回拒绝，模型看到拒绝，这一轮继续。
+
 - **实现** `ctx-claude-code`：Claude Code 起的子代理（`Task` 工具，`builtinTools` 里给了才有）写进子会话 `<发起方的会话>/<工具名>/<调用 id>`：`ctx.run.started` 带 `parent`，然后是它收到的输入、每一步、最后的回答、`ctx.run.ended`；发起方那次调用的结果换成 `ChildRunResult`（`childRunsOf` 找得到），以前只在父会话里记 Claude Code 给的那段文字、子代理里面的消息丢掉。子代理再派的子代理也有子会话，只有输入、回答和结束。子进程的环境加 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`：子代理和后台命令在这一轮里跑完。
 - **新增** `@modelctx-ai/ctx-claude-code/testing` 的 `FakeAnthropicStep`：`tool-call` 和 `tool-calls` 的每次调用可以用 `tool` 指定调哪个工具。
 

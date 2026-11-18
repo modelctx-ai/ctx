@@ -624,7 +624,7 @@ interface Harness {
   - `version`：应用自己的版本标识，原样记进 `ctx.run.started`，回看时知道这一轮跑的是哪一版。
   - `output`：结构化输出。最后的回答按 `schema` 生成（服务商支持的话约束解码）、解析、按 `checkJsonSchema` 校验，放在 `RunResult.output`；不是 JSON 或不合 schema 时这一轮以 `error` 结束，`error.type` 是 `invalid_output`（`retryable: false`）。只在 `end_turn` 时解析：停在工具调用（`requires_action`、`max_steps`、`max_budget`）的没有回答可解析。
   - `toolChoice`：`auto`、`none`、`required`，或者 `{ tool }` 点名一个；点名的工具不在这一轮的工具里时 `invalid_request`。没有工具时忽略。
-  - `permissions`：按工具名的 `allow`、`ask`、`deny`（`default` 缺省 `allow`；纯函数 `toolPermission(permissions, name)` 给出一个工具的）。`deny` 的不执行，模型看到拒绝，这一轮继续；`ask` 的和外部执行的工具一样，写下调用后以 `requires_action` 停下，应用确认了就让执行方执行、追加结果，不确认就追加一条错误结果（`toolResultEntry(call, errorOutput(...))`），再不带输入跑一轮。`Hooks.beforeTool` 在 `allow` 之后照常调。
+  - `permissions`：按工具名的 `allow`、`ask`、`deny`（`default` 缺省 `allow`；纯函数 `toolPermission(permissions, name)` 给出一个工具的）。`deny` 的不执行，模型看到拒绝，这一轮继续，绑到外部执行环境的工具也一样（`deny` 优先）；`ask` 的和外部执行的工具一样，写下调用后以 `requires_action` 停下，应用确认了就让执行方执行、追加结果，不确认就追加一条错误结果（`toolResultEntry(call, errorOutput(...))`），再不带输入跑一轮。`Hooks.beforeTool` 在 `allow` 之后照常调。
   - `budget`：`maxTotalTokens`（所有步骤的 `totalTokens` 之和，没有时用输入加输出）、`maxDurationMs`（墙钟）。只在步骤之间检查：超了就不再走下一步，`stopReason` 是 `max_budget`；正在进行的模型调用和工具不会被打断，硬上限用 `settings.timeoutMs`。成本的上限不在这里：价格表是应用的事，用 `meta.step` 的用量自己算。
   - `environment`：这个 agent 要的执行环境，harness 原样交给执行环境的 `open`（见上面「执行环境」）。记进 `ctx.run.started`。
   - 这几项的值不对（预算不是正数、权限不是三个值之一、`output.schema` 不是对象）时这一轮以 `invalid_request` 结束。不支持某一项的 harness 不能静默忽略：要么以 `invalid_request` 结束，要么在一致性等级里注明。

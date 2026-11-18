@@ -241,7 +241,7 @@ const result = await harness.run({ session: 'user:42', agent, input: '订单 42 
 result.output; // 按 schema 解析过的回答；不合是 stopReason 'error'、error.type 'invalid_output'
 ```
 
-- `deny` 的工具不执行，模型看到拒绝；`ask` 的写下调用后以 `requires_action` 停下，和外部执行的工具一样：应用确认了就 `runPendingTools(store, session, { executor })`，不确认就追加 `toolResultEntry(call, errorOutput('用户拒绝了'))`，再不带输入跑一轮。
+- `deny` 的工具不执行，模型看到拒绝，绑到 `external` 的也一样；`ask` 的写下调用后以 `requires_action` 停下，和外部执行的工具一样：应用确认了就 `runPendingTools(store, session, { executor })`，不确认就追加 `toolResultEntry(call, errorOutput('用户拒绝了'))`，再不带输入跑一轮。
 - `budget` 只在步骤之间检查，超了 `stopReason` 是 `max_budget`；正在进行的模型调用和工具不会被打断，硬上限用 `settings.timeoutMs`。
 
 ### 子 agent
