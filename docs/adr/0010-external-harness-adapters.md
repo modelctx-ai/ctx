@@ -61,10 +61,10 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - 协议：`RunStartedData.harness`、`HarnessInfo`；`isContextOverflowText` 从核心包挪过来，核心包的 `isContextOverflowError` 改用它。
 - `ctx-mcp`：`createMcpServer` 的 `maxOutputChars`（缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`），`onResult` 收到截过的结果。
 - `ctx-claude-code`：`createClaudeCodeHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 Claude Code 2.1.326 验证过，模型是本机的假接口；对真实的 Anthropic 接口没有验证。Claude Code 起的子代理写进子会话（2026-11-18，对 2.1.326 和 2.1.327 核实过）。
-- `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`context`、`output` 五级（`context` 一级 2026-11-18 起）；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。`ask` 权限和外部执行环境（`external`）以 `requires_action` 结束，`window`、`context` 照参考实现的 builder 移植（都是 2026-11-18）。
+- `ctx-pydantic-ai`（Python，[`python/pydantic-ai`](../../python/pydantic-ai/README.md)）：`PydanticAIHarness` 和它的线上入口 `create_app`，加上线上协议的 Python 客户端 `RemoteSessionStore`、`RemoteExecutor`。经 `ctx-conformance` 过 `trace`、`execute`、`resume`、`context`、`output` 五级（`context` 一级 2026-11-18 起）；对 pydantic-ai 2.69.0 验证过，模型是按剧本回答的 `FunctionModel` 和它自带的 `test` 模型，对真实的模型服务没有验证。`ask` 权限和外部执行环境（`external`）以 `requires_action` 结束，`window`、`context` 照参考实现的 builder 移植，超窗时先压缩（都是 2026-11-18）。
 - `ctx-pi`：`createPiHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 pi 1.5.2 验证过（2026-11-18），模型是本机的假 Anthropic 接口；对真实的模型服务没有验证。CI 装同一个版本跑。
 - `ctx-claude-code`、`ctx-pi` 收上下文来源（`sources`），`AgentSpec.context.facts` 映射得上（2026-11-18）；记忆接进这两个 harness 的例子是 [`examples/memory-pi.ts`](../../examples/memory-pi.ts)。
-- 没做：pydantic-ai 的压缩（`context.overflow` 的 `compact` 只裁）、事件规则和别的投影、事实来源；pi 的扩展加进上下文的消息（`custom_message`）和插话（`steer`、`follow_up`）不进日志。
+- 没做：pydantic-ai 的事件规则和别的投影、事实来源；pi 的扩展加进上下文的消息（`custom_message`）和插话（`steer`、`follow_up`）不进日志。
 
 ## 决定记录
 
@@ -95,3 +95,6 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
   - 决定八不变：历史还是程序自己的，ctx 不投影、不写 `summary`，不跑 `context` 一级。
   - 记忆的另外两半不用改：`gate`、`consolidate` 读适配器实时写下的日志（决定二），`recall` 工具是 ctx 的执行环境，经 MCP 交出去（决定三）。
   - 代价：事实每轮不同，系统提示也就每轮不同，程序对历史的提示缓存命中不了；参考实现把事实接在指令后面时也一样。在乎缓存的不给来源，只交 `recall` 工具。
+- 2026-11-18：pydantic-ai 的压缩实施，`window`、`context` 那一条里的「还是不压缩」不再成立。`context.overflow` 的 `compact` 照参考实现 harness 的 `fit` 和 builder 的 `compactDetailed` 移植：切点、记录的写法、分段滚动摘要、检查点，压缩没做成时接着裁剪，`record: false` 不压缩，都一样；测试对同一组日志、同一个剧本的摘要模型和 TypeScript 比切点、每段交给模型的记录、写下的摘要和 `ctx.compacted`。和决定正文的关系：
+  - 决定八不受影响：它说的是程序压缩自己的上下文。pydantic-ai 的历史本来就是 ctx 的投影（2026-11-17 那条的决定四），摘要由 ctx 这一侧写、投影时代替它盖住的条目，正是 `summary` 的本义，和参考实现写的一样。
+  - 写摘要的模型：新选项 `summary_model`，不给就用这一轮的模型，同参考实现的 harness 在 builder 没配模型时的做法。调用走 `pydantic_ai.direct.model_request`，不经 `Agent`：没有工具，不进这一轮的步数和用量。

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from typing import Any
 
@@ -23,7 +24,8 @@ from ctx_pydantic_ai import (
     pending_tool_calls,
     tool_result_entry,
 )
-from ctx_pydantic_ai.context import MISSING_RESULT
+from ctx_pydantic_ai.compact import DEFAULT_SUMMARY_INSTRUCTIONS
+from ctx_pydantic_ai.context import MISSING_RESULT, SUMMARY_PREFIX
 from ctx_pydantic_ai.messages import text_of
 from ctx_pydantic_ai.testing import ECHO_TOOL, ScriptedModel, echo_executor
 
@@ -331,6 +333,18 @@ UNMAPPED = [
     ({'window': {'maxTokens': '1k'}}, 'AgentSpec.window.maxTokens must be a number.'),
     ({'context': {'overflow': {'maxTokens': 0}}}, 'AgentSpec.context.overflow.maxTokens must be a positive number.'),
     ({'context': {'overflow': {'maxTokens': 9, 'strategy': 'drop'}}}, 'AgentSpec.context.overflow.strategy must be'),
+    (
+        {'context': {'overflow': {'maxTokens': 9, 'compact': 4}}},
+        'AgentSpec.context.overflow.compact must be an object.',
+    ),
+    (
+        {'context': {'overflow': {'maxTokens': 9, 'compact': {'keep': 'all'}}}},
+        'AgentSpec.context.overflow.compact.keep must be a number.',
+    ),
+    (
+        {'context': {'overflow': {'maxTokens': 9, 'compact': {'instructions': ['短']}}}},
+        'AgentSpec.context.overflow.compact.instructions must be a string.',
+    ),
     ({'context': {'inherit': {'session': ''}}}, 'AgentSpec.context.inherit.session must be a non-empty string.'),
     ({'context': {'inherit': {'session': 'p', 'upTo': -1}}}, 'AgentSpec.context.inherit.upTo must be a non-negative'),
     ({'settings': {'providerOptions': {'openai': {}}}}, 'AgentSpec.settings.providerOptions not supported'),
@@ -904,19 +918,17 @@ def test_overflow_trims_or_refuses() -> None:
         assert refused['error']['message'].endswith('over the limit of 1.')
         assert roles(await store.list('e'))[-2:] == ['ctx.error', 'ctx.run.ended']
         assert model.requests == []
-        # trim、缺省的 compact：裁到放得下再调模型，不写摘要（这个适配器不压缩）。
-        for strategy in ('trim', None):
-            session = f'long-{strategy}'
-            await dialogue(store, session, 40)
-            overflow = {'maxTokens': 1_500, **({'strategy': strategy} if strategy else {})}
-            result = await harness.run(
-                {'session': session, 'agent': {**AGENT, 'context': {'overflow': overflow}}, 'input': '接着说'}
-            )
-            assert result['stopReason'] == 'end_turn', result.get('error')
-            assert await store.list(session, types=['summary']) == []
-            assert len(texts(model.requests[-1])) < 40
-            [answer] = await store.list(session, types=['message'], last=1)
-            assert answer['meta']['step']['estimatedInputTokens'] <= 1_500
+        # trim：裁到放得下再调模型，不写摘要。
+        await dialogue(store, 'long', 40)
+        overflow = {'maxTokens': 1_500, 'strategy': 'trim'}
+        result = await harness.run(
+            {'session': 'long', 'agent': {**AGENT, 'context': {'overflow': overflow}}, 'input': '接着说'}
+        )
+        assert result['stopReason'] == 'end_turn', result.get('error')
+        assert await store.list('long', types=['summary']) == []
+        assert len(texts(model.requests[-1])) < 40
+        [answer] = await store.list('long', types=['message'], last=1)
+        assert answer['meta']['step']['estimatedInputTokens'] <= 1_500
         # 指令本身就放不下：裁到底还超，不调模型。
         huge = {
             **AGENT,
@@ -925,8 +937,136 @@ def test_overflow_trims_or_refuses() -> None:
         }
         over = await harness.run({'session': 'huge', 'agent': huge, 'input': '在吗'})
         assert over['error']['type'] == 'context_overflow'
-        assert over['error']['message'].endswith('even after trimming.')
-        assert len(model.requests) == 2
+        assert over['error']['message'].endswith('even after compaction and trimming.')
+        assert len(model.requests) == 1
+
+    run(main)
+
+
+def test_overflow_compacts_first() -> None:
+    async def main() -> None:
+        harness, store, model = setup([{'type': 'text', 'text': '早先聊了四十轮'}, {'type': 'text', 'text': '好'}])
+        await dialogue(store, 'long', 40)
+        agent = {**AGENT, 'context': {'overflow': {'maxTokens': 1_500}}}
+        result = await harness.run({'session': 'long', 'agent': agent, 'input': '接着说'})
+        assert result['stopReason'] == 'end_turn', result.get('error')
+        [summary] = await store.list('long', types=['summary'])
+        assert (summary['text'], summary['source']) == ('早先聊了四十轮', 'model')
+        [event] = await store.list('long', kinds=['ctx.compacted'])
+        assert event['source'] == 'context'
+        assert event['data'] == {'covers': summary['covers'], 'summaryId': summary['id']}
+        # 第一次调模型是写摘要：缺省的指令，记录从最早的一条开始；最近 12 条留着，这一轮的输入不在里面。
+        [request] = model.requests[0]
+        assert request.instructions == DEFAULT_SUMMARY_INSTRUCTIONS
+        transcript = request.parts[0].content
+        assert transcript.startswith('user: user 0：') and '接着说' not in transcript
+        # 这一轮的模型看到的历史从摘要开始，没再裁剪。
+        history = texts(model.requests[1])
+        assert history[0] == f'user:{SUMMARY_PREFIX}早先聊了四十轮'
+        assert len(history) == 1 + 12 and history[-1] == 'user:接着说'
+        # 摘要和 `ctx.compacted` 是压缩写的，不算这一轮写的（同参考实现）。
+        assert {entry['type'] for entry in result['recorded']} == {'event', 'message'}
+        [answer] = await store.list('long', types=['message'], last=1)
+        assert answer['meta']['step']['estimatedInputTokens'] <= 1_500
+        # 下一轮从摘要接着：不超就不再压。
+        await harness.run({'session': 'long', 'agent': agent, 'input': '还有呢'})
+        assert len(model.requests) == 3
+        assert len(await store.list('long', types=['summary'])) == 1
+
+    run(main)
+
+
+def test_compaction_options_and_the_summary_model() -> None:
+    async def main() -> None:
+        store = MemorySessionStore()
+        model = ScriptedModel([{'type': 'text', 'text': '好'}])
+        summarizer = ScriptedModel([{'type': 'text', 'text': '四十轮的摘要'}], model_name='summarizer')
+        harness = PydanticAIHarness(
+            store=store,
+            executors=[echo_executor()],
+            models={'scripted': model, 'cheap': summarizer},
+            summary_model='cheap',
+        )
+        await dialogue(store, 'long', 40)
+        compact = {'keep': 0, 'minimum': 1, 'instructions': '压成一句话'}
+        agent = {**AGENT, 'context': {'overflow': {'maxTokens': 1_500, 'compact': compact}}}
+        result = await harness.run({'session': 'long', 'agent': agent, 'input': '接着说'})
+        assert result['stopReason'] == 'end_turn', result.get('error')
+        [[request]] = summarizer.requests
+        assert request.instructions == '压成一句话'
+        # `keep` 至少是 1：这一轮刚记下的输入不进摘要，模型原样看到它。
+        assert '接着说' not in request.parts[0].content
+        assert texts(model.requests[0]) == [f'user:{SUMMARY_PREFIX}四十轮的摘要', 'user:接着说']
+
+    run(main)
+
+
+def test_without_a_summary_compaction_falls_back_to_trimming(caplog: pytest.LogCaptureFixture) -> None:
+    async def main() -> None:
+        script = [
+            {'type': 'error', 'message': 'socket hang up'},
+            {'type': 'text', 'text': '好'},
+            {'type': 'text', 'text': '写了一半', 'truncated': True},
+            {'type': 'text', 'text': '好'},
+        ]
+        harness, store, model = setup(script)
+        agent = {**AGENT, 'context': {'overflow': {'maxTokens': 1_500}}}
+        # 摘要模型出错、摘要被截断：都不写摘要，裁到放得下再调模型。
+        for session in ('failed', 'truncated'):
+            await dialogue(store, session, 40)
+            result = await harness.run({'session': session, 'agent': agent, 'input': '接着说'})
+            assert result['stopReason'] == 'end_turn', result.get('error')
+            assert await store.list(session, types=['summary']) == []
+            assert len(texts(model.requests[-1])) < 40
+        assert 'compaction failed while the context is over its limit; trimming instead: socket hang up' in caplog.text
+        assert 'summary hit maxOutputTokens' in caplog.text
+        assert len(model.requests) == 4
+
+    with caplog.at_level(logging.WARNING, logger='ctx_pydantic_ai'):
+        run(main)
+
+
+def test_a_run_that_is_not_recorded_does_not_compact() -> None:
+    async def main() -> None:
+        harness, store, model = setup([{'type': 'text', 'text': '好'}])
+        await dialogue(store, 'long', 40)
+        agent = {**AGENT, 'context': {'overflow': {'maxTokens': 1_500}}}
+        result = await harness.run({'session': 'long', 'record': False, 'agent': agent, 'input': '接着说'})
+        assert result['stopReason'] == 'end_turn', result.get('error')
+        # 只调了这一轮的模型，没有写摘要：裁剪。
+        [request] = model.requests
+        assert len(texts(request)) < 40
+        assert await store.list('long', types=['summary']) == []
+        assert len(await store.list('long')) == 80
+
+    run(main)
+
+
+def test_abort_while_compacting() -> None:
+    async def main() -> None:
+        started = asyncio.Event()
+
+        async def slow(messages: list[Any], info: AgentInfo) -> ModelResponse:
+            started.set()
+            await asyncio.sleep(30)
+            return ModelResponse(parts=[TextPart('摘要')])
+
+        store = MemorySessionStore()
+        model = ScriptedModel([{'type': 'text', 'text': '好'}])
+        harness = PydanticAIHarness(
+            store=store, executors=[echo_executor()], models={'scripted': model}, summary_model=FunctionModel(slow)
+        )
+        await dialogue(store, 'long', 40)
+        signal = AbortSignal()
+        agent = {**AGENT, 'context': {'overflow': {'maxTokens': 1_500}}}
+        task = asyncio.ensure_future(harness.run({'session': 'long', 'agent': agent, 'input': '接着说'}, signal=signal))
+        await asyncio.wait_for(started.wait(), 10)
+        signal.abort()
+        result = await asyncio.wait_for(task, 10)
+        assert result['stopReason'] == 'aborted'
+        assert model.requests == []
+        assert await store.list('long', types=['summary']) == []
+        assert roles(await store.list('long'))[-1] == 'ctx.run.ended'
 
     run(main)
 

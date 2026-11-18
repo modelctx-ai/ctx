@@ -4,6 +4,8 @@
 
 ## 未发布
 
+- **实现** `ctx-pydantic-ai`：`AgentSpec.context.overflow` 的 `compact`（缺省的策略）先压缩，以前和 `trim` 一样只裁。照参考实现 builder 的 `compactDetailed` 移植：最近 `keep` 条（缺省 12，至少 1）原样留着，更早的写成纯文本的记录，按 `maxInputTokens` 分段交给摘要模型，每段落一个检查点，追加 `summary`（`source` 是 `model`）和 `ctx.compacted`（`source` 是 `context`），再重新组装；压完还超、摘要模型出错、摘要被截断，接着裁剪；`record: false` 的运行不压缩。新选项 `summary_model`（名字或 pydantic-ai 的 `Model`，缺省这一轮的模型），新模块 `ctx_pydantic_ai.compact`（`compact_session` 和同参考实现的常量）；`overflow.compact` 的各项类型不对以 `invalid_request` 结束。**行为变化**：缺省的策略现在会调摘要模型、往日志里追加摘要，只要裁剪就给 `strategy: 'trim'`；裁到底还超时的报错和参考实现一样，以 `even after compaction and trimming.` 结尾。
+
 - **实现** `ctx-claude-code`、`ctx-pi`：`AgentSpec.context.facts`，以前和整个 `context` 一起以 `invalid_request` 结束。新选项 `sources`（`ContextSource` 的数组，例如记忆的 `memory.source()`）和 `sourceTimeoutMs`（缺省 2 秒）：每轮记下输入之后收一次，挑来源（`facts.sources`）、加标题（`facts.heading`）、`facts: false`、出错和超时只告警都同参考实现的 builder；事实接在指令后面（`--append-system-prompt`），不进程序自己的会话，也不写日志。`context` 的其余各项和 `facts.placement: 'prompt'` 仍以 `invalid_request` 结束。
 - **新增** 例子 `examples/memory-pi.ts`：pi 跑的会话照样进记忆的 `gate`、`consolidate`，记忆经来源和 `recall` 工具回到 pi；没装 pi 就跳过，`pnpm examples` 也跑它。
 - **修复** `ctx-claude-code` 的测试和 `examples/claude-code.ts`：探测装没装（`claude --version`）的子进程也只拿到最少的环境变量和临时的家目录、配置目录，不再继承 `process.env`，同 `ctx-pi`。

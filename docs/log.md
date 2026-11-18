@@ -4,6 +4,8 @@
 
 ## 2026-11-18
 
+- **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：「怎么对上」的上下文一行和 `AgentSpec` 的 `context` 一行写超窗时怎么压缩，选项加 `summary_model`，导出加 `ctx_pydantic_ai.compact`，「还没做的」去掉压缩，「验证」和测试加写摘要的调用和对照参考实现的压缩。[架构](architecture.md)：「外部 harness：pydantic-ai」的签名和第三步跟着改。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」去掉压缩，决定记录补一条，写它和决定八为什么不冲突、摘要用哪个模型。
+
 - **更新** [记忆](memory.md)：「接进其余组件」加一段，写自己管上下文的 harness（Claude Code、pi）怎么接记忆：会话、工具、上下文三个接点各走哪条约定，事实放在哪、为什么不放进 `prompt`，提示缓存的代价。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态加 `context.facts`，决定记录补一条，回答 #19 留下的这个问题。
 - **更新** [`ctx-claude-code`](../packages/claude-code/README.md)、[`ctx-pi`](../packages/pi/README.md) 的 README：`AgentSpec` 表拆出 `context.facts` 一行，选项加 `sources`、`sourceTimeoutMs`，「怎么对上」的上下文一行写事实放在哪。[架构](architecture.md)里两个适配器的签名和第二步跟着改。[ctx-memory](../packages/memory/README.md) 的用法加一段指过去，[例子](../examples/README.md)加 `memory-pi.ts`。
 
