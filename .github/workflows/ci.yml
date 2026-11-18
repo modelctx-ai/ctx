@@ -124,6 +124,9 @@ jobs:
         run: uv run --locked pytest
         env:
           CTX_TEST_PYDANTIC_AI: required
+      # 发 PyPI 的那一步打得出包、README 渲染得出来（release.yml 另在干净的环境里装一遍）
+      - working-directory: python/pydantic-ai
+        run: uv build && uvx twine check --strict dist/*
       - run: pnpm exec vp test examples
         env:
           CTX_TEST_PYDANTIC_AI: required
