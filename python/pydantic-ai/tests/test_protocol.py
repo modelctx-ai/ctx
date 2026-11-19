@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from conftest import REPO, Evaluate
+from conftest import REPO, Evaluate, projection_of
 from ctx_pydantic_ai import context, harness, protocol
 from ctx_pydantic_ai.store import _filter
 
@@ -779,6 +779,117 @@ def test_windows_match_typescript(
     assert actual == expected
     if window and (window.get('maxMessages') is not None or window.get('maxTokens') is not None):
         assert projection.dropped > 0 or projection.truncated > 0 or name == 'none'
+
+
+def _returned(call_id: str, output: str) -> dict[str, object]:
+    return {'type': 'tool-result', 'id': call_id, 'name': 'echo', 'output': {'type': 'text', 'text': output}}
+
+
+def _event(seq: int, kind: str, data: object = None, at: int | None = None) -> dict[str, object]:
+    return _entry(seq, at, type='event', kind=kind, **({} if data is None else {'data': data}))
+
+
+TICKS = [
+    _message(1, 'user', '开始'),
+    _event(2, 'tick', {'n': 1}),
+    _event(3, 'tick', {'n': 2}),
+    # 没有规则的事件不可见，也不打断前后同类事件的合并。
+    _event(4, 'ctx.run.started', {'runId': 'r'}),
+    _event(5, 'tick', {'n': 3}),
+    _message(6, 'assistant', '好'),
+    _event(7, 'tick', {'n': 4}),
+    _event(8, 'note', {'text': '提醒：带伞'}),
+    _message(9, 'user', '接着说'),
+    # 补写的旧记录：`seq` 在后、`at` 落在前面那组 tick 中间，合进那一组。
+    _event(10, 'tick', {'n': 0}, at=25),
+]
+SECRETS = [
+    _message(1, 'user', '你好'),
+    _message(2, 'user', '密码是 secret-123'),
+    _message(3, 'assistant', [{'type': 'text', 'text': '我查一下'}, _call('c1')]),
+    _message(4, 'tool', [_returned('c1', 'top secret')]),
+    _message(5, 'user', [{'type': 'text', 'text': '列表内容不改'}]),
+    _message(6, 'assistant', '好的'),
+]
+RULED = [
+    ('fold', TICKS, {'events': {'tick': {'fold': True, 'render': 'user'}}}, None),
+    ('one by one', TICKS, {'events': {'tick': {'render': 'user'}, 'note': {'render': 'system'}}}, None),
+    ('pair and none', TICKS, {'events': {'tick': {'fold': True, 'render': 'pair'}, 'note': {'render': 'none'}}}, None),
+    ('fold in a window', TICKS, {'events': {'tick': {'fold': True, 'render': 'user'}}}, {'maxMessages': 3}),
+    (
+        'an event between a call and its result',
+        [
+            _message(1, 'user', 'q'),
+            _message(2, 'assistant', [_call('c1')]),
+            _event(3, 'note', {'text': '插一句'}),
+            _message(4, 'tool', [_returned('c1', 'c1')]),
+            _message(5, 'assistant', 'done'),
+        ],
+        {'events': {'note': {'render': 'user'}}},
+        None,
+    ),
+    (
+        'summary covers some events',
+        [*TICKS[:5], _entry(11, type='summary', text='前面的事', covers=3), *TICKS[5:]],
+        {'events': {'tick': {'fold': True, 'render': 'user'}}, 'summary': 'system'},
+        None,
+    ),
+    ('summary as an assistant message', SUMMARIZED, {'summary': 'assistant'}, {'maxMessages': 2}),
+    ('redact', SECRETS, {'message': 'redact'}, None),
+    ('estimate', DIALOGUE, {'estimate': 'double'}, {'maxTokens': 600}),
+    ('estimate and truncate', TOOLS, {'estimate': 'double'}, {'maxTokens': 400, 'truncate': True}),
+    (
+        'everything',
+        TICKS,
+        {'events': {'tick': {'fold': True, 'render': 'pair'}}, 'estimate': 'double'},
+        {'maxTokens': 60},
+    ),
+]
+
+
+@pytest.mark.parametrize(('name', 'entries', 'recipe', 'window'), RULED, ids=[case[0] for case in RULED])
+def test_projection_rules_match_typescript(
+    ts: Evaluate, name: str, entries: list[dict[str, object]], recipe: dict[str, Any], window: dict[str, Any] | None
+) -> None:
+    [expected] = ts([('projectRules', [entries, recipe, window])])
+    options = projection_of(recipe)
+    assert options is not None
+    projection = options.project(entries, window)
+    actual = {
+        'messages': projection.messages,
+        'items': [
+            {'from': item.first, 'upTo': item.last, 'at': item.at, 'pinned': item.pinned, 'tokens': item.tokens}
+            for item in projection.items
+        ],
+        'tokens': projection.tokens,
+        'dropped': projection.dropped,
+        'truncated': projection.truncated,
+    }
+    assert actual == expected
+
+
+def test_rules_are_exercised(ts: Evaluate) -> None:
+    """配方真的走到了合并、补写的旧记录、改写和换掉的估算：比的不只是缺省规则。"""
+    [folded, plain] = ts(
+        [('projectRules', [TICKS, {'events': {'tick': {'fold': True, 'render': 'user'}}}, None]), ('project', [TICKS])]
+    )
+    assert folded['messages'][1] == {
+        'role': 'user',
+        'content': 'tick {"n":1}\ntick {"n":0}\ntick {"n":2}\ntick {"n":3}',
+    }
+    assert folded['items'][1]['from'] == 2 and folded['items'][1]['upTo'] == 10
+    assert len(plain) == 3
+    [redacted] = ts([('projectRules', [SECRETS, {'message': 'redact'}, None])])
+    assert redacted['messages'][0] == {'role': 'user', 'content': '> 你好'}
+    assert all('secret' not in str(message) for message in redacted['messages'])
+    assert context.project(DIALOGUE).tokens * 2 == projection_of({'estimate': 'double'}).project(DIALOGUE).tokens
+
+
+def test_render_facts_matches_typescript(ts: Evaluate) -> None:
+    facts = [{'source': 'clock', 'text': '下午三点'}, {'source': 'weather', 'text': '晴'}]
+    cases = [(facts, '现在：'), (facts, None), (facts, ''), ([], '标题'), ([], None)]
+    expected = ts([('renderFacts', [items, heading]) for items, heading in cases])
+    assert [context.render_facts(items, heading) for items, heading in cases] == expected
 
 
 def test_calibration_and_window_budget() -> None:

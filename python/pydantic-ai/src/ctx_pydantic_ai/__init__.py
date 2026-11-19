@@ -1,5 +1,6 @@
 """把 pydantic-ai 的 ``Agent`` 接成 ctx 的 harness：轨迹实时写进 ctx 的会话日志，工具调用交给 ctx 的执行环境，经 ctx 的线上协议对外。"""
 
+from .context import ContextSource, EventRule, ProjectionOptions
 from .executors import Executor, FunctionExecutor, RemoteExecutor
 from .harness import (
     HARNESS_NAME,
@@ -37,10 +38,13 @@ __all__ = [
     'TOOL_APPROVAL_KEY_PREFIX',
     'TOOL_RESULT_KEY_PREFIX',
     'AbortSignal',
+    'ContextSource',
     'CtxError',
+    'EventRule',
     'Executor',
     'FunctionExecutor',
     'MemorySessionStore',
+    'ProjectionOptions',
     'PydanticAIHarness',
     'RemoteExecutor',
     'RemoteSessionStore',

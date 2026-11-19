@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from conftest import REPO, ts_compact
+from conftest import REPO, projection_of, ts_compact
 from ctx_pydantic_ai import CtxError, MemorySessionStore
 from ctx_pydantic_ai import compact as compaction
 from ctx_pydantic_ai.compact import compact_session
@@ -145,6 +145,30 @@ def windows(count: int) -> list[dict[str, Any]]:
     return entries
 
 
+def backfilled_midway() -> list[dict[str, Any]]:
+    """第一段之后能落检查点，第二段里混进一条补写的旧记录、落不了：带进第三段的摘要沿用第一段写下的那条，只换文字。"""
+    entries = chat(20, 400)
+    for index, entry in enumerate(entries):
+        entry['at'] = NOW - 10_000 + index * 10
+    entries.append(message('user', '补写的旧记录', at=NOW - 10_000 + 12 * 10 + 5))
+    return [*entries, *chat(6, 50)]
+
+
+def tick(n: int) -> dict[str, Any]:
+    return {'type': 'event', 'kind': 'tick', 'data': {'n': n}}
+
+
+def ticked() -> list[dict[str, Any]]:
+    """16 条对话、两条 ``tick``、4 条对话，再补写一条 ``at`` 落在两条 ``tick`` 中间的：合成的那一组横跨切点。"""
+    entries = [*chat(16, 60), tick(1), tick(2), *chat(4, 60)]
+    for index, entry in enumerate(entries):
+        entry['at'] = NOW - 10_000 + index * 10
+    entries.append({**tick(0), 'at': NOW - 10_000 + 16 * 10 + 5})
+    return entries
+
+
+FOLD_TICKS = {'events': {'tick': {'fold': True, 'render': 'user'}}}
+
 CASES: dict[str, dict[str, Any]] = {
     'too_short': {'entries': chat(15)},
     'basic': {'entries': chat(20)},
@@ -232,6 +256,43 @@ CASES: dict[str, dict[str, Any]] = {
         'options': {'keep': 4},
     },
     'backfilled': {'entries': windows(24), 'options': {'keep': 3, 'maxInputTokens': 1_200}},
+    # 缺省投影的规则：事件规则、消息的改写、摘要的渲染、换掉的估算，压缩照着来。
+    'events_fold_across_the_cut': {'entries': ticked(), 'options': {'keep': 4}, 'projection': FOLD_TICKS},
+    'events_rendered': {
+        'entries': [entry for index in range(8) for entry in (*chat(2, 40), tick(index))],
+        'options': {'keep': 3, 'minimum': 1},
+        'projection': {'events': {'tick': {'render': 'pair'}}},
+    },
+    'summary_renderer': {
+        'entries': [{'type': 'summary', 'text': '早先：主人对花生过敏。', 'covers': 0}, *chat(20)],
+        'projection': {'summary': 'system'},
+    },
+    'summary_renderer_in_memory': {
+        'entries': windows(24),
+        'options': {'keep': 3, 'maxInputTokens': 1_200},
+        'projection': {'summary': 'assistant'},
+    },
+    # 落不了检查点的那几段：带进下一段的摘要沿用上一条写下的（`covers` 照旧），只换文字。
+    'summary_renderer_keeps_the_last_written': {
+        'entries': backfilled_midway(),
+        'options': {'keep': 3, 'maxInputTokens': 700},
+        'projection': {'summary': 'covers'},
+    },
+    'redacted': {
+        'entries': [*chat(10), message('user', 'the secret code is 42'), *chat(4)],
+        'options': {'keep': 2, 'minimum': 1},
+        'projection': {'message': 'redact'},
+    },
+    'custom_estimate': {
+        'entries': chat(60, 400),
+        'options': {'keep': 4, 'maxInputTokens': 2_000},
+        'projection': {'estimate': 'double'},
+    },
+    'custom_estimate_long_instructions': {
+        'entries': chat(60, 400),
+        'options': {'keep': 4, 'maxInputTokens': 2_000, 'instructions': '把对话压成一段话，用中文。' * 20},
+        'projection': {'estimate': 'double'},
+    },
     'backfilled_keep_zero': {'entries': windows(10), 'options': {'keep': 0, 'minimum': 1}},
 }
 
@@ -273,7 +334,14 @@ async def python_side(case: dict[str, Any]) -> dict[str, Any]:
     seen: list[dict[str, str]] = []
     out: dict[str, Any] = {}
     try:
-        out['result'] = await compact_session(store, 's', scripted(case, clock, seen), case.get('options'), now=now)
+        out['result'] = await compact_session(
+            store,
+            's',
+            scripted(case, clock, seen),
+            case.get('options'),
+            now=now,
+            projection=projection_of(case.get('projection')),
+        )
     except Exception as error:  # noqa: BLE001 - 和 TypeScript 那边抛的比
         out['thrown'] = {
             key: value
@@ -350,3 +418,15 @@ def test_the_cases_cover_every_way_compaction_ends(reference: dict[str, dict[str
         sum(estimate_text_tokens(one['system']) + estimate_text_tokens(one['prompt']) > 1_500 for one in halving) >= 2
     )
     assert reference['carry']['seen'][0]['prompt'].startswith('user: Summary of the earlier conversation:\n早先')
+    # 横跨切点的事件组：covers 退到那一组之前，整组留在视图里。
+    [folded] = [entry for entry in reference['events_fold_across_the_cut']['log'] if entry['type'] == 'summary']
+    assert folded['covers'] == 16
+    assert 'tick {"n":0}' in reference['events_rendered']['seen'][0]['prompt']
+    assert 'assistant: noted' in reference['events_rendered']['seen'][0]['prompt']
+    assert reference['summary_renderer']['seen'][0]['prompt'].startswith('system: Earlier: 早先')
+    later = [one['prompt'] for one in reference['summary_renderer_in_memory']['seen'][1:]]
+    assert later and all(prompt.startswith('assistant: 摘要') for prompt in later)
+    assert all('secret' not in one['prompt'] for one in reference['redacted']['seen'])
+    assert reference['custom_estimate']['result']['calls'] > reference['chunked']['result']['calls']
+    carried = [one['prompt'].split('\n')[0] for one in reference['summary_renderer_keeps_the_last_written']['seen']]
+    assert carried[1:] == ['user: Up to 5: 摘要 1', 'user: Up to 10: 摘要 2', 'user: Up to 10: 摘要 3']

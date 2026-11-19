@@ -5,10 +5,11 @@
 ``minimum`` 条（缺省 8）就不压。``covers`` 是留下的消息里最小的 ``seq`` 减 1，``seq`` 在它之内的都进摘要。
 
 进摘要的消息写成纯文本的记录：``角色: 文字``，工具调用是 ``角色 called 名字(输入的 JSON)``，工具结果是 ``名字 returned 输出``，
-工具的输入、输出各最多 ``COMPACT_TOOL_TOKENS`` 估算 token（留头尾），图片、文件只写占位。记录按 ``maxInputTokens``（缺省
-``DEFAULT_COMPACT_INPUT_TOKENS``）分段，每段连同到目前为止的摘要交给模型，得到的新摘要带进下一段；能落检查点的地方每段写一条
-``summary`` 和一条 ``ctx.compacted``，中途出错、超时或被截断，已经压好的不丢。摘要模型报上下文过长时预算减半再试；摘要被
-``maxOutputTokens`` 截断或没有文字，那一段不写，停在那里。
+工具的输入、输出各最多 ``COMPACT_TOOL_TOKENS`` 估算 token（留头尾），图片、文件只写占位。消息按缺省投影的规则来（事件
+规则、消息的改写、摘要的渲染、换掉的估算），同参考实现。记录按 ``maxInputTokens``（缺省 ``DEFAULT_COMPACT_INPUT_TOKENS``）
+分段，每段连同到目前为止的摘要交给模型，得到的新摘要带进下一段；能落检查点的地方每段写一条 ``summary`` 和一条
+``ctx.compacted``，中途出错、超时或被截断，已经压好的不丢。摘要模型报上下文过长时预算减半再试；摘要被 ``maxOutputTokens``
+截断或没有文字，那一段不写，停在那里。
 """
 
 from __future__ import annotations
@@ -19,8 +20,16 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-from .context import SUMMARY_PREFIX, ProjectedMessage, estimate_text_tokens, json_text, project, truncate_text
-from .protocol import CtxError, event_entry, new_id, now_ms
+from .context import (
+    ProjectedMessage,
+    ProjectionOptions,
+    default_summary_message,
+    estimate_text_tokens,
+    js_number,
+    json_text,
+    truncate_text,
+)
+from .protocol import ENTRY_VERSION, CtxError, event_entry, new_id, now_ms
 from .store import SessionStore
 
 if TYPE_CHECKING:
@@ -80,9 +89,14 @@ def _text_of(parts: Sequence[Mapping[str, Any]]) -> str:
     return ''.join(str(part.get('text', '')) for part in parts if part.get('type') == 'text')
 
 
-def _transcribe(message: Mapping[str, Any], tool_tokens: float = math.inf) -> tuple[str, bool]:
-    """一条消息在记录里的写法（可能有几行，没有可写的是空串），和工具的输入或输出有没有被截短。超过 ``tool_tokens`` 的
-    工具输入、输出截短：留头尾，中间注明省略了多少。"""
+TokensOf = Callable[[str], int]
+
+
+def _transcribe(
+    message: Mapping[str, Any], tool_tokens: float = math.inf, tokens_of: TokensOf = estimate_text_tokens
+) -> tuple[str, bool]:
+    """一条消息在记录里的写法（可能有几行，没有可写的是空串），和工具的输入或输出有没有被截短。超过 ``tool_tokens``（按
+    ``tokens_of`` 估）的工具输入、输出截短：留头尾，中间注明省略了多少。"""
     role = message.get('role')
     content = message.get('content')
     if isinstance(content, str):
@@ -93,7 +107,7 @@ def _transcribe(message: Mapping[str, Any], tool_tokens: float = math.inf) -> tu
 
     def capped(text: str) -> str:
         nonlocal cut
-        short = truncate_text(text, tool_tokens)
+        short = truncate_text(text, tool_tokens, tokens_of)
         if short != text:
             cut = True
         return short
@@ -132,10 +146,6 @@ def _checkpoints(older: Sequence[ProjectedMessage], covers: int) -> Callable[[in
     return at
 
 
-def _js_number(value: float) -> str:
-    return str(int(value)) if float(value).is_integer() else str(value)
-
-
 async def compact_session(
     store: SessionStore,
     session: str,
@@ -144,13 +154,17 @@ async def compact_session(
     *,
     signal: AbortSignal | None = None,
     now: Callable[[], float] = now_ms,
+    projection: ProjectionOptions | None = None,
 ) -> dict[str, Any]:
     """把 ``session`` 较早的历史压成摘要追加进日志，返回 ``CompactResult``（``status``、``summary``、``calls``、
     ``compacted``、``remaining``、``shortened``）。``options`` 是 ``CompactOptions`` 能过线的那部分：``keep``、``minimum``、
     ``instructions``、``maxInputTokens``、``maxOutputTokens``、``timeoutMs``。``now`` 认出 ``at`` 还在未来的条目、算
-    ``timeoutMs`` 还剩多少，存储换了钟时给同一个。"""
+    ``timeoutMs`` 还剩多少，存储换了钟时给同一个。``projection`` 是缺省投影的规则：消息按它渲染（不裁剪），记录的长短按它的
+    ``estimate`` 估（当成一条用户消息）。"""
     options = options or {}
-    full = project(await store.list(session, types=['message', 'summary']))
+    rules = projection or ProjectionOptions()
+    # 没有事件规则时事件都不可见，不用读。
+    full = rules.project(await store.list(session, types=None if rules.events else ['message', 'summary']))
     rest = [item for item in full.items if not item.pinned]
     # `at` 还在未来的条目（把到期时间当 `at` 的提醒）一直排在最后，不算进「最近 keep 条」：写在切点之前的进摘要，
     # 写在切点之后的照常留着。
@@ -165,14 +179,23 @@ async def compact_session(
     minimum = options.get('minimum')
     if cut <= 0 or cut < (DEFAULT_MINIMUM if minimum is None else minimum):
         return nothing
-    # 切点按日志顺序定：留下的条目里最小的 seq 减 1。补写的旧记录按 `at` 排在前面、seq 在后面，不进这次的摘要。参考实现
-    # 在这里还要处理事件合并成的组横跨切点的情况；这个投影没有事件规则，每一项只来自一条条目，不会横跨。
+    # 切点按日志顺序定：留下的条目里最小的 seq 减 1。补写的旧记录按 `at` 排在前面、seq 在后面，不进这次的摘要。
     kept = {id(item) for item in present[cut:]}
     candidates = [item for item in rest if id(item) not in kept]
     if kept:
         covers = min(item.first for item in present[cut:]) - 1
     else:
         covers = max((item.last for item in rest), default=0)
+    # `fold` 合并的事件组可能混进补写的旧记录：组的 seq 范围横跨切点（first ≤ covers < last）时，整组进摘要会让
+    # seq > covers 的成员留在视图里重复，整组留下又会让 seq ≤ covers 的成员被盖住。只能把 covers 退到这一组的第一条之前，
+    # 让整组都留在视图里。退一次可能让别的组横跨，所以退到不再有为止。
+    moved = True
+    while moved:
+        moved = False
+        for item in candidates:
+            if item.first <= covers < item.last:
+                covers = item.first - 1
+                moved = True
     older = [item for item in candidates if item.last <= covers]
     if not older:
         return nothing
@@ -186,6 +209,7 @@ async def compact_session(
         _checkpoints(older, covers),
         signal=signal,
         now=now,
+        rules=rules,
     )
 
 
@@ -212,8 +236,25 @@ async def _roll(
     *,
     signal: AbortSignal | None,
     now: Callable[[], float],
+    rules: ProjectionOptions,
 ) -> dict[str, Any]:
     """滚动摘要：把记录按预算分段，每段连同到目前为止的摘要交给模型，能落检查点的地方写下来。"""
+    custom = rules.estimate
+    tokens_of: TokensOf = (
+        (lambda text: custom({'role': 'user', 'content': text})) if custom is not None else estimate_text_tokens
+    )
+    render = rules.summary or default_summary_message
+    # 还没写下的摘要也要渲染成一行带进下一段：借已有摘要的壳，只换文字。
+    shell: Mapping[str, Any] = carry or {
+        'type': 'summary',
+        'id': '',
+        'session': session,
+        'seq': 0,
+        'at': now(),
+        'v': ENTRY_VERSION,
+        'text': '',
+        'covers': 0,
+    }
     instructions = options.get('instructions')
     if instructions is None:
         instructions = DEFAULT_SUMMARY_INSTRUCTIONS
@@ -222,11 +263,11 @@ async def _roll(
         max_output = DEFAULT_MAX_OUTPUT_TOKENS
     timeout_ms = options.get('timeoutMs')
     deadline = None if timeout_ms is None else now() + timeout_ms
-    overhead = estimate_text_tokens(instructions)
+    overhead = tokens_of(instructions)
     max_input = options.get('maxInputTokens')
     budget = max(1, math.floor(DEFAULT_COMPACT_INPUT_TOKENS if max_input is None else max_input))
     # 到目前为止的摘要：已有的那条，或者这次刚得到、还没写下的。
-    carried = None if carry is None else str(carry.get('text', ''))
+    carried = carry
     written: dict[str, Any] | None = None
     done = saved = calls = shortened = 0
 
@@ -238,9 +279,9 @@ async def _roll(
         return out
 
     while done < len(messages):
-        before = '' if carried is None else f'user: {SUMMARY_PREFIX}{carried}'
+        before = '' if carried is None else _transcribe(render(carried), math.inf, tokens_of)[0]
         # 每行另算 1：行与行之间的换行，和各行分别取整的零头。
-        room = budget - overhead - (estimate_text_tokens(before) + 1 if before else 0)
+        room = budget - overhead - (tokens_of(before) + 1 if before else 0)
         if room < MIN_CHUNK_TOKENS:
             return result('input_too_long')
         tool_tokens = min(COMPACT_TOOL_TOKENS, room // 4)
@@ -248,17 +289,17 @@ async def _roll(
         used = cuts = 0
         index = done
         while index < len(messages):
-            text, cut = _transcribe(messages[index], tool_tokens)
+            text, cut = _transcribe(messages[index], tool_tokens, tokens_of)
             if not text:
                 index += 1
                 continue
-            cost = estimate_text_tokens(text) + 1
+            cost = tokens_of(text) + 1
             if used + cost > room:
                 if lines:
                     break
                 # 单条就超过一段的预算：截短它，不然永远过不去。
-                text = truncate_text(text, room - 1)
-                cost = estimate_text_tokens(text) + 1
+                text = truncate_text(text, room - 1, tokens_of)
+                cost = tokens_of(text) + 1
                 cut = True
             lines.append(text)
             used += cost
@@ -270,7 +311,7 @@ async def _roll(
             break
         remaining = None if deadline is None else deadline - now()
         if remaining is not None and remaining <= 0:
-            raise CtxError('timeout', f'compact() timed out after {_js_number(timeout_ms)}ms.', retryable=True)
+            raise CtxError('timeout', f'compact() timed out after {js_number(timeout_ms)}ms.', retryable=True)
         calls += 1
         try:
             text, finish = await summarize(
@@ -296,5 +337,5 @@ async def _roll(
         entry = None if covers is None else await _record(store, session, summary, covers)
         if entry is not None:
             written, saved = entry, done
-        carried = summary
+        carried = entry if entry is not None else {**(carried or shell), 'text': summary}
     return result('compacted' if written is not None else 'not_needed')

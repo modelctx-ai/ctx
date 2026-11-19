@@ -4,6 +4,8 @@
 
 ## 2026-11-19
 
+- **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：加「事实和投影」一节和例子；「怎么对上」的上下文一行、`AgentSpec` 的 `instructions`、`context` 两行写事实和投影怎么映射，选项加 `projection`、`projections`、`sources`、`source_timeout_ms`、`facts_placement`，导出加 `ContextSource`、`EventRule`、`ProjectionOptions` 和 `ctx_pydantic_ai.context`，「还没做的」去掉事件规则、别的投影和事实来源，测试一节加对照 builder 的 `build`。
+- **更新** [架构](architecture.md)：「外部 harness：pydantic-ai」的签名和第三步写怎么选投影、收事实、把 system 文字和事实接进指令。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」跟上，决定记录补一条：和决定四的关系、规则只按名字选、事实每轮只收一次、空输入的认法。[记忆](memory.md)：pydantic-ai 那一句改成它也收来源，但 `memory.source()` 交不过去。
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#21](https://github.com/modelctx-ai/ctx/issues/21)）：`RunEndedData` 加 `executors`，`PendingToolCall` 加 `executor`，「工具调用经日志往返」加「按名字领工作」；线上形态加 `POST /work/:executor/claim` 一行和它的规则（扫哪些会话、租约、长轮询、`limit`），主体、重试两条跟上；执行环境的两种接法和托管矩阵改成两种都有，「worker 拉取模式之后加」删掉。
 - **更新** [架构](architecture.md)：harness 一节写 `finish` 怎么记 `executors`，`createRemoteWorker` 的一步和循环，服务端怎么扫会话、记租约、长轮询，扫描的代价。[概念](concepts.md)的术语表加「领工作」。
 - **更新** [ADR 0008](adr/0008-tool-calls-through-the-log.md)：头部的实施状态和范围跟上，「还没做」的领工作路由挪到已做，决定记录加一条：为什么名字记在日志里、服务端内存里的租约做到了哪一步。
