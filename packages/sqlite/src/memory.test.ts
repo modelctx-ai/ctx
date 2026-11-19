@@ -52,7 +52,7 @@ function metaOf(database: DatabaseSync, table: string): Record<string, string> {
 const busyTimeout = (database: DatabaseSync): unknown => database.prepare('PRAGMA busy_timeout').get()?.['timeout'];
 
 describe('sqlite memory store', () => {
-  test('新库：四张表加倒排索引的两张、meta 的 memory_schema 是 4，表名前缀缺省 memory_', () => {
+  test('新库：四张表加倒排索引的两张、meta 的 memory_schema 是 5，表名前缀缺省 memory_', () => {
     const store = createSqliteMemoryStore({ path: ':memory:' });
     const tables = (
       store.database.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`).all() as {
@@ -71,7 +71,7 @@ describe('sqlite memory store', () => {
         'memory_procedures',
       ],
     );
-    assert.deepEqual(metaOf(store.database, 'memory_meta'), { memory_schema: '4' });
+    assert.deepEqual(metaOf(store.database, 'memory_meta'), { memory_schema: '5' });
     store.close();
   });
 
@@ -106,7 +106,7 @@ describe('sqlite memory store', () => {
     await sessions.append('s', [userEntry('我喜欢乌龙茶')]);
     const fact = await memory.facts.add(newFact('主人喜欢乌龙茶'));
     assert.deepEqual(metaOf(database, 'ctx_meta'), { schema: '3' });
-    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '4' });
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '5' });
     // 两边按任意顺序重开都不改结构。
     const before = schemaOf(database);
     createSqliteMemoryStore({ database, prefix: 'memory_' });
@@ -123,7 +123,7 @@ describe('sqlite memory store', () => {
     const database = new DatabaseSync(':memory:');
     const sessions = createSqliteStore({ database, prefix: 'ctx_' });
     const memory = createSqliteMemoryStore({ database, prefix: 'ctx_' });
-    assert.deepEqual(metaOf(database, 'ctx_meta'), { memory_schema: '4', schema: '3' });
+    assert.deepEqual(metaOf(database, 'ctx_meta'), { memory_schema: '5', schema: '3' });
     createSqliteStore({ database, prefix: 'ctx_' });
     createSqliteMemoryStore({ database, prefix: 'ctx_' });
     await sessions.append('s', [userEntry('一')]);
@@ -371,7 +371,7 @@ describe('sqlite memory store：结构版本和迁移', () => {
     const before = schemaOf(database);
     createSqliteMemoryStore({ database });
     assert.deepEqual(schemaOf(database), before);
-    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '4' });
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '5' });
   });
 
   test('版本 1 升到当前版本：加 scope 列，旧数据落在缺省的作用域里，旧索引换成带 scope 的，旧事实进了检索的索引', async () => {
@@ -395,7 +395,7 @@ describe('sqlite memory store：结构版本和迁移', () => {
     assert.deepEqual(ids(await other.facts.list()), [mine.id]);
     assert.deepEqual(ids(await store.facts.list()), ['f-old']);
     assert.deepEqual(ids((await store.facts.search({ text: '旧库里有什么事实？' })).map((hit) => hit.fact)), ['f-old']);
-    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '4' });
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '5' });
   });
 
   /** 版本 2 的库：四张表都带 scope，没有倒排索引；两个作用域各有事实，其中一条的 recalls 很长。 */
@@ -454,7 +454,7 @@ describe('sqlite memory store：结构版本和迁移', () => {
   test('版本 2 升到当前版本：建倒排索引，已有的事实补进去（各在各的作用域里），过长的 recalls 截到最近的；再打开什么都不改', async () => {
     const database = v2Database();
     const store = createSqliteMemoryStore({ database });
-    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '4' });
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '5' });
     const found = async (
       scope: typeof store | ReturnType<typeof store.scope>,
       query: Parameters<typeof store.facts.search>[0],
@@ -470,6 +470,10 @@ describe('sqlite memory store：结构版本和迁移', () => {
 
     const facts = await store.facts.list();
     assert.deepEqual(ids(facts), ['f-archived', 'f-closed', 'f-pg', 'f-tea'], '事实一条不少');
+    assert.ok(
+      facts.every((fact) => fact.at === fact.validFrom),
+      '没有写入的时刻：补成 validFrom',
+    );
     const tea = facts.find((fact) => fact.id === 'f-tea');
     assert.deepEqual(
       tea?.recalls,
@@ -537,18 +541,18 @@ describe('sqlite memory store：结构版本和迁移', () => {
     const path = tempPath();
     createSqliteMemoryStore({ path }).close();
     const raw = new DatabaseSync(path);
-    raw.exec(`UPDATE memory_meta SET value = '5' WHERE key = 'memory_schema'`);
+    raw.exec(`UPDATE memory_meta SET value = '6' WHERE key = 'memory_schema'`);
     raw.exec('DROP INDEX memory_facts_scope_open');
     const before = schemaOf(raw);
     raw.close();
-    assert.throws(() => createSqliteMemoryStore({ path }), /memory schema in this database is version 5, newer than/);
+    assert.throws(() => createSqliteMemoryStore({ path }), /memory schema in this database is version 6, newer than/);
     const check = new DatabaseSync(path);
     assert.deepEqual(schemaOf(check), before, '没有补索引');
-    assert.deepEqual(metaOf(check, 'memory_meta'), { memory_schema: '5' });
+    assert.deepEqual(metaOf(check, 'memory_meta'), { memory_schema: '6' });
     check.close();
   });
 
-  test('版本 3 升到 4：笔记加失败的列，同一段的重复笔记只留最早的一条；事实加幂等键；再打开什么都不改', async () => {
+  test('版本 3 升到当前版本：笔记加失败的列，同一段的重复笔记只留最早的一条；事实加幂等键；再打开什么都不改', async () => {
     const database = new DatabaseSync(':memory:');
     const store = createSqliteMemoryStore({ database });
     const fact = await store.facts.add(newFact('主人喜欢喝乌龙茶'));
@@ -569,7 +573,7 @@ describe('sqlite memory store：结构版本和迁移', () => {
     insert.run('n-alice', 'user:alice', 1, 3, 13);
 
     const upgraded = createSqliteMemoryStore({ database });
-    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '4' });
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '5' });
     assert.deepEqual(ids(await upgraded.notes.list()), ['n-first', 'n-other'], '重复的那条删了，只留最早的');
     assert.deepEqual(ids(await upgraded.scope('user:alice').notes.list()), ['n-alice'], '别的作用域的不算重复');
     assert.deepEqual(ids(await upgraded.notes.list({ pending: true })), ['n-first', 'n-other']);
@@ -585,6 +589,33 @@ describe('sqlite memory store：结构版本和迁移', () => {
     const before = schemaOf(database);
     createSqliteMemoryStore({ database });
     assert.deepEqual(schemaOf(database), before);
+  });
+
+  test('版本 4 升到 5：事实加写入的时刻，已有的补成 validFrom，新写的按给的记；再打开什么都不改', async () => {
+    const database = new DatabaseSync(':memory:');
+    const store = createSqliteMemoryStore({ database });
+    const old = await store.facts.add(newFact('主人喜欢喝乌龙茶', { validFrom: 7 }));
+    // 退回版本 4 的结构：事实没有 `at`。
+    database.exec(`
+      ALTER TABLE memory_facts DROP COLUMN at;
+      UPDATE memory_meta SET value = '4' WHERE key = 'memory_schema';
+    `);
+
+    const upgraded = createSqliteMemoryStore({ database });
+    assert.deepEqual(metaOf(database, 'memory_meta'), { memory_schema: '5' });
+    assert.deepEqual(await upgraded.facts.list(), [{ ...old, at: 7 }], '不知道什么时候写的：当成立的时候就记下了');
+    const added = await upgraded.facts.add(newFact('主人住在杭州', { validFrom: 3, at: 20 }));
+    assert.equal(added.at, 20);
+    assert.equal((await upgraded.facts.supersede(added.id, newFact('主人住在上海', { at: 30 }), 30)).at, 30);
+
+    const before = schemaOf(database);
+    createSqliteMemoryStore({ database });
+    assert.deepEqual(schemaOf(database), before);
+    assert.deepEqual(Object.fromEntries((await upgraded.facts.list()).map((fact) => [fact.text, fact.at])), {
+      主人喜欢喝乌龙茶: 7,
+      主人住在杭州: 20,
+      主人住在上海: 30,
+    });
   });
 
   test('认不得的版本值报错', () => {

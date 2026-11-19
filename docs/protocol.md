@@ -783,7 +783,8 @@ interface MemoryFact {
   predicate?: string;
   text: string; // 一句能独立成立的话
   topic?: string;
-  validFrom: number;
+  at: number; // 写进记忆的时刻，激活度从它算起
+  validFrom: number; // 从何时起成立
   validTo?: number; // 没有就是仍然成立
   supersededBy?: string; // 被哪条事实取代
   confidence: number; // 0..1
@@ -792,7 +793,10 @@ interface MemoryFact {
   recalls: readonly number[]; // 最近几次被召回的时刻（最多 MAX_FACT_RECALLS = 32 个），激活度公式里的 t_i
   archivedAt?: number; // 归档的时刻；没有就是没归档
 }
-type NewMemoryFact = Omit<MemoryFact, 'id' | 'validTo' | 'supersededBy' | 'recalls' | 'archivedAt'>;
+// at 不给时存储记成 validFrom
+type NewMemoryFact = Omit<MemoryFact, 'id' | 'at' | 'validTo' | 'supersededBy' | 'recalls' | 'archivedAt'> & {
+  at?: number;
+};
 interface FactHit {
   fact: MemoryFact;
   score: number; // 0..1，越大越相关；recall 用它当相似度
@@ -895,6 +899,7 @@ interface MemoryStore {
 ```
 
 - **事实不 UPDATE。** 变了就 `supersede`：新的写进去、旧的关掉，`supersededBy` 连起来。「上个月用的是哪个数据库」永远能查。关错了用 `reopen` 改回来。
+- **写进来的时刻和成立的时刻分开。** `at` 是事实写进记忆的时刻，`validFrom` 是它从何时起成立：夜里从日志提取的事实可能早就成立了。`at` 不给时存储记成 `validFrom`（导入的、手写的事实不知道是什么时候记下的）。
 - **每个方法单独是原子的。** `supersede` 的加新关旧要么都成，要么都不成：分成 `add` 再 `close` 两步时，第二步失败会留下两条都成立的事实。
 - **几个进程写同一份存储不重复。** 同一段日志（会话加 `from`、`upTo`）只有一条笔记，`notes.add` 遇到已有的返回已有的；事实带 `key` 时一个作用域里只有一条，`add`、`supersede` 遇到已有的键返回已有的、什么都不改。两个进程同时门控、同时夜里处理同一批笔记，结果和一个进程一样。
 - **失败和死信。** 处理一批笔记失败时调用方 `fail`：记次数和原因，笔记还是待处理的；次数到了上限进死信（`failedAt`），不再算待处理，`list({ failed: true })` 列出来，修好原因后 `retry` 放回去。这样一段总让模型出错的日志不会每夜重试、也不会被悄悄标成处理过。
@@ -1051,17 +1056,18 @@ interface ForgetReport {
 ACT-R 的基础激活。每次召回都是一个 `t_i`，近的权重大，远的衰减；显著性 `s` 是常数偏置：
 
 ```
-A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = |now − t_i| / 1 天，t_i ∈ {validFrom, 最近 32 次 recalls}
+A(fact, now) = ln Σ_i (Δt_i + ε)^(−d) + s      Δt_i = |now − t_i| / 1 天，t_i ∈ {at, 晚于 at 的 validFrom, 最近 32 次 recalls}
 R(fact, now) = 1 / (1 + e^(−(A − archiveAt)))  压到 0..1：ACT-R 的提取概率，阈值 τ 取 archiveAt
 score        = 0.6 × similarity + 0.4 × R      rankFacts
 ```
 
 缺省 `d = 0.5`、`ε = 0.02`、`archiveAt = 0.55`（`ACTIVATION_DEFAULTS`）。三个都是协议包里的纯函数；缺省值来自个人助理的量级，要按应用调。
 
-- **有上界。** 只算最近 `MAX_FACT_RECALLS`（32）次召回，所以 `A ≤ ln(33 · ε^(−d)) + s`，缺省参数下是 `5.45 + s`。召回两万次和召回 32 次一样。
-- **未来的时刻按距离算。** `Δt` 取绝对值：十天后才生效的事实和十天前生效的一样活跃，临近时回升。`validFrom` 在未来的事实因此也会衰减、也能归档，不再永远顶着最高的激活度。
+- **有上界。** 只算最近 `MAX_FACT_RECALLS`（32）次召回，所以 `A ≤ ln(34 · ε^(−d)) + s`，缺省参数下是 `5.48 + s`。召回两万次和召回 32 次一样。
+- **从写进来算起。** `t_i` 里是写入的时刻 `at`，不是 `validFrom`：夜里提取出的事实可能一年前就成立了，从 `validFrom` 算的话，刚写进来就已经在阈值以下，第二夜就可能归档。写的时候还没成立的（`validFrom` 晚于 `at`），成立那天也算一次。
+- **未来的时刻按距离算。** `Δt` 取绝对值：还没成立的事实临近成立时回升，成立以后再衰减；召回的时刻也一样。远期才成立的事实照样从写入起衰减、也能归档，不再永远顶着最高的激活度。
 - **排序用 `R`，不直接用 `A`。** `A` 没有固定的量程（缺省参数下从刚写的 2.6 到一年没动的 −2.3），直接加权会盖过 0..1 的相似度：以前刚写的事实相似度是 0 也排在相似度是 1 的旧事实前面。`R` 在阈值上是 0.5，刚写的事实（`s = 0.6`）约 0.88，一个月没动的约 0.16，召回再多也到不了 1。激活度因此最多贡献 0.4：相似度高出 0.67 的，对方召回再多也排在前面。
-- **归档看 `A`。** 一条 `s = 0.6`、从未被召回的事实在 `validFrom` 之后约 1.09 天低于阈值（协议包的单元测试固定了「1 天时还在、1.2 天时已低于」）；`validFrom` 之后一天内被召回一次，约到第 4.4–4.9 天才低于阈值。低于阈值是归档的必要条件，不是充分条件：参考实现还要求这条事实错过了足够多次被召回的机会（见[架构](architecture.md#记忆)的「巩固」），不然新事实头两天没碰上相关的问题就没了。
+- **归档看 `A`。** 一条 `s = 0.6`、从未被召回的事实写入之后约 1.09 天低于阈值（协议包的单元测试固定了「1 天时还在、1.2 天时已低于」）；写入之后一天内被召回一次，约到第 4.4–4.9 天才低于阈值。低于阈值是归档的必要条件，不是充分条件：参考实现还要求这条事实错过了足够多次被召回的机会（见[架构](architecture.md#记忆)的「巩固」），不然新事实头两天没碰上相关的问题就没了。
 
 ## 契约测试
 
@@ -1075,10 +1081,10 @@ score        = 0.6 × similarity + 0.4 × R      rankFacts
 | `describeHarnessContract`         | `({ script }) => { harness, store, agent }`                             | 按等级（`levels`）分组：一轮的日志顺序和 `recorded`、`runId`、工具调用经执行环境、模型出错照常返回 `error` 并写 `ctx.run.ended`、每一步结束就落日志（工具调用之后模型出错，前一步留在日志里）、不合 `inputSchema` 的工具输入不执行（问题作为 `{ type: 'error' }` 回给模型）、超过上限（`maxToolOutputChars`）的结果截断并注明、`inputKey` 重试、不带 `inputKey` 的失败重试不再记输入、模型报上下文过长是 `context_overflow`、`context.overflow`（超了选 `error` 不调模型、`trim` 裁到放得下）、`record: false`、已中止的 `signal`、`stream?` 的事件顺序和出错、`session_busy`、`owner`、`record: false` 不受影响、人工确认（确认请求和调用在同一条助手消息里、确认了的下一轮先执行、拒绝的模型看到原因、流的 `run.ended` 带 `approvals`） |
 | `describeContextBuilderContract`  | `({ script }) => { builder, store }`                                    | `build` 的消息顺序（历史、`input`、`prompt`）、指令、工具名单、不改日志、全是 JSON；不认识的投影名 `not_found`；`view` 里没有规则的事件不可见、摘要代替它盖住的条目；`window` 的 `maxMessages`、`{}`、`truncate`；`tokens?`；`compact?` 的不够长、写摘要和 `ctx.compacted`、被截断不写、超过 `maxInputTokens` 分段；`compactDetailed?` 的 `status`                                                                                                                                                                                                                                                                                                                                                                                        |
 | `describeOrchestratorContract`    | `({ script }) => { orchestrator, store, agent }`                        | `submit`/`status`、同一会话串行、取消排队中的、`events?`、`recover?` 给悬空的工具调用补错误结果、补 `ctx.run.ended`（含会话多于一页、只收同一个 `owner` 的）、`close` 后不收                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 作用域隔离（含检索的索引、归档和恢复）；笔记的 `head`、`pending`、`settle`、同一段只写一次、`fail` 计数和死信、`retry`、`failed` 和 `since`、按会话 `forget`；事实不改写、`key` 幂等、`supersede` 原子（认不得的 `id` 什么都不写）、`reopen`、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加且只留最近 `MAX_FACT_RECALLS` 个、`archive` 退出 `open`、`restore` 恢复、`forget` 真删、`list` 翻页；`search` 的全文命中、中文问句、超长查询（上千个不同的词）、按相关度排、`archived`；程序 `confirm` 计数、`forget`；`core` 历史、`clear`                                                                                                                                                                                             |
+| `describeMemoryStoreContract`     | `({ now }) => MemoryStore`                                              | 作用域隔离（含检索的索引、归档和恢复）；笔记的 `head`、`pending`、`settle`、同一段只写一次、`fail` 计数和死信、`retry`、`failed` 和 `since`、按会话 `forget`；事实不改写、`at` 不给时是 `validFrom`、`key` 幂等、`supersede` 原子（认不得的 `id` 什么都不写）、`reopen`、`close` 和 `supersededBy`、`cite` 去重、`touch` 追加且只留最近 `MAX_FACT_RECALLS` 个、`archive` 退出 `open`、`restore` 恢复、`forget` 真删、`list` 翻页；`search` 的全文命中、中文问句、超长查询（上千个不同的词）、按相关度排、`archived`；程序 `confirm` 计数、`forget`；`core` 历史、`clear`                                                                                                                                                                  |
 | `describeDecisionModelContract`   | `() => DecisionModel`                                                   | 三种问题的形状、概率和为 1、`choice` 是概率最大的、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `describeExtractionModelContract` | `() => ExtractionModel`                                                 | 每种字段的 `value` 形状、找不到时 `value: null` 且 `pNull` 高、`signal` 中止                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志；`recall` 后 `recalls` 多一个、归档的也召回并恢复、`minConfidence`；`source` 连着带出几轮 `recalls` 不跟着涨；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `describeMemoryContract`          | `(setup: { sessions, decision, extraction, now }) => { memory, store }` | `gate` 不改日志、笔记指向正确的 `seq` 区间、`head` 前进；`consolidate` 幂等、取代不覆盖、证据指回日志、写下的事实 `at` 是这次的 `now`；`recall` 后 `recalls` 多一个、归档的也召回并恢复、`minConfidence`；`source` 连着带出几轮 `recalls` 不跟着涨；`source`、`tools` 的形状                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 harness、编排器和上下文的工厂收到一份模型剧本 `script`（`ModelScriptStep[]`：`text`（带 `truncated` 时是被 `maxOutputTokens` 截断的输出）、调用回显工具的 `tool-call`、`error`），按它造模型和回显工具（回显工具的 `inputSchema` 要求 `text` 是字符串，结果里原样带着输入；harness 一次工具结果的上限不是 `DEFAULT_MAX_TOOL_OUTPUT_CHARS` 的，在 `describeHarnessContract` 的第四个参数里给 `maxToolOutputChars`）；`@modelctx-ai/ctx/testing` 的 `createScriptedModel` 是现成的。上下文的工厂给出一个缺省配置的 builder 和它读的存储，剧本是给 `compact` 的摘要模型的。记忆的契约用协议包 `/testing` 里的剧本模型 `createScriptedDecisionModel`、`createScriptedExtractionModel`：`describeMemoryContract` 自己造好它们和一个内存会话日志交给工厂。谁跑：记忆存储的契约由 `ctx-memory` 的内存存储（带和不带 `embed`）、`createSqliteMemoryStore`、`createRemoteMemoryStore` 跑；决策模型的由剧本模型、启发式、`decisionFromLanguageModel`、`ctx-models` 的两个 provider（假 `fetch`）跑；提取模型的由剧本模型、`extractionFromLanguageModel`、`ctx-models` 的 `cloudflare` 跑；`describeMemoryContract` 由 `createMemory` 加内存存储跑，门控阈值固定在 0.1..0.9 之间，`LanguageModel` 可以不给。上下文的契约由 `createContextBuilder` 加内存存储跑；它只管协议方法里看得见的行为，投影规则这些进程内配置（事件怎么渲染、摘要怎么写）不在里面，由 `project` 的单元测试管。
 

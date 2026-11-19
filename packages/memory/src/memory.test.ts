@@ -130,13 +130,14 @@ async function seed(
   store: MemoryStore,
   sessions: SessionStore,
   text: string,
-  extra: { topic?: string; validFrom?: number; salience?: number; confidence?: number } = {},
+  extra: { topic?: string; at?: number; validFrom?: number; salience?: number; confidence?: number } = {},
 ) {
   const [entry] = await sessions.append('s', [userEntry(text)]);
   return store.facts.add({
     subject: 'user',
     text,
-    validFrom: extra.validFrom ?? NOW,
+    ...(extra.at !== undefined ? { at: extra.at } : {}),
+    validFrom: extra.validFrom ?? extra.at ?? NOW,
     confidence: extra.confidence ?? 0.9,
     salience: extra.salience ?? 0.6,
     sources: [{ session: 's', from: entry!.seq, upTo: entry!.seq }],
@@ -539,12 +540,12 @@ describe('createMemory：consolidate', () => {
 
   test('衰减：激活度低于 archiveAt 还不够，还要错过 minChances 次机会；没人用记忆的日子不算', async () => {
     const { sessions, store, memory } = setup();
-    const old = await seed(store, sessions, '很久以前的事', { validFrom: NOW - 30 * DAY });
-    const fresh = await seed(store, sessions, '昨天的事', { validFrom: NOW - 0.5 * DAY });
+    const old = await seed(store, sessions, '很久以前的事', { at: NOW - 30 * DAY });
+    const fresh = await seed(store, sessions, '昨天的事', { at: NOW - 0.5 * DAY });
     assert.equal((await memory.consolidate()).facts.archived, 0, '这三十天记忆没被召回过：没有机会，不归档');
 
     // 另一条事实这几天天天被召回：很久以前那条每天都错过一次。
-    const busy = await seed(store, sessions, '天天用到的事', { validFrom: NOW - 40 * DAY });
+    const busy = await seed(store, sessions, '天天用到的事', { at: NOW - 40 * DAY });
     for (let day = 6; day >= 1; day -= 1) await store.facts.touch([busy.id], NOW - day * DAY);
     assert.equal((await memory.consolidate()).facts.archived, 0, '六个日子，还差一个');
     await store.facts.touch([busy.id], NOW - 6.5 * DAY);
@@ -562,8 +563,8 @@ describe('createMemory：consolidate', () => {
 
   test('衰减：minChances 给 0 就只看激活度；archiveAt 可调', async () => {
     const strict = setup({ decay: { minChances: 0 } });
-    const old = await seed(strict.store, strict.sessions, '很久以前的事', { validFrom: NOW - 30 * DAY });
-    const fresh = await seed(strict.store, strict.sessions, '昨天的事', { validFrom: NOW - 0.5 * DAY });
+    const old = await seed(strict.store, strict.sessions, '很久以前的事', { at: NOW - 30 * DAY });
+    const fresh = await seed(strict.store, strict.sessions, '昨天的事', { at: NOW - 0.5 * DAY });
     assert.equal((await strict.memory.consolidate()).facts.archived, 1);
     assert.deepEqual(
       (await strict.store.facts.list({ open: true })).map((fact) => fact.id),
@@ -572,7 +573,7 @@ describe('createMemory：consolidate', () => {
     assert.notEqual((await strict.store.facts.list()).find((fact) => fact.id === old.id)?.archivedAt, undefined);
 
     const lenient = setup({ decay: { minChances: 0, archiveAt: -5 } });
-    await seed(lenient.store, lenient.sessions, '很久以前的事', { validFrom: NOW - 30 * DAY });
+    await seed(lenient.store, lenient.sessions, '很久以前的事', { at: NOW - 30 * DAY });
     assert.equal((await lenient.memory.consolidate()).facts.archived, 0);
   });
 
@@ -602,11 +603,15 @@ describe('createMemory：consolidate', () => {
     assert.equal((await open()).length, 1, '天天用的那条一直在');
   });
 
-  test('衰减：validFrom 在未来的事实不再永不归档，按离现在多远算；临近的留下', async () => {
+  test('衰减：validFrom 在未来的事实也从写入算起，写下以后没用到的照样归档；刚写下的、临近成立的留下', async () => {
     const { sessions, store, memory } = setup();
-    const far = await seed(store, sessions, '主人打算 2030 年退休', { validFrom: NOW + 1000 * DAY });
-    const near = await seed(store, sessions, '主人后天出发去东京', { validFrom: NOW + 2 * DAY });
-    const busy = await seed(store, sessions, '天天用到的事', { validFrom: NOW - 40 * DAY });
+    const far = await seed(store, sessions, '主人打算 2030 年退休', {
+      at: NOW - 40 * DAY,
+      validFrom: NOW + 1000 * DAY,
+    });
+    const near = await seed(store, sessions, '主人后天出发去东京', { at: NOW - 40 * DAY, validFrom: NOW + 2 * DAY });
+    const planned = await seed(store, sessions, '主人打算明年换工作', { at: NOW, validFrom: NOW + 300 * DAY });
+    const busy = await seed(store, sessions, '天天用到的事', { at: NOW - 40 * DAY });
     for (let day = 8; day >= 1; day -= 1) await store.facts.touch([busy.id], NOW - day * DAY);
     assert.equal((await memory.consolidate()).facts.archived, 1);
     const archived = (await store.facts.list()).filter((fact) => fact.archivedAt !== undefined);
@@ -614,7 +619,40 @@ describe('createMemory：consolidate', () => {
       archived.map((fact) => fact.id),
       [far.id],
     );
-    assert.ok((await store.facts.list({ open: true })).some((fact) => fact.id === near.id));
+    const open = (await store.facts.list({ open: true })).map((fact) => fact.id);
+    assert.ok(open.includes(near.id), '后天成立的：临近了');
+    assert.ok(open.includes(planned.id), '今天刚写下的：离成立还远也是新的');
+  });
+
+  test('衰减：提取出的早就成立的事实从写入算起，写进来第二夜不归档', async () => {
+    const clock = { now: NOW };
+    const extraction = {
+      name: 'x',
+      async extract() {
+        return {
+          facts: { value: ['[2025-06-01] 主人住在台北'], pNull: 0.1, confidence: 0.8 },
+          decisions: { value: null, pNull: 0.9, confidence: 0.9 },
+          lesson: { value: null, pNull: 0.9, confidence: 0.9 },
+        };
+      },
+    };
+    const { sessions, store, memory } = setup({
+      decision: createScriptedDecisionModel(KEEP),
+      extraction,
+      now: () => clock.now,
+    });
+    // 别的事实前些天天天被召回：从 2025 年 6 月算的话，这条早就错过了够多的机会。
+    const busy = await seed(store, sessions, '天天用到的事', { at: NOW - 40 * DAY });
+    for (let day = 8; day >= 1; day -= 1) await store.facts.touch([busy.id], NOW - day * DAY);
+    await sessions.append('s', [userEntry('我去年六月就搬到台北了，记住')]);
+    await memory.gate('s');
+    assert.equal((await memory.consolidate()).facts.added, 1);
+    const taipei = (await store.facts.list()).find((fact) => fact.text === '主人住在台北');
+    assert.deepEqual([taipei?.at, taipei?.validFrom], [NOW, Date.parse('2025-06-01')], '今天写下的，去年就成立了');
+
+    clock.now = NOW + DAY;
+    assert.equal((await memory.consolidate()).facts.archived, 0, '第二夜：从写入算才一天');
+    assert.ok((await store.facts.list({ open: true })).some((fact) => fact.id === taipei?.id));
   });
 
   test('core：有 model 时用它重写；open 事实没变就不再重写；超预算时回到缺省写法', async () => {

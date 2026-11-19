@@ -418,15 +418,23 @@ function recallDays(facts: readonly MemoryFact[]): number[] {
   return [...days].toSorted((a, b) => a - b);
 }
 
-/** 事实最后一次活动的时刻：`validFrom` 和各次召回里最晚的。晚于 `now` 的按离 `now` 多远折回过去，和 `activation` 一样。 */
-function lastActivity(fact: Pick<MemoryFact, 'validFrom' | 'recalls'>, now: number): number {
+/**
+ * 事实最后一次活动的时刻：写入的时刻、晚于写入的 `validFrom` 和各次召回里最晚的。晚于 `now` 的按离 `now` 多远折回过去，
+ * 和 `activation` 一样。
+ */
+function lastActivity(fact: Pick<MemoryFact, 'at' | 'validFrom' | 'recalls'>, now: number): number {
   let last = -Infinity;
-  for (const at of [fact.validFrom, ...fact.recalls]) last = Math.max(last, at > now ? 2 * now - at : at);
+  const starts = fact.validFrom > fact.at ? [fact.at, fact.validFrom] : [fact.at];
+  for (const t of [...starts, ...fact.recalls]) last = Math.max(last, t > now ? 2 * now - t : t);
   return last;
 }
 
 /** 错过的机会：`days`（升序）里晚于事实最后一次活动那天、又不晚于今天的有几个。 */
-function missedChances(fact: Pick<MemoryFact, 'validFrom' | 'recalls'>, days: readonly number[], now: number): number {
+function missedChances(
+  fact: Pick<MemoryFact, 'at' | 'validFrom' | 'recalls'>,
+  days: readonly number[],
+  now: number,
+): number {
   const from = dayOf(lastActivity(fact, now));
   const to = dayOf(now);
   // 二分找第一个大于 `bound` 的位置。
@@ -868,6 +876,7 @@ export function createMemory(options: MemoryOptions): Memory {
       subject,
       text,
       ...(batch.topic !== undefined ? { topic: batch.topic } : {}),
+      at: now,
       validFrom: found.validFrom,
       confidence: clamp01(found.confidence),
       salience: batch.salience,
@@ -1140,7 +1149,7 @@ export function createMemory(options: MemoryOptions): Memory {
       }
     }
 
-    // 衰减：激活度低于阈值、又错过了足够多次机会的归档。这一夜刚写、刚并入的不归档（提取出的 validFrom 可能早于今天）。
+    // 衰减：激活度低于阈值、又错过了足够多次机会的归档。这一夜刚写、刚并入的不归档，`decay` 调得再严也一样。
     signal?.throwIfAborted();
     const candidates = await openFacts();
     const days = recallDays(candidates);
