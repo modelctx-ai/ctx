@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from conftest import serve, ts_pending, ts_run
+from conftest import serve, ts_claim, ts_pending, ts_run
 from ctx_pydantic_ai import CtxError, PydanticAIHarness, RemoteExecutor, RemoteSessionStore, tool_approval_entry
 from ctx_pydantic_ai.testing import ScriptedModel
 
@@ -121,6 +121,45 @@ def test_a_run_writes_through_ctx_remote(ctx_remote: dict[str, Any]) -> None:
             await store.aclose()
             for executor in executors:
                 await executor.aclose()
+
+    run(main)
+
+
+def test_a_typescript_worker_claims_what_the_python_harness_left(node: str, ctx_remote: dict[str, Any]) -> None:
+    # Python 的 harness 停下等外部执行环境 `local`：TypeScript 的 worker 不给会话名，按名字领走（`POST /work/local/claim`），
+    # 交给 ctx-remote 上的 `local` 执行、结果追加回会话，Python 的 harness 下一轮接着走。
+    async def main() -> None:
+        store = RemoteSessionStore(ctx_remote['baseUrl'], access_token=ctx_remote['token'])
+        echo = {
+            'name': 'echo',
+            'description': '原样返回输入',
+            'inputSchema': {'type': 'object', 'properties': {'text': {'type': 'string'}}},
+            'executor': 'local',
+        }
+        model = ScriptedModel(
+            [{'type': 'tool-call', 'id': 'c1', 'input': {'text': 'hi'}}, {'type': 'text', 'text': '回显好了'}]
+        )
+        harness = PydanticAIHarness(store=store, tools=[echo], external=['local'], models={'scripted': model})
+        session = 'py/work 领'
+        try:
+            first = await harness.run({'session': session, 'agent': {'model': 'scripted'}, 'input': '回显'})
+            assert first['stopReason'] == 'requires_action', first
+            remote = {'baseUrl': ctx_remote['baseUrl'], 'token': ctx_remote['token']}
+            done = ts_claim(node, {**remote, 'executor': 'local'})
+            assert done['failed'] == []
+            [claimed] = done['executed']
+            assert claimed['session'] == session
+            assert claimed['executor'] == 'local'
+            assert claimed['call'] == first['pending'][0]
+            assert ts_claim(node, {**remote, 'executor': 'local'}) == {'executed': [], 'failed': []}
+            tool = (await store.list(session))[-1]
+            assert tool['source'] == 'local'
+            assert tool['message']['content'][0]['output'] == {'type': 'json', 'value': {'text': 'hi'}}
+            second = await harness.run({'session': session, 'agent': {'model': 'scripted'}})
+            assert second['stopReason'] == 'end_turn', second
+            assert second['text'] == '回显好了'
+        finally:
+            await store.aclose()
 
     run(main)
 

@@ -275,6 +275,13 @@ const defs: Record<string, Schema> = {
     },
   ),
   ToolApproval: obj({ approvalId: str, callId: str }, { reason: str }, '等确认的一次工具调用（`RunResult.approvals`）'),
+  ApprovalDecision: obj({ approved: bool }, { reason: str }),
+  PendingApproval: obj({ approvalId: str }, { reason: str, decision: ref('ApprovalDecision') }),
+  ClaimedToolCall: obj(
+    { session: str, runId: str, seq: int, call: ref('ToolCall') },
+    { approval: ref('PendingApproval'), executor: str },
+    '`POST /work/:executor/claim` 领到的一次调用：等着的调用（`PendingToolCall`）加上它所在的会话',
+  ),
   RunEvent: oneOf(
     obj({ type: literal('run.started'), runId: str, session: str }, { seq: int }),
     obj({ type: literal('model.started'), runId: str, step: int }),

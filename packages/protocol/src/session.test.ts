@@ -181,6 +181,7 @@ describe('reading framework events', () => {
         }),
       ],
       [CTX_EVENTS.runEnded, runEndedEntry({ runId: 'r1', stopReason: 'end_turn', usage: { inputTokens: 3 } })],
+      [CTX_EVENTS.runEnded, runEndedEntry({ runId: 'r1', stopReason: 'requires_action', executors: { c1: 'worker' } })],
       [CTX_EVENTS.compacted, compactedEntry({ covers: 2, summaryId: 's1' })],
       [CTX_EVENTS.error, ctxErrorEntry({ runId: 'r1', message: 'boom', type: 'api_call' })],
       [CTX_EVENTS.erased, erasedEntry({ op: 'remove', seqs: [2, 3], count: 2 })],
@@ -228,6 +229,23 @@ describe('reading framework events', () => {
       { runId: 'r1', stopReason: 'later_reason', usage: { inputTokens: 3 } },
       'stopReason 只查是字符串；usage 只留数字',
     );
+    assert.deepEqual(
+      ctxEventData(
+        read(CTX_EVENTS.runEnded, { runId: 'r1', stopReason: 'requires_action', executors: { c1: 'w', c2: 2 } }),
+        CTX_EVENTS.runEnded,
+      ),
+      { runId: 'r1', stopReason: 'requires_action', executors: { c1: 'w' } },
+      'executors 只留值是字符串的',
+    );
+    for (const executors of [{ c1: 1 }, ['w'], 'w']) {
+      assert.deepEqual(
+        ctxEventData(
+          read(CTX_EVENTS.runEnded, { runId: 'r1', stopReason: 'requires_action', executors }),
+          CTX_EVENTS.runEnded,
+        ),
+        { runId: 'r1', stopReason: 'requires_action' },
+      );
+    }
     assert.deepEqual(
       ctxEventData(read(CTX_EVENTS.erased, { op: 'truncate', upTo: '3', seqs: [1, 'x'], count: 2 }), CTX_EVENTS.erased),
       { op: 'truncate', count: 2 },

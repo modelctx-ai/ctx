@@ -114,7 +114,7 @@ interface SessionStore {
 | `kind`            | 谁写          | `data`                                                                                                                                                                             |
 | ----------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ctx.run.started` | harness       | `RunStartedData`：`{ runId, agent, owner?, parent?, harness? }`，`agent` 是 `agentSpecToJson(spec)`，`harness` 是外部 harness 的身份 `HarnessInfo`：`{ name, version?, session? }` |
-| `ctx.run.ended`   | harness       | `RunEndedData`：`{ runId, stopReason, usage? }`                                                                                                                                    |
+| `ctx.run.ended`   | harness       | `RunEndedData`：`{ runId, stopReason, usage?, executors? }`，`executors` 是 `requires_action` 时留给外部执行环境的调用归谁：调用 `id` → 执行环境的名字                             |
 | `ctx.compacted`   | 上下文        | `CompactedData`：`{ covers, summaryId }`                                                                                                                                           |
 | `ctx.error`       | harness、编排 | `CtxErrorData`：`{ runId?, message, type? }`                                                                                                                                       |
 | `ctx.unreadable`  | （不写入）    | `UnreadableData`：`{ v?, type?, error: { type, message } }`，见下面                                                                                                                |
@@ -464,7 +464,7 @@ interface EnvironmentSpec {
 - **每会话的执行环境（[ADR 0009](adr/0009-hosted-prerequisites.md)）。** `provision`、`dispose` 管整个执行环境，`open`、`close` 管一个会话：每个会话一个容器、一个工作目录。harness 在一轮里第一次把调用交给某个执行环境之前调一次它的 `open(session, { environment: agent.environment })`；`open` 抛错时这一轮交给它的调用都得到错误结果，模型看得到原因，这一轮照常往下走。会话什么时候结束由应用决定，框架不猜：应用调各个执行环境的 `close`（参考实现的 `closeExecutorSessions(executors, session)`）。闲置回收是执行环境自己的策略。`EnvironmentSpec` 满足不了（没有那个镜像、不支持白名单、要的变量没配）时 `open` 抛 `invalid_request`，不静默降级。
 - **凭证不进执行环境。** 凭证不出现在 `ToolCall`、`ExecutionContext`、`AgentSpec` 里，日志里也就没有；`EnvironmentSpec.env` 只有变量的名字。需要凭证的工具放在 harness 这一侧执行（函数执行环境、MCP 服务器），模型生成的代码碰不到；一定要在沙箱里用的，由部署方在出口替换：沙箱里只有占位符，出站代理换成真的。交给子进程的环境变量模型生成的代码读得到。
 - 实现：进程内函数（核心包）、MCP 服务器（`ctx-mcp`）、本机子进程（`ctx-exec`，`sessionCwd` 时每个会话一个工作目录）、HTTP 远端（`ctx-remote`）。反方向：`ctx-mcp` 的 `createMcpServer` 把执行环境包成 MCP 服务器（stdio 或 Streamable HTTP），自带循环的程序经它调 ctx 的工具；调用方不经过 harness，所以输入检查、结果截断、执行前 `open` 会话（`open`）和 `deny`（`permissions`）都在它这边做。`listenMcpHttp` 在本机起一个带一次性令牌的 HTTP 服务器，给自己起的子进程连。
-- 远端执行环境有两种接法：harness 调它（它是服务），或它从 harness 领工作（它是只需出站连接的 worker，像 Managed Agents 的自托管沙箱）。协议相同，`ctx-remote` 先做前者。
+- 远端执行环境有两种接法：harness 调它（它是服务），或它从 harness 领工作（它是只需出站连接的 worker，像 Managed Agents 的自托管沙箱）。协议相同，`ctx-remote` 两种都有：服务端挂 `executors`，或者 worker 按名字领工作（`POST /work/:executor/claim`，见下面「工具调用经日志往返」）。
 
 ## Harness
 
@@ -640,7 +640,8 @@ interface Harness {
   - `budget`：`maxTotalTokens`（所有步骤的 `totalTokens` 之和，没有时用输入加输出）、`maxDurationMs`（墙钟）。只在步骤之间检查：超了就不再走下一步，`stopReason` 是 `max_budget`；正在进行的模型调用和工具不会被打断，硬上限用 `settings.timeoutMs`。成本的上限不在这里：价格表是应用的事，用 `meta.step` 的用量自己算。
   - `environment`：这个 agent 要的执行环境，harness 原样交给执行环境的 `open`（见上面「执行环境」）。记进 `ctx.run.started`。
   - 这几项的值不对（预算不是正数、权限不是三个值之一、`output.schema` 不是对象）时这一轮以 `invalid_request` 结束。不支持某一项的 harness 不能静默忽略：要么以 `invalid_request` 结束，要么在一致性等级里注明。
-- **工具调用经日志往返（[ADR 0008](adr/0008-tool-calls-through-the-log.md)）。** 绑定到「外部执行环境」的工具（由 harness 的实现配置，参考实现是 `createHarness({ external })`）交给模型，但不在 harness 这一侧执行：模型调用了它们，这一轮写下调用后以 `requires_action` 结束，`pending` 列出这些调用，不占会话。执行方追加结果：`toolResultEntry(call, output)` 是一条 `tool` 消息，带幂等键 `ctx.tool-result:<id>`（`TOOL_RESULT_KEY_PREFIX`），同一次调用只记一条。结果齐了以后，下一轮不带输入接着跑。`pendingToolCalls(entries)` 是纯函数，给出等待中的调用（`PendingToolCall`：`call`、`runId`、带调用的条目的 `seq`）：以 `requires_action` 结束的那一轮留下的，去掉后面已经追加了结果的；之后又有运行以别的原因结束，之前等着的就作废。结果一直不来时由应用决定：照常提交下一轮，投影给缺结果的调用补一条「没有记录到结果」。
+- **工具调用经日志往返（[ADR 0008](adr/0008-tool-calls-through-the-log.md)）。** 绑定到「外部执行环境」的工具（由 harness 的实现配置，参考实现是 `createHarness({ external })`）交给模型，但不在 harness 这一侧执行：模型调用了它们，这一轮写下调用后以 `requires_action` 结束，`pending` 列出这些调用，不占会话。执行方追加结果：`toolResultEntry(call, output)` 是一条 `tool` 消息，带幂等键 `ctx.tool-result:<id>`（`TOOL_RESULT_KEY_PREFIX`），同一次调用只记一条。结果齐了以后，下一轮不带输入接着跑。`pendingToolCalls(entries)` 是纯函数，给出等待中的调用（`PendingToolCall`：`call`、`runId`、带调用的条目的 `seq`、`executor?`）：以 `requires_action` 结束的那一轮留下的，去掉后面已经追加了结果的；之后又有运行以别的原因结束，之前等着的就作废。结果一直不来时由应用决定：照常提交下一轮，投影给缺结果的调用补一条「没有记录到结果」。
+  - **按名字领工作。** 以 `requires_action` 结束时，harness 在 `ctx.run.ended` 里记下留给外部执行环境的调用归谁（`RunEndedData.executors`：调用 `id` → 执行环境的名字，`ToolDefinition.executor`），`PendingToolCall.executor` 带着它；在 harness 里执行的调用（包括等确认的）不记。执行方据此按自己的名字找工作，不用知道有哪些会话：`ctx-remote` 的 `POST /work/:executor/claim`（见「线上形态」）。
 - **人工确认（#21）。** 要等人决定的调用也走这条路：`ask` 权限的调用，和 `beforeTool` 按输入回了 `{ ask: true, reason? }` 的调用（输入不合 `inputSchema` 的先回给模型，不问钩子，也不问人）。这次调用不执行，harness 在这次调用的助手消息里写下确认请求（`tool-approval-request`：`approvalId`、`callId`、`reason`），这一步走完以 `requires_action` 结束，`pending` 里有这次调用，`approvals` 列出确认请求（`ToolApproval`）。
   1. 应用的决定是一条 `tool` 消息：`toolApprovalEntry(approvalId, { approved, reason? })`（`tool-approval-response`），带幂等键 `ctx.tool-approval:<approvalId>`（`TOOL_APPROVAL_KEY_PREFIX`），同一个请求只认先到的决定。追加以后提交下一轮，带不带新输入都行。
   2. 下一轮开头、记输入之前，harness 先处理上一轮留下的决定：确认了、在这里执行的调用照常执行（不再问 `beforeTool`，这一轮的 `deny` 仍然优先），拒绝的写上 `approvalDeniedOutput(call, reason)`（`Tool call "<name>" was not approved: <reason>`），都是 `toolResultEntry`；确认了、绑到外部执行环境的留给执行方。流式时这些结果在 `run.started` 之后作为 `tool.returned` 发出，调用在上一轮的流里报过。还没决定的不动：模型看到缺结果，这一轮以别的原因结束后它就作废，迟到的决定不算数。
@@ -1087,17 +1088,17 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 
 不是每个组件都有线上协议。能跨进程、有线上形态和一致性测试的是会话、执行环境、harness、编排、记忆存储。上下文、工具目录、模型不是线上协议：`ContextBuilder` 的行为大半在投影规则这些函数里，没有一致性测试，跟着 harness 走；工具目录是同步的进程内对象，远端执行环境用 `tools()` 报定义；模型直接用 AI SDK 的 `LanguageModel`，跨边界只传名字。这不是缺陷：它们本来就和 harness 在同一个进程里。
 
-| 组件           | 进程内                                                            | 另一进程 / 远端                                                                              | 第三方托管                                                           |
-| -------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| 会话           | 内存、SQLite                                                      | `ctx-remote`：服务端挂 `store` / `createRemoteSessionStore`（含 `watch`）                    | 实现 `SessionStore` 的任何存储服务                                   |
-| 上下文         | 投影 + 来源                                                       | 跟着 harness 走；也可单独成服务                                                              | —                                                                    |
-| 工具           | 注册表                                                            | 跟着 harness 走；远端执行环境的 `tools()` 报定义，加进本地注册表                             | —                                                                    |
-| 执行环境       | 函数、子进程（`ctx-exec`）、MCP                                   | `ctx-remote`：服务端挂 `executors` / `createRemoteExecutor`；worker 拉取模式之后加           | 容器平台、Managed Agents 的沙箱                                      |
-| Harness        | AI SDK 循环                                                       | `ctx-remote`：服务端挂 `harness` / `createRemoteHarness`（含 `stream`）                      | Managed Agents（之后）                                               |
-| 编排           | 进程内队列                                                        | `ctx-remote`：服务端挂 `orchestrator` / `createRemoteOrchestrator`（含 `recover`、`events`） | 任何任务队列                                                         |
-| 模型           | AI SDK                                                            | 名字 → 远端 harness 自己造                                                                   | 各服务商                                                             |
-| 记忆           | 内存（`ctx-memory`）、SQLite（`ctx-sqlite`）；门面 `createMemory` | `ctx-remote`：服务端挂 `memory` / `createRemoteMemoryStore`                                  | 实现 `MemoryStore` 的记忆服务                                        |
-| 决策、提取模型 | 启发式、`LanguageModel` 装成的（`ctx-memory`）                    | 名字 → 各进程自己造                                                                          | `ctx-models`：Cloudflare（Clef、Clairic）、TypeSafe（Jev，只做决策） |
+| 组件           | 进程内                                                            | 另一进程 / 远端                                                                                                         | 第三方托管                                                           |
+| -------------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 会话           | 内存、SQLite                                                      | `ctx-remote`：服务端挂 `store` / `createRemoteSessionStore`（含 `watch`）                                               | 实现 `SessionStore` 的任何存储服务                                   |
+| 上下文         | 投影 + 来源                                                       | 跟着 harness 走；也可单独成服务                                                                                         | —                                                                    |
+| 工具           | 注册表                                                            | 跟着 harness 走；远端执行环境的 `tools()` 报定义，加进本地注册表                                                        | —                                                                    |
+| 执行环境       | 函数、子进程（`ctx-exec`）、MCP                                   | `ctx-remote`：服务端挂 `executors` / `createRemoteExecutor`；只有出站连接的 worker 按名字领工作（`createRemoteWorker`） | 容器平台、Managed Agents 的沙箱                                      |
+| Harness        | AI SDK 循环                                                       | `ctx-remote`：服务端挂 `harness` / `createRemoteHarness`（含 `stream`）                                                 | Managed Agents（之后）                                               |
+| 编排           | 进程内队列                                                        | `ctx-remote`：服务端挂 `orchestrator` / `createRemoteOrchestrator`（含 `recover`、`events`）                            | 任何任务队列                                                         |
+| 模型           | AI SDK                                                            | 名字 → 远端 harness 自己造                                                                                              | 各服务商                                                             |
+| 记忆           | 内存（`ctx-memory`）、SQLite（`ctx-sqlite`）；门面 `createMemory` | `ctx-remote`：服务端挂 `memory` / `createRemoteMemoryStore`                                                             | 实现 `MemoryStore` 的记忆服务                                        |
+| 决策、提取模型 | 启发式、`LanguageModel` 装成的（`ctx-memory`）                    | 名字 → 各进程自己造                                                                                                     | `ctx-models`：Cloudflare（Clef、Clairic）、TypeSafe（Jev，只做决策） |
 
 服务端是 `@modelctx-ai/ctx-remote/server` 的 `startRemote(options)` 或 `createRemoteHandler(options)`：给了哪些组件就挂哪些路径，一个服务可以同时挂几样。
 
@@ -1125,6 +1126,7 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 |          | `execute`         | `POST /executors/:name/execute`                                    | `{ call, context: { session, runId? } }` → `{ output }`；断开即中止                                                                         |
 |          | `open`            | `POST /executors/:name/sessions/:session/open`                     | `{ environment? }` → `{}`；执行环境没有 `open` 时什么都不做                                                                                 |
 |          | `close`           | `DELETE /executors/:name/sessions/:session`                        | → `{}`                                                                                                                                      |
+|          | （领工作）        | `POST /work/:executor/claim`                                       | `{ limit?, waitMs?, leaseMs? }` → `{ calls }`（`ClaimedToolCall[]`）；见下面                                                                |
 | Harness  | `run`             | `POST /runs`                                                       | `RunRequest` 去掉 `signal`（可带 `aborted: true`）→ `RunResult`                                                                             |
 |          | `stream`          | `POST /runs?stream=1`                                              | 同上 → NDJSON `RunEvent`；断开即中止                                                                                                        |
 |          | 取消（`signal`）  | `DELETE /runs/:runId`                                              | → `{ cancelled }`                                                                                                                           |
@@ -1141,13 +1143,14 @@ harness、编排器和上下文的工厂收到一份模型剧本 `script`（`Mod
 几条跨路径的规则：
 
 - 等很久才有结果的两个请求（`POST /runs`、`POST /executors/:name/execute`）会在结果出来之前先发 200 的响应头，隔一段时间写一个换行当心跳，最后才是 JSON 正文（JSON 允许前面有空白）。头发出去之后才出的错改不了状态码，正文是 `{ error, status }`，`status` 是本来该回的状态码。
-- **主体（[ADR 0009](adr/0009-hosted-prerequisites.md)）。** 服务端可以把请求映射到一个主体 `Principal { id, sessionPrefixes?, memoryScopes?, admin? }`（`ctx-remote` 的 `authenticate`，和单一的访问令牌二选一）。认不出是 401。带会话的入口都按 `sessionPrefixes` 查，超出的回 403 `permission_error`：会话的路径、`execute` 的 `context.session`、执行环境会话的 `open` 和 `close`、提交运行时的 `session`、`parent.session` 和 `agent.context.inherit.session`、按 `runId` 取消和查状态时那一轮的会话。`GET /sessions` 只列范围里的，编排器的事件流只发范围里的；`/memory/*` 的作用域按 `memoryScopes` 查；`recover` 横跨所有会话，只有 `admin` 能调。身份怎么来（JWT、mTLS、网关传来的头）是部署方的事。
+- **主体（[ADR 0009](adr/0009-hosted-prerequisites.md)）。** 服务端可以把请求映射到一个主体 `Principal { id, sessionPrefixes?, memoryScopes?, admin? }`（`ctx-remote` 的 `authenticate`，和单一的访问令牌二选一）。认不出是 401。带会话的入口都按 `sessionPrefixes` 查，超出的回 403 `permission_error`：会话的路径、`execute` 的 `context.session`、执行环境会话的 `open` 和 `close`、提交运行时的 `session`、`parent.session` 和 `agent.context.inherit.session`、按 `runId` 取消和查状态时那一轮的会话。`GET /sessions` 只列范围里的，领工作只扫范围里的会话，编排器的事件流只发范围里的；`/memory/*` 的作用域按 `memoryScopes` 查；`recover` 横跨所有会话，只有 `admin` 能调。身份怎么来（JWT、mTLS、网关传来的头）是部署方的事。
+- **领工作。** `POST /work/:executor/claim` 扫主体看得见的会话，给出最后一轮以 `requires_action` 停下、`ctx.run.ended` 记着归这个执行环境、现在就能执行（不等确认，或者已经确认了）的调用，每个带上它的会话（`ClaimedToolCall`：`PendingToolCall` 加 `session`）。领到的在租约内（`leaseMs`，缺省是服务端的配置，`ctx-remote` 是 5 分钟）不再给别的领取；执行方把结果追加回会话（`toolResultEntry`），它就不再等了。一个都没有时长轮询，最多等 `waitMs`（30 秒封顶）。`limit` 缺省 16、最多 100。租约只是让几个 worker 少做重复的事：它在服务端进程的内存里，同一次调用的结果只记一条靠的是幂等键。服务端要挂了会话存储，没挂是 404。
 - 到了并发上限回 429（`type: rate_limit_error`，`retryable: true`）。
 - 500 的 `message` 只有一句通用的话和一个编号，原文在服务端的日志里；协议错误（`invalid_request`、`not_found`、`conflict`）照旧带着自己的 `type` 和文字。
-- 客户端可以放心重试的：所有 `GET`、带着 `id` 的 `append`（存储按 `id` 去重）、两个取消。提交运行、执行工具、记忆的写入不幂等，不重试。会话的 `clear` 和三个擦除重发一遍不会多删，但第二次回的条数是 0，本包的客户端不自动重试，调用方想重试可以自己重发。
+- 客户端可以放心重试的：所有 `GET`、带着 `id` 的 `append`（存储按 `id` 去重）、两个取消。提交运行、执行工具、领工作、记忆的写入不幂等，不重试。会话的 `clear` 和三个擦除重发一遍不会多删，但第二次回的条数是 0，本包的客户端不自动重试，调用方想重试可以自己重发。
 
 **对一个地址跑一致性测试。** 被测的服务以一致性模式运行，多一个入口 `POST /conformance/instances`：请求体是 `ConformanceSetup`（`components`、模型剧本 `script`、模型的延迟 `delayMs`、存储的钟 `clock`），回一个新的隔离实例（`baseUrl` 是相对路径，另给契约用的 `agent` 和 `executor: { name, echo }`）。`ctx-conformance --url <地址>`（`@modelctx-ai/ctx-remote`）给每个用例建一个实例，用客户端跑会话、执行环境、harness、编排器、记忆存储的契约测试。任何语言写的服务端，提供这个入口、实现了线上形态，就能这样验证（Python 的 `ctx-pydantic-ai` 就这样验证它的 harness，见 [`python/pydantic-ai`](../python/pydantic-ai/README.md#一致性等级)）；剧本的语义见 [`packages/remote`](../packages/remote/README.md#对一个地址跑一致性测试)。
 
 编排器放在 `/orchestrator` 下，不和 harness 共用 `/runs`：同一个服务可以同时挂两者，「现在跑一轮、等结果」和「排进队列」是两件事。细节（取消的时序、长轮询的上限、安全缺省）见 [`packages/remote`](../packages/remote/README.md)。
 
-WebSocket 传输、执行环境的 worker 拉取模式在之后加，协议不变。
+WebSocket 传输在之后加，协议不变。

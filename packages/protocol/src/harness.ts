@@ -351,6 +351,8 @@ export interface PendingToolCall {
   readonly seq: number;
   /** 这次调用在等确认：harness 写下的确认请求，和应用已经追加的决定。 */
   readonly approval?: PendingApproval;
+  /** 留给哪个外部执行环境执行（`RunEndedData.executors`）。在 harness 里执行的调用、日志里没记的时候没有。 */
+  readonly executor?: string;
 }
 
 /**
@@ -401,9 +403,12 @@ export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
         run = { runId, calls: new Map() };
         continue;
       }
-      // 这一轮停下来等结果：它留下的调用等待中；别的结束方式让之前等着的都作废。
-      const waiting = ctxEventData(entry, CTX_EVENTS.runEnded)?.stopReason === 'requires_action';
-      open = waiting && run?.runId === runId ? new Map(run.calls) : new Map();
+      // 这一轮停下来等结果：它留下的调用等待中，带上各自归哪个外部执行环境；别的结束方式让之前等着的都作废。
+      const ended = ctxEventData(entry, CTX_EVENTS.runEnded);
+      open =
+        ended?.stopReason === 'requires_action' && run?.runId === runId
+          ? boundTo(run.calls, ended.executors)
+          : new Map();
       run = undefined;
       continue;
     }
@@ -436,6 +441,19 @@ export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
     }
   }
   return [...open.values()];
+}
+
+/** 等着的调用带上 `ctx.run.ended` 记下的执行环境。 */
+function boundTo(
+  calls: ReadonlyMap<string, PendingToolCall>,
+  executors: Readonly<Record<string, string>> | undefined,
+): Map<string, PendingToolCall> {
+  return new Map(
+    [...calls].map(([id, item]) => {
+      const executor = executors && Object.hasOwn(executors, id) ? executors[id] : undefined;
+      return [id, executor === undefined ? item : { ...item, executor }];
+    }),
+  );
 }
 
 /**

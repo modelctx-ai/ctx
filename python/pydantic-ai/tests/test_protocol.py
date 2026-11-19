@@ -334,8 +334,11 @@ def _started(seq: int, run_id: Any) -> dict[str, Any]:
     return {'seq': seq, 'type': 'event', 'kind': 'ctx.run.started', 'data': {'runId': run_id}}
 
 
-def _ended(seq: int, run_id: str, stop: str) -> dict[str, Any]:
-    return {'seq': seq, 'type': 'event', 'kind': 'ctx.run.ended', 'data': {'runId': run_id, 'stopReason': stop}}
+def _ended(seq: int, run_id: str, stop: str, executors: Any = None) -> dict[str, Any]:
+    data: dict[str, Any] = {'runId': run_id, 'stopReason': stop}
+    if executors is not None:
+        data['executors'] = executors
+    return {'seq': seq, 'type': 'event', 'kind': 'ctx.run.ended', 'data': data}
 
 
 def _calls(seq: int, *ids: str, executed: bool = False) -> dict[str, Any]:
@@ -371,6 +374,18 @@ def _decided(seq: int, approval: str, approved: bool, reason: str | None = None)
 
 PENDING = {
     '停下来等结果': [_started(1, 'r1'), _calls(2, 'c1', 'c2'), _ended(3, 'r1', 'requires_action')],
+    '记下了归哪个执行环境': [
+        _started(1, 'r1'),
+        _calls(2, 'c1', 'c2', 'c3'),
+        _ended(3, 'r1', 'requires_action', {'c1': 'worker', 'c2': 7, 'zz': 'other'}),
+    ],
+    '执行环境不是对象': [_started(1, 'r1'), _calls(2, 'c1'), _ended(3, 'r1', 'requires_action', ['worker'])],
+    '确认了的外部调用': [
+        _started(1, 'r1'),
+        _asked(2, 'c1', 'a1'),
+        _ended(3, 'r1', 'requires_action', {'c1': 'worker'}),
+        _decided(4, 'a1', True),
+    ],
     '等确认': [_started(1, 'r1'), _asked(2, 'c1', 'a1', reason='会删文件'), _ended(3, 'r1', 'requires_action')],
     '确认了': [_started(1, 'r1'), _asked(2, 'c1', 'a1'), _ended(3, 'r1', 'requires_action'), _decided(4, 'a1', True)],
     '拒绝了，带原因': [

@@ -234,6 +234,8 @@ interface Setup {
   readonly maxSteps: number;
   /** 这一轮怎么处置一次工具调用（`Verdict`），同一次调用只判一次。 */
   readonly verdict: (call: ToolCall) => Promise<Verdict>;
+  /** 这个工具的调用留给哪个外部执行环境；在这里执行的（包括等确认的）没有。 */
+  readonly executorOf: (name: string) => string | undefined;
 }
 
 interface Produced {
@@ -1046,6 +1048,12 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       toolCount: definitions.length,
       maxSteps: agent.maxSteps ?? (definitions.length > 0 ? 5 : 1),
       verdict,
+      executorOf: (name) => {
+        const definition = offered.get(name);
+        return definition && external.has(definition.executor) && toolPermission(permissions, name) !== 'deny'
+          ? definition.executor
+          : undefined;
+      },
     };
   }
 
@@ -1268,9 +1276,24 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       }
     }
     const usage = usageOf(produced.usage);
+    // 留给外部执行环境的调用记下归谁：执行方按名字领工作。
+    const bound = Object.fromEntries(
+      pending.flatMap((call) => {
+        const executor = ready.executorOf(call.name);
+        return executor === undefined ? [] : [[call.id, executor] as const];
+      }),
+    );
     await write(state, [
       ...messages.slice(state.logged).map((message) => messageEntry(message, { source: 'model' })),
-      runEndedEntry({ runId: state.runId, stopReason, ...(usage ? { usage } : {}) }, { source: 'harness' }),
+      runEndedEntry(
+        {
+          runId: state.runId,
+          stopReason,
+          ...(usage ? { usage } : {}),
+          ...(Object.keys(bound).length > 0 ? { executors: bound } : {}),
+        },
+        { source: 'harness' },
+      ),
     ]);
     return {
       runId: state.runId,

@@ -224,6 +224,8 @@ if (result.stopReason === 'requires_action') {
 
 `runPendingTools` 只执行归这个执行环境的调用（`executor.tools()` 报的名字，或者 `tools`），结果带幂等键，两个 worker 都执行了也只记一条；有副作用的工具自己幂等。等人确认的调用（下面的 `ask`）确认了才执行，没决定的、被拒绝的不碰。结果一直不来时，应用照常提交下一轮就行，等着的调用随之作废。
 
+以 `requires_action` 结束时，`ctx.run.ended` 记下每个留给外部执行环境的调用归谁（`executors`：调用 `id` → 执行环境的名字），`pendingToolCalls` 给出的 `PendingToolCall.executor` 就是它。worker 不知道有哪些会话时，用 `ctx-remote` 的 `createRemoteWorker` 按名字领工作，见 [`ctx-remote`](../remote/README.md#在内网的-worker)。
+
 ### Agent 配置：结构化输出、工具选择、权限、预算
 
 `AgentSpec` 里这几项都是 JSON，换 harness、过 `ctx-remote` 都还在：

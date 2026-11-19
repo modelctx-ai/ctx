@@ -1225,7 +1225,30 @@ class PydanticAIHarness:
                 else:
                     output = final
         pending = state.pending if stop == 'requires_action' else None
-        return await self._end(state, stop, text=text, error=error, usage=usage, output=output, pending=pending)
+        return await self._end(
+            state,
+            stop,
+            text=text,
+            error=error,
+            usage=usage,
+            output=output,
+            pending=pending,
+            executors=self._bound(spec, definitions, pending),
+        )
+
+    def _bound(
+        self, spec: Mapping[str, Any], definitions: list[dict[str, Any]], pending: list[dict[str, Any]] | None
+    ) -> dict[str, str] | None:
+        """留给外部执行环境的调用归谁执行（``ctx.run.ended`` 的 ``executors``，同参考实现）：调用 ``id`` → 执行环境的名字。
+        在这里执行的调用（包括等确认的）不记，``deny`` 的不会留下。执行方据此按名字领工作。"""
+        offered = {str(definition['name']): definition for definition in definitions}
+        bound: dict[str, str] = {}
+        for call in pending or []:
+            definition = offered.get(str(call['name']))
+            executor = str(definition.get('executor', '')) if definition is not None else ''
+            if executor in self._external and tool_permission(spec.get('permissions'), str(call['name'])) != 'deny':
+                bound[call['id']] = executor
+        return bound or None
 
     async def _run_tools(self, state: _Run, node: Any, run: Any, calls: list[dict[str, Any]]) -> None:
         """跑这一步的工具：调用、结果按事件发出，结果到齐了按调用的顺序、按执行方分组写进日志。"""
@@ -1325,9 +1348,10 @@ class PydanticAIHarness:
         usage: dict[str, int] | None = None,
         output: Any = None,
         pending: list[dict[str, Any]] | None = None,
+        executors: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """收尾：没等到结果的工具调用补错误结果，出错写 ``ctx.error``，最后写 ``ctx.run.ended``。等着别处执行的调用不补，
-        放在 ``pending`` 里。"""
+        """收尾：没等到结果的工具调用补错误结果，出错写 ``ctx.error``，最后写 ``ctx.run.ended``（等着的调用归哪个外部执行环境
+        记在它的 ``executors`` 里）。等着别处执行的调用不补，放在 ``pending`` 里。"""
         entries: list[dict[str, Any]] = []
         if state.open:
             message = {
@@ -1351,7 +1375,9 @@ class PydanticAIHarness:
             )
         entries.append(
             event_entry(
-                RUN_ENDED, data=compact({'runId': state.run_id, 'stopReason': stop, 'usage': usage}), source='harness'
+                RUN_ENDED,
+                data=compact({'runId': state.run_id, 'stopReason': stop, 'usage': usage, 'executors': executors}),
+                source='harness',
             )
         )
         await self._write(state, entries)
