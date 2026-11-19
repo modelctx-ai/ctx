@@ -4,6 +4,12 @@
 
 ## 2026-11-19
 
+- **新增** [`ctx-managed-agents`](../packages/managed-agents/README.md) 的 README：安装、用法、怎么对上（会话身份、模型和指令、轨迹、断线、ctx 的工具、内置工具和 MCP、停下等的、停着等时又说了话、没发出去的输入、重试、取消、续接之前、上下文、子线程）、日志里一轮的样子、`AgentSpec` 和 `stopReason` 的映射、选项、一致性等级、验证（没有对真实服务验证）、导出。
+- **更新** [架构](architecture.md)：加「外部 harness：Managed Agents」一节；实现约束里 Node 专属的一行加 ctx-managed-agents 的 `node:crypto` 和假服务端的 `node:http`，依赖的一行加它把 `@anthropic-ai/sdk` 当 peer。
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：托管矩阵里 harness 的第三方托管从「Managed Agents（之后）」改成 `ctx-managed-agents`；「外部 harness 的身份」的 `name` 和已有的适配器加上它，写明它还过 `approval`。
+- **更新** [ADR 0010](adr/0010-external-harness-adapters.md)：头部的实施状态和范围、`tags`、实施状态加 Managed Agents，决定记录加一条：和决定二到决定八的关系（工具不经 MCP 而是自定义工具、会话退不回去、模型和指令定在会话上、`ask` 和外部执行环境映射得上、没发出去的输入补发）和代价。[ADR 0002](adr/0002-packages.md)：拆分表和依赖关系表加第十三个包，决定记录加一条：为什么单独成包、SDK 为什么是 peer。
+- **更新** [概念](concepts.md)：和 Anthropic 实践的对照之后那句改成 Managed Agents 已经接进来了。[文档索引](index.md)的「包」、[实践：yoyo](repos.md)的包数和包名、根目录的 [README](../README.md) 和[英文译本](../README.en.md)的包表和 `overrides`（译本的同步日期改成今天）、[例子](../examples/README.md)加 `managed-agents.ts` 和怎么对真实服务跑。
+
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`MemoryFact` 加 `at`（写入的时刻），`NewMemoryFact` 里可选；存储的规则加「写进来的时刻和成立的时刻分开」；激活度一节的 `t_i` 换成 `at`、晚于 `at` 的 `validFrom` 和召回，上界改成 34 个时刻，加「从写进来算起」一条，「未来的时刻」「归档看 `A`」跟上；契约测试的覆盖写上 `at`。
 - **更新** [记忆](memory.md)：「归档不能只看时间」写时间从写入算起，失败模式加「早就成立的事实一写进来就忘」。[架构](architecture.md)：巩固的提取和衰减两条写 `at` 怎么记、怎么算，删掉「没有写入时间」那句；SQLite 的结构版本改成 5，加版本 5 的迁移。[概念](concepts.md)的术语表：事实带 `at`，激活度从写入算起。[ADR 0006](adr/0006-memory.md)：决定记录补一条，2026-10-27 的待办第三条做了。
 - **更新** [`ctx-memory`](../packages/memory/README.md)、[`ctx-sqlite`](../packages/sqlite/README.md)、[协议包](../packages/protocol/README.md)的 README：`at` 怎么记、遗忘从写入算起、`facts` 表的 `at` 列、结构版本 5 和它的迁移。[实践：yoyo](repos.md)：yoyo 库里记忆存储的结构版本从早就过时的 1 改成 5。

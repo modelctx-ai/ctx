@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'vite-plus/test';
 
 import { claudeCodeInstalled, main as claudeCode } from './claude-code.ts';
+import { main as managedAgents } from './managed-agents.ts';
 import { main as memory } from './memory.ts';
 import { main as memoryPi } from './memory-pi.ts';
 import { main as moveSession } from './move-session.ts';
@@ -80,6 +81,16 @@ describe('examples', () => {
       assert.deepEqual(result.toolSources, ['local', 'local']);
     },
   );
+
+  test('managed-agents：Managed Agents 跑循环，ctx 的工具作为自定义工具回到 ctx，第二轮续接它的会话', async () => {
+    const result = await managedAgents(quiet);
+    assert.match(result.answers[0]!, /带把伞/);
+    assert.match(result.answers[1]!, /不用带伞/);
+    assert.equal(result.sessions.length, 2);
+    assert.ok(result.sessions[0]);
+    assert.equal(result.sessions[1], result.sessions[0]);
+    assert.deepEqual(result.toolSources, ['local', 'local']);
+  });
 
   test.skipIf(!hasPi)(
     'pi：pi 跑循环，ctx 的工具经 MCP 回到 ctx，第二轮续接它自己的会话',

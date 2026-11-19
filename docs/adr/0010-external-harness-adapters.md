@@ -2,16 +2,16 @@
 type: Decision Record
 title: 'ADR 0010：外部 harness 的适配：轨迹实时落日志、工具经 MCP 回到 ctx、会话一对一'
 description: '自带循环的程序（Claude Code、pi）作为 harness 接进 ctx：流式输出实时写进会话日志，ctx 的执行环境经 MCP 交给它，`ctx.run.started` 记它的身份和会话，失败重试退回到失败之前，映射不了的配置以 `invalid_request` 结束，它压缩自己的上下文时不写 `summary`'
-tags: [adr, harness, adapter, claude-code, pi, mcp]
+tags: [adr, harness, adapter, claude-code, pi, managed-agents, mcp]
 status: stable
 ---
 
 # ADR 0010：外部 harness 的适配：轨迹实时落日志、工具经 MCP 回到 ctx、会话一对一
 
 - 状态：已采纳
-- 实施状态：Claude Code、pydantic-ai（Python）、pi 已实施，未发布
+- 实施状态：Claude Code、pydantic-ai（Python）、pi、Managed Agents 已实施，未发布
 - 日期：2026-11-17
-- 范围：`ctx-protocol`（`RunStartedData.harness`、`HarnessInfo`、`isContextOverflowText`）、`ctx-mcp`（`createMcpServer` 的 `maxOutputChars`）、新包 `ctx-claude-code`、`ctx-pi`、Python 的 `ctx-pydantic-ai`（`python/pydantic-ai`）
+- 范围：`ctx-protocol`（`RunStartedData.harness`、`HarnessInfo`、`isContextOverflowText`）、`ctx-mcp`（`createMcpServer` 的 `maxOutputChars`）、新包 `ctx-claude-code`、`ctx-pi`、`ctx-managed-agents`、Python 的 `ctx-pydantic-ai`（`python/pydantic-ai`）
 - 依据：issue #23
 
 ## 背景
@@ -65,7 +65,8 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
 - `ctx-pi`：`createPiHarness`，过 `trace`、`execute`、`resume`、`output` 四级，对 pi 1.5.2 验证过（2026-11-18），模型是本机的假 Anthropic 接口；对真实的模型服务没有验证。CI 装同一个版本跑。
 - `ctx-claude-code`、`ctx-pi` 收上下文来源（`sources`），`AgentSpec.context.facts` 映射得上（2026-11-18）；记忆接进这两个 harness 的例子是 [`examples/memory-pi.ts`](../../examples/memory-pi.ts)。
 - 两个进程级适配器一样的部分收进协议包（`executorMap`、`executorTools`、`endedInFailure`、`repeatsFailedInput`、`createSessionQueue`、`streamRun`，`collectFacts` 的 `only`、`logger`）和 `ctx-mcp`（`createMcpServer` 的 `open`、`permissions`，`listenMcpHttp`、`mcpToolName`），核心包也改用协议包里的那几样（2026-11-18）。
-- 没做：pi 的扩展加进上下文的消息（`custom_message`）和插话（`steer`、`follow_up`）不进日志。
+- `ctx-managed-agents`：`createManagedAgentsHarness`，过 `trace`、`execute`、`resume`、`output`、`approval` 五级（2026-11-19）。照 Managed Agents 的接口文档和 `@anthropic-ai/sdk` 1.10.0（beta `managed-agents-2026-04-01`）的类型写，测试对着本包的假服务端跑；没有对真实服务验证。
+- 没做：pi 的扩展加进上下文的消息（`custom_message`）和插话（`steer`、`follow_up`）不进日志。Managed Agents 的多 agent（子线程）、`user.define_outcome`、`system.message` 不用。
 
 ## 决定记录
 
@@ -109,3 +110,12 @@ Claude Code 的无界面模式（`claude -p`）在 2.1.326 上核实过：`--out
   - 规则是 Python 的函数，过不了线：`AgentSpec.context` 只按名字选，同协议的 `ContextSpec`。压缩按 `default` 的规则写记录，同参考实现；合并的事件组横跨切点时 `covers` 往前退，以前这个投影没有事件规则、用不上。
   - 事实每轮只收一次，超窗兜底重新组装时沿用：参考实现的 harness 每次 `build` 都重收。来源每次的结果可能不同，同一轮里裁剪前后该是同一份事实；结果一样时两边没有区别。
   - 核对时发现 Python 认空的输入、提示只看长度，只有空白的输入照样记下、照样占预算；改成和 `isEmptyContent` 一样。
+- 2026-11-19：Managed Agents 的适配器实施（`ctx-managed-agents`）：第一个托管在别处的 harness，不起进程，只调接口（`@anthropic-ai/sdk` 的 `client.beta.sessions`）。照接口文档和 SDK 的类型写，测试对着本包的假服务端跑，没有对真实服务验证。和 Claude Code、pi 不一样的地方，决定正文不变：
+  - 决定二：轨迹从会话的事件流（SSE）拿，先连上再发话。一次模型请求结束（`span.model_request_end`）写这一步的助手消息，文字增量是要了预览时的 `event_delta`，只是前缀，缓冲的 `agent.message` 到了补上丢掉的部分。事件流不重放：断了就重连，每次连上都和事件历史对一遍，按事件 `id` 去重。
+  - 决定三：ctx 的工具不经 MCP，作为自定义工具交给会话：程序跑在 Anthropic 那边，连不到本机的 MCP 服务器，自定义工具（`agent.custom_tool_use` 和 `user.custom_tool_result`）本来就是给应用侧执行的接法。输入检查、结果截断、执行前 `open` 在适配器里做，同参考实现。它自己的工具（容器里的 `agent_toolset_20260401`、agent 的 MCP 服务器）由应用显式列出才交出去，结果条目的 `source` 是 `managed-agents`。决定九用不上：它不依赖 `ctx-mcp`，把 `@anthropic-ai/sdk` 当 peer。
+  - 决定四：位置是事件的 `id`（`meta.managedAgents.event`、`last`）。模型和系统提示建会话时定下、之后改不了：`ctx.run.started` 记它们的摘要（`config`），续接时变了以 `invalid_request` 结束；工具可以改，和上一轮结束时不一样就更新会话的工具。
+  - 决定五做不到：Managed Agents 的会话只追加，没有退回或分支的接口。失败后带同样的输入重试，输入不再记，但要再发一遍，它的上下文里会有两遍；它自己会压缩，不会越重试越长到停不下来。
+  - 决定六：中断是 `user.interrupt`；被中断的一轮它也报 `end_turn`，停止原因由适配器按自己叫停的原因定。`retries_exhausted` 按它前面的 `session.error` 定 `error.type`。
+  - 决定七：`ask` 权限和外部执行环境映射得上，过 `approval` 一级：自定义工具的调用本来就让会话停在 `requires_action` 等结果，这一轮写下调用就结束，下一轮按日志了结（结果、确认、拒绝），同参考实现在记输入之前处理应用追加的决定；还没决定的回「没有记录到结果」，和参考实现的投影给缺结果的调用补的一样。它自己要确认的内置工具也这样等。停着等时一轮又带了新输入：它只收了结的事件，先了结、等它把上一轮做完再发；这中间又停下的，输入记下没发，`ctx.run.ended` 的 `meta.managedAgents.unsent` 留给下一轮补发，每句话在日志里一次、它也只收到一次。`context.facts` 映射不上：系统提示整个会话不变，放进这一轮的话又会一直留在它的会话里。
+  - 决定八：它压缩自己的上下文时记 `managed-agents.compacted`，事件不带摘要，不另记程序补的消息。
+  - 代价：多 agent（子线程）不支持，转到主线程的调用回一句不支持；会话建在 Anthropic 那边，`record: false` 每轮建一个新会话，用完留着不删。
