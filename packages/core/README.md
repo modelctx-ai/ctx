@@ -222,7 +222,7 @@ if (result.stopReason === 'requires_action') {
 }
 ```
 
-`runPendingTools` 只执行归这个执行环境的调用（`executor.tools()` 报的名字，或者 `tools`），结果带幂等键，两个 worker 都执行了也只记一条；有副作用的工具自己幂等。结果一直不来时，应用照常提交下一轮就行，等着的调用随之作废。
+`runPendingTools` 只执行归这个执行环境的调用（`executor.tools()` 报的名字，或者 `tools`），结果带幂等键，两个 worker 都执行了也只记一条；有副作用的工具自己幂等。等人确认的调用（下面的 `ask`）确认了才执行，没决定的、被拒绝的不碰。结果一直不来时，应用照常提交下一轮就行，等着的调用随之作废。
 
 ### Agent 配置：结构化输出、工具选择、权限、预算
 
@@ -241,8 +241,42 @@ const result = await harness.run({ session: 'user:42', agent, input: '订单 42 
 result.output; // 按 schema 解析过的回答；不合是 stopReason 'error'、error.type 'invalid_output'
 ```
 
-- `deny` 的工具不执行，模型看到拒绝，绑到 `external` 的也一样；`ask` 的写下调用后以 `requires_action` 停下，和外部执行的工具一样：应用确认了就 `runPendingTools(store, session, { executor })`，不确认就追加 `toolResultEntry(call, errorOutput('用户拒绝了'))`，再不带输入跑一轮。
+- `deny` 的工具不执行，模型看到拒绝，绑到 `external` 的也一样；`ask` 的不执行，写下调用和确认请求后以 `requires_action` 停下（见下面「人工确认」）。
 - `budget` 只在步骤之间检查，超了 `stopReason` 是 `max_budget`；正在进行的模型调用和工具不会被打断，硬上限用 `settings.timeoutMs`。
+
+### 人工确认
+
+`ask` 权限的调用，和 `beforeTool` 按输入回了 `{ ask: true, reason? }` 的调用，先不执行：确认请求写在这次调用的助手消息里，这一步走完以 `requires_action` 结束，`result.approvals` 列出要确认的。应用把决定追加进日志，再跑一轮：
+
+```ts
+import { createHarness, toolApprovalEntry } from '@modelctx-ai/ctx';
+
+const harness = createHarness({
+  store,
+  context,
+  tools,
+  hooks: {
+    // 按输入决定：删东西要人点头，别的照常执行
+    beforeTool: (call) =>
+      call.name === 'shell' && /\brm\b/.test(JSON.stringify(call.input))
+        ? { ask: true, reason: '会删文件' }
+        : undefined,
+  },
+});
+
+const first = await harness.run({ session: 'user:42', agent, input: '清理一下临时目录' });
+for (const approval of first.approvals ?? []) {
+  const approved = await askTheUser(approval); // 应用自己的界面；reason 给人看
+  await store.append('user:42', [
+    toolApprovalEntry(approval.approvalId, { approved, reason: approved ? undefined : '用户拒绝了' }),
+  ]);
+}
+await harness.run({ session: 'user:42', agent }); // 先执行确认了的、给拒绝的写上拒绝，再调模型
+```
+
+- 下一轮开头、记输入之前处理决定：确认了的照常执行（不再问 `beforeTool`，`deny` 仍然优先），拒绝的写上 `approvalDeniedOutput(call, reason)`，模型看到没执行和原因；绑到 `external` 的确认了交给执行方（`runPendingTools`）。还没决定就跑下一轮的，模型看到缺结果，这次确认随之作废。
+- 流式时这些结果在 `run.started` 之后作为 `tool.returned` 发出。确认部件只给应用看：投影时去掉，模型看到的是调用和结果。
+- 要给人看等着的调用，用 `readPendingToolCalls(store, session)`：`approval` 带确认请求和已经追加的决定。
 
 ### 子 agent
 
@@ -328,7 +362,7 @@ await orchestrator.submit({ session: 'user:42', agent: agents.mailer, input: '�
 | `createContext(options)`                                                                                                                                                                                 | 门面：`append`、`entries`、`view`、`facts`、`prepare`、`generate`、`stream`、`compact`、`compactDetailed`，以及 `builder`、`executor`、`harness`                                                                                                                                                                                                                                                                                                                                                             |
 | `describeError`、`redact`、`errorInfo`、`isContextOverflowError`                                                                                                                                         | 给日志和界面用的错误摘要；去密钥；`RunResult.error` 的形状（上下文过长时 `type` 是 `context_overflow`）；判断一个错误是不是服务商说的「上下文过长」（按 HTTP 413 和常见的错误码、消息，没有对真实服务验证）                                                                                                                                                                                                                                                                                                  |
 | `toModelMessages`、`fromModelMessages`（单条是 `toModelMessage`、`fromModelMessage`）、`toUserContent`、`fromUserContent`                                                                                | ctx 的 `Message` 和 AI SDK 的 `ModelMessage`、`UserContent` 互转；遇到子集之外的部件抛 `unsupported_part`，harness 把这一轮以 `error` 结束。`createContext()` 仍收 AI SDK 的 `UserContent`，在边界上转                                                                                                                                                                                                                                                                                                       |
-| `runPendingTools(store, session, { executor, tools?, source?, maxOutputChars?, signal? })`、`RunPendingToolsOptions`、`PendingToolsResult`                                                               | 执行方的一步（[ADR 0008](https://github.com/modelctx-ai/ctx/blob/main/docs/adr/0008-tool-calls-through-the-log.md)）：最后一轮以 `requires_action` 结束时，把归这个执行环境的等待中的调用逐个执行，结果作为 `toolResultEntry` 追加进会话；返回 `executed` 和 `remaining`                                                                                                                                                                                                                                     |
+| `runPendingTools(store, session, { executor, tools?, source?, maxOutputChars?, signal? })`、`RunPendingToolsOptions`、`PendingToolsResult`                                                               | 执行方的一步（[ADR 0008](https://github.com/modelctx-ai/ctx/blob/main/docs/adr/0008-tool-calls-through-the-log.md)）：最后一轮以 `requires_action` 结束时，把归这个执行环境的等待中的调用逐个执行（等人确认的确认了才执行），结果作为 `toolResultEntry` 追加进会话；返回 `executed` 和 `remaining`                                                                                                                                                                                                           |
 | `createSubagentTool({ name, runner, agent, session?, input?, context?, store?, inputSchema?, description? })`、`SubagentTool`、`SubagentToolOptions`、`SubagentContext`                                  | 派子 agent 的工具，返回 `{ definition, execute }`，注册进函数执行环境。子运行带 `parent`，结果是 `childRunOutput`；`runner` 是 `Harness` 时父的 `signal` 传下去，是 `Orchestrator` 时中止就 `cancel`；`context: 'inherit'` 设 `AgentSpec.context.inherit`，要给 `store`                                                                                                                                                                                                                                      |
 | `closeExecutorSessions(executors, session)`                                                                                                                                                              | 会话结束时调各个执行环境的 `close`（没有的跳过，一个失败不挡别的），返回 `{ closed, failed }`；harness 只 `open` 不 `close`，会话什么时候算结束由应用决定                                                                                                                                                                                                                                                                                                                                                    |
 | `pruneSession(store, session, { keep?, maxAgeMs?, now?, pageSize? })`、`PruneOptions`                                                                                                                    | 保留期：删掉被生效的摘要盖住的历史（走 `truncate`），返回删掉的条数。`keep` 留最后写入的 N 条，`maxAgeMs` 留 `at` 在这段时间之内的，都不给就全删；有未结束的运行时不删到它。没有定时器，应用自己决定什么时候调（见[架构](https://github.com/modelctx-ai/ctx/blob/main/docs/architecture.md#删除和保留期)）                                                                                                                                                                                                   |

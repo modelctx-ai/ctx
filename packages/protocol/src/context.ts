@@ -183,6 +183,19 @@ function asList(rendered: Message | readonly Message[] | null | undefined): read
   return Array.isArray(rendered) ? rendered : [rendered as Message];
 }
 
+/**
+ * 工具确认的两个部件（`tool-approval-request`、`tool-approval-response`）只给应用看，投影时去掉：确认了的调用由 harness
+ * 执行、写下结果，模型看到的是调用和结果。去掉之后空了的消息不要。
+ */
+export function withoutApprovals(message: Message): Message | undefined {
+  if (typeof message.content === 'string' || (message.role !== 'assistant' && message.role !== 'tool')) return message;
+  const content = message.content.filter(
+    (part) => part.type !== 'tool-approval-request' && part.type !== 'tool-approval-response',
+  );
+  if (content.length === message.content.length) return message;
+  return content.length > 0 ? ({ ...message, content } as Message) : undefined;
+}
+
 /** 带工具调用的助手消息和紧跟的工具结果是一个整体，裁剪时一起留或一起丢。 */
 function blocks(items: readonly ProjectedMessage[]): ProjectedMessage[][] {
   const out: ProjectedMessage[][] = [];
@@ -427,7 +440,8 @@ function projected(
   for (let i = 0; i < shown.length; i += 1) {
     const entry = shown[i]!;
     if (entry.type === 'message') {
-      const message = options.message ? options.message(entry) : entry.message;
+      const rendered = options.message ? options.message(entry) : entry.message;
+      const message = rendered ? withoutApprovals(rendered) : undefined;
       if (message) rest.push(make(message, entry.seq, entry.seq, entry.at));
       continue;
     }

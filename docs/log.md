@@ -2,6 +2,13 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-11-19
+
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#21](https://github.com/modelctx-ai/ctx/issues/21)）：Harness 一节加「人工确认」：`ask` 权限的调用和 `beforeTool` 回了 `{ ask: true }` 的调用怎么写确认请求、应用怎么追加决定（`toolApprovalEntry`）、下一轮开头怎么处理、执行方只执行确认了的；`RunResult` 加 `approvals`（`ToolApproval`），`ToolDecision` 加 `ask`，`permissions` 那一条改成指向人工确认；投影一节写明确认部件不交给模型（`withoutApprovals`）；一致性等级加 `approval`，契约测试表跟上。译本的 `synced` 改成今天。
+- **更新** [架构](architecture.md)：harness 一节写参考实现怎么用 AI SDK 的 `toolApproval` 停下、每次调用的处置只判一次、确认请求写进工具执行前的助手消息、下一轮开头怎么执行确认了的；`runPendingTools` 写明跳过等确认的；pydantic-ai 一节跟上。[概念](concepts.md)的术语表加「人工确认、确认请求」，一致性等级加 `approval`。
+- **更新** [ADR 0008](adr/0008-tool-calls-through-the-log.md)：实施状态把人工确认从「还没做」挪到已做，决定记录加一条：为什么改成经确认请求和决定往返、`runPendingTools` 的不兼容。
+- **更新** [协议包](../packages/protocol/README.md)、[核心包](../packages/core/README.md)、[`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：导出加确认的几个函数和类型；核心包加「人工确认」一节和例子；pydantic-ai 的例子改成追加决定，一致性等级改成六级。[`ctx-claude-code`](../packages/claude-code/README.md)、[`ctx-pi`](../packages/pi/README.md) 写明不跑 `approval`。
+
 ## 2026-11-18
 
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`ToolRegistry` 加 `executor?`；执行环境一节加 `Executors`、`executorMap`、`executorTools`，写明 `createMcpServer` 那一侧做的事（`open`、`permissions`）和 `listenMcpHttp`；来源的 `collectFacts` 加 `only`、`logger`；harness 一节加 `streamRun`；「失败的重试不让历史变长」末尾写明 `endedInFailure`、`repeatsFailedInput`，「一个会话最多一个未结束的运行」第 3 条末尾写明 `createSessionQueue`。这些都是从适配器里收进协议包的函数，规则本身不变。

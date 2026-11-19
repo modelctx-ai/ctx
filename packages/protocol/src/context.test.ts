@@ -54,6 +54,28 @@ function toolResult(id: string, name: string): Message {
 }
 
 describe('project', () => {
+  test('工具确认的部件不交给模型：去掉之后空了的消息不要，调用和结果照常配对', async () => {
+    const entries = await seed(
+      userEntry('删掉临时文件'),
+      messageEntry({
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', id: 'c1', name: 'rm', input: { path: '/tmp/x' } },
+          { type: 'tool-approval-request', approvalId: 'p1', callId: 'c1', reason: '要删文件' },
+        ],
+      }),
+      messageEntry({ role: 'tool', content: [{ type: 'tool-approval-response', approvalId: 'p1', approved: true }] }),
+      messageEntry(toolResult('c1', 'rm')),
+      assistantEntry('删好了'),
+    );
+    assert.deepEqual(project(entries).messages, [
+      { role: 'user', content: '删掉临时文件' },
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'rm', input: { path: '/tmp/x' } }] },
+      toolResult('c1', 'rm'),
+      { role: 'assistant', content: '删好了' },
+    ]);
+  });
+
   test('连续碎碎念合成一条，对话原句不截断', async () => {
     const entries = await seed(
       eventEntry('pet.whisper', { text: '在呢' }),

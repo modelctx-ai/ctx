@@ -90,6 +90,7 @@ from .protocol import (
     Json,
     after_conflict,
     agent_spec_to_json,
+    approval_denied_output,
     compact,
     ended_in_failure,
     error_output,
@@ -100,10 +101,12 @@ from .protocol import (
     limit_tool_output,
     message_entry,
     new_id,
+    pending_tool_calls,
     repeats_failed_input,
     run_parent_problem,
     select_tools,
     tool_permission,
+    tool_result_entry,
 )
 from .store import SessionStore
 
@@ -213,6 +216,10 @@ class _Run:
     deferred: set[str] = field(default_factory=set)
     #: 步骤走完时还等着别处执行的调用（``ToolCall``）：这一轮以 ``requires_action`` 结束时就是 ``pending``。
     pending: list[dict[str, Any]] = field(default_factory=list)
+    #: 这一轮发出的确认请求（``ask`` 的调用）：调用的 ``id`` → ``ToolApproval``。
+    approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 上一轮以 ``requires_action`` 结束时，它的 ``ctx.run.started`` 的 ``seq``：这一轮开头先处理它留下的确认。
+    waiting: int | None = None
 
 
 async def _waited(previous: asyncio.Future[None], signal: AbortSignal | None) -> bool:
@@ -299,6 +306,14 @@ def _context_problem(context: Any) -> str | None:
     return None
 
 
+def _permissions_problem(spec: Mapping[str, Any]) -> str | None:
+    permissions = spec.get('permissions') or {}
+    values = [permissions.get('default'), *(permissions.get('tools') or {}).values()]
+    if any(value is not None and value not in ('allow', 'ask', 'deny') for value in values):
+        return 'AgentSpec.permissions values must be "allow", "ask" or "deny".'
+    return None
+
+
 def spec_problem(spec: Mapping[str, Any]) -> str | None:
     """映射不了的 ``AgentSpec`` 字段：有就以 ``invalid_request`` 结束，不静默忽略。"""
     model = spec.get('model')
@@ -325,10 +340,9 @@ def spec_problem(spec: Mapping[str, Any]) -> str | None:
     timeout = settings.get('timeoutMs')
     if timeout is not None and not (isinstance(timeout, (int, float)) and timeout > 0):
         return 'AgentSpec.settings.timeoutMs must be a positive number.'
-    permissions = spec.get('permissions') or {}
-    values = [permissions.get('default'), *(permissions.get('tools') or {}).values()]
-    if any(value is not None and value not in ('allow', 'ask', 'deny') for value in values):
-        return 'AgentSpec.permissions values must be "allow", "ask" or "deny".'
+    problem = _permissions_problem(spec)
+    if problem is not None:
+        return problem
     for key, value in (spec.get('budget') or {}).items():
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not value > 0:
             return f'AgentSpec.budget.{key} must be a positive number.'
@@ -615,6 +629,14 @@ class PydanticAIHarness:
                 return None
             if not state.record:
                 return False
+            # 上一轮停下等结果或确认：记下它从哪开始，这一轮开头先处理应用追加的确认。
+            state.waiting = None
+            if is_event(last, RUN_ENDED) and (last.get('data') or {}).get('stopReason') == 'requires_action':
+                try:
+                    starts = await self._store.list(session, kinds=[RUN_STARTED], last=1)
+                except Exception as error:
+                    raise _WriteFailed(error) from error
+                state.waiting = starts[-1]['seq'] if starts else None
             repeated = (
                 not _empty(content)
                 and ended_in_failure(lifecycle)
@@ -684,6 +706,9 @@ class PydanticAIHarness:
             }
         emit(compact({'type': 'run.started', 'runId': state.run_id, 'session': request['session'], 'seq': state.head}))
         spec = request['agent']
+        problem = await self._resolve_approvals(state)
+        if problem is not None:
+            return await self._end(state, 'error', error={'message': problem, 'type': 'invalid_request'})
         content = request.get('input')
         in_log = False
         if state.record and not _empty(content):
@@ -748,6 +773,59 @@ class PydanticAIHarness:
                 error={'message': 'Nothing to answer: give RunRequest.input or prompt.', 'type': 'invalid_request'},
             )
         return await self._converse(state, spec, definitions, model, history, prompt, prepared)
+
+    async def _resolve_approvals(self, state: _Run) -> str | None:
+        """上一轮停下等确认（``state.waiting``）：记这一轮的输入之前，先把应用追加的决定落成结果（同参考实现）。确认了的、
+        在这里执行的调用照常执行（``deny`` 仍然优先），拒绝的写上 ``approval_denied_output``；确认了、绑到外部执行环境的
+        留给执行方，还没决定的不动。每个结果一条 ``tool_result_entry``，一次写下，按调用发 ``tool.returned``。权限的值
+        不对时返回问题，不执行。"""
+        if state.waiting is None or not state.record:
+            return None
+        session = str(state.request['session'])
+        spec = state.request['agent']
+        try:
+            entries = await self._store.list(session, after=state.waiting - 1)
+        except Exception as error:
+            raise _WriteFailed(error) from error
+        decided = [item for item in pending_tool_calls(entries) if 'decision' in (item.get('approval') or {})]
+        if not decided:
+            return None
+        problem = _permissions_problem(spec)
+        if problem is not None:
+            return problem
+        catalog = {str(tool['name']): tool for tool in await self._catalog()}
+        opened: dict[str, asyncio.Task[None]] = {}
+
+        async def settle(call: dict[str, Any], decision: Mapping[str, Any]) -> dict[str, Any] | None:
+            name = str(call['name'])
+            if not decision.get('approved'):
+                return approval_denied_output(call, decision.get('reason'))
+            definition = catalog.get(name)
+            if definition is None:
+                return error_output(f'Tool "{name}" is not available.')
+            if tool_permission(spec.get('permissions'), name) == 'deny':
+                return error_output(f'Tool call "{name}" was denied by the agent\'s permissions.')
+            if str(definition.get('executor', '')) in self._external:
+                return None
+            problem = schema_problem(compile_schema(definition.get('inputSchema') or {'type': 'object'}), call['input'])
+            if problem is not None:
+                return error_output(f'Invalid input for tool "{name}": {problem}')
+            executor = self._executors.get(str(definition.get('executor', '')))
+            if executor is None:
+                return error_output(f'Tool "{name}" has no executor "{definition.get("executor")}" in this harness.')
+            output = await self._execute_tool(executor, session, spec, opened, dict(call), state)
+            return limit_tool_output(output, self._max_output)
+
+        try:
+            outputs = await asyncio.gather(*(settle(item['call'], item['approval']['decision']) for item in decided))
+        finally:
+            for task in opened.values():
+                task.cancel()
+        results = [(item['call'], output) for item, output in zip(decided, outputs, strict=True) if output is not None]
+        await self._write(state, [tool_result_entry(call, output, source='harness') for call, output in results])
+        for call, output in results:
+            state.emit({'type': 'tool.returned', 'runId': state.run_id, 'callId': call['id'], 'output': output})
+        return None
 
     async def _prepare(
         self,
@@ -878,6 +956,20 @@ class PydanticAIHarness:
             return infer_model(resolved)
         except Exception as error:  # 不认识的服务商、缺凭证
             raise CtxError('invalid_request', f'pydantic-ai cannot make model "{resolved}": {error}') from error
+
+    def _ask(self, state: _Run, spec: Mapping[str, Any], names: set[str], message: dict[str, Any]) -> None:
+        """``ask`` 的调用要等人确认：确认请求（``tool-approval-request``）接在这次调用的助手消息里，同参考实现。"""
+        content = message.get('content')
+        if not isinstance(content, list):
+            return
+        for part in list(content):
+            if part.get('type') != 'tool-call' or part.get('name') not in names:
+                continue
+            if tool_permission(spec.get('permissions'), str(part['name'])) != 'ask':
+                continue
+            approval = {'approvalId': new_id(), 'callId': part['id']}
+            state.approvals[part['id']] = approval
+            content.append({'type': 'tool-approval-request', **approval})
 
     def _defers(self, spec: Mapping[str, Any], definition: Mapping[str, Any]) -> bool:
         """这个工具交给别处执行：``ask`` 的，或者绑到外部执行环境、没有被 ``deny`` 的（``deny`` 优先，同参考实现）。"""
@@ -1057,6 +1149,7 @@ class PydanticAIHarness:
                         usage = add_usage(usage, step_usage)
                         finish = response.finish_reason
                         message = assistant_message(response, names, OUTPUT_TOOL if structured else None)
+                        self._ask(state, spec, names, message)
                         # 估算只对第一步的请求成立：之后几步的请求里多了这一轮的工具调用和结果。
                         first = step == 0
                         meta = {
@@ -1270,6 +1363,7 @@ class PydanticAIHarness:
                 'recorded': state.recorded,
                 'stopReason': 'aborted',
             }
+        approvals = [state.approvals[call['id']] for call in pending or [] if call['id'] in state.approvals]
         summary = compact(
             {
                 'runId': state.run_id,
@@ -1278,6 +1372,7 @@ class PydanticAIHarness:
                 'usage': usage,
                 'output': output,
                 'pending': pending or None,
+                'approvals': approvals or None,
                 'error': error,
             }
         )
