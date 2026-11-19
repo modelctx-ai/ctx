@@ -1,0 +1,55 @@
+{
+  "name": "@modelctx-ai/ctx-managed-agents",
+  "version": "0.3.0",
+  "description": "把 Claude Managed Agents 接成 ctx 的 harness：循环在 Anthropic 那边跑，事件流实时写进会话日志，ctx 的工具作为自定义工具回到 ctx 的执行环境。",
+  "keywords": [
+    "ai",
+    "agent",
+    "anthropic",
+    "managed-agents",
+    "harness"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/modelctx-ai/ctx.git",
+    "directory": "packages/managed-agents"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "exports": {
+    ".": {
+      "@modelctx-ai/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "@modelctx-ai/source": "./src/testing.ts",
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "vp pack"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/sdk": "^1.10.0",
+    "@modelctx-ai/ctx-protocol": "workspace:^"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^1.10.0",
+    "@modelctx-ai/ctx": "workspace:^",
+    "@modelctx-ai/ctx-protocol": "workspace:^"
+  }
+}

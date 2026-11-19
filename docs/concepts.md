@@ -119,7 +119,7 @@ ctx 的拆法参考了 Anthropic 公开的工程和研究材料。对应关系�
 | [构建有效的 agent](https://www.anthropic.com/engineering/building-effective-agents)               | 工作流（预定义路径）和 agent（模型自己决定）之分；链式、路由、并行、编排者-工作者、评估-优化几种模式；先简单                                                                                 | 编排器用 `Harness.run` 组合出这些模式；协议不预设哪一种                                                                                                                                            |
 | [Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)                                   | hooks、权限、子代理、会话续跑                                                                                                                                                                | `Hooks`、编排器、`SessionStore`                                                                                                                                                                    |
 
-差别只有一个：以上都是 Anthropic 托管、只跑 Claude；ctx 的每个组件都可以放在任何地方，模型经 AI SDK 接任何服务商。Managed Agents 可以作为一种实现接进来（一个远端 `Harness` 加 `Executor`）。
+差别只有一个：以上都是 Anthropic 托管、只跑 Claude；ctx 的每个组件都可以放在任何地方，模型经 AI SDK 接任何服务商。Managed Agents 作为一种实现接进来了：`ctx-managed-agents` 把它的会话接成 `Harness`，ctx 的工具作为它的自定义工具回到 ctx 的执行环境。
 
 ## 设计约束
 

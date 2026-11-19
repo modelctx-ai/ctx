@@ -4,8 +4,10 @@
   "type": "module",
   "description": "ctx 的最小例子：每个对应一种部署，都能直接跑。",
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.10.0",
     "@modelctx-ai/ctx": "workspace:^",
     "@modelctx-ai/ctx-claude-code": "workspace:^",
+    "@modelctx-ai/ctx-managed-agents": "workspace:^",
     "@modelctx-ai/ctx-mcp": "workspace:^",
     "@modelctx-ai/ctx-memory": "workspace:^",
     "@modelctx-ai/ctx-models": "workspace:^",
