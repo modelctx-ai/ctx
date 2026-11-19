@@ -112,6 +112,11 @@ def ts_pending(node: str, payload: dict[str, Any]) -> dict[str, Any]:
     return _ts_command(node, 'pending', payload)
 
 
+def ts_claim(node: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """用 TypeScript 的 ``createRemoteWorker`` 按执行环境的名字领一次工作、执行、追加结果（见 ``ctx_ts.mjs claim``）。"""
+    return _ts_command(node, 'claim', payload)
+
+
 def ts_compact(node: str, cases: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """用 TypeScript 的 builder 把每一组条目压一次（见 ``ctx_ts.mjs compact``）。"""
     return _ts_command(node, 'compact', list(cases))

@@ -16,6 +16,7 @@ import {
   PROTOCOL_SCHEMA,
   PROTOCOL_VERSION,
   type ProtocolInfo,
+  readPendingToolCalls,
   runIdOf,
   runParentProblem,
   silentLogger,
@@ -48,7 +49,7 @@ import {
 } from '@modelctx-ai/ctx-protocol';
 
 import { openApiDocument } from './openapi.ts';
-import { parse, stringify, type WireRunRequest } from './wire.ts';
+import { parse, stringify, type ClaimedToolCall, type WireRunRequest } from './wire.ts';
 
 export interface RemoteHandlerOptions {
   /** 挂在 `/sessions` 下。 */
@@ -98,8 +99,13 @@ export interface RemoteHandlerOptions {
    * `list()` 的结果不变；服务端不必把整个会话一次读进内存、序列化成一个响应。
    */
   readonly maxListEntries?: number;
-  /** 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔，缺省 250 毫秒。 */
+  /** 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔，缺省 250 毫秒。领工作的长轮询也按它重扫。 */
   readonly pollIntervalMs?: number;
+  /**
+   * `POST /work/:executor/claim` 领到的调用多久之内不再给别的领取，缺省 5 分钟；请求里的 `leaseMs` 优先。租约只在这个
+   * 进程的内存里：几个服务实例之间不共享，重启就没了。同一次调用的结果只记一条靠的是日志的幂等键，不是租约。
+   */
+  readonly workLeaseMs?: number;
   /**
    * 编排器的运行结果在结束后保留多久（给客户端的 `done` 取），缺省 10 分钟，最多留 1000 个。
    * 过了这段时间、或者服务重启过，挂了 `store` 时从会话日志的 `ctx.run.ended` 还原。
@@ -569,6 +575,26 @@ function bodyObject(body: unknown, shape: string): Record<string, unknown> {
   return body;
 }
 
+/** 可选的数字：不给是 `undefined`；给了要是不小于 `min` 的有限数，`integer` 时还要是整数。 */
+function optionalNumberField(
+  body: Record<string, unknown>,
+  key: string,
+  min: number,
+  integer = false,
+): number | undefined {
+  const value = body[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < min || (integer && !Number.isInteger(value))) {
+    invalid(`\`${key}\` must be ${integer ? 'an integer' : 'a number'} >= ${min}`);
+  }
+  return value;
+}
+
+/** 租约的键：会话名里什么字符都可能有，用 JSON 数组分开。 */
+function leaseKey(session: string, callId: string): string {
+  return JSON.stringify([session, callId]);
+}
+
 function numberField(body: Record<string, unknown>, key: string): number {
   const value = body[key];
   if (typeof value !== 'number' || !Number.isFinite(value)) invalid(`\`${key}\` must be a number`);
@@ -629,6 +655,11 @@ function defined<T extends object>(value: T): T {
 const TERMINAL: readonly RunStatus[] = ['completed', 'failed', 'cancelled'];
 /** 一次长轮询最多挂多久。 */
 const MAX_WAIT_MS = 30_000;
+/** 领工作一次最多领几个，和不给 `limit` 时领几个。 */
+const MAX_CLAIM = 100;
+const DEFAULT_CLAIM = 16;
+/** 领工作扫会话时一页多少个名字。 */
+const CLAIM_SCAN_PAGE = 500;
 /** 还没开始就被取消的 harness 运行，记这么久等它的请求到。 */
 const PENDING_CANCEL_MS = 60_000;
 const MAX_PENDING_CANCELS = 1_000;
@@ -718,6 +749,7 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   const maxExecutions = options.maxExecutions ?? 64;
   const maxStreams = options.maxStreams ?? 256;
   const maxPendingRuns = options.maxPendingRuns ?? 1024;
+  const workLeaseMs = options.workLeaseMs ?? 5 * 60_000;
   /** 经这个服务提交、还没结束的运行数。 */
   let pendingRuns = 0;
   const logger = options.logger ?? silentLogger;
@@ -740,6 +772,8 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
   const finished = new Set<string>();
   let executions = 0;
   let streams = 0;
+  /** 领工作领走的调用（会话和调用 `id`）→ 租约到期的时间。 */
+  const leases = new Map<string, number>();
 
   /**
    * 内部出的错给调用方什么：协议错误（`invalid_request`、`not_found`、`conflict`）原样给；别的只给一句通用的话和
@@ -1014,6 +1048,88 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
       );
     } finally {
       executions -= 1;
+    }
+  }
+
+  // ---- 领工作 ----
+
+  /**
+   * `POST /work/:executor/claim`：主体看得见的会话里，归这个执行环境、现在就能执行的调用。领到的占一段租约；一个都没有时
+   * 长轮询，每 `pollIntervalMs` 重扫一次，最多等 `waitMs`。
+   */
+  async function workRoutes(
+    method: string,
+    rest: string[],
+    url: URL,
+    req: IncomingMessage,
+    res: ServerResponse,
+    who: Principal | undefined,
+  ) {
+    const sessionStore = need(store, 'a session store');
+    const [executor, action, extra] = rest;
+    if (executor === undefined || action !== 'claim' || extra !== undefined) notFoundPath(url);
+    if (method !== 'POST') fail(405, 'use POST /work/:executor/claim');
+    const body = bodyObject(await readBody(req, limit), '{ "limit"?, "waitMs"?, "leaseMs"? }');
+    const wanted = Math.min(optionalNumberField(body, 'limit', 1, true) ?? DEFAULT_CLAIM, MAX_CLAIM);
+    const waitMs = Math.min(optionalNumberField(body, 'waitMs', 0) ?? 0, MAX_WAIT_MS);
+    const leaseMs = optionalNumberField(body, 'leaseMs', 1) ?? workLeaseMs;
+    const deadline = Date.now() + waitMs;
+    const controller = new AbortController();
+    const stop = (): void => controller.abort();
+    res.on('close', stop);
+    try {
+      while (!controller.signal.aborted) {
+        const calls = await claimCalls(sessionStore, who, executor, wanted, leaseMs);
+        if (controller.signal.aborted) {
+          // 调用方已经走了：领到的给不出去，放回去。
+          for (const call of calls) leases.delete(leaseKey(call.session, call.call.id));
+          break;
+        }
+        if (calls.length > 0 || Date.now() >= deadline) {
+          sendJson(res, 200, { calls });
+          return;
+        }
+        await sleep(Math.min(pollIntervalMs, deadline - Date.now()), controller.signal);
+      }
+      res.end();
+    } finally {
+      res.off('close', stop);
+    }
+  }
+
+  /**
+   * 扫主体看得见的会话（按名字），找最后一轮以 `requires_action` 停下、`ctx.run.ended` 记着归 `executor` 的调用：不等确认
+   * （或者已经确认了）、没被别的领取占着的，最多 `wanted` 个，各占 `leaseMs`。每个会话读一次最后的生命周期事件，只有
+   * 停着等的会话才多读。
+   */
+  async function claimCalls(
+    sessionStore: SessionStore,
+    who: Principal | undefined,
+    executor: string,
+    wanted: number,
+    leaseMs: number,
+  ): Promise<ClaimedToolCall[]> {
+    const now = Date.now();
+    for (const [key, until] of leases) if (until <= now) leases.delete(key);
+    const claimed: ClaimedToolCall[] = [];
+    for (let after: string | undefined; ;) {
+      const page = await visibleSessions(sessionStore, who, {
+        limit: CLAIM_SCAN_PAGE,
+        ...(after !== undefined ? { after } : {}),
+      });
+      for (const session of page) {
+        for (const item of await readPendingToolCalls(sessionStore, session)) {
+          if (item.executor !== executor) continue;
+          if (item.approval && item.approval.decision?.approved !== true) continue;
+          const key = leaseKey(session, item.call.id);
+          if (leases.has(key)) continue;
+          leases.set(key, now + leaseMs);
+          claimed.push({ session, ...item });
+          if (claimed.length >= wanted) return claimed;
+        }
+      }
+      if (page.length < CLAIM_SCAN_PAGE) return claimed;
+      after = page.at(-1);
     }
   }
 
@@ -1559,6 +1675,9 @@ export function createRemoteHandler(options: RemoteHandlerOptions): RemoteHandle
         case 'executors':
           await executorRoutes(method, rest, url, req, res, who);
           break;
+        case 'work':
+          await workRoutes(method, rest, url, req, res, who);
+          break;
         case 'runs':
           await runs(method, rest, url, req, res, who);
           break;
@@ -1619,7 +1738,7 @@ export async function startRemote(options: StartRemoteOptions): Promise<RemoteSe
   });
 }
 
-export { isRemoteError, type ErrorBody, type RemoteError, type WireRunRequest } from './wire.ts';
+export { isRemoteError, type ClaimedToolCall, type ErrorBody, type RemoteError, type WireRunRequest } from './wire.ts';
 export {
   createConformanceHandler,
   type ConformanceHandlerOptions,

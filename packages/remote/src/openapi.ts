@@ -150,6 +150,14 @@ const OPERATIONS: readonly Operation[] = [
     body: shape({ call: ref('ToolCall'), context: shape({ session: str }, { runId: str }) }),
     response: shape({ output: ref('ToolOutput') }),
   },
+  {
+    method: 'post',
+    path: '/work/{executor}/claim',
+    tag: '执行环境',
+    summary: '按执行环境的名字领等着的调用，领到的占一段租约；一个都没有时长轮询到 waitMs',
+    body: shape({}, { limit: int, waitMs: int, leaseMs: int }),
+    response: shape({ calls: arrayOf(ref('ClaimedToolCall')) }),
+  },
 
   {
     method: 'post',

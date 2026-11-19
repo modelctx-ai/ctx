@@ -800,9 +800,11 @@ def test_an_external_call_waits_for_its_result_in_the_log() -> None:
         log = await store.list('s')
         assert roles(log) == ['ctx.run.started', 'user', 'assistant', 'ctx.run.ended']
         assert log[-1]['data']['stopReason'] == 'requires_action'
-        assert [(item['call']['id'], item['runId'], item['seq']) for item in pending_tool_calls(log)] == [
-            ('c1', first['runId'], log[2]['seq'])
-        ]
+        # 同参考实现：`ctx.run.ended` 记下它归哪个外部执行环境，执行方按名字领工作。
+        assert log[-1]['data']['executors'] == {'c1': 'worker'}
+        assert [
+            (item['call']['id'], item['runId'], item['seq'], item['executor']) for item in pending_tool_calls(log)
+        ] == [('c1', first['runId'], log[2]['seq'], 'worker')]
         # 执行方追加结果：两个都执行了也只记一条（幂等键）。
         output = {'type': 'text', 'text': '订单 42 已发货'}
         for _ in range(2):
@@ -865,6 +867,7 @@ def test_a_step_with_a_local_and_an_external_call() -> None:
         # 在这里执行的照常记下结果；交给别处的不补「结果未知」。
         assert [part['id'] for part in log[3]['message']['content']] == ['c2']
         assert [item['call']['id'] for item in pending_tool_calls(log)] == ['c1']
+        assert log[-1]['data']['executors'] == {'c1': 'worker'}
         assert len(model.requests) == 1
 
     run(main)
@@ -885,6 +888,10 @@ def test_ask_stops_until_the_app_confirms() -> None:
         assert first['stopReason'] == 'requires_action'
         assert first['pending'] == [{'id': 'c1', 'name': 'echo', 'input': {'text': 'hi'}}]
         assert calls == []
+        # 在这里执行的调用等确认时不记执行环境：确认了由下一轮的 harness 执行，不交给 worker。
+        ended = (await store.list('s'))[-1]
+        assert ended['data']['stopReason'] == 'requires_action'
+        assert 'executors' not in ended['data']
         # 应用确认了：交给执行环境执行，把结果追加进日志，再不带输入跑一轮。
         [call] = first['pending']
         output = await executor.execute(call, {'session': 's', 'runId': first['runId']})

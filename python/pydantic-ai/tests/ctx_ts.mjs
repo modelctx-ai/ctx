@@ -7,6 +7,8 @@
 //   被拒绝时是 `{ thrown: { name, message, status, type } }`。
 // - `pending`：stdin 是 `{ baseUrl, token, session, executor }`，用 `runPendingTools` 把会话里等着的调用交给 ctx-remote 上的
 //   那个执行环境、结果追加进会话，stdout 是 `{ executed, remaining }`。
+// - `claim`：stdin 是 `{ baseUrl, token, executor }`，用 `createRemoteWorker` 按执行环境的名字领一次工作（不给会话名），
+//   交给 ctx-remote 上同名的执行环境执行、结果追加回各自的会话，stdout 是 `{ executed, failed }`。
 // - `compact`：stdin 是一组 `{ entries, options, script?, window?, now?, tick? }`，每一组的条目写进一个新的内存存储的会话
 //   `s`，用 builder 的 `compactDetailed` 压一次，stdout 是每一组的 `{ result, thrown?, log, seen }`。摘要模型按剧本回答
 //   （见 `summarizer`），`seen` 是每次交给它的 `{ system, prompt }`；钟从 `now` 开始，每次调摘要模型走 `tick` 毫秒，存储和
@@ -131,6 +133,14 @@ async function pending() {
   process.stdout.write(JSON.stringify(result));
 }
 
+async function claim() {
+  const { createRemoteExecutor, createRemoteWorker } = await load('packages/remote/src/index.ts');
+  const { baseUrl, token, executor } = await stdin();
+  const options = { baseUrl, accessToken: token };
+  const worker = createRemoteWorker({ ...options, executor: createRemoteExecutor({ ...options, name: executor }) });
+  process.stdout.write(JSON.stringify(await worker.step()));
+}
+
 /** 摘要模型说输入太长时的报错，照 OpenAI 兼容接口的说法（`isContextOverflowError` 认得）。 */
 const TOO_LONG = "This model's maximum context length is 2048 tokens. However, your messages resulted in 9000 tokens.";
 
@@ -221,8 +231,9 @@ if (command === 'eval') await evaluate();
 else if (command === 'remote') await remote(values['max-list'] === undefined ? undefined : Number(values['max-list']));
 else if (command === 'run') await run();
 else if (command === 'pending') await pending();
+else if (command === 'claim') await claim();
 else if (command === 'compact') await compact();
 else {
-  console.error('usage: ctx_ts.mjs eval | remote [--max-list N] | run | pending | compact');
+  console.error('usage: ctx_ts.mjs eval | remote [--max-list N] | run | pending | claim | compact');
   process.exit(2);
 }

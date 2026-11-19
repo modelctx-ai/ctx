@@ -96,6 +96,25 @@ const calls = (...ids: string[]) =>
   });
 
 describe('pendingToolCalls', () => {
+  test('带上 ctx.run.ended 记下的外部执行环境；没记的、记的不是字符串的没有', () => {
+    const log = stored([
+      started('r1'),
+      calls('c1', 'c2', 'constructor'),
+      eventEntry(CTX_EVENTS.runEnded, {
+        data: { runId: 'r1', stopReason: 'requires_action', executors: { c1: 'worker', c2: 7 } },
+      }),
+    ]);
+    assert.deepEqual(
+      pendingToolCalls(log).map((item) => [item.call.id, item.executor]),
+      [
+        ['c1', 'worker'],
+        ['c2', undefined],
+        ['constructor', undefined],
+      ],
+    );
+    assert.ok(!('executor' in pendingToolCalls(log)[1]!), '没记的不带这个键');
+  });
+
   test('以 requires_action 结束的一轮留下的调用，去掉已经有结果的', () => {
     const log = stored([
       started('r1'),

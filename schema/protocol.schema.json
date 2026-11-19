@@ -1317,6 +1317,61 @@
       "required": ["approvalId", "callId"],
       "additionalProperties": false
     },
+    "ApprovalDecision": {
+      "type": "object",
+      "properties": {
+        "approved": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": ["approved"],
+      "additionalProperties": false
+    },
+    "PendingApproval": {
+      "type": "object",
+      "properties": {
+        "approvalId": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "decision": {
+          "$ref": "#/$defs/ApprovalDecision"
+        }
+      },
+      "required": ["approvalId"],
+      "additionalProperties": false
+    },
+    "ClaimedToolCall": {
+      "type": "object",
+      "description": "`POST /work/:executor/claim` 领到的一次调用：等着的调用（`PendingToolCall`）加上它所在的会话",
+      "properties": {
+        "session": {
+          "type": "string"
+        },
+        "runId": {
+          "type": "string"
+        },
+        "seq": {
+          "type": "integer"
+        },
+        "call": {
+          "$ref": "#/$defs/ToolCall"
+        },
+        "approval": {
+          "$ref": "#/$defs/PendingApproval"
+        },
+        "executor": {
+          "type": "string"
+        }
+      },
+      "required": ["session", "runId", "seq", "call"],
+      "additionalProperties": false
+    },
     "RunEvent": {
       "oneOf": [
         {

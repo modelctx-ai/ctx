@@ -4,6 +4,10 @@
 
 ## 2026-11-19
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#21](https://github.com/modelctx-ai/ctx/issues/21)）：`RunEndedData` 加 `executors`，`PendingToolCall` 加 `executor`，「工具调用经日志往返」加「按名字领工作」；线上形态加 `POST /work/:executor/claim` 一行和它的规则（扫哪些会话、租约、长轮询、`limit`），主体、重试两条跟上；执行环境的两种接法和托管矩阵改成两种都有，「worker 拉取模式之后加」删掉。
+- **更新** [架构](architecture.md)：harness 一节写 `finish` 怎么记 `executors`，`createRemoteWorker` 的一步和循环，服务端怎么扫会话、记租约、长轮询，扫描的代价。[概念](concepts.md)的术语表加「领工作」。
+- **更新** [ADR 0008](adr/0008-tool-calls-through-the-log.md)：头部的实施状态和范围跟上，「还没做」的领工作路由挪到已做，决定记录加一条：为什么名字记在日志里、服务端内存里的租约做到了哪一步。
+- **更新** [`ctx-remote`](../packages/remote/README.md) 的 README：加「在内网的 worker」一节（例子、`createRemoteWorker` 的三个方法、租约），选项加 `workLeaseMs`，线上形态加领工作的路径和说明，主体、重试两条跟上，「之后」删掉 worker 拉取模式。[核心包](../packages/core/README.md)、[协议包](../packages/protocol/README.md)、[`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README 写明 `executors` 和 `PendingToolCall.executor`，指向领工作。
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#21](https://github.com/modelctx-ai/ctx/issues/21)）：Harness 一节加「人工确认」：`ask` 权限的调用和 `beforeTool` 回了 `{ ask: true }` 的调用怎么写确认请求、应用怎么追加决定（`toolApprovalEntry`）、下一轮开头怎么处理、执行方只执行确认了的；`RunResult` 加 `approvals`（`ToolApproval`），`ToolDecision` 加 `ask`，`permissions` 那一条改成指向人工确认；投影一节写明确认部件不交给模型（`withoutApprovals`）；一致性等级加 `approval`，契约测试表跟上。译本的 `synced` 改成今天。
 - **更新** [架构](architecture.md)：harness 一节写参考实现怎么用 AI SDK 的 `toolApproval` 停下、每次调用的处置只判一次、确认请求写进工具执行前的助手消息、下一轮开头怎么执行确认了的；`runPendingTools` 写明跳过等确认的；pydantic-ai 一节跟上。[概念](concepts.md)的术语表加「人工确认、确认请求」，一致性等级加 `approval`。
 - **更新** [ADR 0008](adr/0008-tool-calls-through-the-log.md)：实施状态把人工确认从「还没做」挪到已做，决定记录加一条：为什么改成经确认请求和决定往返、`runPendingTools` 的不兼容。

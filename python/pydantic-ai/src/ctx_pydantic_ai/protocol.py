@@ -507,11 +507,21 @@ def approval_denied_output(call: Mapping[str, Any], reason: str | None = None) -
     return error_output(f'Tool call "{call["name"]}" was not approved' + (f': {reason}' if reason else '.'))
 
 
+def _bound_to(calls: Mapping[str, dict[str, Any]], executors: Any) -> dict[str, dict[str, Any]]:
+    """等着的调用带上 ``ctx.run.ended`` 记下的执行环境：只认值是字符串的。"""
+    bound = executors if isinstance(executors, dict) else {}
+    return {
+        call_id: {**item, 'executor': bound[call_id]} if isinstance(bound.get(call_id), str) else item
+        for call_id, item in calls.items()
+    }
+
+
 def pending_tool_calls(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """等着别处执行、还没有结果的工具调用（协议包的 ``pendingToolCalls``），每个是 ``{ call, runId, seq, approval? }``：以
-    ``requires_action`` 结束的那一轮留下的调用，去掉后面已经追加了结果的。之后又有运行以别的原因结束，之前留下的就不再算。
-    条目按 ``seq`` 排好；服务商执行的调用不算。等确认的调用带着 ``approval``（``approvalId``、``reason``、应用追加的
-    ``decision``，同一个请求只认先到的决定）。"""
+    """等着别处执行、还没有结果的工具调用（协议包的 ``pendingToolCalls``），每个是
+    ``{ call, runId, seq, approval?, executor? }``：以 ``requires_action`` 结束的那一轮留下的调用，去掉后面已经追加了结果的。
+    之后又有运行以别的原因结束，之前留下的就不再算。条目按 ``seq`` 排好；服务商执行的调用不算。等确认的调用带着
+    ``approval``（``approvalId``、``reason``、应用追加的 ``decision``，同一个请求只认先到的决定）；留给外部执行环境的带着
+    ``executor``（``ctx.run.ended`` 的 ``executors`` 记下的名字）。"""
     waiting: dict[str, dict[str, Any]] = {}
     run_id: str | None = None
     calls: dict[str, dict[str, Any]] = {}
@@ -532,8 +542,12 @@ def pending_tool_calls(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, A
             if entry['kind'] == RUN_STARTED:
                 run_id, calls = data['runId'], {}
                 continue
-            # 这一轮停下来等结果：它留下的调用等待中；别的结束方式让之前等着的都作废。
-            waiting = dict(calls) if data.get('stopReason') == 'requires_action' and run_id == data['runId'] else {}
+            # 这一轮停下来等结果：它留下的调用等待中，带上各自归哪个外部执行环境；别的结束方式让之前等着的都作废。
+            waiting = (
+                _bound_to(calls, data.get('executors'))
+                if data.get('stopReason') == 'requires_action' and run_id == data['runId']
+                else {}
+            )
             run_id, calls = None, {}
             continue
         content = entry['message'].get('content') if entry.get('type') == 'message' else None

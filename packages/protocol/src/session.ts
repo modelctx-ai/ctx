@@ -374,6 +374,11 @@ export interface RunEndedData {
   readonly runId: string;
   readonly stopReason: StopReason;
   readonly usage?: Usage;
+  /**
+   * `requires_action` 时，留给外部执行环境的调用归谁执行：调用 `id` → 执行环境的名字（`ToolDefinition.executor`）。
+   * 在 harness 里执行的调用（包括等确认的）不在里面。执行方据此按名字领工作（`ctx-remote` 的 `POST /work/:executor/claim`）。
+   */
+  readonly executors?: Readonly<Record<string, string>>;
 }
 
 /** `ctx.compacted` 的 `data`。 */
@@ -510,6 +515,13 @@ function runParentOf(value: JsonValue | undefined): RunParent | undefined {
   return { session, runId, ...(typeof toolCallId === 'string' ? { toolCallId } : {}) };
 }
 
+/** 值是字符串的那些键；不是对象、一个都没有时 `undefined`。 */
+function stringsOf(value: JsonValue | undefined): Record<string, string> | undefined {
+  if (!isJsonObject(value)) return undefined;
+  const kept = Object.entries(value).filter((pair): pair is [string, string] => typeof pair[1] === 'string');
+  return kept.length > 0 ? Object.fromEntries(kept) : undefined;
+}
+
 function isEraseOp(value: JsonValue | undefined): value is EraseOp {
   return value === 'truncate' || value === 'remove' || value === 'redact';
 }
@@ -529,10 +541,16 @@ const READERS: { readonly [K in CtxEventKind]: (data: JsonObject) => CtxEventDat
       ...(info ? { harness: info } : {}),
     };
   },
-  [CTX_EVENTS.runEnded]: ({ runId, stopReason, usage }) =>
-    typeof runId === 'string' && typeof stopReason === 'string'
-      ? { runId, stopReason: stopReason as StopReason, ...(isJsonObject(usage) ? { usage: usageFromJson(usage) } : {}) }
-      : undefined,
+  [CTX_EVENTS.runEnded]: ({ runId, stopReason, usage, executors }) => {
+    if (typeof runId !== 'string' || typeof stopReason !== 'string') return undefined;
+    const bound = stringsOf(executors);
+    return {
+      runId,
+      stopReason: stopReason as StopReason,
+      ...(isJsonObject(usage) ? { usage: usageFromJson(usage) } : {}),
+      ...(bound ? { executors: bound } : {}),
+    };
+  },
   [CTX_EVENTS.compacted]: ({ covers, summaryId }) =>
     typeof covers === 'number' && typeof summaryId === 'string' ? { covers, summaryId } : undefined,
   [CTX_EVENTS.error]: ({ runId, message, type }) =>

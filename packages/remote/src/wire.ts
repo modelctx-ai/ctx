@@ -4,7 +4,7 @@
  * 协议的值全是纯 JSON（消息里的二进制是 base64 字符串，URL 是字符串），所以直接 `JSON.stringify` / `JSON.parse`，
  * 没有编码。0.2 及以前把二进制和 `URL` 换成带 `\u0000ctx` 标记的对象，新旧版本不能混用：两头要一起升级。
  */
-import type { ErrorInfo, RunRequest } from '@modelctx-ai/ctx-protocol';
+import type { ErrorInfo, PendingToolCall, RunRequest } from '@modelctx-ai/ctx-protocol';
 
 export function stringify(value: unknown): string {
   return JSON.stringify(value);
@@ -58,6 +58,11 @@ export function isRemoteError(error: unknown): error is RemoteError {
 
 /** `RunRequest` 去掉 `signal`，模型只能是名字；`aborted` 表示调用方的 `signal` 在发出前已经中止。 */
 export type WireRunRequest = Omit<RunRequest, 'signal'> & { readonly aborted?: boolean };
+
+/** `POST /work/:executor/claim` 领到的一次调用：等着的调用（`PendingToolCall`）加上它所在的会话。 */
+export interface ClaimedToolCall extends PendingToolCall {
+  readonly session: string;
+}
 
 /** 一段路径：会话名、执行环境名、runId 都可能含 `/`、`:` 之类，统一转义。 */
 export function segment(value: string): string {

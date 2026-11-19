@@ -505,6 +505,8 @@ console.log(await local.tools()); // 注册过的 ToolDefinition，executor: 'lo
 
 `external` 列出在别处执行的执行环境的名字（[ADR 0008](adr/0008-tool-calls-through-the-log.md)）：绑定到它们的工具经 `toToolSet` 的 `external` 选项包成不带 `execute` 的 AI SDK 工具，模型调用时 AI SDK 停下这一轮；harness 看最后一步里有调用、没有结果的（服务商执行的不算），有就以 `requires_action` 结束，`pending` 是这些调用；本地的工具在同一步里照常执行。列了的名字不给 `executors` 也不告警。执行方用 `runPendingTools(store, session, { executor, tools?, source?, maxOutputChars?, signal? })`：`readPendingToolCalls` 读最后一个生命周期事件，是以 `requires_action` 结束的 `ctx.run.ended` 才往下，从那一轮的 `ctx.run.started` 起读条目、找出等待中的；归这个执行环境的（`tools` 或 `executor.tools()` 报的名字）、又不在等确认的（没有确认请求，或者已经确认了）逐个 `execute`，每个结果截断后追加一条 `toolResultEntry`（`source` 缺省是执行环境的名字）。没决定的、被拒绝的、执行时抛错的不记，留在 `remaining` 里。
 
+以 `requires_action` 结束时，`finish` 给 `pending` 里的每个调用查 `Setup.executorOf`（这一轮交给模型的工具里，绑到 `external` 的、不是 `deny` 的），查到的写进 `ctx.run.ended` 的 `executors`；在这一侧执行的（包括等确认的）不写。只有出站连接的 worker 用 `ctx-remote` 的 `createRemoteWorker({ executor, limit?, leaseMs?, maxOutputChars?, source? })`：`step()` 发 `POST /work/:executor/claim`（`executor.name`），领到的一起执行，各自的结果截断后追加回各自的会话；被中止的、执行时抛错的、结果没写进去的不记，租约过了会再领到。`run(signal)` 一直 `step`，每次长轮询 25 秒，连不上、429、5xx 按客户端的退避再试，别的错抛出。服务端那一边：按名字一页页列主体看得见的会话（`visibleSessions`），每个会话用 `readPendingToolCalls` 读一次最后的生命周期事件，停着等的才往下读；挑出 `executor` 是这个名字、不等确认（或者已经确认了）、不在租约里的，记下租约（进程内存里的 `Map`，键是会话和调用 `id`，每次领取先清掉过期的）。一个都没有就隔 `pollIntervalMs` 再扫，到 `waitMs` 为止；调用方中途断开时不再扫，已经领到的放回去。扫描的代价和会话数成正比，会话很多时把 `pollIntervalMs` 调大，或者让 worker 直接 `watch` 它知道的会话。
+
 `executors` 可以是数组（按各自的 `name`）或 `{ 名字: 执行环境 }`（`Executors`）；`tools` 是 `createToolRegistry()` 建的注册表时，它自带的函数执行环境（`ToolRegistry.executor`）自动加进来，表由协议包的 `executorMap` 建，Claude Code、pi 的适配器也一样。
 
 ```ts

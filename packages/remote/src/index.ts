@@ -7,10 +7,13 @@ import {
   checkProtocolInfo,
   checkSessionName,
   CtxError,
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   DEFAULT_MEMORY_SCOPE,
   ENTRY_VERSION,
   errorOutput,
+  limitToolOutput,
   PROTOCOL_VERSION,
+  toolResultEntry,
   unreadableEntry,
   type AppendOptions,
   type CoreVersion,
@@ -51,11 +54,12 @@ import {
   remoteError,
   segment,
   stringify,
+  type ClaimedToolCall,
   type RemoteError,
   type WireRunRequest,
 } from './wire.ts';
 
-export { isRemoteError, type ErrorBody, type RemoteError, type WireRunRequest } from './wire.ts';
+export { isRemoteError, type ClaimedToolCall, type ErrorBody, type RemoteError, type WireRunRequest } from './wire.ts';
 
 export interface RemoteClientOptions {
   /** 服务端的地址，含路径前缀，例如 `http://127.0.0.1:53001` 或 `https://agents.example.com/ctx`。 */
@@ -535,6 +539,140 @@ export function createRemoteExecutor(options: RemoteExecutorOptions): Executor &
             `Tool "${call.name}" may not have run; retry if it is safe to run twice.`,
           { retryable: true },
         );
+      }
+    },
+  };
+}
+
+// ---- 领工作 ----
+
+export interface ClaimOptions {
+  /** 一次最多领几个，缺省 16，最多 100。 */
+  readonly limit?: number;
+  /** 一个都没有时等多久（长轮询），缺省 0：马上返回；最多 30 秒。 */
+  readonly waitMs?: number;
+  /** 领到的调用多久之内不再给别的领取，缺省用服务端的 `workLeaseMs`（5 分钟）。 */
+  readonly leaseMs?: number;
+  readonly signal?: AbortSignal;
+}
+
+export interface RemoteWorkerOptions extends RemoteClientOptions {
+  /** 执行领到的调用，按它的 `name` 领：harness 的 `external` 和工具定义的 `executor` 里写的那个名字。 */
+  readonly executor: Executor;
+  /** 一次最多领几个，缺省 8；领到的一起执行。 */
+  readonly limit?: number;
+  /** 领到的调用多久之内不再给别的 worker，缺省用服务端的 `workLeaseMs`。执行可能比它久时调大。 */
+  readonly leaseMs?: number;
+  /** 结果最多多少字符，缺省 `DEFAULT_MAX_TOOL_OUTPUT_CHARS`；0 或 Infinity 不限。 */
+  readonly maxOutputChars?: number;
+  /** 结果条目的 `source`，缺省是执行环境的名字。 */
+  readonly source?: string;
+}
+
+export interface WorkerStep {
+  /** 执行了、结果追加进会话了的。 */
+  readonly executed: readonly ClaimedToolCall[];
+  /** 执行时抛错、被中止、结果没写进去的：不记结果，租约过了会再领到。 */
+  readonly failed: readonly ClaimedToolCall[];
+}
+
+export interface RemoteWorker {
+  readonly name: string;
+  /** 只领，不执行（`POST /work/:executor/claim`）。 */
+  claim(options?: ClaimOptions): Promise<ClaimedToolCall[]>;
+  /** 领一批、一起执行、每个结果追加一条 `toolResultEntry`。`waitMs` 同 `claim`，缺省 0。 */
+  step(options?: { readonly waitMs?: number; readonly signal?: AbortSignal }): Promise<WorkerStep>;
+  /**
+   * 一直 `step`（每次长轮询 25 秒），直到 `signal` 中止，然后正常返回。连不上、服务端出错（429、5xx）隔一会儿再试；
+   * 别的错（没鉴权、服务端没挂会话存储、版本不对）抛出来。
+   */
+  run(signal: AbortSignal): Promise<void>;
+}
+
+/** `run` 每次领取长轮询多久：比服务端的上限（30 秒）短一点。 */
+const WORKER_WAIT_MS = 25_000;
+
+/** worker 的循环出了这种错就等一会儿再领：连不上、限流、服务端出错。 */
+function worthRetrying(error: unknown): boolean {
+  if (isRemoteError(error)) return error.status === 429 || error.status >= 500;
+  return transient(error);
+}
+
+/**
+ * 在内网、只有出站连接的 worker：按执行环境的名字向 `ctx-remote` 领工作（`POST /work/:executor/claim`），不用知道有
+ * 哪些会话。执行领到的调用，结果追加回各自的会话（带幂等键：两个 worker 都执行了也只记先到的）；结果都齐了以后，
+ * 由应用不带输入再跑一轮。
+ */
+export function createRemoteWorker(options: RemoteWorkerOptions): RemoteWorker {
+  const connection = connect(options);
+  const sessions = createRemoteSessionStore(options);
+  const { executor } = options;
+  const { name } = executor;
+  const path = `/work/${segment(name)}/claim`;
+  const maxOutputChars = options.maxOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
+  const source = options.source ?? name;
+
+  async function claim(claimOptions: ClaimOptions = {}): Promise<ClaimedToolCall[]> {
+    const { limit, waitMs, leaseMs, signal } = claimOptions;
+    const body = await connection.json<{ calls: ClaimedToolCall[] }>('POST', path, {
+      body: {
+        ...(limit !== undefined ? { limit } : {}),
+        ...(waitMs !== undefined ? { waitMs } : {}),
+        ...(leaseMs !== undefined ? { leaseMs } : {}),
+      },
+      ...(signal ? { signal } : {}),
+    });
+    return body.calls;
+  }
+
+  /** 执行一个，结果写回它的会话；被中止的不记（那不是工具的结果）。 */
+  async function perform(item: ClaimedToolCall, signal: AbortSignal | undefined): Promise<boolean> {
+    try {
+      const output = await executor.execute(item.call, {
+        session: item.session,
+        runId: item.runId,
+        ...(signal ? { signal } : {}),
+      });
+      if (signal?.aborted) return false;
+      await sessions.append(item.session, [
+        toolResultEntry(item.call, limitToolOutput(output, maxOutputChars), { source }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function step(stepOptions: { readonly waitMs?: number; readonly signal?: AbortSignal } = {}) {
+    const { signal } = stepOptions;
+    const calls = await claim({
+      limit: options.limit ?? 8,
+      waitMs: stepOptions.waitMs ?? 0,
+      ...(options.leaseMs !== undefined ? { leaseMs: options.leaseMs } : {}),
+      ...(signal ? { signal } : {}),
+    });
+    const done = await Promise.all(calls.map((item) => perform(item, signal)));
+    return {
+      executed: calls.filter((_, index) => done[index]),
+      failed: calls.filter((_, index) => !done[index]),
+    };
+  }
+
+  return {
+    name,
+    claim,
+    step,
+    async run(signal) {
+      for (let failures = 0; !signal.aborted;) {
+        try {
+          await step({ waitMs: WORKER_WAIT_MS, signal });
+          failures = 0;
+        } catch (error) {
+          if (signal.aborted) return;
+          if (!worthRetrying(error)) throw error;
+          await pause(connection.delay(failures), signal);
+          failures += 1;
+        }
       }
     },
   };

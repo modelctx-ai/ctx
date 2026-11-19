@@ -9,9 +9,9 @@ status: stable
 # ADR 0008：工具调用经日志往返
 
 - 状态：已采纳
-- 实施状态：已实施，未发布。人工确认也走这条路；`ctx-remote` 按执行环境名字领工作的路由还没做，见文末
+- 实施状态：已实施，未发布。人工确认也走这条路；worker 可以经 `ctx-remote` 按执行环境的名字领工作
 - 日期：2026-11-16
-- 范围：`ctx-protocol`（`StopReason`、`RunResult.pending`、`pendingToolCalls`、`toolResultEntry`）、`@modelctx-ai/ctx`（harness 的 `external`、`runPendingTools`）
+- 范围：`ctx-protocol`（`StopReason`、`RunResult.pending`、`pendingToolCalls`、`toolResultEntry`、`RunEndedData.executors`）、`@modelctx-ai/ctx`（harness 的 `external`、`runPendingTools`）、`ctx-remote`（`POST /work/:executor/claim`、`createRemoteWorker`）
 - 依据：issue #21；依赖每一步即时落日志（#20）
 
 ## 背景
@@ -58,11 +58,11 @@ harness 和执行环境之间只有同步的请求、响应：`Executor.execute(
 - 协议：`StopReason` 加 `requires_action`；`RunResult.pending`；纯函数 `pendingToolCalls`、`toolResultEntry`、常量 `TOOL_RESULT_KEY_PREFIX`、类型 `PendingToolCall`。
 - 核心包：`createHarness({ external })`，`toToolSet` 的 `external` 选项（这些工具不带 `execute`，AI SDK 遇到它们的调用就停下这一轮）；`runPendingTools`。
 - 人工确认（#21）：`ask` 权限的调用，和 `beforeTool` 按输入回了 `{ ask: true, reason? }` 的调用，确认请求（`tool-approval-request`）写在调用的助手消息里，`RunResult.approvals` 列出；应用追加 `toolApprovalEntry`（`tool-approval-response`，幂等键 `ctx.tool-approval:<approvalId>`），下一轮开头 harness 先执行确认了的、给拒绝的写上 `approvalDeniedOutput`，绑到外部执行环境的确认了留给执行方。协议包另有 `readPendingToolCalls`、`withoutApprovals`（投影去掉确认部件）、`PendingToolCall.approval`；契约测试的等级 `approval`。参考实现用 AI SDK 的 `toolApproval` 停下这一轮；`ctx-pydantic-ai` 没有钩子，只做 `ask` 的那一半，也过这一级。
-- 还没做：
-  - **`ctx-remote` 按执行环境名字领工作的路由。** 现在 worker 要知道去哪些会话找：`sessions()`、`watch`，或者应用告诉它。
+- 按执行环境的名字领工作（#21）：以 `requires_action` 结束时 harness 在 `ctx.run.ended` 里记下留给外部执行环境的调用归谁（`RunEndedData.executors`，调用 `id` → 名字），`pendingToolCalls` 给出 `PendingToolCall.executor`；`ctx-pydantic-ai` 一样写。`ctx-remote` 加 `POST /work/:executor/claim`：扫主体看得见的会话，给出归这个名字、现在就能执行的调用（`ClaimedToolCall`，带会话），领到的在服务端内存里占一段租约（`workLeaseMs`，缺省 5 分钟），一个都没有时长轮询；客户端 `createRemoteWorker` 领、执行、把结果追加回会话。worker 不用知道有哪些会话。
 
 ## 决定记录
 
 - 2026-11-16：采纳并实施。
 - 2026-11-16：`AgentSpec.permissions` 的 `ask` 复用这条路做静态的人工确认（#47）。
+- 2026-11-19：worker 按执行环境的名字领工作（#21）。名字记在日志里（`ctx.run.ended` 的 `executors`），不是由服务端去查工具目录：执行在哪里是部署的事，停下的那一轮的 harness 最清楚；日志自己说清楚了，谁读都一样（服务端、直接读存储的 worker、给人看的界面）。「代价」里说的领取在这里部分做了：服务端给领到的调用一段内存里的租约，同一个服务实例上的 worker 不会同时领到同一个调用；几个服务实例之间、服务重启前后照旧可能重复执行，结果只记一条仍然靠幂等键。存储层的租约还是不做。
 - 2026-11-19：人工确认改成经确认请求和决定往返（#21）。以前 `ask` 的调用只是等着，执行方（`runPendingTools`）不分确没确认都执行，应用不确认就自己追加错误结果；现在决定是日志里的一条 `tool-approval-response`，执行方只执行确认了的，拒绝由下一轮的 harness 写上。不兼容：靠 `runPendingTools` 执行 `ask` 的调用的，要先追加 `toolApprovalEntry`。
