@@ -462,6 +462,8 @@ def repeats_failed_input(
 
 #: ``tool_result_entry`` 的幂等键前缀（协议包的 ``TOOL_RESULT_KEY_PREFIX``）：同一次调用的结果只记一次。
 TOOL_RESULT_KEY_PREFIX = 'ctx.tool-result:'
+#: ``tool_approval_entry`` 的幂等键前缀（协议包的 ``TOOL_APPROVAL_KEY_PREFIX``）：一次确认请求只记先到的那个决定。
+TOOL_APPROVAL_KEY_PREFIX = 'ctx.tool-approval:'
 
 
 def tool_result_entry(
@@ -478,13 +480,49 @@ def tool_result_entry(
     )
 
 
+def tool_approval_entry(
+    approval_id: str,
+    decision: Mapping[str, Any],
+    *,
+    source: str | None = None,
+    meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """应用对一次确认请求的决定（``{ approved, reason? }``），追加回会话的 ``tool`` 消息（协议包的 ``toolApprovalEntry``），
+    带幂等键 ``ctx.tool-approval:<approvalId>``。之后不带输入跑一轮：harness 先执行确认了的、给拒绝的写上拒绝。"""
+    part = compact(
+        {
+            'type': 'tool-approval-response',
+            'approvalId': approval_id,
+            'approved': decision['approved'],
+            'reason': decision.get('reason'),
+        }
+    )
+    return message_entry(
+        {'role': 'tool', 'content': [part]}, source=source, key=f'{TOOL_APPROVAL_KEY_PREFIX}{approval_id}', meta=meta
+    )
+
+
+def approval_denied_output(call: Mapping[str, Any], reason: str | None = None) -> dict[str, Any]:
+    """没被确认的调用的结果（协议包的 ``approvalDeniedOutput``）：模型看到它没执行、为什么。"""
+    return error_output(f'Tool call "{call["name"]}" was not approved' + (f': {reason}' if reason else '.'))
+
+
 def pending_tool_calls(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """等着别处执行、还没有结果的工具调用（协议包的 ``pendingToolCalls``），每个是 ``{ call, runId, seq }``：以
+    """等着别处执行、还没有结果的工具调用（协议包的 ``pendingToolCalls``），每个是 ``{ call, runId, seq, approval? }``：以
     ``requires_action`` 结束的那一轮留下的调用，去掉后面已经追加了结果的。之后又有运行以别的原因结束，之前留下的就不再算。
-    条目按 ``seq`` 排好；服务商执行的调用不算。"""
+    条目按 ``seq`` 排好；服务商执行的调用不算。等确认的调用带着 ``approval``（``approvalId``、``reason``、应用追加的
+    ``decision``，同一个请求只认先到的决定）。"""
     waiting: dict[str, dict[str, Any]] = {}
     run_id: str | None = None
     calls: dict[str, dict[str, Any]] = {}
+    #: 确认请求 → 它的调用。
+    requested: dict[str, str] = {}
+
+    def decide(pool: dict[str, dict[str, Any]], call_id: str, decision: dict[str, Any]) -> None:
+        item = pool.get(call_id)
+        if item is not None and 'approval' in item and 'decision' not in item['approval']:
+            pool[call_id] = {**item, 'approval': {**item['approval'], 'decision': decision}}
+
     for entry in entries:
         if entry.get('type') == 'event' and entry.get('kind') in (RUN_STARTED, RUN_ENDED):
             data = entry.get('data')
@@ -505,6 +543,26 @@ def pending_tool_calls(entries: Sequence[Mapping[str, Any]]) -> list[dict[str, A
             if part.get('type') == 'tool-call' and part.get('providerExecuted') is not True and run_id is not None:
                 call = {'id': part['id'], 'name': part['name'], 'input': part.get('input')}
                 calls[part['id']] = {'call': call, 'runId': run_id, 'seq': entry['seq']}
+            elif (
+                part.get('type') == 'tool-approval-request'
+                and part.get('isAutomatic') is not True
+                and run_id is not None
+            ):
+                item = calls.get(part['callId'])
+                if item is None or 'approval' in item:
+                    continue
+                requested[part['approvalId']] = part['callId']
+                calls[part['callId']] = {
+                    **item,
+                    'approval': compact({'approvalId': part['approvalId'], 'reason': part.get('reason')}),
+                }
+            elif part.get('type') == 'tool-approval-response':
+                call_id = requested.get(part['approvalId'])
+                if call_id is None:
+                    continue
+                decision = compact({'approved': part['approved'], 'reason': part.get('reason')})
+                decide(waiting, call_id, decision)
+                decide(calls, call_id, decision)
             elif part.get('type') == 'tool-result':
                 waiting.pop(part['id'], None)
                 calls.pop(part['id'], None)

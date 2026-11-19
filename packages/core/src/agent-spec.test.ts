@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict';
 
-import { CTX_EVENTS, type AgentSpec, type JsonObject } from '@modelctx-ai/ctx-protocol';
+import { CTX_EVENTS, toolApprovalEntry, type AgentSpec, type JsonObject } from '@modelctx-ai/ctx-protocol';
 import { describe, test } from 'vite-plus/test';
 
 import { createContextBuilder } from './builder.ts';
 import { createHarness } from './harness.ts';
-import { runPendingTools } from './pending.ts';
 import { createMemoryStore } from './store.ts';
 import { createScriptedModel } from './testing.ts';
 import { createToolRegistry } from './tools.ts';
@@ -98,8 +97,8 @@ describe('AgentSpec：权限', () => {
     assert.match(JSON.stringify(model.doGenerateCalls[1]!.prompt), /denied by the agent's permissions/);
   });
 
-  test('ask：写下调用后以 requires_action 停下；确认后执行方执行，下一轮接着走', async () => {
-    const { harness, store, tools, executed } = setup();
+  test('ask：写下调用和确认请求后以 requires_action 停下；确认了，下一轮先执行再接着走', async () => {
+    const { harness, store, executed } = setup();
     const model = toolThenText('回显好了');
     const agent: AgentSpec = { model, permissions: { default: 'ask' } };
     const first = await harness.run({ session: 's', agent, input: '回显' });
@@ -108,12 +107,14 @@ describe('AgentSpec：权限', () => {
       first.pending?.map((call) => call.name),
       ['echo'],
     );
+    assert.deepEqual(
+      first.approvals?.map((approval) => approval.callId),
+      ['c1'],
+    );
     assert.deepEqual(executed, []);
-    // 应用确认了：交给注册表自带的执行环境执行。
-    const done = await runPendingTools(store, 's', { executor: tools.executor });
-    assert.equal(done.executed.length, 1);
-    assert.deepEqual(executed, [{ text: 'hi' }]);
+    await store.append('s', [toolApprovalEntry(first.approvals[0]!.approvalId, { approved: true })]);
     const second = await harness.run({ session: 's', agent });
+    assert.deepEqual(executed, [{ text: 'hi' }]);
     assert.equal(second.stopReason, 'end_turn');
     assert.equal(second.text, '回显好了');
   });

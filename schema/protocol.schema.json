@@ -1240,6 +1240,12 @@
             "$ref": "#/$defs/ToolCall"
           }
         },
+        "approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolApproval"
+          }
+        },
         "error": {
           "$ref": "#/$defs/ErrorInfo"
         }
@@ -1281,11 +1287,34 @@
             "$ref": "#/$defs/ToolCall"
           }
         },
+        "approvals": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolApproval"
+          }
+        },
         "error": {
           "$ref": "#/$defs/ErrorInfo"
         }
       },
       "required": ["runId", "text", "messages", "recorded", "stopReason"],
+      "additionalProperties": false
+    },
+    "ToolApproval": {
+      "type": "object",
+      "description": "等确认的一次工具调用（`RunResult.approvals`）",
+      "properties": {
+        "approvalId": {
+          "type": "string"
+        },
+        "callId": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": ["approvalId", "callId"],
       "additionalProperties": false
     },
     "RunEvent": {

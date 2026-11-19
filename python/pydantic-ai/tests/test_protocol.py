@@ -30,6 +30,9 @@ def test_constants_match_the_typescript_packages() -> None:
     assert _ts_constant('packages/protocol/src/harness.ts', 'TOOL_RESULT_KEY_PREFIX') == repr(
         protocol.TOOL_RESULT_KEY_PREFIX
     )
+    assert _ts_constant('packages/protocol/src/harness.ts', 'TOOL_APPROVAL_KEY_PREFIX') == repr(
+        protocol.TOOL_APPROVAL_KEY_PREFIX
+    )
     assert _ts_constant('packages/core/src/harness.ts', 'INTERRUPTED_TOOL_RESULT') == repr(harness.INTERRUPTED)
     assert _ts_constant('packages/protocol/src/context.ts', 'MISSING_RESULT') == repr(context.MISSING_RESULT)
     allowed = _ts_constant('packages/remote/src/server.ts', 'DEFAULT_ALLOWED_SETTINGS')
@@ -271,6 +274,14 @@ LOGS = {
         _message(2, 'user', 'third', at=100),
         _message(3, 'user', 'second', at=15),
     ],
+    'approval parts are not for the model': [
+        _message(1, 'user', 'q'),
+        _message(2, 'assistant', [_call('c1'), {'type': 'tool-approval-request', 'approvalId': 'a1', 'callId': 'c1'}]),
+        _message(3, 'tool', [{'type': 'tool-approval-response', 'approvalId': 'a1', 'approved': True}]),
+        _message(4, 'tool', [_result('c1')]),
+        _message(5, 'assistant', [{'type': 'tool-approval-request', 'approvalId': 'a2', 'callId': 'zzz'}]),
+        _message(6, 'assistant', 'done'),
+    ],
 }
 
 
@@ -340,8 +351,76 @@ def _result(seq: int, call: str) -> dict[str, Any]:
     return {'seq': seq, 'type': 'message', 'message': {'role': 'tool', 'content': [part]}}
 
 
+def _asked(seq: int, call: str, approval: str, *, reason: str | None = None, automatic: bool = False) -> dict[str, Any]:
+    request: dict[str, Any] = {'type': 'tool-approval-request', 'approvalId': approval, 'callId': call}
+    if reason is not None:
+        request['reason'] = reason
+    if automatic:
+        request['isAutomatic'] = True
+    message = _calls(seq, call)
+    message['message']['content'].append(request)
+    return message
+
+
+def _decided(seq: int, approval: str, approved: bool, reason: str | None = None) -> dict[str, Any]:
+    part: dict[str, Any] = {'type': 'tool-approval-response', 'approvalId': approval, 'approved': approved}
+    if reason is not None:
+        part['reason'] = reason
+    return {'seq': seq, 'type': 'message', 'message': {'role': 'tool', 'content': [part]}}
+
+
 PENDING = {
     '停下来等结果': [_started(1, 'r1'), _calls(2, 'c1', 'c2'), _ended(3, 'r1', 'requires_action')],
+    '等确认': [_started(1, 'r1'), _asked(2, 'c1', 'a1', reason='会删文件'), _ended(3, 'r1', 'requires_action')],
+    '确认了': [_started(1, 'r1'), _asked(2, 'c1', 'a1'), _ended(3, 'r1', 'requires_action'), _decided(4, 'a1', True)],
+    '拒绝了，带原因': [
+        _started(1, 'r1'),
+        _asked(2, 'c1', 'a1'),
+        _ended(3, 'r1', 'requires_action'),
+        _decided(4, 'a1', False, '不行'),
+    ],
+    '只认先到的决定': [
+        _started(1, 'r1'),
+        _asked(2, 'c1', 'a1'),
+        _ended(3, 'r1', 'requires_action'),
+        _decided(4, 'a1', True),
+        _decided(5, 'a1', False),
+    ],
+    '自动确认的不算': [_started(1, 'r1'), _asked(2, 'c1', 'a1', automatic=True), _ended(3, 'r1', 'requires_action')],
+    '不认识的确认': [
+        _started(1, 'r1'),
+        _asked(2, 'c1', 'a1'),
+        _ended(3, 'r1', 'requires_action'),
+        _decided(4, 'zz', True),
+    ],
+    '这一轮里就决定了': [
+        _started(1, 'r1'),
+        _asked(2, 'c1', 'a1'),
+        _decided(3, 'a1', True),
+        _ended(4, 'r1', 'requires_action'),
+    ],
+    '确认请求指的不是这一轮的调用': [
+        _started(1, 'r1'),
+        _calls(2, 'c0'),
+        _ended(3, 'r1', 'requires_action'),
+        _started(4, 'r2'),
+        {
+            'seq': 5,
+            'type': 'message',
+            'message': {
+                'role': 'assistant',
+                'content': [{'type': 'tool-approval-request', 'approvalId': 'a0', 'callId': 'c0'}],
+            },
+        },
+        _decided(6, 'a0', True),
+    ],
+    '下一轮开头的确认算数': [
+        _started(1, 'r1'),
+        _asked(2, 'c1', 'a1'),
+        _ended(3, 'r1', 'requires_action'),
+        _started(4, 'r2'),
+        _decided(5, 'a1', False),
+    ],
     '结果追加了一个': [_started(1, 'r1'), _calls(2, 'c1', 'c2'), _ended(3, 'r1', 'requires_action'), _result(4, 'c2')],
     '同一步里执行了的不算': [
         _started(1, 'r1'),
@@ -464,6 +543,23 @@ def test_repeats_failed_input_matches_typescript(ts: Evaluate, name: str) -> Non
     tail, content, options = RETRIES[name]
     [expected] = ts([('repeatsFailedInput', [tail, content, options])])
     assert protocol.repeats_failed_input(tail, content, **options) is expected
+
+
+def test_tool_approval_entry_and_denied_output_match_typescript(ts: Evaluate) -> None:
+    approved, denied, sourced, plain, reasoned = ts(
+        [
+            ('toolApprovalEntry', ['a1', {'approved': True}]),
+            ('toolApprovalEntry', ['a1', {'approved': False, 'reason': '不行'}]),
+            ('toolApprovalEntry', ['a1', {'approved': True}, {'source': 'app'}]),
+            ('approvalDeniedOutput', [{'name': 'rm'}]),
+            ('approvalDeniedOutput', [{'name': 'rm'}, '太危险']),
+        ]
+    )
+    assert protocol.tool_approval_entry('a1', {'approved': True}) == approved
+    assert protocol.tool_approval_entry('a1', {'approved': False, 'reason': '不行'}) == denied
+    assert protocol.tool_approval_entry('a1', {'approved': True}, source='app') == sourced
+    assert protocol.approval_denied_output({'name': 'rm'}) == plain
+    assert protocol.approval_denied_output({'name': 'rm'}, '太危险') == reasoned
 
 
 def test_tool_result_entry_matches_typescript(ts: Evaluate) -> None:

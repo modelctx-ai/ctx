@@ -249,7 +249,13 @@ const defs: Record<string, Schema> = {
   ),
   RunResultSummary: obj(
     { runId: str, text: str, stopReason: ref('StopReason') },
-    { usage: ref('Usage'), output: any, pending: arrayOf(ref('ToolCall')), error: ref('ErrorInfo') },
+    {
+      usage: ref('Usage'),
+      output: any,
+      pending: arrayOf(ref('ToolCall')),
+      approvals: arrayOf(ref('ToolApproval')),
+      error: ref('ErrorInfo'),
+    },
     '`RunResult` 去掉 `messages`、`recorded`：`run.ended` 事件和编排器的结果',
   ),
   RunResult: obj(
@@ -260,8 +266,15 @@ const defs: Record<string, Schema> = {
       recorded: arrayOf(ref('Entry')),
       stopReason: ref('StopReason'),
     },
-    { usage: ref('Usage'), output: any, pending: arrayOf(ref('ToolCall')), error: ref('ErrorInfo') },
+    {
+      usage: ref('Usage'),
+      output: any,
+      pending: arrayOf(ref('ToolCall')),
+      approvals: arrayOf(ref('ToolApproval')),
+      error: ref('ErrorInfo'),
+    },
   ),
+  ToolApproval: obj({ approvalId: str, callId: str }, { reason: str }, '等确认的一次工具调用（`RunResult.approvals`）'),
   RunEvent: oneOf(
     obj({ type: literal('run.started'), runId: str, session: str }, { seq: int }),
     obj({ type: literal('model.started'), runId: str, step: int }),

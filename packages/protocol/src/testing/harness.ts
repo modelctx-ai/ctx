@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 
-import type { AgentSpec, Harness, RunEvent, RunRequest } from '../harness.ts';
+import {
+  pendingToolCalls,
+  toolApprovalEntry,
+  type AgentSpec,
+  type Harness,
+  type RunEvent,
+  type RunRequest,
+} from '../harness.ts';
 import { CTX_EVENTS, type Entry, type SessionStore } from '../session.ts';
 import { DEFAULT_MAX_TOOL_OUTPUT_CHARS, type ToolOutput } from '../tools.ts';
 import type { JsonObject } from '../types.ts';
@@ -54,10 +61,12 @@ function randomMarker(): string {
  * - `resume`：一个会话一个未结束的运行（`session_busy`）、输入的幂等（`inputKey`、失败的重试不再记输入），崩溃后能从日志接着跑。
  * - `context`：用 `ContextBuilder` 组装上下文：`agent.context`（投影名、事实）、`context.overflow`。自己管上下文的 harness 不跑。
  * - `output`：`AgentSpec.output` 的结构化输出和 `version`。
+ * - `approval`：人工确认经日志往返：`ask` 的调用不执行，确认请求（`tool-approval-request`）写在调用的助手消息里，
+ *   `RunResult.approvals` 列出；应用追加 `toolApprovalEntry` 后下一轮先执行确认了的、给拒绝的写上拒绝。
  */
-export type HarnessLevel = 'trace' | 'execute' | 'resume' | 'context' | 'output';
+export type HarnessLevel = 'trace' | 'execute' | 'resume' | 'context' | 'output' | 'approval';
 
-export const HARNESS_LEVELS: readonly HarnessLevel[] = ['trace', 'execute', 'resume', 'context', 'output'];
+export const HARNESS_LEVELS: readonly HarnessLevel[] = ['trace', 'execute', 'resume', 'context', 'output', 'approval'];
 
 export interface HarnessContractOptions {
   /** 跑哪几级，缺省全部。参考实现全过；适配器按自己做到的跑，并在文档里写明。 */
@@ -552,6 +561,89 @@ export function describeHarnessContract(
       const ended = events.at(-1);
       assert.equal(ended?.type === 'run.ended' && ended.result.stopReason, 'end_turn');
       assert.equal(kinds(await store.list('s')).at(-1), CTX_EVENTS.runEnded);
+    });
+
+    atLevel(
+      'approval',
+      'ask：不执行，确认请求和调用在同一条助手消息里；确认了的下一轮先执行，拒绝的模型看到拒绝和原因',
+      async () => {
+        const text = randomMarker();
+        const { harness, store, agent } = await factory({
+          script: [
+            { type: 'tool-call', id: 'call-1', input: { text } },
+            { type: 'text', text: '回显好了' },
+            { type: 'tool-call', id: 'call-2', input: { text: 'again' } },
+            { type: 'text', text: '那就不回显' },
+          ],
+        });
+        const asking: AgentSpec = { ...agent, permissions: { default: 'ask' } };
+        const first = await harness.run({ session: 's', agent: asking, input: '回显一下' });
+        assert.equal(first.stopReason, 'requires_action');
+        assert.deepEqual(
+          first.pending?.map((call) => call.id),
+          ['call-1'],
+        );
+        const [approval] = first.approvals ?? [];
+        assert.equal(approval?.callId, 'call-1');
+        assert.ok(roundTrips(first.approvals));
+        const entries = await store.list('s');
+        assert.deepEqual(toolResults(entries), [], '等确认的调用不执行');
+        const asked = entries.find(
+          (entry) =>
+            entry.type === 'message' &&
+            typeof entry.message.content !== 'string' &&
+            entry.message.content.some((part) => part.type === 'tool-approval-request'),
+        );
+        assert.ok(
+          asked?.type === 'message' &&
+            typeof asked.message.content !== 'string' &&
+            asked.message.content.some((part) => part.type === 'tool-call' && part.id === 'call-1'),
+          '确认请求和调用在同一条助手消息里',
+        );
+        assert.equal(pendingToolCalls(entries)[0]?.approval?.approvalId, approval.approvalId);
+
+        await store.append('s', [toolApprovalEntry(approval.approvalId, { approved: true })]);
+        const second = await harness.run({ session: 's', agent: asking });
+        assert.equal(second.stopReason, 'end_turn');
+        assert.equal(second.text, '回显好了');
+        const results = toolResults(await store.list('s'));
+        assert.deepEqual(
+          results.map((result) => result.id),
+          ['call-1'],
+        );
+        assert.ok(outputText(results[0]!.output).includes(text), '确认了的调用执行了');
+
+        const third = await harness.run({ session: 's', agent: asking, input: '再来一次' });
+        assert.equal(third.stopReason, 'requires_action');
+        const [again] = third.approvals ?? [];
+        assert.equal(again?.callId, 'call-2');
+        await store.append('s', [toolApprovalEntry(again.approvalId, { approved: false, reason: 'not now' })]);
+        const fourth = await harness.run({ session: 's', agent: asking });
+        assert.equal(fourth.stopReason, 'end_turn');
+        assert.equal(fourth.text, '那就不回显');
+        const denied = toolResults(await store.list('s')).find((result) => result.id === 'call-2');
+        assert.equal(denied?.output.type, 'error');
+        assert.match(outputText(denied.output), /not now/);
+      },
+    );
+
+    atLevel('approval', 'stream（有时）：等确认时 run.ended 的结果带 approvals', async () => {
+      const { harness, agent } = await factory({
+        script: [{ type: 'tool-call', id: 'call-1', input: { text: randomMarker() } }],
+      });
+      if (!harness.stream) return;
+      const events: RunEvent[] = [];
+      const asking: AgentSpec = { ...agent, permissions: { default: 'ask' } };
+      for await (const event of harness.stream({ session: 's', agent: asking, input: '回显一下' })) events.push(event);
+      const ended = events.at(-1);
+      assert.equal(ended?.type, 'run.ended');
+      if (ended?.type !== 'run.ended') return;
+      assert.equal(ended.result.stopReason, 'requires_action');
+      assert.deepEqual(
+        ended.result.approvals?.map((approval) => approval.callId),
+        ['call-1'],
+      );
+      assert.ok(!events.some((event) => event.type === 'tool.returned'), '等确认的调用不执行');
     });
 
     atLevel('trace', 'stream（有时）：模型出错时先给 error 再给 run.ended，不抛', async () => {

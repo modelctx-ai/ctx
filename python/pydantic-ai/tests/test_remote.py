@@ -10,12 +10,20 @@ from typing import Any
 import pytest
 
 from conftest import serve, ts_pending, ts_run
-from ctx_pydantic_ai import CtxError, PydanticAIHarness, RemoteExecutor, RemoteSessionStore
+from ctx_pydantic_ai import CtxError, PydanticAIHarness, RemoteExecutor, RemoteSessionStore, tool_approval_entry
 from ctx_pydantic_ai.testing import ScriptedModel
 
 
 def run(coroutine: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(coroutine())
+
+
+async def _append(remote: dict[str, Any], session: str, entry: dict[str, Any]) -> None:
+    store = RemoteSessionStore(remote['baseUrl'], access_token=remote['token'])
+    try:
+        await store.append(session, [entry])
+    finally:
+        await store.aclose()
 
 
 def test_session_store_against_ctx_remote(ctx_remote: dict[str, Any]) -> None:
@@ -152,13 +160,22 @@ def test_the_typescript_client_drives_serve(node: str, ctx_remote: dict[str, Any
         assert kinds[0] == 'run.started'
         assert kinds[-1] == 'run.ended'
         assert streamed['result']['stopReason'] == 'end_turn'
-        # `ask`：停下来等应用确认。应用用 `runPendingTools` 交给 ctx-remote 上的执行环境、把结果追加进会话，再不带输入跑一轮。
+        # `ask`：停下来等应用确认。没确认时 `runPendingTools` 不碰它；应用追加确认以后，它交给 ctx-remote 上的执行环境、
+        # 把结果追加进会话，再不带输入跑一轮。
         asked = {'session': 'py/serve-ask', 'agent': {'model': 'test', 'permissions': {'default': 'ask'}}}
         waiting = ts_run(node, {'baseUrl': server.url, 'token': 'serve-token', 'request': {**asked, 'input': '用一下'}})
         assert waiting['result']['stopReason'] == 'requires_action', waiting
         pending = waiting['result']['pending']
         assert [call['name'] for call in pending] == ['echo']
+        [approval] = waiting['result']['approvals']
+        assert approval['callId'] == pending[0]['id']
         remote = {'baseUrl': ctx_remote['baseUrl'], 'token': ctx_remote['token']}
+        early = ts_pending(node, {**remote, 'session': 'py/serve-ask', 'executor': 'local'})
+        assert early['executed'] == []
+        assert early['remaining'][0]['approval'] == {'approvalId': approval['approvalId']}
+        asyncio.run(
+            _append(ctx_remote, 'py/serve-ask', tool_approval_entry(approval['approvalId'], {'approved': True}))
+        )
         done = ts_pending(node, {**remote, 'session': 'py/serve-ask', 'executor': 'local'})
         assert [item['call'] for item in done['executed']] == pending
         assert done['remaining'] == []

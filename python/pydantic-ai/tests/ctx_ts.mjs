@@ -44,6 +44,8 @@ async function evaluate() {
     truncateMessage: protocol.truncateMessage,
     pendingToolCalls: protocol.pendingToolCalls,
     toolResultEntry: protocol.toolResultEntry,
+    toolApprovalEntry: protocol.toolApprovalEntry,
+    approvalDeniedOutput: protocol.approvalDeniedOutput,
     isFenced: protocol.isFenced,
     endedInFailure: protocol.endedInFailure,
     repeatsFailedInput: protocol.repeatsFailedInput,

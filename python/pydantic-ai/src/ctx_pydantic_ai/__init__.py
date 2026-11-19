@@ -14,9 +14,12 @@ from .protocol import (
     DEFAULT_MAX_TOOL_OUTPUT_CHARS,
     ENTRY_VERSION,
     PROTOCOL_VERSION,
+    TOOL_APPROVAL_KEY_PREFIX,
     TOOL_RESULT_KEY_PREFIX,
     CtxError,
+    approval_denied_output,
     pending_tool_calls,
+    tool_approval_entry,
     tool_result_entry,
 )
 from .server import CONFORMANCE_PATH, create_app, create_conformance_app
@@ -31,6 +34,7 @@ __all__ = [
     'OUTPUT_TOOL',
     'PROTOCOL_VERSION',
     'RETRY_EVENT',
+    'TOOL_APPROVAL_KEY_PREFIX',
     'TOOL_RESULT_KEY_PREFIX',
     'AbortSignal',
     'CtxError',
@@ -41,9 +45,11 @@ __all__ = [
     'RemoteExecutor',
     'RemoteSessionStore',
     'SessionStore',
+    'approval_denied_output',
     'create_app',
     'create_conformance_app',
     'pending_tool_calls',
     'spec_problem',
+    'tool_approval_entry',
     'tool_result_entry',
 ]

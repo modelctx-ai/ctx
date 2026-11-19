@@ -1,6 +1,6 @@
 """一致性测试：``ctx-pydantic-ai conformance`` 起的服务，用 TypeScript 的 ``ctx-conformance`` 跑 harness 契约。
 
-和 ``ctx-remote``、``ctx-claude-code`` 跑的是同一套用例（``describeHarnessContract``），经线上协议，五个等级都跑。
+和 ``ctx-remote``、``ctx-claude-code`` 跑的是同一套用例（``describeHarnessContract``），经线上协议，六个等级都跑。
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ import subprocess
 
 from conftest import REPO, SOURCE_CONDITION, child_env, serve
 
-LEVELS = 'trace,execute,resume,context,output'
+LEVELS = 'trace,execute,resume,context,output,approval'
 
 
 def test_the_harness_contract_passes_over_the_wire(node: str) -> None:

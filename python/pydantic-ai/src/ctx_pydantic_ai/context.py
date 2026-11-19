@@ -498,6 +498,18 @@ def _windowed(
     return kept, dropped, sum(1 for item in kept if item in cut)
 
 
+def without_approvals(message: Mapping[str, Any]) -> dict[str, Any] | None:
+    """工具确认的两个部件（``tool-approval-request``、``tool-approval-response``）只给应用看，投影时去掉（协议包的
+    ``withoutApprovals``）：确认了的调用由 harness 执行、写下结果。去掉之后空了的消息不要。"""
+    content = message.get('content')
+    if not isinstance(content, list) or message.get('role') not in ('assistant', 'tool'):
+        return dict(message)
+    kept = [part for part in content if part.get('type') not in ('tool-approval-request', 'tool-approval-response')]
+    if len(kept) == len(content):
+        return dict(message)
+    return {**message, 'content': kept} if kept else None
+
+
 def project(entries: Sequence[Mapping[str, Any]], window: Mapping[str, Any] | None = None) -> Projection:
     """日志 → 这一次交给模型的消息（协议包 ``project`` 的缺省规则：没有事件规则、摘要渲染成用户消息）。
     ``window`` 是 ``WindowOptions``（``maxMessages``、``maxTokens``、``truncate``），不给或 ``{}`` 不裁剪。"""
@@ -507,11 +519,13 @@ def project(entries: Sequence[Mapping[str, Any]], window: Mapping[str, Any] | No
     if summary is not None:
         message = {'role': 'user', 'content': f'{SUMMARY_PREFIX}{summary.get("text", "")}'}
         pinned.append(_item(message, summary['covers'], summary['covers'], summary.get('at', 0), True))
-    rest = [
-        _item(dict(entry['message']), entry['seq'], entry['seq'], entry.get('at', 0))
-        for entry in ordered
-        if entry.get('type') == 'message' and (summary is None or entry['seq'] > summary['covers'])
-    ]
+    rest: list[ProjectedMessage] = []
+    for entry in ordered:
+        if entry.get('type') != 'message' or (summary is not None and entry['seq'] <= summary['covers']):
+            continue
+        message = without_approvals(entry['message'])
+        if message is not None:
+            rest.append(_item(message, entry['seq'], entry['seq'], entry.get('at', 0)))
     kept, dropped, truncated = _windowed(pinned, rest, window)
     return Projection(
         messages=[item.message for item in kept],
