@@ -777,14 +777,14 @@ sequenceDiagram
   M->>S: core.set
 ```
 
-- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说。起始日期按条给：对话里说了某一条从哪天起成立的，那一条开头写 `[YYYY-MM-DD]`，就是它的 `validFrom`；没写的取这批第一条的 `at`。以前一个 `since` 字段套给整批，一条的日期会被安到别的事实上。
+- 提取：待处理的笔记按主题分组，每组按 `consolidate.maxTokens`（缺省 6000 估算 token）分批，每批一次 `extract`，字段是 `facts`、`decisions`、`lesson`。`facts` 和 `decisions` 都写成事实。`pNull > consolidate.maxPNull`（缺省 0.3）的字段当作没说。起始日期按条给：对话里说了某一条从哪天起成立的，那一条开头写 `[YYYY-MM-DD]`，就是它的 `validFrom`；没写的取这批第一条的 `at`。以前一个 `since` 字段套给整批，一条的日期会被安到别的事实上。事实自己的 `at`（写入的时刻）是这一夜的 `now`，和 `validFrom` 分开。
 - 证据：以前证据就是这批笔记的区间，只保证「有区间」，不保证区间里真有这句话。现在每条事实先在原文里找支撑：事实的字词（`evidenceTerms`：中文一个字一个，转述常换掉相邻的字，按两个字切太严；去掉虚字、代词，和「主人」「用户」、`subject` 这些主语，原文里主人说的是「我」），某一条原文覆盖了至少 `consolidate.minEvidenceOverlap`（缺省 0.5），或者几条合起来覆盖到。有支撑的，每条笔记的证据收窄到和事实有共同字词的条目（`sourceRef`），一条都没有的笔记不当证据。没有支撑的，证据仍是整批，置信度降到不超过 `consolidate.ungroundedConfidence`（缺省 0.4，低于召回的缺省门槛 0.5），报告的 `facts.ungrounded` 记一笔：模型编的、从别处推出来的、被注入的话进不了召回，但留在存储里给人看。这是启发式，防的是凭空写进记忆的话，不是证明；「我不吃肉」推出「主人吃素」这种推断也会被降下来，要收的话调低 `minEvidenceOverlap`。
 - 并入：候选是同主题的 open 事实（没有主题时用 `search`），按相似度取前 5。措辞相同（空白和句读归一、不分大小写后相等）的直接并入，不调 `decide`；否则有对照的事实放进 `state`，这就是分类问题。置信度低于 `consolidate.escalateBelow`（缺省 0.6）、又有 `model` 时升级给 `LanguageModel`，回答不能用时沿用决策模型的。`merge` 是 `cite`（追加 `sources`）加 `touch`；`supersede` 是存储的 `supersede`：新的写进去、旧的关掉（`supersededBy` 指向新的），一步完成，不会留下两条都成立的。旧的按新事实自己写的日期关（早于旧事实生效时按今天），没写日期按今天。新事实的日期在将来（「下个月起改用……」）时不取代，两条都留着，各带各的起始日期：协议的有效期只有「关了」和「没关」，关在将来的日期上等于现在就关了。
 - 幂等键：新事实的 `key` 是 `m1:` 加来源区间和归一化文字的 53 位哈希。同一批笔记再处理一次（另一个进程同时在跑、上次半途失败）算出的是同一个键，存储返回已有的那条。
 - 反思是唯一的开放生成，只在 `lesson` 非空且有 `model` 时做：和同主题已有的程序是同一条就 `confirm`，否则 `add`。`add` 时 `confirmations` 是 1，相同的证据 `confirm` 不计数；召回只带 `confirmations ≥ recall.confirmations`（缺省 2）的。
 - 按批隔离：每一批（和每一组读原文）单独 `try`，一批失败不挡后面的。可以重试的错（`retryable: true`：超时、429、5xx）当场再试一次，还不行就留着下次，不记次数，报告的 `failed` 数它。别的错（包括模型的回答取不出 JSON、`invalid_response`）`notes.fail` 记一次，次数到 `consolidate.maxAttempts`（缺省 3）进死信，告警并调 `onDeadLetter`；死信不再处理，修好原因后 `store.notes.retry(ids)` 放回去。以前一批持续失败（某段内容总让模型输出坏 JSON）时整个 `consolidate` 都过不去，解析失败的那批又被当成「什么都没说」标掉，记忆悄悄丢了。
 - 读不到原文的笔记（会话清掉了）直接 `settle`，什么都不写。既没有 `extraction` 也没有 `model` 时不处理笔记，笔记保持待处理，只做衰减和 `core` 的缺省渲染，第一次告警一次。
-- 衰减：open 的事实同时满足两条才归档。一是[激活度](protocol.md#激活度-activationretrievability)低于 `decay.archiveAt`。二是错过了至少 `decay.minChances`（缺省 7）次机会：这条事实最后一次活动（`validFrom` 或最后一次被召回，取晚的）之后，记忆有这么多个不同的日子（UTC）召回过别的事实，它一次都没轮上。日子从 open 事实的 `recalls` 里数。只看时间的话，一条 `s = 0.6` 的新事实 1.09 天后就归档，头两天没碰上相关的问题就没了；没人用记忆的日子现在不算，主人离开一个月回来也不会全归档。缺省取 7 是一周的节律：只在周末或每周例会上用得到的事实，七个有召回的日子里轮得到一次。`minChances: 0` 回到只看激活度。`validFrom` 在未来的事实按它离现在多远算（和激活度一样折回过去），所以远期的也会归档，临近的不会。这一轮刚写入或刚并入的事实不在同一轮归档（提取出的 `validFrom` 可能早于今天）。归档不是删除：召回还找得到它（降权），被召回就恢复。没有写入时间这个字段，所以提取出的 `since` 很早的事实，从写入的第二夜起仍然按 `validFrom` 算。
+- 衰减：open 的事实同时满足两条才归档。一是[激活度](protocol.md#激活度-activationretrievability)低于 `decay.archiveAt`。二是错过了至少 `decay.minChances`（缺省 7）次机会：这条事实最后一次活动（写入的时刻、晚于它的 `validFrom`、最后一次被召回，取最晚的）之后，记忆有这么多个不同的日子（UTC）召回过别的事实，它一次都没轮上。日子从 open 事实的 `recalls` 里数。只看时间的话，一条 `s = 0.6` 的新事实 1.09 天后就归档，头两天没碰上相关的问题就没了；没人用记忆的日子现在不算，主人离开一个月回来也不会全归档。缺省取 7 是一周的节律：只在周末或每周例会上用得到的事实，七个有召回的日子里轮得到一次。`minChances: 0` 回到只看激活度。两条都从写入的时刻算起，不从 `validFrom`：提取出的 `since` 很早的事实，写进来第二夜也不归档。写的时候还没成立的，成立的日子按它离现在多远算（和激活度一样折回过去），所以远期的也会归档，临近的不会。这一轮刚写入或刚并入的事实不在同一轮归档，`decay` 调得再严也一样。归档不是删除：召回还找得到它（降权），被召回就恢复。
 - `core`：有 `model` 时从 open 事实重写；open 事实的集合和上次重写时一样就不再调模型（这个记录在进程里，重启后第一夜会重写一次）；输出为空或超预算时回到 `renderCore`。没有 `model` 时用 `renderCore`。文字和当前版本相同就不写新版本。
 - 幂等：笔记 `settle` 之后不再处理；中途失败时已经 `settle` 的批次不受影响，没 `settle` 的下一夜重做，重做时同一个键的事实不再写，措辞相同的直接并入，同一段证据不会记两次。白天不受影响。
 - 报告里 `facts.added` 只数 `new`，取代的那条新事实算在 `superseded` 里；`escalated` 数调了几次 `LanguageModel` 做并入判断。
@@ -800,7 +800,7 @@ sequenceDiagram
 
 ### SQLite 和内存存储
 
-SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，加检索用的 `fact_docs`、`fact_terms`，前缀缺省 `memory_`；结构版本 4 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。
+SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>notes`、`facts`、`procedures`、`core`、`meta`，加检索用的 `fact_docs`、`fact_terms`，前缀缺省 `memory_`；结构版本 5 存在 `<prefix>meta` 的 `memory_schema` 键里，和会话存储的 `schema` 键不同，两边用同一个前缀也不冲突。
 
 两个存储的 `search` 是同一套：协议包的 `searchTerms` 切词（字母数字连成的词、中日韩文字相邻两字），`termOverlap` 打分（共同的词数除以较小的那一边），分数相同时共同的词多的在前、再相同按 `id`。同一组事实、同一个查询，两边的命中和分数一样。
 
@@ -808,6 +808,7 @@ SQLite 存储可以和 `createSqliteStore` 共用一个库：表是 `<prefix>not
 - 没有用 FTS5：它不是每个 Node 自带的 SQLite 都编进去了（这个包的 `engines` 从 22.13 起），自带的 `unicode61` 分词器不切中文，`trigram` 匹配不到两个字的词。自己切词、用普通表，哪个版本都一样。
 - 版本 2 的库打开时升到 3：建两张表，已有的事实（各个作用域的，含关闭、归档的）补进索引，`recalls` 超过 `MAX_FACT_RECALLS` 个的截到最近的那些。
 - 版本 4：`notes` 加 `attempts`、`error`、`failed_at`，`(scope, session, from_seq, up_to)` 上有唯一索引（建之前已有的重复只留最早的一条），`notes.add` 用 `ON CONFLICT DO NOTHING`；`facts` 加 `fact_key`，`(scope, fact_key)` 上有部分唯一索引（没有键的不限）。待处理的部分索引换成也排除死信的 `notes_scope_waiting`。`supersede` 在一个 `BEGIN IMMEDIATE` 里写新的、关旧的。
+- 版本 5：`facts` 加 `at`（写入的时刻）。已有的事实不知道是什么时候写的，补成 `valid_from`，激活度和以前一样算。
 - 内存存储每次扫一遍这个作用域的事实，每条事实的词只切一次、按 `id` 记着；给了 `embed` 再和余弦取大的。
 
 ### 模型

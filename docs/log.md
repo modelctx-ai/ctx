@@ -4,6 +4,10 @@
 
 ## 2026-11-19
 
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`MemoryFact` 加 `at`（写入的时刻），`NewMemoryFact` 里可选；存储的规则加「写进来的时刻和成立的时刻分开」；激活度一节的 `t_i` 换成 `at`、晚于 `at` 的 `validFrom` 和召回，上界改成 34 个时刻，加「从写进来算起」一条，「未来的时刻」「归档看 `A`」跟上；契约测试的覆盖写上 `at`。
+- **更新** [记忆](memory.md)：「归档不能只看时间」写时间从写入算起，失败模式加「早就成立的事实一写进来就忘」。[架构](architecture.md)：巩固的提取和衰减两条写 `at` 怎么记、怎么算，删掉「没有写入时间」那句；SQLite 的结构版本改成 5，加版本 5 的迁移。[概念](concepts.md)的术语表：事实带 `at`，激活度从写入算起。[ADR 0006](adr/0006-memory.md)：决定记录补一条，2026-10-27 的待办第三条做了。
+- **更新** [`ctx-memory`](../packages/memory/README.md)、[`ctx-sqlite`](../packages/sqlite/README.md)、[协议包](../packages/protocol/README.md)的 README：`at` 怎么记、遗忘从写入算起、`facts` 表的 `at` 列、结构版本 5 和它的迁移。[实践：yoyo](repos.md)：yoyo 库里记忆存储的结构版本从早就过时的 1 改成 5。
+
 - **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：加「事实和投影」一节和例子；「怎么对上」的上下文一行、`AgentSpec` 的 `instructions`、`context` 两行写事实和投影怎么映射，选项加 `projection`、`projections`、`sources`、`source_timeout_ms`、`facts_placement`，导出加 `ContextSource`、`EventRule`、`ProjectionOptions` 和 `ctx_pydantic_ai.context`，「还没做的」去掉事件规则、别的投影和事实来源，测试一节加对照 builder 的 `build`。
 - **更新** [架构](architecture.md)：「外部 harness：pydantic-ai」的签名和第三步写怎么选投影、收事实、把 system 文字和事实接进指令。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」跟上，决定记录补一条：和决定四的关系、规则只按名字选、事实每轮只收一次、空输入的认法。[记忆](memory.md)：pydantic-ai 那一句改成它也收来源，但 `memory.source()` 交不过去。
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#21](https://github.com/modelctx-ai/ctx/issues/21)）：`RunEndedData` 加 `executors`，`PendingToolCall` 加 `executor`，「工具调用经日志往返」加「按名字领工作」；线上形态加 `POST /work/:executor/claim` 一行和它的规则（扫哪些会话、租约、长轮询、`limit`），主体、重试两条跟上；执行环境的两种接法和托管矩阵改成两种都有，「worker 拉取模式之后加」删掉。

@@ -108,6 +108,7 @@ function createScope(shared: Shared, options: MemoryStoreOptions): MemoryStore {
   const write = (draft: NewMemoryFact): MemoryFact => {
     const written: MemoryFact = {
       ...draft,
+      at: draft.at ?? draft.validFrom,
       sources: draft.sources.map((ref) => ({ ...ref })),
       id: newId('f'),
       recalls: [],

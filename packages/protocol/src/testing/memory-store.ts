@@ -220,11 +220,13 @@ export function describeMemoryStoreContract(
       assert.equal(await store.notes.head('s'), 0);
     });
 
-    test('facts：add 生成 id，recalls 从空开始，没有有效期终点、取代和归档；字段原样读回', async () => {
+    test('facts：add 生成 id，recalls 从空开始，没有有效期终点、取代和归档；字段原样读回；at 不给时是 validFrom', async () => {
       const store = await factory(MEMORY_STORE_SETUP);
       const input = newFact('主人喜欢乌龙茶', {
         predicate: 'likes',
         topic: 'user',
+        at: MEMORY_NOW + 5,
+        validFrom: MEMORY_NOW - 3,
         sources: [ref(1, 2), ref(5, 5, 't')],
       });
       const fact = await store.facts.add(input);
@@ -232,8 +234,9 @@ export function describeMemoryStoreContract(
       assert.deepEqual(fact, { ...input, id: fact.id, recalls: [] });
       assert.deepEqual(await store.facts.list(), [fact]);
       assert.ok(roundTrips(fact), '事实能 JSON 往返：可选字段不给时不出现');
-      const other = await store.facts.add(newFact('主人住在台北'));
+      const other = await store.facts.add(newFact('主人住在台北', { validFrom: MEMORY_NOW - 7 }));
       assert.notEqual(other.id, fact.id);
+      assert.equal(other.at, MEMORY_NOW - 7, '不知道什么时候记下的：当成立的时候就记下了');
     });
 
     test('facts：没有证据或证据区间不合法时不写，抛 invalid_request', async () => {
@@ -694,11 +697,13 @@ export function describeMemoryStoreContract(
     test('facts：supersede 原子地加新关旧；认不得的 id 什么都不写；键已经有了什么都不改；已经关闭的只写新的', async () => {
       const store = await factory(MEMORY_STORE_SETUP);
       const old = await store.facts.add(newFact('主人住在杭州'));
-      const added = await store.facts.supersede(old.id, newFact('主人住在上海', { key: 'move' }), 50);
+      const added = await store.facts.supersede(old.id, newFact('主人住在上海', { key: 'move', at: 40 }), 50);
       assert.equal(added.text, '主人住在上海');
+      assert.equal(added.at, 40, '新的记自己的写入时刻');
       const closed = await factById(store, old.id);
       assert.equal(closed?.validTo, 50);
       assert.equal(closed?.supersededBy, added.id);
+      assert.equal(closed?.at, old.at, '旧的写入时刻不变');
       assert.equal((await factById(store, added.id))?.validTo, undefined);
 
       await assert.rejects(store.facts.supersede('missing', newFact('不该写'), 60), hasType('not_found'));

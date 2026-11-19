@@ -323,10 +323,10 @@ const defs: Record<string, Schema> = {
   Note: obj({ id: str, ...note }, { ...noteOptional, attempts: int, error: str, failedAt: num }),
   NewNote: obj(note, noteOptional),
   MemoryFact: obj(
-    { id: str, ...fact, recalls: arrayOf(num) },
+    { id: str, ...fact, at: num, recalls: arrayOf(num) },
     { ...factOptional, validTo: num, supersededBy: str, archivedAt: num },
   ),
-  NewMemoryFact: obj(fact, factOptional),
+  NewMemoryFact: obj(fact, { ...factOptional, at: num }),
   FactHit: obj({ fact: ref('MemoryFact'), score: num }),
   SearchQuery: obj({ text: str }, { topic: str, k: int, open: bool, archived: bool }),
   Procedure: obj({ id: str, ...procedure, confirmations: int }, { topic: str, retiredAt: num }),

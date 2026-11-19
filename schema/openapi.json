@@ -4375,6 +4375,9 @@
               "$ref": "#/components/schemas/SourceRef"
             }
           },
+          "at": {
+            "type": "number"
+          },
           "recalls": {
             "type": "array",
             "items": {
@@ -4400,7 +4403,7 @@
             "type": "number"
           }
         },
-        "required": ["id", "subject", "text", "validFrom", "confidence", "salience", "sources", "recalls"],
+        "required": ["id", "subject", "text", "validFrom", "confidence", "salience", "sources", "at", "recalls"],
         "additionalProperties": false
       },
       "NewMemoryFact": {
@@ -4435,6 +4438,9 @@
           },
           "topic": {
             "type": "string"
+          },
+          "at": {
+            "type": "number"
           }
         },
         "required": ["subject", "text", "validFrom", "confidence", "salience", "sources"],
