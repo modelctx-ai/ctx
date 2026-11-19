@@ -9,10 +9,13 @@
 //   那个执行环境、结果追加进会话，stdout 是 `{ executed, remaining }`。
 // - `claim`：stdin 是 `{ baseUrl, token, executor }`，用 `createRemoteWorker` 按执行环境的名字领一次工作（不给会话名），
 //   交给 ctx-remote 上同名的执行环境执行、结果追加回各自的会话，stdout 是 `{ executed, failed }`。
-// - `compact`：stdin 是一组 `{ entries, options, script?, window?, now?, tick? }`，每一组的条目写进一个新的内存存储的会话
-//   `s`，用 builder 的 `compactDetailed` 压一次，stdout 是每一组的 `{ result, thrown?, log, seen }`。摘要模型按剧本回答
-//   （见 `summarizer`），`seen` 是每次交给它的 `{ system, prompt }`；钟从 `now` 开始，每次调摘要模型走 `tick` 毫秒，存储和
-//   builder 用同一个钟。
+// - `compact`：stdin 是一组 `{ entries, options, script?, window?, now?, tick?, projection? }`，每一组的条目写进一个新的内存
+//   存储的会话 `s`，用 builder 的 `compactDetailed` 压一次，stdout 是每一组的 `{ result, thrown?, log, seen }`。摘要模型按
+//   剧本回答（见 `summarizer`），`seen` 是每次交给它的 `{ system, prompt }`；钟从 `now` 开始，每次调摘要模型走 `tick` 毫秒，
+//   存储和 builder 用同一个钟。`projection` 是 builder 缺省投影的配方（见 `projectionOf`）。
+// - `build`：stdin 是一组 `{ entries, parent?, request, sources?, projection?, projections?, factsPlacement?,
+//   sourceTimeoutMs? }`，条目写进会话 `s`（`parent` 写进 `p`），builder 按配方配上来源和投影（见 `projectionOf`、
+//   `sourcesOf`），`build({ session: 's', ...request })` 一次，stdout 是每一组的 `{ call }` 或 `{ thrown }`。
 import { parseArgs } from 'node:util';
 
 const root = new URL('../../../', import.meta.url);
@@ -22,6 +25,73 @@ async function stdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+/** 事件配方渲染的文字：每条事件一行 `kind data的JSON`。 */
+const line = (events) => events.map((event) => `${event.kind} ${JSON.stringify(event.data ?? null)}`).join('\n');
+
+/**
+ * 投影配置的配方：函数过不了进程边界，两边按名字各实现一遍（Python 那边是 conftest.py 的 `projection_of`）。
+ * `{ events?, summary?, message?, estimate?, window? }`：
+ * - `events`：`{ [kind]: { fold?, render } }`，`render` 是 `user`（一条用户消息，每条事件一行 `kind data的JSON`）、
+ *   `system`（同样的文字，system 消息）、`pair`（这条用户消息再加一条助手消息 `noted`）、`none`（丢掉）；
+ * - `summary`：`system`（system 消息 `Earlier: 文字`）、`assistant`（助手消息，原文）或 `covers`（用户消息
+ *   `Up to 覆盖到的seq: 文字`）；
+ * - `message`：`redact`（JSON 里有 `secret` 的丢掉，内容是字符串的用户消息前面加 `> `）；
+ * - `estimate`：`double`（缺省估算的两倍）；`window`：投影自己的窗口。
+ */
+function projectionOf(protocol, recipe) {
+  if (!recipe) return undefined;
+  const renderers = {
+    user: (events) => ({ role: 'user', content: line(events) }),
+    system: (events) => ({ role: 'system', content: line(events) }),
+    pair: (events) => [
+      { role: 'user', content: line(events) },
+      { role: 'assistant', content: 'noted' },
+    ],
+    none: () => null,
+  };
+  const summaries = {
+    system: (entry) => ({ role: 'system', content: `Earlier: ${entry.text}` }),
+    assistant: (entry) => ({ role: 'assistant', content: entry.text }),
+    covers: (entry) => ({ role: 'user', content: `Up to ${entry.covers}: ${entry.text}` }),
+  };
+  const messages = {
+    redact: ({ message }) => {
+      if (JSON.stringify(message).includes('secret')) return null;
+      return message.role === 'user' && typeof message.content === 'string'
+        ? { ...message, content: `> ${message.content}` }
+        : message;
+    },
+  };
+  const estimates = { double: (message) => 2 * protocol.estimateTokens(message) };
+  const window = { ...recipe.window, ...(recipe.estimate ? { estimate: estimates[recipe.estimate] } : {}) };
+  return {
+    ...(recipe.events
+      ? {
+          events: Object.fromEntries(
+            Object.entries(recipe.events).map(([kind, rule]) => [
+              kind,
+              { fold: rule.fold ?? false, render: renderers[rule.render] },
+            ]),
+          ),
+        }
+      : {}),
+    ...(recipe.summary ? { summary: summaries[recipe.summary] } : {}),
+    ...(recipe.message ? { message: messages[recipe.message] } : {}),
+    ...(Object.keys(window).length > 0 ? { window } : {}),
+  };
+}
+
+/** 上下文来源的配方 `{ name, text?, delayMs?, error? }`：等 `delayMs` 毫秒，给了 `error` 就抛它，否则交 `text`。 */
+function sourcesOf(protocol, recipes = []) {
+  return recipes.map(({ name, text = null, delayMs = 0, error }) =>
+    protocol.defineSource(name, async () => {
+      if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      if (error) throw new Error(error);
+      return text;
+    }),
+  );
 }
 
 async function evaluate() {
@@ -39,6 +109,18 @@ async function evaluate() {
       const { messages, tokens, dropped, truncated } = protocol.project(entries, { window });
       return { messages, tokens, dropped, truncated };
     },
+    // 按配方的规则投影；窗口另给，配方里的 `window` 不用（`estimate` 照用）。
+    projectRules: (entries, recipe, window) => {
+      const { window: own, ...rules } = projectionOf(protocol, recipe) ?? {};
+      const estimate = own?.estimate ? { estimate: own.estimate } : {};
+      const { messages, items, tokens, dropped, truncated } = protocol.project(entries, {
+        ...rules,
+        window: { ...window, ...estimate },
+      });
+      const spans = items.map(({ from, upTo, at, pinned, tokens: size }) => ({ from, upTo, at, pinned, tokens: size }));
+      return { messages, items: spans, tokens, dropped, truncated };
+    },
+    renderFacts: protocol.renderFacts,
     estimateTextTokens: protocol.estimateTextTokens,
     estimateFileTokens: protocol.estimateFileTokens,
     estimateTokens: protocol.estimateTokens,
@@ -203,7 +285,7 @@ async function compact() {
 async function compactOnce(
   core,
   protocol,
-  { entries, options = {}, script = [], window = null, now: start = 0, tick = 0 },
+  { entries, options = {}, script = [], window = null, now: start = 0, tick = 0, projection = null },
 ) {
   const clock = { now: start };
   const now = () => clock.now;
@@ -211,7 +293,8 @@ async function compactOnce(
   const store = core.createMemoryStore({ now });
   await store.append('s', entries);
   const model = summarizer(protocol, { script, window, tick, clock, seen });
-  const builder = core.createContextBuilder({ store, model, now });
+  const rules = projectionOf(protocol, projection);
+  const builder = core.createContextBuilder({ store, model, now, ...(rules ? { projection: rules } : {}) });
   let result;
   let thrown;
   try {
@@ -220,6 +303,50 @@ async function compactOnce(
     thrown = { message: error.message, type: error.type };
   }
   return { result, thrown, log: await store.list('s'), seen };
+}
+
+async function build() {
+  const core = await load('packages/core/src/index.ts');
+  const protocol = await load('packages/protocol/src/index.ts');
+  const outputs = [];
+  for (const one of await stdin()) outputs.push(await buildOnce(core, protocol, one));
+  process.stdout.write(JSON.stringify(outputs));
+}
+
+async function buildOnce(
+  core,
+  protocol,
+  { entries, parent = [], request, sources = [], projection = null, projections = {}, factsPlacement, sourceTimeoutMs },
+) {
+  const store = core.createMemoryStore();
+  await store.append('s', entries);
+  if (parent.length > 0) await store.append('p', parent);
+  const rules = projectionOf(protocol, projection);
+  const builder = core.createContextBuilder({
+    store,
+    sources: sourcesOf(protocol, sources),
+    ...(rules ? { projection: rules } : {}),
+    projections: Object.fromEntries(
+      Object.entries(projections).map(([name, recipe]) => [name, projectionOf(protocol, recipe)]),
+    ),
+    ...(factsPlacement ? { factsPlacement } : {}),
+    ...(sourceTimeoutMs !== undefined ? { sourceTimeoutMs } : {}),
+  });
+  try {
+    const {
+      instructions = null,
+      messages,
+      tokens,
+      calibration = null,
+      facts,
+    } = await builder.build({
+      session: 's',
+      ...request,
+    });
+    return { call: { instructions, messages, tokens, calibration, facts } };
+  } catch (error) {
+    return { thrown: { message: error.message, type: error.type } };
+  }
 }
 
 const { positionals, values } = parseArgs({
@@ -233,7 +360,8 @@ else if (command === 'run') await run();
 else if (command === 'pending') await pending();
 else if (command === 'claim') await claim();
 else if (command === 'compact') await compact();
+else if (command === 'build') await build();
 else {
-  console.error('usage: ctx_ts.mjs eval | remote [--max-list N] | run | pending | claim | compact');
+  console.error('usage: ctx_ts.mjs eval | remote [--max-list N] | run | pending | claim | compact | build');
   process.exit(2);
 }

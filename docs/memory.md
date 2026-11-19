@@ -111,7 +111,7 @@ flowchart LR
 - 工具：`Memory` 给适配器的 `executors`，`recall` 经 MCP 交给程序，调用回到记忆。
 - 上下文：`memory.source()` 给适配器的 `sources`。适配器每轮记下输入之后收一次（召回要看得到这一轮说的话），接在指令后面经 `--append-system-prompt` 交出去：每轮重新给，不进程序自己的会话，也不写日志。`AgentSpec.context.facts` 照样按名字选用、加标题；`placement: 'prompt'` 不支持，放进这一轮的用户消息就留在程序的会话里了。事实每轮不同，系统提示也就每轮不同，程序对历史的提示缓存命中不了（参考实现把事实接在指令后面时也一样）；在乎缓存的只交 `recall` 工具。
 
-pydantic-ai 的适配器从日志投影历史，接点和参考实现一样，只是 Python 那边还没有上下文来源，记忆只能经 `recall` 工具。例子见 [`examples/memory-pi.ts`](../examples/memory-pi.ts)。
+pydantic-ai 的适配器从日志投影历史，接点和参考实现一样。它也收上下文来源（`sources`，Python 的 `ContextSource`），但 `memory.source()` 是 TypeScript 的对象、交不过去，现成的接法只有 `recall` 工具。例子见 [`examples/memory-pi.ts`](../examples/memory-pi.ts)。
 
 ## 预算
 

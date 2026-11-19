@@ -14,7 +14,7 @@ import math
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import jsonschema
 import pydantic_ai
@@ -61,11 +61,16 @@ from pydantic_ai.usage import UsageLimits
 
 from .compact import Summarize, compact_session
 from .context import (
+    DEFAULT_SOURCE_TIMEOUT_MS,
+    ContextSource,
+    Estimate,
+    ProjectionOptions,
     calibration_of,
+    collect_facts,
     estimate_text_tokens,
     estimate_tokens,
     json_text,
-    project,
+    render_facts,
     window_of,
 )
 from .executors import Executor
@@ -178,9 +183,13 @@ class AbortSignal:
 
 @dataclass
 class _Prepared:
-    """这一轮交给模型的历史（ctx 消息）、整次调用的估算 token（校准过的话乘上了倍数）、校准的倍数。"""
+    """这一轮交给模型的调用（参考实现的 ``PreparedCall``）：历史（ctx 消息，没有 system 消息）；指令（``AgentSpec.instructions``、
+    放在指令里的事实、投影里的 system 文字）；最后的临时提示（``RunRequest.prompt``，事实放在 ``prompt`` 时接在它前面）；整次调用
+    的估算 token（校准过的话乘上了倍数）；校准的倍数。"""
 
     messages: list[dict[str, Any]]
+    instructions: str | None
+    prompt: Json
     tokens: int
     calibration: float
 
@@ -220,6 +229,8 @@ class _Run:
     approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
     #: 上一轮以 ``requires_action`` 结束时，它的 ``ctx.run.started`` 的 ``seq``：这一轮开头先处理它留下的确认。
     waiting: int | None = None
+    #: 这一轮收到的事实（``{ source, text }``）：超窗兜底重新组装时沿用，不再收一遍。
+    facts: list[dict[str, str]] = field(default_factory=list)
 
 
 async def _waited(previous: asyncio.Future[None], signal: AbortSignal | None) -> bool:
@@ -245,7 +256,12 @@ def _skipped(request: Mapping[str, Any], emit: Callable[[dict[str, Any]], None])
 
 
 def _empty(content: Json) -> bool:
-    return content is None or (isinstance(content, (str, list)) and len(content) == 0)
+    """同参考实现的 ``isEmptyContent``：没有、只有空白的文字、空的部件列表都算空。"""
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content.strip() == ''
+    return isinstance(content, list) and len(content) == 0
 
 
 def _number(value: Any) -> bool:
@@ -282,6 +298,14 @@ def _context_problem(context: Any) -> str | None:
     facts = context.get('facts')
     if facts is not None and not isinstance(facts, (bool, dict)):
         return 'AgentSpec.context.facts must be a boolean or an object.'
+    if isinstance(facts, dict):
+        sources = facts.get('sources')
+        if sources is not None and not (isinstance(sources, list) and all(isinstance(name, str) for name in sources)):
+            return 'AgentSpec.context.facts.sources must be a list of strings.'
+        if facts.get('placement') is not None and facts['placement'] not in ('instructions', 'prompt'):
+            return 'AgentSpec.context.facts.placement must be "instructions" or "prompt".'
+        if facts.get('heading') is not None and not isinstance(facts['heading'], str):
+            return 'AgentSpec.context.facts.heading must be a string.'
     if context.get('projection') is not None and not isinstance(context['projection'], str):
         return 'AgentSpec.context.projection must be a string.'
     overflow = context.get('overflow')
@@ -472,6 +496,15 @@ class PydanticAIHarness:
       以 ``requires_action`` 结束（``pending`` 列出这些调用），执行方把结果追加进日志（``tool_result_entry``），下一轮不带输入
       接着跑。``permissions`` 是 ``ask`` 的工具也这样，应用确认了再让执行方执行。它们的工具定义要在 ``tools`` 里。
     - ``summary_model``：超窗兜底压缩时写摘要的模型，名字（按 ``models`` 找）或 pydantic-ai 的模型；不给就用这一轮的模型。
+    - ``projection``：缺省的投影配置（``ProjectionOptions``：事件规则、摘要和消息怎么渲染、缺省的窗口、换掉的估算），不给是协议包
+      ``project`` 的缺省规则。``AgentSpec.context.projection`` 不给时用它，压缩也按它。
+    - ``projections``：按名字注册的其他投影配置，``AgentSpec.context.projection`` 按名字选，不认识的名字这一轮以 ``not_found``
+      结束；这里给了 ``default`` 就以这里的为准。每套配置是完整的，不和 ``default`` 合并。
+    - ``sources``：上下文来源（``ContextSource``），每轮调模型之前并行收一次事实；``AgentSpec.context.facts`` 是 ``False`` 时
+      不收，``FactsSpec.sources`` 只收这些。
+    - ``source_timeout_ms``：单个来源最多等多久，超时就当它这次没有内容。
+    - ``facts_placement``：事实接在指令后面（``instructions``），还是放进最后的临时用户消息（``prompt``：指令每轮都一样，服务商的
+      提示缓存能命中）；``FactsSpec.placement`` 能按轮换。
     """
 
     def __init__(
@@ -485,7 +518,14 @@ class PydanticAIHarness:
         source: str | None = None,
         external: Sequence[str] = (),
         summary_model: Model | str | None = None,
+        projection: ProjectionOptions | None = None,
+        projections: Mapping[str, ProjectionOptions] | None = None,
+        sources: Sequence[ContextSource] = (),
+        source_timeout_ms: float = DEFAULT_SOURCE_TIMEOUT_MS,
+        facts_placement: Literal['instructions', 'prompt'] = 'instructions',
     ) -> None:
+        if facts_placement not in ('instructions', 'prompt'):
+            raise ValueError('facts_placement must be "instructions" or "prompt".')
         self._store = store
         self._executors: dict[str, Executor] = (
             dict(executors) if isinstance(executors, Mapping) else {executor.name: executor for executor in executors}
@@ -496,6 +536,13 @@ class PydanticAIHarness:
         self._source = source
         self._external = frozenset(external)
         self._summary_model = summary_model
+        self._projections: dict[str, ProjectionOptions] = {
+            'default': projection or ProjectionOptions(),
+            **(projections or {}),
+        }
+        self._sources = list(sources)
+        self._source_timeout_ms = source_timeout_ms
+        self._facts_placement = facts_placement
         self._tails: dict[str, asyncio.Future[None]] = {}
 
     # ---- 对外 ----
@@ -747,11 +794,13 @@ class PydanticAIHarness:
         if signal is not None and signal.aborted:
             return await self._end(state, 'aborted')
         context = spec.get('context') or {}
-        projection = context.get('projection')
-        if projection is not None and projection != 'default':
-            # 只有缺省的投影（同参考实现：不认识的名字以 `not_found` 失败，不回退）。
-            error = {'message': f'Unknown projection "{projection}". Registered: default.', 'type': 'not_found'}
+        name = _projection_name(context)
+        if name not in self._projections:
+            # 同参考实现：不认识的名字以 `not_found` 失败，不回退；在收事实之前。
+            registered = ', '.join(self._projections)
+            error = {'message': f'Unknown projection "{name}". Registered: {registered}.', 'type': 'not_found'}
             return await self._end(state, 'error', error=error)
+        state.facts = await self._facts(state, context.get('facts'))
 
         # 输入已经在日志里时它在历史里；不写日志时它和 `prompt` 一样接在最后，都算进历史之外的预算。
         extra = None if in_log else content
@@ -765,7 +814,7 @@ class PydanticAIHarness:
         if signal is not None and signal.aborted:
             return await self._end(state, 'aborted')
         history = to_model_messages(prepared.messages)
-        prompt = _prompt_of(request.get('prompt')) if in_log else _prompt_of(content, request.get('prompt'))
+        prompt = _prompt_of(prepared.prompt) if in_log else _prompt_of(content, prepared.prompt)
         if prompt is None and (not history or isinstance(history[-1], ModelResponse)):
             return await self._end(
                 state,
@@ -827,6 +876,18 @@ class PydanticAIHarness:
             state.emit({'type': 'tool.returned', 'runId': state.run_id, 'callId': call['id'], 'output': output})
         return None
 
+    async def _facts(self, state: _Run, facts: Any) -> list[dict[str, str]]:
+        """这一轮的事实（``AgentSpec.context.facts``）：``False`` 不收，``FactsSpec.sources`` 只收这些来源。"""
+        if facts is False:
+            return []
+        return await collect_facts(
+            self._sources,
+            session=str(state.request['session']),
+            signal=state.signal,
+            timeout_ms=self._source_timeout_ms,
+            only=facts.get('sources') if isinstance(facts, dict) else None,
+        )
+
     async def _prepare(
         self,
         state: _Run,
@@ -835,39 +896,60 @@ class PydanticAIHarness:
         extra: Json,
         window: Mapping[str, Any] | None,
     ) -> _Prepared:
-        """组装这一轮的历史，同参考实现 builder 的 ``build``：窗口的 ``maxTokens`` 是整次调用的预算，指令、工具定义、
-        这一轮没进日志的输入和 ``prompt`` 先占掉一部分，剩下的才给历史；按上一轮的真实用量校准（只往小里收）。
-        ``context.inherit`` 的会话投影接在前面，用本会话剩下的预算。没有事实来源：不收事实。"""
+        """组装这一轮的调用，同参考实现 builder 的 ``build``：窗口的 ``maxTokens`` 是整次调用的预算，指令、事实、工具定义、
+        这一轮没进日志的输入和 ``prompt`` 先占掉一部分，剩下的才给历史；按上一轮的真实用量校准（只往小里收）。``window``
+        不给时用选中的投影配置自己的窗口。``context.inherit`` 的会话投影接在前面，用本会话剩下的预算。投影里的 system 消息
+        按出现的顺序接到指令后面（在事实之后），事实按 ``placement`` 放进指令或最后的临时提示。"""
         request = state.request
-        inherit = (spec.get('context') or {}).get('inherit')
+        context = spec.get('context') or {}
+        chosen = self._projections[_projection_name(context)]
+        facts = context.get('facts')
+        facts_spec: Mapping[str, Any] = facts if isinstance(facts, dict) else {}
+        inherit = context.get('inherit')
+        # 没有事件规则时事件都不可见，不用读。
+        types = None if chosen.events else ['message', 'summary']
         try:
-            entries = await self._store.list(str(request['session']), types=['message', 'summary'])
-            parent = (
-                await self._store.list(str(inherit['session']), types=['message', 'summary'])
-                if inherit is not None
-                else None
-            )
+            entries = await self._store.list(str(request['session']), types=types)
+            parent = await self._store.list(str(inherit['session']), types=types) if inherit is not None else None
         except Exception as error:
             raise _WriteFailed(error) from error
+        estimate = chosen.estimate or estimate_tokens
+        rendered = render_facts(state.facts, facts_spec.get('heading')) if state.facts else None
         reserve = (
             estimate_text_tokens(spec.get('instructions') or '')
+            + (estimate_text_tokens(rendered) if rendered is not None else 0)
             + (estimate_text_tokens(json_text(definitions)) if definitions else 0)
-            + _sized(extra)
-            + _sized(request.get('prompt'))
+            + _sized(extra, estimate)
+            + _sized(request.get('prompt'), estimate)
         )
-        calibration = calibration_of(entries)
-        own = project(entries, window_of(window, reserve, calibration))
+        # 接了分词器（投影自己的 `estimate`）就不校准：估算本来就准，样本里的偏差多半是别的原因。
+        calibration = 1 if chosen.estimate is not None else calibration_of(entries)
+        limits = window if window is not None else chosen.window
+        own = chosen.project(entries, window_of(limits, reserve, calibration))
         messages, tokens = own.messages, own.tokens
         if parent is not None:
             upto = inherit.get('upTo')
             if upto is not None:
                 parent = [entry for entry in parent if entry['seq'] <= upto]
-            inherited = project(parent, window_of(window, reserve + own.tokens, calibration))
+            inherited = chosen.project(parent, window_of(limits, reserve + own.tokens, calibration))
             messages, tokens = [*inherited.messages, *own.messages], inherited.tokens + own.tokens
         total = reserve + tokens
         if calibration > 1:
             total = math.ceil(total * calibration)
-        return _Prepared(messages=messages, tokens=total, calibration=calibration)
+        placement = facts_spec.get('placement') or self._facts_placement
+        system = [text_of(message) for message in messages if message.get('role') == 'system']
+        prompt = request.get('prompt')
+        if rendered is not None and placement == 'prompt':
+            prompt = _with_facts(prompt, rendered)
+        return _Prepared(
+            messages=[message for message in messages if message.get('role') != 'system'],
+            instructions=_joined(
+                [spec.get('instructions'), rendered if placement == 'instructions' else None, *system]
+            ),
+            prompt=prompt,
+            tokens=total,
+            calibration=calibration,
+        )
 
     async def _fit(
         self,
@@ -924,7 +1006,9 @@ class PydanticAIHarness:
             chosen_model = self._model(chosen_model)
         summarize = _summarizer(chosen_model, state.signal)
         session = str(state.request['session'])
-        result = await compact_session(self._store, session, summarize, chosen, signal=state.signal)
+        result = await compact_session(
+            self._store, session, summarize, chosen, signal=state.signal, projection=self._projections['default']
+        )
         return 'summary' in result
 
     async def _catalog(self) -> list[dict[str, Any]]:
@@ -1094,7 +1178,7 @@ class PydanticAIHarness:
         agent: Agent[None, Any] = Agent(
             model,
             output_type=output_type,
-            instructions=spec.get('instructions'),
+            instructions=prepared.instructions,
             tools=tools,
             name=spec.get('name'),
         )
@@ -1415,8 +1499,29 @@ class PydanticAIHarness:
         return {**summary, 'messages': state.messages, 'recorded': state.recorded}
 
 
-def _sized(content: Json) -> int:
-    return 0 if _empty(content) else estimate_tokens({'role': 'user', 'content': content})
+def _sized(content: Json, estimate: Estimate = estimate_tokens) -> int:
+    return 0 if _empty(content) else estimate({'role': 'user', 'content': content})
+
+
+def _projection_name(context: Mapping[str, Any]) -> str:
+    """``AgentSpec.context.projection``，缺省 ``default``。"""
+    name = context.get('projection')
+    return 'default' if name is None else str(name)
+
+
+def _joined(parts: Sequence[Any]) -> str | None:
+    """几段文字用空行连起来，空的不要；都空是 ``None``（参考实现 builder 的 ``joined``）。"""
+    text = '\n\n'.join(part for part in parts if isinstance(part, str) and part.strip() != '')
+    return text or None
+
+
+def _with_facts(prompt: Json, facts: str) -> Json:
+    """事实放进最后的临时提示：接在原来的提示前面（参考实现 builder 的 ``withFacts``）。"""
+    if _empty(prompt):
+        return facts
+    if isinstance(prompt, str):
+        return f'{facts}\n\n{prompt}'
+    return [{'type': 'text', 'text': facts}, *prompt]
 
 
 def _prompt_of(*contents: Json) -> Any:
