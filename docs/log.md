@@ -2,6 +2,10 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-11-20
+
+- **更新** [实践：yoyo](repos.md)：yoyo 不用的包加上 `ctx-pi`、`ctx-managed-agents`，依赖图下面「图里没画」的那几个包跟契约表对齐；`yoyo.db` 契约写明新版本的 `ctx-sqlite` 打开旧库就地升级、升级后旧版本打不开。
+
 ## 2026-11-19
 
 - **新增** [`ctx-managed-agents`](../packages/managed-agents/README.md) 的 README：安装、用法、怎么对上（会话身份、模型和指令、轨迹、断线、ctx 的工具、内置工具和 MCP、停下等的、停着等时又说了话、没发出去的输入、重试、取消、续接之前、上下文、子线程）、日志里一轮的样子、`AgentSpec` 和 `stopReason` 的映射、选项、一致性等级、验证（没有对真实服务验证）、导出。
