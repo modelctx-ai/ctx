@@ -1,9 +1,10 @@
-"""从日志投影出上下文，和 token 的估算、截短：协议包 ``context.ts`` 的 ``project`` 和 ``tokens.ts`` 的缺省规则。
+"""从日志投影出上下文、收集事实，和 token 的估算、截短：协议包 ``context.ts`` 的 ``project``、``collectFacts`` 和
+``tokens.ts`` 的移植。
 
-投影：按 ``(at, seq)`` 排，``covers`` 最大的摘要代替它盖住的条目、渲染成一条用户消息固定在最前，事件不进上下文，带工具调用的
-助手消息和紧跟的工具结果是一组，组里的调用和结果按 ``id`` 配对（没有调用的结果去掉，没有结果的调用补一条错误结果）。有窗口时
-从最旧的组裁起，至少留最后一组，裁过之后开头不留助手消息（前面有摘要时除外）；``truncate`` 时先给单条消息封顶，裁到只剩最后
-一组还超就接着截短。
+投影：按 ``(at, seq)`` 排，``covers`` 最大的摘要代替它盖住的条目、固定在最前（缺省渲染成一条用户消息），消息条目可以改写或
+过滤，事件按规则渲染（没有规则的不进上下文，``fold`` 的同类事件连在一起时合成一组），带工具调用的助手消息和紧跟的工具结果是
+一组，组里的调用和结果按 ``id`` 配对（没有调用的结果去掉，没有结果的调用补一条错误结果）。有窗口时从最旧的组裁起，至少留最后
+一组，裁过之后开头不留助手消息（前面有摘要时除外）；``truncate`` 时先给单条消息封顶，裁到只剩最后一组还超就接着截短。
 
 估算不分词：中日韩文字一个字算 1，ASCII 4 个字符算 1，其余文字 2 个字符算 1，补充平面的字符算 2；附件按
 ``estimate_file_tokens``。长度、切点按 UTF-16 码元算，和 TypeScript 的字符串一样。
@@ -11,13 +12,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+import logging
 import math
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 from .protocol import Json, error_output
+
+if TYPE_CHECKING:
+    from .harness import AbortSignal
+
+_log = logging.getLogger(__name__)
 
 #: 日志里有调用、没有结果的工具调用补的结果（协议包投影的 ``MISSING_RESULT``）。
 MISSING_RESULT = 'No result was recorded for this tool call.'
@@ -306,7 +315,119 @@ def truncate_message(
     return {**message, 'content': parts}
 
 
+# ---- 来源和事实 ----
+
+#: 单个来源缺省最多等多久（毫秒），超时就当它这次没有内容（协议包 ``collectFacts`` 的缺省）。
+DEFAULT_SOURCE_TIMEOUT_MS = 2_000
+
+
+@dataclass(frozen=True)
+class ContextSource:
+    """生成那一刻才去取的上下文，例如当前任务、天气（协议包的 ``ContextSource``）：``collect(context)`` 返回文字，可以是
+    协程；``context`` 是 ``{ session, signal? }``。文字只在这一次调用里出现，不写进日志。"""
+
+    name: str
+    collect: Callable[[Mapping[str, Any]], Awaitable[str | None] | str | None]
+
+
+def js_number(value: float) -> str:
+    """数字在 JavaScript 里的写法：整数值不带 ``.0``。"""
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+async def _within(work: Awaitable[Any], timeout_ms: float, name: str) -> Any:
+    """等 ``work`` 最多 ``timeout_ms`` 毫秒，到点就取消它、抛错。"""
+    task = asyncio.ensure_future(work)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=None if math.isinf(timeout_ms) else max(0.0, timeout_ms) / 1000)
+    finally:
+        if not task.done():
+            task.cancel()
+    if not done:
+        raise TimeoutError(f'context source "{name}" timed out after {js_number(timeout_ms)}ms')
+    return task.result()
+
+
+async def collect_facts(
+    sources: Sequence[ContextSource],
+    *,
+    session: str,
+    signal: AbortSignal | None = None,
+    timeout_ms: float = DEFAULT_SOURCE_TIMEOUT_MS,
+    only: Sequence[str] | None = None,
+) -> list[dict[str, str]]:
+    """并行收集事实（协议包的 ``collectFacts``）：``{ source, text }`` 的列表，顺序按 ``sources``，文字去掉两头的空白，空的
+    不要。某个来源出错或超过 ``timeout_ms`` 只影响它自己，记一条告警。``only`` 只收这些名字的来源（``FactsSpec.sources``），
+    里面有没注册的名字也记一条告警。"""
+    chosen = list(sources)
+    if only is not None:
+        wanted = dict.fromkeys(only)
+        chosen = [source for source in chosen if source.name in wanted]
+        registered = {source.name for source in sources}
+        for name in wanted:
+            if name not in registered:
+                _log.warning('context source "%s" is not registered', name)
+    context: dict[str, Any] = {'session': session}
+    if signal is not None:
+        context['signal'] = signal
+
+    async def one(source: ContextSource) -> dict[str, str] | None:
+        try:
+            text = source.collect(context)
+            if inspect.isawaitable(text):
+                text = await _within(text, timeout_ms, source.name)
+        except Exception as error:  # noqa: BLE001 - 一个来源坏了只影响它自己
+            _log.warning('context source "%s" failed: %s', source.name, error)
+            return None
+        trimmed = text.strip() if isinstance(text, str) else ''
+        return {'source': source.name, 'text': trimmed} if trimmed else None
+
+    return [fact for fact in await asyncio.gather(*(one(source) for source in chosen)) if fact is not None]
+
+
+def render_facts(facts: Sequence[Mapping[str, Any]], heading: str | None = None) -> str:
+    """事实写成一段文字（协议包的 ``renderFacts``）：一条一行，给了 ``heading`` 就放在第一行。"""
+    lines = [str(fact.get('text', '')) for fact in facts]
+    return '\n'.join([heading, *lines] if heading else lines)
+
+
 # ---- 投影 ----
+
+#: 事件规则渲染出的东西：一条消息、几条，或 ``None``（丢掉）。
+Rendered = Message | Sequence[Message] | None
+
+
+@dataclass(frozen=True)
+class EventRule:
+    """一种事件怎么进入模型上下文（协议包的 ``EventRule``）：``render(events)`` 把一条事件（``fold`` 时是连在一起的同类
+    事件合成的一组）渲染成消息，返回 ``None`` 就丢掉。没有规则的事件不进上下文，也不打断前后同类事件的合并。"""
+
+    render: Callable[[list[Mapping[str, Any]]], Rendered]
+    fold: bool = False
+
+
+@dataclass(frozen=True)
+class ProjectionOptions:
+    """一套投影配置（协议包的 ``ProjectionOptions``）：
+
+    - ``events``：事件规则，按 ``kind``。
+    - ``summary``：摘要条目渲染成哪条消息，缺省一条用户消息（``default_summary_message``）。
+    - ``message``：改写或过滤消息条目，返回 ``None`` 就丢掉。
+    - ``window``：缺省的窗口（``WindowOptions``）；``AgentSpec.window`` 给了就整个换掉它。
+    - ``estimate``：一条消息的 token 怎么估（接了分词器时），缺省 ``estimate_tokens``。给了就不按上一轮的用量校准。
+    """
+
+    events: Mapping[str, EventRule] = field(default_factory=dict)
+    summary: Callable[[Mapping[str, Any]], Message] | None = None
+    message: Callable[[Mapping[str, Any]], Message | None] | None = None
+    window: Mapping[str, Any] | None = None
+    estimate: Callable[[Mapping[str, Any]], int] | None = None
+
+    def project(self, entries: Sequence[Mapping[str, Any]], window: Mapping[str, Any] | None = None) -> Projection:
+        """按这套规则投影；窗口用 ``window``，不是 ``self.window``：用哪个窗口由调用方定。"""
+        return project(
+            entries, window, events=self.events, summary=self.summary, message=self.message, estimate=self.estimate
+        )
 
 
 @dataclass(eq=False)
@@ -333,6 +454,14 @@ class Projection:
     summary: Mapping[str, Any] | None = None
 
 
+Estimate = Callable[[Mapping[str, Any]], int]
+
+
+def default_summary_message(entry: Mapping[str, Any]) -> Message:
+    """摘要缺省渲染成的消息（协议包的 ``defaultSummaryMessage``）：一条用户消息。"""
+    return {'role': 'user', 'content': f'{SUMMARY_PREFIX}{entry.get("text", "")}'}
+
+
 def latest_summary(entries: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
     """生效的摘要：``covers`` 最大的那一条，``covers`` 相同时 ``seq`` 大的（后写的）。"""
     found: Mapping[str, Any] | None = None
@@ -348,8 +477,10 @@ def latest_summary(entries: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | 
     return found
 
 
-def _item(message: Message, first: int, last: int, at: int, pinned: bool = False) -> ProjectedMessage:
-    return ProjectedMessage(message, first, last, at, pinned, estimate_tokens(message))
+def _item(
+    message: Message, first: int, last: int, at: int, estimate: Estimate, pinned: bool = False
+) -> ProjectedMessage:
+    return ProjectedMessage(message, first, last, at, pinned, estimate(message))
 
 
 def _blocks(items: Sequence[ProjectedMessage]) -> list[list[ProjectedMessage]]:
@@ -363,7 +494,7 @@ def _blocks(items: Sequence[ProjectedMessage]) -> list[list[ProjectedMessage]]:
     return out
 
 
-def _paired(group: list[ProjectedMessage]) -> list[ProjectedMessage]:
+def _paired(group: list[ProjectedMessage], estimate: Estimate) -> list[ProjectedMessage]:
     """一组里的工具调用和结果按 ``id`` 配对：结果找不到同组的调用就去掉，调用找不到结果就补一条错误结果。
     服务商自己执行的调用（``providerExecuted``）不补。"""
     first, *results = group
@@ -388,7 +519,7 @@ def _paired(group: list[ProjectedMessage]) -> list[ProjectedMessage]:
             out.append(item)
         elif kept:
             trimmed = {**item.message, 'content': kept}
-            out.append(replace(item, message=trimmed, tokens=estimate_tokens(trimmed)))
+            out.append(replace(item, message=trimmed, tokens=estimate(trimmed)))
     missing = [(call_id, name) for call_id, name in calls.items() if call_id not in answered]
     if missing:
         message = {
@@ -398,7 +529,7 @@ def _paired(group: list[ProjectedMessage]) -> list[ProjectedMessage]:
                 for call_id, name in missing
             ],
         }
-        out.append(_item(message, first.first, first.last, first.at))
+        out.append(_item(message, first.first, first.last, first.at, estimate))
     return out
 
 
@@ -406,10 +537,12 @@ def _starts_with_user(group: Sequence[ProjectedMessage]) -> bool:
     return bool(group) and group[0].message.get('role') == 'user'
 
 
-def _shortened(item: ProjectedMessage, max_tokens: float, cut: set[ProjectedMessage]) -> ProjectedMessage:
+def _shortened(
+    item: ProjectedMessage, max_tokens: float, cut: set[ProjectedMessage], estimate: Estimate
+) -> ProjectedMessage:
     """把 ``item`` 截到 ``max_tokens`` 以内；截不动（或没变小）就原样返回。截过的记进 ``cut``。"""
-    message = truncate_message(item.message, max_tokens)
-    tokens = estimate_tokens(message)
+    message = truncate_message(item.message, max_tokens, estimate)
+    tokens = estimate(message)
     if message is item.message or tokens >= item.tokens:
         return item
     shorter = replace(item, message=message, tokens=tokens)
@@ -418,7 +551,9 @@ def _shortened(item: ProjectedMessage, max_tokens: float, cut: set[ProjectedMess
     return shorter
 
 
-def _capped(groups: list[list[ProjectedMessage]], budget: float, cut: set[ProjectedMessage]) -> None:
+def _capped(
+    groups: list[list[ProjectedMessage]], budget: float, cut: set[ProjectedMessage], estimate: Estimate
+) -> None:
     """单条消息封顶：超过历史预算一半的截到一半。从最新的一组往回做，累计超过预算就停。就地改 ``groups``。"""
     cap = max(_MIN_TRUNCATED_TOKENS, math.floor(budget / 2))
     total = 0
@@ -427,12 +562,12 @@ def _capped(groups: list[list[ProjectedMessage]], budget: float, cut: set[Projec
         group = groups[index]
         for at, item in enumerate(group):
             if item.tokens > cap:
-                group[at] = _shortened(item, cap, cut)
+                group[at] = _shortened(item, cap, cut, estimate)
             total += group[at].tokens
         index -= 1
 
 
-def _fitted(kept: list[ProjectedMessage], excess: float, cut: set[ProjectedMessage]) -> None:
+def _fitted(kept: list[ProjectedMessage], excess: float, cut: set[ProjectedMessage], estimate: Estimate) -> None:
     """裁到不能再裁还超 ``excess`` 个 token：从最大的消息截起，摘要最后才动。就地改 ``kept``。"""
     order = sorted(range(len(kept)), key=lambda at: (kept[at].pinned, -kept[at].tokens))
     left = excess
@@ -442,13 +577,16 @@ def _fitted(kept: list[ProjectedMessage], excess: float, cut: set[ProjectedMessa
         item = kept[at]
         if item.tokens <= _MIN_TRUNCATED_TOKENS:
             continue
-        shorter = _shortened(item, max(_MIN_TRUNCATED_TOKENS, item.tokens - left), cut)
+        shorter = _shortened(item, max(_MIN_TRUNCATED_TOKENS, item.tokens - left), cut, estimate)
         left -= item.tokens - shorter.tokens
         kept[at] = shorter
 
 
 def _windowed(
-    pinned: list[ProjectedMessage], rest: list[ProjectedMessage], window: Mapping[str, Any] | None
+    pinned: list[ProjectedMessage],
+    rest: list[ProjectedMessage],
+    window: Mapping[str, Any] | None,
+    estimate: Estimate,
 ) -> tuple[list[ProjectedMessage], int, int]:
     max_messages = None if window is None else window.get('maxMessages')
     max_tokens = None if window is None else window.get('maxTokens')
@@ -459,7 +597,7 @@ def _windowed(
         if group[0].message.get('role') == 'tool':
             dropped += len(group)
             continue
-        groups.append(_paired(group))
+        groups.append(_paired(group, estimate))
     if max_messages is None and max_tokens is None:
         return [*pinned, *(item for group in groups for item in group)], dropped, 0
 
@@ -467,7 +605,7 @@ def _windowed(
     cut: set[ProjectedMessage] = set()
     truncating = window is not None and window.get('truncate') is True and max_tokens is not None
     if truncating:
-        _capped(groups, max_tokens - pinned_tokens, cut)
+        _capped(groups, max_tokens - pinned_tokens, cut, estimate)
     count = sum(len(group) for group in groups)
     tokens = pinned_tokens + sum(item.tokens for group in groups for item in group)
 
@@ -494,32 +632,85 @@ def _windowed(
             drop()
     kept = [*pinned, *(item for group in groups[start:] for item in group)]
     if truncating and tokens > max_tokens:
-        _fitted(kept, tokens - max_tokens, cut)
+        _fitted(kept, tokens - max_tokens, cut, estimate)
     return kept, dropped, sum(1 for item in kept if item in cut)
 
 
-def project(entries: Sequence[Mapping[str, Any]], window: Mapping[str, Any] | None = None) -> Projection:
-    """日志 → 这一次交给模型的消息（协议包 ``project`` 的缺省规则：没有事件规则、摘要渲染成用户消息）。
-    ``window`` 是 ``WindowOptions``（``maxMessages``、``maxTokens``、``truncate``），不给或 ``{}`` 不裁剪。"""
+def without_approvals(message: Mapping[str, Any]) -> dict[str, Any] | None:
+    """工具确认的两个部件（``tool-approval-request``、``tool-approval-response``）只给应用看，投影时去掉（协议包的
+    ``withoutApprovals``）：确认了的调用由 harness 执行、写下结果。去掉之后空了的消息不要。"""
+    content = message.get('content')
+    if not isinstance(content, list) or message.get('role') not in ('assistant', 'tool'):
+        return dict(message)
+    kept = [part for part in content if part.get('type') not in ('tool-approval-request', 'tool-approval-response')]
+    if len(kept) == len(content):
+        return dict(message)
+    return {**message, 'content': kept} if kept else None
+
+
+def _as_list(rendered: Rendered) -> list[Message]:
+    if not rendered:
+        return []
+    return [rendered] if isinstance(rendered, Mapping) else list(rendered)
+
+
+def project(
+    entries: Sequence[Mapping[str, Any]],
+    window: Mapping[str, Any] | None = None,
+    *,
+    events: Mapping[str, EventRule] | None = None,
+    summary: Callable[[Mapping[str, Any]], Message] | None = None,
+    message: Callable[[Mapping[str, Any]], Message | None] | None = None,
+    estimate: Estimate | None = None,
+) -> Projection:
+    """日志 → 这一次交给模型的消息（协议包的 ``project``）。``window`` 是 ``WindowOptions``（``maxMessages``、``maxTokens``、
+    ``truncate``），不给或 ``{}`` 不裁剪。``events``、``summary``、``message``、``estimate`` 同 ``ProjectionOptions``；都不给
+    就是缺省规则：事件不进上下文，摘要渲染成一条用户消息。"""
+    measure = estimate or estimate_tokens
     ordered = sorted(entries, key=lambda entry: (entry.get('at', 0), entry.get('seq', 0)))
-    summary = latest_summary(ordered)
+    found = latest_summary(ordered)
     pinned: list[ProjectedMessage] = []
-    if summary is not None:
-        message = {'role': 'user', 'content': f'{SUMMARY_PREFIX}{summary.get("text", "")}'}
-        pinned.append(_item(message, summary['covers'], summary['covers'], summary.get('at', 0), True))
-    rest = [
-        _item(dict(entry['message']), entry['seq'], entry['seq'], entry.get('at', 0))
+    if found is not None:
+        rendered = (summary or default_summary_message)(found)
+        pinned.append(_item(rendered, found['covers'], found['covers'], found.get('at', 0), measure, pinned=True))
+    rules = events or {}
+    # 没有规则的事件对模型不可见，也不打断前后同类事件的合并。
+    shown = [
+        entry
         for entry in ordered
-        if entry.get('type') == 'message' and (summary is None or entry['seq'] > summary['covers'])
+        if (found is None or entry['seq'] > found['covers'])
+        and (entry.get('type') == 'message' or (entry.get('type') == 'event' and entry.get('kind') in rules))
     ]
-    kept, dropped, truncated = _windowed(pinned, rest, window)
+    rest: list[ProjectedMessage] = []
+    index = 0
+    while index < len(shown):
+        entry = shown[index]
+        index += 1
+        if entry.get('type') == 'message':
+            rewritten = entry['message'] if message is None else message(entry)
+            visible = without_approvals(rewritten) if rewritten else None
+            if visible is not None:
+                rest.append(_item(visible, entry['seq'], entry['seq'], entry.get('at', 0), measure))
+            continue
+        rule = rules[entry['kind']]
+        group = [entry]
+        if rule.fold:
+            while index < len(shown) and shown[index].get('type') == 'event' and shown[index]['kind'] == entry['kind']:
+                group.append(shown[index])
+                index += 1
+        first = min(member['seq'] for member in group)
+        last = max(member['seq'] for member in group)
+        # 一组按 `at` 排好了，最后一条的 `at` 最晚。
+        at = group[-1].get('at', 0)
+        rest.extend(_item(one, first, last, at, measure) for one in _as_list(rule.render(group)))
+    kept, dropped, truncated = _windowed(pinned, rest, window, measure)
     return Projection(
         messages=[item.message for item in kept],
         items=kept,
         tokens=sum(item.tokens for item in kept),
         dropped=dropped,
         truncated=truncated,
-        summary=summary,
+        summary=found,
     )
 
 

@@ -49,9 +49,10 @@ export interface SqliteMemoryStore extends MemoryStore {
  *    `recalls` 超过 `MAX_FACT_RECALLS` 个的截到最近的那些。
  * 4：`notes` 加 `attempts`、`error`、`failed_at`（失败和死信），同一个作用域、会话、区间的笔记唯一（已有的重复只留最早的一条）；
  *    `facts` 加 `fact_key`（幂等键），一个作用域里唯一。待处理的部分索引换成也排除死信的。
+ * 5：`facts` 加 `at`（写入的时刻）。已有的事实不知道是什么时候写的，补成 `valid_from`，激活度和以前一样算。
  * 同一级的结构可能是之前的提交建的，所以版本号对得上时也要查实际的表、列和索引（见 `memoryRepairs`）。
  */
-const MEMORY_SCHEMA_VERSION = 4;
+const MEMORY_SCHEMA_VERSION = 5;
 const MEMORY_SCHEMA_KEY = 'memory_schema';
 
 /** 待处理的笔记：没处理过、也没进死信。`list({ pending: true })` 和部分索引用同一段文字。 */
@@ -132,6 +133,7 @@ function memoryTables(prefix: string): MemoryTable[] {
         predicate TEXT,
         text TEXT NOT NULL,
         topic TEXT,
+        at INTEGER NOT NULL,
         valid_from INTEGER NOT NULL,
         valid_to INTEGER,
         superseded_by TEXT,
@@ -142,7 +144,8 @@ function memoryTables(prefix: string): MemoryTable[] {
         archived_at INTEGER,
         fact_key TEXT
       )`,
-      columns: { fact_key: 'fact_key TEXT' },
+      // 老库补的 `at` 不能带 NOT NULL（SQLite 加列时要有缺省值），迁移时按 `valid_from` 补齐（`backfillMemory`）。
+      columns: { fact_key: 'fact_key TEXT', at: 'at INTEGER' },
       before: {},
       indexes: {
         // 幂等键一个作用域里唯一；没有键的不限。
@@ -275,8 +278,8 @@ function factIndexer(database: DatabaseSync, prefix: string): (scope: string, fa
 }
 
 /**
- * 版本 3 的数据迁移：还没进索引的事实补进去，过长的 `recalls` 截到最近 `MAX_FACT_RECALLS` 个。
- * 只动缺的和超长的，重复执行没有副作用。
+ * 数据迁移：还没进索引的事实补进去，过长的 `recalls` 截到最近 `MAX_FACT_RECALLS` 个（版本 3），没有写入时刻的
+ * 补成 `valid_from`（版本 5）。只动缺的和超长的，重复执行没有副作用。
  */
 function backfillMemory(database: DatabaseSync, prefix: string): void {
   const facts = `${prefix}facts`;
@@ -293,6 +296,7 @@ function backfillMemory(database: DatabaseSync, prefix: string): void {
   const trim = database.prepare(`UPDATE ${facts} SET recalls = ? WHERE id = ?`);
   for (const row of long)
     trim.run(JSON.stringify((JSON.parse(row.recalls) as number[]).slice(-MAX_FACT_RECALLS)), row.id);
+  database.exec(`UPDATE ${facts} SET at = valid_from WHERE at IS NULL`);
 }
 
 /** 和会话存储的 `migrate` 同一个模式：先不加锁看一眼，结构完整就不写；否则在写锁里重读版本、补齐、记版本。 */
@@ -336,6 +340,7 @@ interface FactRow {
   predicate: string | null;
   text: string;
   topic: string | null;
+  at: number;
   valid_from: number;
   valid_to: number | null;
   superseded_by: string | null;
@@ -388,6 +393,7 @@ function decodeFact(row: FactRow): MemoryFact {
     ...optional('predicate', row.predicate),
     text: row.text,
     ...optional('topic', row.topic),
+    at: row.at,
     validFrom: row.valid_from,
     ...optional('validTo', row.valid_to),
     ...optional('supersededBy', row.superseded_by),
@@ -498,7 +504,7 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
     `UPDATE ${notes} SET settled_at = ? WHERE id = ? AND scope = ? AND ${PENDING_NOTE}`,
   );
   const insertFact = database.prepare(
-    `INSERT INTO ${facts} (id, scope, subject, predicate, text, topic, valid_from, confidence, salience, sources, fact_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO ${facts} (id, scope, subject, predicate, text, topic, at, valid_from, confidence, salience, sources, fact_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const selectFact = database.prepare(`SELECT * FROM ${facts} WHERE id = ? AND scope = ?`);
   const selectKey = database.prepare(`SELECT * FROM ${facts} WHERE scope = ? AND fact_key = ?`);
@@ -543,6 +549,7 @@ export function createSqliteMemoryStore(options: SqliteMemoryStoreOptions): Sqli
         draft.predicate ?? null,
         draft.text,
         draft.topic ?? null,
+        draft.at ?? draft.validFrom,
         draft.validFrom,
         draft.confidence,
         draft.salience,

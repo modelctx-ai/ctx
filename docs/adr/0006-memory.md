@@ -149,3 +149,11 @@ ACT-R 的基础激活 `A = ln Σ (Δt_i + ε)^(−d) + s`：每次召回是一�
   6. **System One 的请求有超时**：`SystemOneSpec.timeoutMs`（缺省 30 秒），超时是可以重试的 `timeout`。
 
   2026-10-27 的待办里「`NoteQuery` 没有时间过滤」做了（`NoteQuery.since`）。破坏面：自己实现 `MemoryStore` 的要加七个方法（`notes.fail`、`retry`、`forget`，`facts.supersede`、`reopen`，`procedures.forget`，`core.clear`）和 `key`、同一段笔记去重的语义；自己实现 `Memory` 的要加 `forget`；构造 `ConsolidateReport` 的要加 `failed`、`dead`。SQLite 的记忆结构升到 4。
+
+- 2026-11-19：事实记下写入的时刻（2026-10-27 的待办第三条，2026-11-15「这次没做」的第一条）。上面的决定 6 和 2026-11-15 的修订 5 按下面的读：
+  1. **`MemoryFact.at`**：写进记忆的时刻，和 `validFrom`（从何时起成立）分开。`NewMemoryFact` 里可选，不给时存储记成 `validFrom`；参考实现夜里写的事实是这一夜的 `now`。
+  2. **激活度从写入算起**（修订决定 6 的 `t_i`）：`t_i` 是 `at`、晚于 `at` 的 `validFrom` 和最近 32 次召回，以前是 `validFrom` 和召回。提取出的事实可能一年前就成立了，从 `validFrom` 算的话刚写进来就在阈值以下，「错过的机会」也从那天数起，第二夜就可能归档；「这一轮写的不在同一轮归档」只挡得住第一夜。写的时候还没成立的，成立那天也算一次：临近成立时回升，成立以后再衰减（修订 5 的「按离现在多远算」不变）。上界从 `ln(33 · ε^(−d)) + s` 变成 `ln(34 · ε^(−d)) + s`。参考实现数「错过的机会」也从写入算起。
+  3. **没给 `at` 的当成立时就记下了**：老数据、导入的和手写的事实不知道是什么时候记下的。没有选「必填」：直接写 `facts.add` 的调用方（应用的种子数据、测试）都要改，而它们给的 `validFrom` 本来就是「那时记下的」。也没有选「存储按自己的钟填」：存储不看钟。
+  4. 召回的 `since`（工具的 `since_days`）仍然按 `validFrom` 筛：它问的是「最近开始成立的」。
+
+  破坏面：自己实现 `MemoryStore` 的要存 `at`（没给时等于 `validFrom`），契约测试查；自己构造 `MemoryFact`、调 `activation` 或 `retrievability` 的要带 `at`。SQLite 的记忆结构升到 5，已有的事实 `at` 补成 `valid_from`，激活度和升级前一样。

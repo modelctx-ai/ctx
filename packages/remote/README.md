@@ -2,10 +2,10 @@
 
 把 ctx 的协议搬到 HTTP 上：会话存储、执行环境、harness、编排器、记忆存储都能放到进程边界的另一侧。服务端把进程内的协议对象挂成 HTTP 路径，客户端把这些路径还原成协议的接口。两头都只认协议：服务端挂的可以是核心包、`ctx-sqlite`、`ctx-exec` 或你自己的实现，客户端拿到的就是 `SessionStore`、`Executor`、`Harness`、`Orchestrator`、`MemoryStore`，交给任何认协议的代码用。只依赖 `@modelctx-ai/ctx-protocol`。
 
-| 入口                             | 内容                                                                                                                                     | 运行环境                                                                       |
-| -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `@modelctx-ai/ctx-remote`        | 客户端：`createRemoteSessionStore`、`createRemoteExecutor`、`createRemoteHarness`、`createRemoteOrchestrator`、`createRemoteMemoryStore` | 任何有 `fetch` 的运行时（Node、Deno、Bun、浏览器、Workers），不用 `node:` 模块 |
-| `@modelctx-ai/ctx-remote/server` | 服务端：`createRemoteHandler`、`startRemote`                                                                                             | Node ≥22（`node:http`）                                                        |
+| 入口                             | 内容                                                                                                                                                           | 运行环境                                                                       |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `@modelctx-ai/ctx-remote`        | 客户端：`createRemoteSessionStore`、`createRemoteExecutor`、`createRemoteHarness`、`createRemoteOrchestrator`、`createRemoteMemoryStore`、`createRemoteWorker` | 任何有 `fetch` 的运行时（Node、Deno、Bun、浏览器、Workers），不用 `node:` 模块 |
+| `@modelctx-ai/ctx-remote/server` | 服务端：`createRemoteHandler`、`startRemote`                                                                                                                   | Node ≥22（`node:http`）                                                        |
 
 ## 安装
 
@@ -97,12 +97,13 @@ createServer((req, res) => {
 | `maxBodyBytes`         | 4 MiB                      | 请求体上限，超过 413                                                                                                                                                     |
 | `basePath`             | `''`                       | 路径前缀                                                                                                                                                                 |
 | `maxListEntries`       | 1000                       | `GET …/entries` 一次最多回多少条；更长时响应带 `more: true`，本包的客户端自己接着读                                                                                      |
-| `pollIntervalMs`       | 250                        | 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔                                                                                                          |
+| `pollIntervalMs`       | 250                        | 存储没有 `watch` 时，`entries/stream` 轮询 `list(after)` 的间隔；领工作的长轮询也按它重扫                                                                                |
 | `retainResultsMs`      | 10 分钟                    | 经这个服务提交给编排器的运行，结束后结果在内存里留多久（最多 1000 个）。过了这段时间或者服务重启过，挂着 `store` 时从会话日志的 `ctx.run.ended` 还原                     |
 | `heartbeatMs`          | 15 秒                      | 没有数据可发时隔多久发一次心跳，0 是不发。见「长请求和断线」                                                                                                             |
 | `maxRuns`              | 32                         | `POST /runs` 同时跑的上限，满了 429                                                                                                                                      |
 | `maxExecutions`        | 64                         | `POST /executors/:name/execute` 同时跑的上限，满了 429                                                                                                                   |
 | `maxStreams`           | 256                        | 同时开着的 `entries/stream` 和 `orchestrator/events` 流的上限，满了 429                                                                                                  |
+| `workLeaseMs`          | 5 分钟                     | `POST /work/:executor/claim` 领到的调用多久之内不再给别的领取；请求里的 `leaseMs` 优先。租约在这个进程的内存里，几个服务实例之间不共享、重启就没了                       |
 | `maxPendingRuns`       | 1024                       | 经 `POST /orchestrator/runs` 提交、还没结束（排队的加正在跑的）的运行的上限，满了 429。编排器自己只限同时跑几个，排队的不限                                              |
 | `logger`               | 不出声                     | 协议的 `Logger`。内部出的错在这里 `warn`，带着回给调用方的那个编号（`ref`）                                                                                              |
 | `host`、`port`         | `127.0.0.1`、`0`           | 只有 `startRemote`：监听地址；返回 `{ origin, baseUrl, close }`，`close` 断开所有连接、不关组件                                                                          |
@@ -145,7 +146,34 @@ await orchestrator.close(); // 只关这个客户端
 | `createRemoteHarness(…)`                                                                     | `Harness`：`run`、`stream`。`agent.model` 不是字符串就抛。`signal` 中止时发 `DELETE /runs/:runId`，`run` 照常返回 `stopReason: aborted`；`stream` 提前不读就断开连接，服务端同样中止并写 `ctx.run.ended`                                                                                                                                                                                                                                                        |
 | `createRemoteOrchestrator({ …, waitMs? })`                                                   | `Orchestrator`：`submit`、`status`、`cancel`、`recover`、`events`、`close`。`done` 用长轮询 `GET /orchestrator/runs/:id?wait=&session=` 实现（每次最多等 `waitMs`，缺省 25 秒），连不上时按 `retry` 重试，服务重启后结果从会话日志还原（服务端要挂着 `store`）；`close` 只关这个客户端：不再提交、结束它的事件流、等它提交的运行结束。`events` 断了按 `retry` 退避重连，断开那一阵的事件收不到（事件没有位置可以续接），要不漏就按 `runId` 查状态或者看会话日志 |
 
-选项的类型是 `RemoteClientOptions`（`baseUrl`、`accessToken?`、`headers?`、`fetch?`、`retry?: RetryOptions`、`checkProtocol?`），会话存储是 `RemoteSessionStoreOptions`（多一个 `unreadable?`），记忆存储是 `RemoteMemoryStoreOptions`（多一个 `scope?`），执行环境是 `RemoteExecutorOptions`（多一个 `name`），编排器是 `RemoteOrchestratorOptions`（多一个 `waitMs?`）。
+选项的类型是 `RemoteClientOptions`（`baseUrl`、`accessToken?`、`headers?`、`fetch?`、`retry?: RetryOptions`、`checkProtocol?`），会话存储是 `RemoteSessionStoreOptions`（多一个 `unreadable?`），记忆存储是 `RemoteMemoryStoreOptions`（多一个 `scope?`），执行环境是 `RemoteExecutorOptions`（多一个 `name`），编排器是 `RemoteOrchestratorOptions`（多一个 `waitMs?`），worker 是 `RemoteWorkerOptions`（见下）。
+
+### 在内网的 worker
+
+执行环境只能出站连接（没有入站端口、在内网）时，不要把它挂成服务端的 `executors`：让 harness 把它列进 `external`（[ADR 0008](../../docs/adr/0008-tool-calls-through-the-log.md)），worker 按执行环境的名字向服务端领工作。它不用知道有哪些会话：harness 停下时在 `ctx.run.ended` 里记下了每个调用归谁。
+
+```ts
+import { createFunctionExecutor } from '@modelctx-ai/ctx';
+import { createRemoteWorker } from '@modelctx-ai/ctx-remote';
+
+// 名字和 harness 的 `external`、工具定义的 `executor` 一样
+const executor = createFunctionExecutor('warehouse').register(
+  { name: 'lookup', description: '查内网的订单', inputSchema: { type: 'object' } },
+  async (input) => ({ type: 'text', text: await queryOrders(input) }),
+);
+const worker = createRemoteWorker({ baseUrl: 'https://agents.example.com/ctx', accessToken, executor });
+await worker.run(AbortSignal.timeout(8 * 3600_000)); // 领到就执行、把结果写回会话，直到中止
+```
+
+结果都齐了以后，由应用不带输入再跑一轮（`submit({ session, agent })`），模型从日志接着走。
+
+| `createRemoteWorker({ …, executor, limit?, leaseMs?, maxOutputChars?, source? })` | 行为                                                                                                                                                                                                                                                                                                    |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `claim({ limit?, waitMs?, leaseMs?, signal? })`                                   | 只领不执行：`POST /work/:executor/claim`（`executor.name`），返回 `ClaimedToolCall[]`（`PendingToolCall` 加 `session`）。`waitMs` 缺省 0，马上返回；不自动重试                                                                                                                                          |
+| `step({ waitMs?, signal? })`                                                      | 领一批（`limit`，缺省 8）、一起执行、每个结果截断后（`maxOutputChars`）追加一条 `toolResultEntry`（`source` 缺省是执行环境的名字），返回 `WorkerStep`：`{ executed, failed }`。执行时抛错的、被中止的、结果没写进去的算 `failed`，不记结果，租约过了会再领到；工具回的 `{ type: 'error' }` 照常记成结果 |
+| `run(signal)`                                                                     | 一直 `step`，每次长轮询 25 秒，直到 `signal` 中止后正常返回。连不上、429、5xx 按 `retry` 的退避再试；别的错（401、服务端没挂会话存储的 404、版本不对）抛出来                                                                                                                                            |
+
+返回值的类型是 `RemoteWorker`，`claim` 的选项是 `ClaimOptions`，领到的调用是 `ClaimedToolCall`（`/server` 也导出这个类型）。领到的调用在租约内（`leaseMs`，缺省服务端的 `workLeaseMs`）不再给别的领取，执行可能比它久时调大；租约在服务端进程的内存里，几个服务实例之间可能重复执行，同一次调用的结果只记一条靠幂等键。有副作用的工具要自己幂等。
 
 客户端第一次请求之前读一次 `GET /protocol`（`checkProtocolInfo`）：协议版本和这一端的 `PROTOCOL_VERSION` 不同、对方写的条目格式比这一端新，或者服务端没有这个入口（0.3 之前的版本、不是 ctx 的服务），都抛 `unsupported_version`，不发后面的请求。连不上不算版本不对，下一次请求再握手。对面是只实现了部分路径的服务时给 `checkProtocol: false`。
 
@@ -168,8 +196,8 @@ await orchestrator.close(); // 只关这个客户端
   ```
 
 - **长任务走编排器，不走 `POST /runs`**。同步的 `POST /runs` 在客户端断开时会中止这一轮：跑几十分钟的任务过不了带空闲超时、又会吃掉心跳的代理。长任务用 `POST /orchestrator/runs` 提交，`done` 靠 `GET /orchestrator/runs/:id?wait=` 的长轮询拿结果，断了重连不影响服务端那一轮。
-- **在内网的执行环境**。执行环境只能出站连接时，不要把它挂成服务端的 `executors`：让 harness 把它列进 `external`（[ADR 0008](../../docs/adr/0008-tool-calls-through-the-log.md)），内网的 worker 用 `createRemoteSessionStore` 连过来，`runPendingTools` 执行等待中的调用、把结果追加回会话。
-- **重试**。`retry: { retries?, minDelayMs?, maxDelayMs? }`（缺省 4 次，200 毫秒起每次翻倍、带抖动，最多 5 秒）。连不上、连接中途断了、服务端回 429/502/503/504 时重试，只用在重试了也不会多做一遍的请求上：所有 `GET`、会话的 `append`、两个取消、`watch` 和编排器 `events` 的重连、编排器的 `done`。提交运行、执行工具、记忆的写入不重试。
+- **在内网的执行环境**。执行环境只能出站连接时用 `createRemoteWorker` 领工作（见「在内网的 worker」）；知道去哪些会话找时，也可以用 `createRemoteSessionStore` 连过来，交给核心包的 `runPendingTools`。
+- **重试**。`retry: { retries?, minDelayMs?, maxDelayMs? }`（缺省 4 次，200 毫秒起每次翻倍、带抖动，最多 5 秒）。连不上、连接中途断了、服务端回 429/502/503/504 时重试，只用在重试了也不会多做一遍的请求上：所有 `GET`、会话的 `append`、两个取消、`watch` 和编排器 `events` 的重连、编排器的 `done`。提交运行、执行工具、领工作、记忆的写入不重试。
 - **`append` 重试后的返回值**。第一次其实写成功、只是响应丢了的条目，重试时会被存储按 `id` 去重跳过；客户端从会话末尾（最近 200 条）把它们找回来放进返回值。带 `expectSeq` 的一批重试时得到的冲突，如果自己的条目已经在了，算成功，不抛 `conflict`。
 - **比客户端新的条目**。服务端先升级、条目的 `v` 比这个客户端认识的高时，`list`、`watch`、`append` 的返回值缺省抛 `unsupported_version`；`unreadable: 'placeholder'` 时那一条换成 `ctx.unreadable` 事件，其余照常（见[协议层](../../docs/protocol.md#会话-sessionstore)）。
 
@@ -256,6 +284,7 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 |          | `execute`        | `POST /executors/:name/execute`                                                   | `{ call: ToolCall, context: { session, runId? } }` | `{ output: ToolOutput }`                                          |
 |          | `open`           | `POST /executors/:name/sessions/:session/open`                                    | `{ environment?: EnvironmentSpec }`                | `{}`；执行环境没有 `open` 时什么都不做                            |
 |          | `close`          | `DELETE /executors/:name/sessions/:session`                                       | —                                                  | `{}`                                                              |
+|          | （领工作）       | `POST /work/:executor/claim`                                                      | `{ limit?, waitMs?, leaseMs? }`                    | `{ calls: ClaimedToolCall[] }`                                    |
 | Harness  | `run`            | `POST /runs`                                                                      | `RunRequest` 去掉 `signal`，可加 `aborted: true`   | `RunResult`                                                       |
 |          | `stream`         | `POST /runs?stream=1`                                                             | 同上                                               | NDJSON，每行一个 `RunEvent`                                       |
 |          | （`signal`）     | `DELETE /runs/:runId`                                                             | —                                                  | `{ cancelled: boolean }`                                          |
@@ -275,6 +304,7 @@ JSON 请求和响应，流式用 NDJSON（`application/x-ndjson`，每行一个�
 - harness 的取消：客户端断开（`stream` 不读了、进程崩了）时服务端中止这一轮；`signal` 中止时客户端发 `DELETE /runs/:runId`，同一个 `POST /runs` 照常回 `RunResult`（`stopReason: aborted`）。`DELETE` 比 `POST` 先到时服务端记一分钟，那一轮到了就以已中止开始。`signal` 在发出前已经中止时请求体带 `aborted: true`，服务端照样写 `ctx.run.started` / `ctx.run.ended`。
 - `GET /orchestrator/runs/:runId?wait=<ms>` 是长轮询：这一轮没结束时最多等 `wait` 毫秒（上限 30 秒）再回；结束了就带上 `result`（或 harness 抛错时的 `error`）。结果不在内存里了（过了 `retainResultsMs`、服务重启过，或者编排器已经不认识这个 `runId`）而请求带着 `session`、服务端又挂着 `store` 时，从会话日志还原：找这一轮的 `ctx.run.ended`，`recorded` 是它和 `ctx.run.started` 之间的条目，`messages` 是其中模型写的消息，`status` 按 `stopReason` 推出来。
 - `GET /orchestrator/events` 先订阅再回响应头：客户端拿到响应头以后提交的运行，事件一定在这条流里。客户端在提交前会等自己正在建立的事件流连上。
+- `POST /work/:executor/claim` 按名字一页页扫主体看得见的会话：每个会话读一次最后的生命周期事件，最后一轮以 `requires_action` 停下的才往下读，挑出 `ctx.run.ended` 记着归这个执行环境、不等确认（或者已经确认了）、不在租约里的调用，最多 `limit` 个（缺省 16，最多 100），各占 `leaseMs`。一个都没有时长轮询，每 `pollIntervalMs` 重扫，最多等 `waitMs`（上限 30 秒）；调用方中途断开就不再扫，已经领到的放回去。扫描的代价和会话数成正比。请求体不对 400，服务端没挂会话存储 404。
 - 编排器的路径放在 `/orchestrator` 下，和 harness 的 `/runs` 分开：同一个服务可以同时挂两者，`POST /runs` 是「现在跑一轮、等结果」，`POST /orchestrator/runs` 是「排队」。
 
 ## 鉴权和安全缺省
@@ -319,7 +349,7 @@ const server = await startRemote({
 
 - 带会话的入口按 `sessionPrefixes` 查（按字面的前缀）：`/sessions/:session/…`、`execute` 的 `context.session`、`/executors/:name/sessions/:session`、`POST /runs` 和 `POST /orchestrator/runs` 的 `session`、`parent.session`、`agent.context.inherit.session`，`DELETE /runs/:runId` 那一轮的会话。
 - 编排器的 `status`、`cancel` 按 `runId` 找到经这个服务提交的那一轮的会话再查；限定了会话的主体碰不到不是经这个服务提交的运行（`status` 只能带 `session=` 从会话日志里还原自己的）。
-- `GET /sessions` 只列范围里的；`GET /orchestrator/events` 只发范围里的。
+- `GET /sessions` 只列范围里的；`POST /work/:executor/claim` 只扫范围里的会话；`GET /orchestrator/events` 只发范围里的。
 - `/memory/*` 的 `scope` 按 `memoryScopes` 查。
 - `POST /orchestrator/recover` 横跨所有会话，只有 `admin: true` 能调。
 - `authenticate` 抛错按认不出算（401），原文进 `logger`。
@@ -328,10 +358,9 @@ const server = await startRemote({
 
 ## 之后
 
-- **worker 拉取模式**：执行环境只需出站连接，从 harness 领工作再交回结果（像 Managed Agents 的自托管沙箱），适合没有入站端口的环境。
 - **WebSocket 传输**：一条连接上双向收发事件。
 
-两者都是传输方式的变化，协议不变：客户端拿到的仍是同样的 `Executor`、`Harness`，契约测试照样跑。
+这是传输方式的变化，协议不变：客户端拿到的仍是同样的 `Executor`、`Harness`，契约测试照样跑。
 
 ## 对一个地址跑一致性测试
 

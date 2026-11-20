@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-import { CTX_EVENTS, pendingToolCalls, type Entry, type RunEvent } from '@modelctx-ai/ctx-protocol';
+import { CTX_EVENTS, ctxEventData, pendingToolCalls, type Entry, type RunEvent } from '@modelctx-ai/ctx-protocol';
 import { describe, test } from 'vite-plus/test';
 
 import { createContextBuilder } from './builder.ts';
@@ -74,6 +74,48 @@ describe('工具调用经日志往返', () => {
     assert.equal(second.text, '订单 42 已经发货了');
     assert.match(JSON.stringify(model.doGenerateCalls[1]!.prompt), /订单 42 已发货/);
     assert.equal(calls.length, 2, 'harness 这一侧没有执行');
+  });
+
+  test('ctx.run.ended 记下等着的调用归哪个外部执行环境（等确认的也记），pendingToolCalls 带上它', async () => {
+    const { store, harness } = setup();
+    await harness.run({
+      session: 's',
+      agent: { model: createScriptedModel(script, { tool: 'lookup' }) },
+      input: '订单 42？',
+    });
+    const log = await store.list('s');
+    assert.deepEqual(ctxEventData(log.at(-1), CTX_EVENTS.runEnded)?.executors, { c1: 'worker' });
+    assert.equal(pendingToolCalls(log)[0]?.executor, 'worker');
+    await harness.run({
+      session: 'a',
+      agent: { model: createScriptedModel(script, { tool: 'lookup' }), permissions: { default: 'ask' } },
+      input: '订单 42？',
+    });
+    const [asked] = pendingToolCalls(await store.list('a'));
+    assert.equal(asked?.executor, 'worker');
+    assert.ok(asked?.approval, '确认了才交给 worker');
+  });
+
+  test('在 harness 里执行的调用等确认时不记执行环境', async () => {
+    const store = createMemoryStore();
+    const tools = createToolRegistry();
+    tools.executor.register({ name: 'echo', inputSchema: { type: 'object' } }, (input) => ({
+      type: 'json',
+      value: input,
+    }));
+    tools.add(tools.executor.definition('echo')!);
+    const harness = createHarness({ store, context: createContextBuilder({ store }), tools, external: ['worker'] });
+    const result = await harness.run({
+      session: 's',
+      agent: { model: createScriptedModel(script), permissions: { default: 'ask' } },
+      input: '回显',
+    });
+    assert.equal(result.stopReason, 'requires_action');
+    const log = await store.list('s');
+    const ended = ctxEventData(log.at(-1), CTX_EVENTS.runEnded);
+    assert.equal(ended?.stopReason, 'requires_action');
+    assert.equal(ended?.executors, undefined);
+    assert.equal(pendingToolCalls(log)[0]?.executor, undefined);
   });
 
   test('stream 也一样；不归这个执行环境的调用留在 remaining', async () => {

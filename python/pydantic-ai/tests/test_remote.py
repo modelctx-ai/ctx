@@ -9,13 +9,21 @@ from typing import Any
 
 import pytest
 
-from conftest import serve, ts_pending, ts_run
-from ctx_pydantic_ai import CtxError, PydanticAIHarness, RemoteExecutor, RemoteSessionStore
+from conftest import serve, ts_claim, ts_pending, ts_run
+from ctx_pydantic_ai import CtxError, PydanticAIHarness, RemoteExecutor, RemoteSessionStore, tool_approval_entry
 from ctx_pydantic_ai.testing import ScriptedModel
 
 
 def run(coroutine: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(coroutine())
+
+
+async def _append(remote: dict[str, Any], session: str, entry: dict[str, Any]) -> None:
+    store = RemoteSessionStore(remote['baseUrl'], access_token=remote['token'])
+    try:
+        await store.append(session, [entry])
+    finally:
+        await store.aclose()
 
 
 def test_session_store_against_ctx_remote(ctx_remote: dict[str, Any]) -> None:
@@ -117,6 +125,45 @@ def test_a_run_writes_through_ctx_remote(ctx_remote: dict[str, Any]) -> None:
     run(main)
 
 
+def test_a_typescript_worker_claims_what_the_python_harness_left(node: str, ctx_remote: dict[str, Any]) -> None:
+    # Python 的 harness 停下等外部执行环境 `local`：TypeScript 的 worker 不给会话名，按名字领走（`POST /work/local/claim`），
+    # 交给 ctx-remote 上的 `local` 执行、结果追加回会话，Python 的 harness 下一轮接着走。
+    async def main() -> None:
+        store = RemoteSessionStore(ctx_remote['baseUrl'], access_token=ctx_remote['token'])
+        echo = {
+            'name': 'echo',
+            'description': '原样返回输入',
+            'inputSchema': {'type': 'object', 'properties': {'text': {'type': 'string'}}},
+            'executor': 'local',
+        }
+        model = ScriptedModel(
+            [{'type': 'tool-call', 'id': 'c1', 'input': {'text': 'hi'}}, {'type': 'text', 'text': '回显好了'}]
+        )
+        harness = PydanticAIHarness(store=store, tools=[echo], external=['local'], models={'scripted': model})
+        session = 'py/work 领'
+        try:
+            first = await harness.run({'session': session, 'agent': {'model': 'scripted'}, 'input': '回显'})
+            assert first['stopReason'] == 'requires_action', first
+            remote = {'baseUrl': ctx_remote['baseUrl'], 'token': ctx_remote['token']}
+            done = ts_claim(node, {**remote, 'executor': 'local'})
+            assert done['failed'] == []
+            [claimed] = done['executed']
+            assert claimed['session'] == session
+            assert claimed['executor'] == 'local'
+            assert claimed['call'] == first['pending'][0]
+            assert ts_claim(node, {**remote, 'executor': 'local'}) == {'executed': [], 'failed': []}
+            tool = (await store.list(session))[-1]
+            assert tool['source'] == 'local'
+            assert tool['message']['content'][0]['output'] == {'type': 'json', 'value': {'text': 'hi'}}
+            second = await harness.run({'session': session, 'agent': {'model': 'scripted'}})
+            assert second['stopReason'] == 'end_turn', second
+            assert second['text'] == '回显好了'
+        finally:
+            await store.aclose()
+
+    run(main)
+
+
 def test_the_typescript_client_drives_serve(node: str, ctx_remote: dict[str, Any]) -> None:
     # pydantic-ai 自带的 `test` 模型：把给它的工具各调一次，再用文字报结果。
     server = serve(
@@ -152,13 +199,22 @@ def test_the_typescript_client_drives_serve(node: str, ctx_remote: dict[str, Any
         assert kinds[0] == 'run.started'
         assert kinds[-1] == 'run.ended'
         assert streamed['result']['stopReason'] == 'end_turn'
-        # `ask`：停下来等应用确认。应用用 `runPendingTools` 交给 ctx-remote 上的执行环境、把结果追加进会话，再不带输入跑一轮。
+        # `ask`：停下来等应用确认。没确认时 `runPendingTools` 不碰它；应用追加确认以后，它交给 ctx-remote 上的执行环境、
+        # 把结果追加进会话，再不带输入跑一轮。
         asked = {'session': 'py/serve-ask', 'agent': {'model': 'test', 'permissions': {'default': 'ask'}}}
         waiting = ts_run(node, {'baseUrl': server.url, 'token': 'serve-token', 'request': {**asked, 'input': '用一下'}})
         assert waiting['result']['stopReason'] == 'requires_action', waiting
         pending = waiting['result']['pending']
         assert [call['name'] for call in pending] == ['echo']
+        [approval] = waiting['result']['approvals']
+        assert approval['callId'] == pending[0]['id']
         remote = {'baseUrl': ctx_remote['baseUrl'], 'token': ctx_remote['token']}
+        early = ts_pending(node, {**remote, 'session': 'py/serve-ask', 'executor': 'local'})
+        assert early['executed'] == []
+        assert early['remaining'][0]['approval'] == {'approvalId': approval['approvalId']}
+        asyncio.run(
+            _append(ctx_remote, 'py/serve-ask', tool_approval_entry(approval['approvalId'], {'approved': True}))
+        )
         done = ts_pending(node, {**remote, 'session': 'py/serve-ask', 'executor': 'local'})
         assert [item['call'] for item in done['executed']] == pending
         assert done['remaining'] == []

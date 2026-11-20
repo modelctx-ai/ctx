@@ -14,7 +14,7 @@ import math
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import jsonschema
 import pydantic_ai
@@ -61,11 +61,16 @@ from pydantic_ai.usage import UsageLimits
 
 from .compact import Summarize, compact_session
 from .context import (
+    DEFAULT_SOURCE_TIMEOUT_MS,
+    ContextSource,
+    Estimate,
+    ProjectionOptions,
     calibration_of,
+    collect_facts,
     estimate_text_tokens,
     estimate_tokens,
     json_text,
-    project,
+    render_facts,
     window_of,
 )
 from .executors import Executor
@@ -90,6 +95,7 @@ from .protocol import (
     Json,
     after_conflict,
     agent_spec_to_json,
+    approval_denied_output,
     compact,
     ended_in_failure,
     error_output,
@@ -100,10 +106,12 @@ from .protocol import (
     limit_tool_output,
     message_entry,
     new_id,
+    pending_tool_calls,
     repeats_failed_input,
     run_parent_problem,
     select_tools,
     tool_permission,
+    tool_result_entry,
 )
 from .store import SessionStore
 
@@ -175,9 +183,13 @@ class AbortSignal:
 
 @dataclass
 class _Prepared:
-    """这一轮交给模型的历史（ctx 消息）、整次调用的估算 token（校准过的话乘上了倍数）、校准的倍数。"""
+    """这一轮交给模型的调用（参考实现的 ``PreparedCall``）：历史（ctx 消息，没有 system 消息）；指令（``AgentSpec.instructions``、
+    放在指令里的事实、投影里的 system 文字）；最后的临时提示（``RunRequest.prompt``，事实放在 ``prompt`` 时接在它前面）；整次调用
+    的估算 token（校准过的话乘上了倍数）；校准的倍数。"""
 
     messages: list[dict[str, Any]]
+    instructions: str | None
+    prompt: Json
     tokens: int
     calibration: float
 
@@ -213,6 +225,12 @@ class _Run:
     deferred: set[str] = field(default_factory=set)
     #: 步骤走完时还等着别处执行的调用（``ToolCall``）：这一轮以 ``requires_action`` 结束时就是 ``pending``。
     pending: list[dict[str, Any]] = field(default_factory=list)
+    #: 这一轮发出的确认请求（``ask`` 的调用）：调用的 ``id`` → ``ToolApproval``。
+    approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
+    #: 上一轮以 ``requires_action`` 结束时，它的 ``ctx.run.started`` 的 ``seq``：这一轮开头先处理它留下的确认。
+    waiting: int | None = None
+    #: 这一轮收到的事实（``{ source, text }``）：超窗兜底重新组装时沿用，不再收一遍。
+    facts: list[dict[str, str]] = field(default_factory=list)
 
 
 async def _waited(previous: asyncio.Future[None], signal: AbortSignal | None) -> bool:
@@ -238,7 +256,12 @@ def _skipped(request: Mapping[str, Any], emit: Callable[[dict[str, Any]], None])
 
 
 def _empty(content: Json) -> bool:
-    return content is None or (isinstance(content, (str, list)) and len(content) == 0)
+    """同参考实现的 ``isEmptyContent``：没有、只有空白的文字、空的部件列表都算空。"""
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return content.strip() == ''
+    return isinstance(content, list) and len(content) == 0
 
 
 def _number(value: Any) -> bool:
@@ -275,6 +298,14 @@ def _context_problem(context: Any) -> str | None:
     facts = context.get('facts')
     if facts is not None and not isinstance(facts, (bool, dict)):
         return 'AgentSpec.context.facts must be a boolean or an object.'
+    if isinstance(facts, dict):
+        sources = facts.get('sources')
+        if sources is not None and not (isinstance(sources, list) and all(isinstance(name, str) for name in sources)):
+            return 'AgentSpec.context.facts.sources must be a list of strings.'
+        if facts.get('placement') is not None and facts['placement'] not in ('instructions', 'prompt'):
+            return 'AgentSpec.context.facts.placement must be "instructions" or "prompt".'
+        if facts.get('heading') is not None and not isinstance(facts['heading'], str):
+            return 'AgentSpec.context.facts.heading must be a string.'
     if context.get('projection') is not None and not isinstance(context['projection'], str):
         return 'AgentSpec.context.projection must be a string.'
     overflow = context.get('overflow')
@@ -296,6 +327,14 @@ def _context_problem(context: Any) -> str | None:
         upto = inherit.get('upTo')
         if upto is not None and not (isinstance(upto, int) and not isinstance(upto, bool) and upto >= 0):
             return 'AgentSpec.context.inherit.upTo must be a non-negative integer (a seq).'
+    return None
+
+
+def _permissions_problem(spec: Mapping[str, Any]) -> str | None:
+    permissions = spec.get('permissions') or {}
+    values = [permissions.get('default'), *(permissions.get('tools') or {}).values()]
+    if any(value is not None and value not in ('allow', 'ask', 'deny') for value in values):
+        return 'AgentSpec.permissions values must be "allow", "ask" or "deny".'
     return None
 
 
@@ -325,10 +364,9 @@ def spec_problem(spec: Mapping[str, Any]) -> str | None:
     timeout = settings.get('timeoutMs')
     if timeout is not None and not (isinstance(timeout, (int, float)) and timeout > 0):
         return 'AgentSpec.settings.timeoutMs must be a positive number.'
-    permissions = spec.get('permissions') or {}
-    values = [permissions.get('default'), *(permissions.get('tools') or {}).values()]
-    if any(value is not None and value not in ('allow', 'ask', 'deny') for value in values):
-        return 'AgentSpec.permissions values must be "allow", "ask" or "deny".'
+    problem = _permissions_problem(spec)
+    if problem is not None:
+        return problem
     for key, value in (spec.get('budget') or {}).items():
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not value > 0:
             return f'AgentSpec.budget.{key} must be a positive number.'
@@ -458,6 +496,15 @@ class PydanticAIHarness:
       以 ``requires_action`` 结束（``pending`` 列出这些调用），执行方把结果追加进日志（``tool_result_entry``），下一轮不带输入
       接着跑。``permissions`` 是 ``ask`` 的工具也这样，应用确认了再让执行方执行。它们的工具定义要在 ``tools`` 里。
     - ``summary_model``：超窗兜底压缩时写摘要的模型，名字（按 ``models`` 找）或 pydantic-ai 的模型；不给就用这一轮的模型。
+    - ``projection``：缺省的投影配置（``ProjectionOptions``：事件规则、摘要和消息怎么渲染、缺省的窗口、换掉的估算），不给是协议包
+      ``project`` 的缺省规则。``AgentSpec.context.projection`` 不给时用它，压缩也按它。
+    - ``projections``：按名字注册的其他投影配置，``AgentSpec.context.projection`` 按名字选，不认识的名字这一轮以 ``not_found``
+      结束；这里给了 ``default`` 就以这里的为准。每套配置是完整的，不和 ``default`` 合并。
+    - ``sources``：上下文来源（``ContextSource``），每轮调模型之前并行收一次事实；``AgentSpec.context.facts`` 是 ``False`` 时
+      不收，``FactsSpec.sources`` 只收这些。
+    - ``source_timeout_ms``：单个来源最多等多久，超时就当它这次没有内容。
+    - ``facts_placement``：事实接在指令后面（``instructions``），还是放进最后的临时用户消息（``prompt``：指令每轮都一样，服务商的
+      提示缓存能命中）；``FactsSpec.placement`` 能按轮换。
     """
 
     def __init__(
@@ -471,7 +518,14 @@ class PydanticAIHarness:
         source: str | None = None,
         external: Sequence[str] = (),
         summary_model: Model | str | None = None,
+        projection: ProjectionOptions | None = None,
+        projections: Mapping[str, ProjectionOptions] | None = None,
+        sources: Sequence[ContextSource] = (),
+        source_timeout_ms: float = DEFAULT_SOURCE_TIMEOUT_MS,
+        facts_placement: Literal['instructions', 'prompt'] = 'instructions',
     ) -> None:
+        if facts_placement not in ('instructions', 'prompt'):
+            raise ValueError('facts_placement must be "instructions" or "prompt".')
         self._store = store
         self._executors: dict[str, Executor] = (
             dict(executors) if isinstance(executors, Mapping) else {executor.name: executor for executor in executors}
@@ -482,6 +536,13 @@ class PydanticAIHarness:
         self._source = source
         self._external = frozenset(external)
         self._summary_model = summary_model
+        self._projections: dict[str, ProjectionOptions] = {
+            'default': projection or ProjectionOptions(),
+            **(projections or {}),
+        }
+        self._sources = list(sources)
+        self._source_timeout_ms = source_timeout_ms
+        self._facts_placement = facts_placement
         self._tails: dict[str, asyncio.Future[None]] = {}
 
     # ---- 对外 ----
@@ -615,6 +676,14 @@ class PydanticAIHarness:
                 return None
             if not state.record:
                 return False
+            # 上一轮停下等结果或确认：记下它从哪开始，这一轮开头先处理应用追加的确认。
+            state.waiting = None
+            if is_event(last, RUN_ENDED) and (last.get('data') or {}).get('stopReason') == 'requires_action':
+                try:
+                    starts = await self._store.list(session, kinds=[RUN_STARTED], last=1)
+                except Exception as error:
+                    raise _WriteFailed(error) from error
+                state.waiting = starts[-1]['seq'] if starts else None
             repeated = (
                 not _empty(content)
                 and ended_in_failure(lifecycle)
@@ -684,6 +753,9 @@ class PydanticAIHarness:
             }
         emit(compact({'type': 'run.started', 'runId': state.run_id, 'session': request['session'], 'seq': state.head}))
         spec = request['agent']
+        problem = await self._resolve_approvals(state)
+        if problem is not None:
+            return await self._end(state, 'error', error={'message': problem, 'type': 'invalid_request'})
         content = request.get('input')
         in_log = False
         if state.record and not _empty(content):
@@ -722,11 +794,13 @@ class PydanticAIHarness:
         if signal is not None and signal.aborted:
             return await self._end(state, 'aborted')
         context = spec.get('context') or {}
-        projection = context.get('projection')
-        if projection is not None and projection != 'default':
-            # 只有缺省的投影（同参考实现：不认识的名字以 `not_found` 失败，不回退）。
-            error = {'message': f'Unknown projection "{projection}". Registered: default.', 'type': 'not_found'}
+        name = _projection_name(context)
+        if name not in self._projections:
+            # 同参考实现：不认识的名字以 `not_found` 失败，不回退；在收事实之前。
+            registered = ', '.join(self._projections)
+            error = {'message': f'Unknown projection "{name}". Registered: {registered}.', 'type': 'not_found'}
             return await self._end(state, 'error', error=error)
+        state.facts = await self._facts(state, context.get('facts'))
 
         # 输入已经在日志里时它在历史里；不写日志时它和 `prompt` 一样接在最后，都算进历史之外的预算。
         extra = None if in_log else content
@@ -740,7 +814,7 @@ class PydanticAIHarness:
         if signal is not None and signal.aborted:
             return await self._end(state, 'aborted')
         history = to_model_messages(prepared.messages)
-        prompt = _prompt_of(request.get('prompt')) if in_log else _prompt_of(content, request.get('prompt'))
+        prompt = _prompt_of(prepared.prompt) if in_log else _prompt_of(content, prepared.prompt)
         if prompt is None and (not history or isinstance(history[-1], ModelResponse)):
             return await self._end(
                 state,
@@ -748,6 +822,71 @@ class PydanticAIHarness:
                 error={'message': 'Nothing to answer: give RunRequest.input or prompt.', 'type': 'invalid_request'},
             )
         return await self._converse(state, spec, definitions, model, history, prompt, prepared)
+
+    async def _resolve_approvals(self, state: _Run) -> str | None:
+        """上一轮停下等确认（``state.waiting``）：记这一轮的输入之前，先把应用追加的决定落成结果（同参考实现）。确认了的、
+        在这里执行的调用照常执行（``deny`` 仍然优先），拒绝的写上 ``approval_denied_output``；确认了、绑到外部执行环境的
+        留给执行方，还没决定的不动。每个结果一条 ``tool_result_entry``，一次写下，按调用发 ``tool.returned``。权限的值
+        不对时返回问题，不执行。"""
+        if state.waiting is None or not state.record:
+            return None
+        session = str(state.request['session'])
+        spec = state.request['agent']
+        try:
+            entries = await self._store.list(session, after=state.waiting - 1)
+        except Exception as error:
+            raise _WriteFailed(error) from error
+        decided = [item for item in pending_tool_calls(entries) if 'decision' in (item.get('approval') or {})]
+        if not decided:
+            return None
+        problem = _permissions_problem(spec)
+        if problem is not None:
+            return problem
+        catalog = {str(tool['name']): tool for tool in await self._catalog()}
+        opened: dict[str, asyncio.Task[None]] = {}
+
+        async def settle(call: dict[str, Any], decision: Mapping[str, Any]) -> dict[str, Any] | None:
+            name = str(call['name'])
+            if not decision.get('approved'):
+                return approval_denied_output(call, decision.get('reason'))
+            definition = catalog.get(name)
+            if definition is None:
+                return error_output(f'Tool "{name}" is not available.')
+            if tool_permission(spec.get('permissions'), name) == 'deny':
+                return error_output(f'Tool call "{name}" was denied by the agent\'s permissions.')
+            if str(definition.get('executor', '')) in self._external:
+                return None
+            problem = schema_problem(compile_schema(definition.get('inputSchema') or {'type': 'object'}), call['input'])
+            if problem is not None:
+                return error_output(f'Invalid input for tool "{name}": {problem}')
+            executor = self._executors.get(str(definition.get('executor', '')))
+            if executor is None:
+                return error_output(f'Tool "{name}" has no executor "{definition.get("executor")}" in this harness.')
+            output = await self._execute_tool(executor, session, spec, opened, dict(call), state)
+            return limit_tool_output(output, self._max_output)
+
+        try:
+            outputs = await asyncio.gather(*(settle(item['call'], item['approval']['decision']) for item in decided))
+        finally:
+            for task in opened.values():
+                task.cancel()
+        results = [(item['call'], output) for item, output in zip(decided, outputs, strict=True) if output is not None]
+        await self._write(state, [tool_result_entry(call, output, source='harness') for call, output in results])
+        for call, output in results:
+            state.emit({'type': 'tool.returned', 'runId': state.run_id, 'callId': call['id'], 'output': output})
+        return None
+
+    async def _facts(self, state: _Run, facts: Any) -> list[dict[str, str]]:
+        """这一轮的事实（``AgentSpec.context.facts``）：``False`` 不收，``FactsSpec.sources`` 只收这些来源。"""
+        if facts is False:
+            return []
+        return await collect_facts(
+            self._sources,
+            session=str(state.request['session']),
+            signal=state.signal,
+            timeout_ms=self._source_timeout_ms,
+            only=facts.get('sources') if isinstance(facts, dict) else None,
+        )
 
     async def _prepare(
         self,
@@ -757,39 +896,60 @@ class PydanticAIHarness:
         extra: Json,
         window: Mapping[str, Any] | None,
     ) -> _Prepared:
-        """组装这一轮的历史，同参考实现 builder 的 ``build``：窗口的 ``maxTokens`` 是整次调用的预算，指令、工具定义、
-        这一轮没进日志的输入和 ``prompt`` 先占掉一部分，剩下的才给历史；按上一轮的真实用量校准（只往小里收）。
-        ``context.inherit`` 的会话投影接在前面，用本会话剩下的预算。没有事实来源：不收事实。"""
+        """组装这一轮的调用，同参考实现 builder 的 ``build``：窗口的 ``maxTokens`` 是整次调用的预算，指令、事实、工具定义、
+        这一轮没进日志的输入和 ``prompt`` 先占掉一部分，剩下的才给历史；按上一轮的真实用量校准（只往小里收）。``window``
+        不给时用选中的投影配置自己的窗口。``context.inherit`` 的会话投影接在前面，用本会话剩下的预算。投影里的 system 消息
+        按出现的顺序接到指令后面（在事实之后），事实按 ``placement`` 放进指令或最后的临时提示。"""
         request = state.request
-        inherit = (spec.get('context') or {}).get('inherit')
+        context = spec.get('context') or {}
+        chosen = self._projections[_projection_name(context)]
+        facts = context.get('facts')
+        facts_spec: Mapping[str, Any] = facts if isinstance(facts, dict) else {}
+        inherit = context.get('inherit')
+        # 没有事件规则时事件都不可见，不用读。
+        types = None if chosen.events else ['message', 'summary']
         try:
-            entries = await self._store.list(str(request['session']), types=['message', 'summary'])
-            parent = (
-                await self._store.list(str(inherit['session']), types=['message', 'summary'])
-                if inherit is not None
-                else None
-            )
+            entries = await self._store.list(str(request['session']), types=types)
+            parent = await self._store.list(str(inherit['session']), types=types) if inherit is not None else None
         except Exception as error:
             raise _WriteFailed(error) from error
+        estimate = chosen.estimate or estimate_tokens
+        rendered = render_facts(state.facts, facts_spec.get('heading')) if state.facts else None
         reserve = (
             estimate_text_tokens(spec.get('instructions') or '')
+            + (estimate_text_tokens(rendered) if rendered is not None else 0)
             + (estimate_text_tokens(json_text(definitions)) if definitions else 0)
-            + _sized(extra)
-            + _sized(request.get('prompt'))
+            + _sized(extra, estimate)
+            + _sized(request.get('prompt'), estimate)
         )
-        calibration = calibration_of(entries)
-        own = project(entries, window_of(window, reserve, calibration))
+        # 接了分词器（投影自己的 `estimate`）就不校准：估算本来就准，样本里的偏差多半是别的原因。
+        calibration = 1 if chosen.estimate is not None else calibration_of(entries)
+        limits = window if window is not None else chosen.window
+        own = chosen.project(entries, window_of(limits, reserve, calibration))
         messages, tokens = own.messages, own.tokens
         if parent is not None:
             upto = inherit.get('upTo')
             if upto is not None:
                 parent = [entry for entry in parent if entry['seq'] <= upto]
-            inherited = project(parent, window_of(window, reserve + own.tokens, calibration))
+            inherited = chosen.project(parent, window_of(limits, reserve + own.tokens, calibration))
             messages, tokens = [*inherited.messages, *own.messages], inherited.tokens + own.tokens
         total = reserve + tokens
         if calibration > 1:
             total = math.ceil(total * calibration)
-        return _Prepared(messages=messages, tokens=total, calibration=calibration)
+        placement = facts_spec.get('placement') or self._facts_placement
+        system = [text_of(message) for message in messages if message.get('role') == 'system']
+        prompt = request.get('prompt')
+        if rendered is not None and placement == 'prompt':
+            prompt = _with_facts(prompt, rendered)
+        return _Prepared(
+            messages=[message for message in messages if message.get('role') != 'system'],
+            instructions=_joined(
+                [spec.get('instructions'), rendered if placement == 'instructions' else None, *system]
+            ),
+            prompt=prompt,
+            tokens=total,
+            calibration=calibration,
+        )
 
     async def _fit(
         self,
@@ -846,7 +1006,9 @@ class PydanticAIHarness:
             chosen_model = self._model(chosen_model)
         summarize = _summarizer(chosen_model, state.signal)
         session = str(state.request['session'])
-        result = await compact_session(self._store, session, summarize, chosen, signal=state.signal)
+        result = await compact_session(
+            self._store, session, summarize, chosen, signal=state.signal, projection=self._projections['default']
+        )
         return 'summary' in result
 
     async def _catalog(self) -> list[dict[str, Any]]:
@@ -878,6 +1040,20 @@ class PydanticAIHarness:
             return infer_model(resolved)
         except Exception as error:  # 不认识的服务商、缺凭证
             raise CtxError('invalid_request', f'pydantic-ai cannot make model "{resolved}": {error}') from error
+
+    def _ask(self, state: _Run, spec: Mapping[str, Any], names: set[str], message: dict[str, Any]) -> None:
+        """``ask`` 的调用要等人确认：确认请求（``tool-approval-request``）接在这次调用的助手消息里，同参考实现。"""
+        content = message.get('content')
+        if not isinstance(content, list):
+            return
+        for part in list(content):
+            if part.get('type') != 'tool-call' or part.get('name') not in names:
+                continue
+            if tool_permission(spec.get('permissions'), str(part['name'])) != 'ask':
+                continue
+            approval = {'approvalId': new_id(), 'callId': part['id']}
+            state.approvals[part['id']] = approval
+            content.append({'type': 'tool-approval-request', **approval})
 
     def _defers(self, spec: Mapping[str, Any], definition: Mapping[str, Any]) -> bool:
         """这个工具交给别处执行：``ask`` 的，或者绑到外部执行环境、没有被 ``deny`` 的（``deny`` 优先，同参考实现）。"""
@@ -1002,7 +1178,7 @@ class PydanticAIHarness:
         agent: Agent[None, Any] = Agent(
             model,
             output_type=output_type,
-            instructions=spec.get('instructions'),
+            instructions=prepared.instructions,
             tools=tools,
             name=spec.get('name'),
         )
@@ -1057,6 +1233,7 @@ class PydanticAIHarness:
                         usage = add_usage(usage, step_usage)
                         finish = response.finish_reason
                         message = assistant_message(response, names, OUTPUT_TOOL if structured else None)
+                        self._ask(state, spec, names, message)
                         # 估算只对第一步的请求成立：之后几步的请求里多了这一轮的工具调用和结果。
                         first = step == 0
                         meta = {
@@ -1132,7 +1309,30 @@ class PydanticAIHarness:
                 else:
                     output = final
         pending = state.pending if stop == 'requires_action' else None
-        return await self._end(state, stop, text=text, error=error, usage=usage, output=output, pending=pending)
+        return await self._end(
+            state,
+            stop,
+            text=text,
+            error=error,
+            usage=usage,
+            output=output,
+            pending=pending,
+            executors=self._bound(spec, definitions, pending),
+        )
+
+    def _bound(
+        self, spec: Mapping[str, Any], definitions: list[dict[str, Any]], pending: list[dict[str, Any]] | None
+    ) -> dict[str, str] | None:
+        """留给外部执行环境的调用归谁执行（``ctx.run.ended`` 的 ``executors``，同参考实现）：调用 ``id`` → 执行环境的名字。
+        在这里执行的调用（包括等确认的）不记，``deny`` 的不会留下。执行方据此按名字领工作。"""
+        offered = {str(definition['name']): definition for definition in definitions}
+        bound: dict[str, str] = {}
+        for call in pending or []:
+            definition = offered.get(str(call['name']))
+            executor = str(definition.get('executor', '')) if definition is not None else ''
+            if executor in self._external and tool_permission(spec.get('permissions'), str(call['name'])) != 'deny':
+                bound[call['id']] = executor
+        return bound or None
 
     async def _run_tools(self, state: _Run, node: Any, run: Any, calls: list[dict[str, Any]]) -> None:
         """跑这一步的工具：调用、结果按事件发出，结果到齐了按调用的顺序、按执行方分组写进日志。"""
@@ -1232,9 +1432,10 @@ class PydanticAIHarness:
         usage: dict[str, int] | None = None,
         output: Any = None,
         pending: list[dict[str, Any]] | None = None,
+        executors: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """收尾：没等到结果的工具调用补错误结果，出错写 ``ctx.error``，最后写 ``ctx.run.ended``。等着别处执行的调用不补，
-        放在 ``pending`` 里。"""
+        """收尾：没等到结果的工具调用补错误结果，出错写 ``ctx.error``，最后写 ``ctx.run.ended``（等着的调用归哪个外部执行环境
+        记在它的 ``executors`` 里）。等着别处执行的调用不补，放在 ``pending`` 里。"""
         entries: list[dict[str, Any]] = []
         if state.open:
             message = {
@@ -1258,7 +1459,9 @@ class PydanticAIHarness:
             )
         entries.append(
             event_entry(
-                RUN_ENDED, data=compact({'runId': state.run_id, 'stopReason': stop, 'usage': usage}), source='harness'
+                RUN_ENDED,
+                data=compact({'runId': state.run_id, 'stopReason': stop, 'usage': usage, 'executors': executors}),
+                source='harness',
             )
         )
         await self._write(state, entries)
@@ -1270,6 +1473,7 @@ class PydanticAIHarness:
                 'recorded': state.recorded,
                 'stopReason': 'aborted',
             }
+        approvals = [state.approvals[call['id']] for call in pending or [] if call['id'] in state.approvals]
         summary = compact(
             {
                 'runId': state.run_id,
@@ -1278,6 +1482,7 @@ class PydanticAIHarness:
                 'usage': usage,
                 'output': output,
                 'pending': pending or None,
+                'approvals': approvals or None,
                 'error': error,
             }
         )
@@ -1294,8 +1499,29 @@ class PydanticAIHarness:
         return {**summary, 'messages': state.messages, 'recorded': state.recorded}
 
 
-def _sized(content: Json) -> int:
-    return 0 if _empty(content) else estimate_tokens({'role': 'user', 'content': content})
+def _sized(content: Json, estimate: Estimate = estimate_tokens) -> int:
+    return 0 if _empty(content) else estimate({'role': 'user', 'content': content})
+
+
+def _projection_name(context: Mapping[str, Any]) -> str:
+    """``AgentSpec.context.projection``，缺省 ``default``。"""
+    name = context.get('projection')
+    return 'default' if name is None else str(name)
+
+
+def _joined(parts: Sequence[Any]) -> str | None:
+    """几段文字用空行连起来，空的不要；都空是 ``None``（参考实现 builder 的 ``joined``）。"""
+    text = '\n\n'.join(part for part in parts if isinstance(part, str) and part.strip() != '')
+    return text or None
+
+
+def _with_facts(prompt: Json, facts: str) -> Json:
+    """事实放进最后的临时提示：接在原来的提示前面（参考实现 builder 的 ``withFacts``）。"""
+    if _empty(prompt):
+        return facts
+    if isinstance(prompt, str):
+        return f'{facts}\n\n{prompt}'
+    return [{'type': 'text', 'text': facts}, *prompt]
 
 
 def _prompt_of(*contents: Json) -> Any:

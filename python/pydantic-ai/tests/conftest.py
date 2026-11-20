@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -13,11 +14,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+from ctx_pydantic_ai.context import ContextSource, EventRule, ProjectionOptions, estimate_tokens, json_text
 
 os.environ.setdefault('PYDANTIC_AI_NO_BANNER', '1')
 
@@ -112,9 +115,81 @@ def ts_pending(node: str, payload: dict[str, Any]) -> dict[str, Any]:
     return _ts_command(node, 'pending', payload)
 
 
+def ts_claim(node: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """用 TypeScript 的 ``createRemoteWorker`` 按执行环境的名字领一次工作、执行、追加结果（见 ``ctx_ts.mjs claim``）。"""
+    return _ts_command(node, 'claim', payload)
+
+
 def ts_compact(node: str, cases: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """用 TypeScript 的 builder 把每一组条目压一次（见 ``ctx_ts.mjs compact``）。"""
     return _ts_command(node, 'compact', list(cases))
+
+
+def ts_build(node: str, cases: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """用 TypeScript 的 builder 给每一组条目组装一次调用（见 ``ctx_ts.mjs build``）。"""
+    return _ts_command(node, 'build', list(cases))
+
+
+# ---- 配方：函数过不了进程边界，两边按名字各实现一遍（同 ``ctx_ts.mjs`` 的 ``projectionOf``、``sourcesOf``） ----
+
+
+def _line(events: Sequence[Mapping[str, Any]]) -> str:
+    return '\n'.join(f'{event["kind"]} {json_text(event.get("data"))}' for event in events)
+
+
+_RENDERERS: dict[str, Callable[[list[Mapping[str, Any]]], Any]] = {
+    'user': lambda events: {'role': 'user', 'content': _line(events)},
+    'system': lambda events: {'role': 'system', 'content': _line(events)},
+    'pair': lambda events: [{'role': 'user', 'content': _line(events)}, {'role': 'assistant', 'content': 'noted'}],
+    'none': lambda events: None,
+}
+_SUMMARIES: dict[str, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
+    'system': lambda entry: {'role': 'system', 'content': f'Earlier: {entry["text"]}'},
+    'assistant': lambda entry: {'role': 'assistant', 'content': entry['text']},
+    'covers': lambda entry: {'role': 'user', 'content': f'Up to {entry["covers"]}: {entry["text"]}'},
+}
+
+
+def _redact(entry: Mapping[str, Any]) -> dict[str, Any] | None:
+    message = entry['message']
+    if 'secret' in json_text(message):
+        return None
+    if message.get('role') == 'user' and isinstance(message.get('content'), str):
+        return {**message, 'content': f'> {message["content"]}'}
+    return message
+
+
+def projection_of(recipe: Mapping[str, Any] | None) -> ProjectionOptions | None:
+    """投影配置的配方 → ``ProjectionOptions``，规则见 ``ctx_ts.mjs`` 的 ``projectionOf``。"""
+    if recipe is None:
+        return None
+    events = {
+        kind: EventRule(render=_RENDERERS[rule['render']], fold=rule.get('fold', False))
+        for kind, rule in (recipe.get('events') or {}).items()
+    }
+    return ProjectionOptions(
+        events=events,
+        summary=_SUMMARIES[recipe['summary']] if recipe.get('summary') else None,
+        message=_redact if recipe.get('message') == 'redact' else None,
+        window=recipe.get('window'),
+        estimate=(lambda message: 2 * estimate_tokens(message)) if recipe.get('estimate') == 'double' else None,
+    )
+
+
+def sources_of(recipes: Sequence[Mapping[str, Any]] | None) -> list[ContextSource]:
+    """上下文来源的配方 ``{ name, text?, delayMs?, error? }`` → ``ContextSource``，同 ``ctx_ts.mjs`` 的 ``sourcesOf``。"""
+
+    def source(recipe: Mapping[str, Any]) -> ContextSource:
+        async def collect(context: Mapping[str, Any]) -> str | None:
+            if recipe.get('delayMs'):
+                await asyncio.sleep(recipe['delayMs'] / 1000)
+            if recipe.get('error'):
+                raise RuntimeError(recipe['error'])
+            return recipe.get('text')
+
+        return ContextSource(recipe['name'], collect)
+
+    return [source(recipe) for recipe in recipes or []]
 
 
 class Process:

@@ -74,6 +74,10 @@ export interface MemoryFact {
   /** 一句能独立成立的话。 */
   readonly text: string;
   readonly topic?: string;
+  /**
+   * 写进记忆的时刻（毫秒）。激活度从它算起，不从 `validFrom`：夜里提取出的事实可能早就成立了，刚写进来的仍然是新的。
+   */
+  readonly at: number;
   /** 从何时起成立（毫秒）。 */
   readonly validFrom: number;
   /** 到何时不再成立；没有就是仍然成立。`close` 写。 */
@@ -92,8 +96,13 @@ export interface MemoryFact {
   readonly archivedAt?: number;
 }
 
-/** 写入的事实：`id` 由存储生成，`recalls` 从空开始；有效期、取代、归档只能由对应的方法改。 */
-export type NewMemoryFact = Omit<MemoryFact, 'id' | 'validTo' | 'supersededBy' | 'recalls' | 'archivedAt'>;
+/**
+ * 写入的事实：`id` 由存储生成，`recalls` 从空开始；有效期、取代、归档只能由对应的方法改。`at` 不给时存储记成 `validFrom`：
+ * 导入的、手写的事实不知道是什么时候记下的，就当成立的时候就记下了。
+ */
+export type NewMemoryFact = Omit<MemoryFact, 'id' | 'at' | 'validTo' | 'supersededBy' | 'recalls' | 'archivedAt'> & {
+  readonly at?: number;
+};
 
 /** 一次搜索命中：事实和相关度。 */
 export interface FactHit {
@@ -433,7 +442,7 @@ export interface Recalled {
 }
 
 export interface ConsolidateOptions {
-  /** 这一夜的时刻，缺省是当前时间。衰减、`settle`、`close`、`core.set` 都用它。 */
+  /** 这一夜的时刻，缺省是当前时间。衰减、`settle`、`close`、`core.set` 和写下的事实的 `at` 都用它。 */
   readonly now?: number;
   readonly signal?: AbortSignal;
 }
@@ -548,21 +557,22 @@ export interface ActivationOptions {
 }
 
 /**
- * ACT-R 的基础激活：`A = ln Σᵢ (Δtᵢ + ε)^(−d) + s`，`Δtᵢ = |now − tᵢ| / 1 天`，`tᵢ` 是 `validFrom` 和最近
- * `MAX_FACT_RECALLS` 次召回，`s` 是 `salience`。晚于 `now` 的时刻按它离 `now` 有多远算：十天后才生效的事实和十天前
- * 生效的一样活跃，临近时回升，所以 `validFrom` 在未来的事实也会衰减。
- * 有上界：`ln((MAX_FACT_RECALLS + 1) · ε^(−d)) + s`，缺省参数下是 `5.45 + s`。夜间归档看它是不是低于 `archiveAt`；
+ * ACT-R 的基础激活：`A = ln Σᵢ (Δtᵢ + ε)^(−d) + s`，`Δtᵢ = |now − tᵢ| / 1 天`，`s` 是 `salience`。`tᵢ` 是写入的时刻 `at`、
+ * 晚于写入的 `validFrom` 和最近 `MAX_FACT_RECALLS` 次召回：从写入算起，早就成立的事实刚写进来也是新的；写的时候还没成立的，
+ * 成立那天也算一次。晚于 `now` 的时刻按它离 `now` 有多远算，所以还没成立的事实临近时回升，成立以后再衰减。
+ * 有上界：`ln((MAX_FACT_RECALLS + 2) · ε^(−d)) + s`，缺省参数下是 `5.48 + s`。夜间归档看它是不是低于 `archiveAt`；
  * 排序用的是压到 0..1 的 `retrievability`。
  */
 export function activation(
-  fact: Pick<MemoryFact, 'validFrom' | 'recalls' | 'salience'>,
+  fact: Pick<MemoryFact, 'at' | 'validFrom' | 'recalls' | 'salience'>,
   now: number,
   options?: ActivationOptions,
 ): number {
   const d = options?.d ?? ACTIVATION_DEFAULTS.d;
   const epsilon = options?.epsilon ?? ACTIVATION_DEFAULTS.epsilon;
+  const starts = fact.validFrom > fact.at ? [fact.at, fact.validFrom] : [fact.at];
   let sum = 0;
-  for (const t of [fact.validFrom, ...fact.recalls.slice(-MAX_FACT_RECALLS)])
+  for (const t of [...starts, ...fact.recalls.slice(-MAX_FACT_RECALLS)])
     sum += (Math.abs(now - t) / DAY_MS + epsilon) ** -d;
   return Math.log(sum) + fact.salience;
 }
@@ -578,7 +588,7 @@ export interface RetrievabilityOptions extends ActivationOptions {
  * `A` 没有固定的量程，直接加权会盖过相似度。
  */
 export function retrievability(
-  fact: Pick<MemoryFact, 'validFrom' | 'recalls' | 'salience'>,
+  fact: Pick<MemoryFact, 'at' | 'validFrom' | 'recalls' | 'salience'>,
   now: number,
   options?: RetrievabilityOptions,
 ): number {

@@ -125,6 +125,8 @@ function prepare() {
       ...packed.map((item) => item.tarball),
       'ai@^7',
       'zod@^4',
+      // ctx-managed-agents 的 peer。
+      '@anthropic-ai/sdk@^1.10.0',
       `typescript@${dev.typescript}`,
       `@types/node@${dev['@types/node']}`,
       // `@ai-sdk/provider` 的声明文件引了 `json-schema` 的类型却没把它列成依赖；不跳过库检查就得补上。

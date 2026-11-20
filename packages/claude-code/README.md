@@ -143,7 +143,7 @@ console.log(result.stopReason, result.text);
 
 ## 一致性等级
 
-过 `describeHarnessContract` 的 `trace`、`execute`、`resume`、`output`。不跑 `context`：上下文是 Claude Code 自己组装的。
+过 `describeHarnessContract` 的 `trace`、`execute`、`resume`、`output`。不跑 `context`：上下文是 Claude Code 自己组装的；不跑 `approval`：整轮在 Claude Code 里跑完，没有 `requires_action`。
 
 还没做的：
 

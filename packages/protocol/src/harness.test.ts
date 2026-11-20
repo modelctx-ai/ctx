@@ -6,16 +6,19 @@ import { describe, test } from 'vite-plus/test';
 import {
   afterConflict,
   agentSpecToJson,
+  approvalDeniedOutput,
   createSessionQueue,
   endedInFailure,
   isFenced,
   modelName,
   pendingToolCalls,
+  readPendingToolCalls,
   REDACTED_HEADER,
   repeatsFailedInput,
   stepMetaOf,
   stepMetaToJson,
   streamRun,
+  toolApprovalEntry,
   toolResultEntry,
   type RunEvent,
   type RunPosition,
@@ -36,6 +39,7 @@ import {
   type Entry,
   type ListOptions,
   type NewEntry,
+  type SessionStore,
 } from './session.ts';
 
 describe('agent spec', () => {
@@ -78,6 +82,11 @@ function stored(entries: readonly NewEntry[]): Entry[] {
   return entries.map((entry, index) => ({ ...entry, id: `e${index}`, session: 's', seq: index + 1, at: index, v: 1 }));
 }
 
+function storeOf(entries: readonly NewEntry[]): SessionStore {
+  const log = stored(entries);
+  return { list: async (_session: string, options?: ListOptions) => filterEntries(log, options) } as SessionStore;
+}
+
 const started = (runId: string) => eventEntry(CTX_EVENTS.runStarted, { data: { runId, agent: { model: 'm' } } });
 const ended = (runId: string, stopReason: string) => eventEntry(CTX_EVENTS.runEnded, { data: { runId, stopReason } });
 const calls = (...ids: string[]) =>
@@ -87,6 +96,25 @@ const calls = (...ids: string[]) =>
   });
 
 describe('pendingToolCalls', () => {
+  test('带上 ctx.run.ended 记下的外部执行环境；没记的、记的不是字符串的没有', () => {
+    const log = stored([
+      started('r1'),
+      calls('c1', 'c2', 'constructor'),
+      eventEntry(CTX_EVENTS.runEnded, {
+        data: { runId: 'r1', stopReason: 'requires_action', executors: { c1: 'worker', c2: 7 } },
+      }),
+    ]);
+    assert.deepEqual(
+      pendingToolCalls(log).map((item) => [item.call.id, item.executor]),
+      [
+        ['c1', 'worker'],
+        ['c2', undefined],
+        ['constructor', undefined],
+      ],
+    );
+    assert.ok(!('executor' in pendingToolCalls(log)[1]!), '没记的不带这个键');
+  });
+
   test('以 requires_action 结束的一轮留下的调用，去掉已经有结果的', () => {
     const log = stored([
       started('r1'),
@@ -112,6 +140,78 @@ describe('pendingToolCalls', () => {
 
   test('toolResultEntry 带幂等键', () => {
     assert.equal(toolResultEntry({ id: 'a', name: 'lookup' }, { type: 'text', text: '好' }).key, 'ctx.tool-result:a');
+  });
+
+  test('等确认的调用带着确认请求和后来追加的决定；同一个请求只认先到的决定，对不上的、自动的不算', () => {
+    const log = stored([
+      started('r1'),
+      messageEntry({
+        role: 'assistant',
+        content: [
+          { type: 'tool-call', id: 'a', name: 'lookup', input: { id: 'a' } },
+          { type: 'tool-call', id: 'b', name: 'lookup', input: { id: 'b' } },
+          { type: 'tool-call', id: 'c', name: 'lookup', input: { id: 'c' } },
+          { type: 'tool-approval-request', approvalId: 'p-a', callId: 'a', reason: '要删文件' },
+          { type: 'tool-approval-request', approvalId: 'p-b', callId: 'b' },
+          { type: 'tool-approval-request', approvalId: 'p-c', callId: 'c', isAutomatic: true },
+        ],
+      }),
+      ended('r1', 'requires_action'),
+      toolApprovalEntry('p-a', { approved: false, reason: '不行' }),
+      toolApprovalEntry('p-a', { approved: true }),
+      toolApprovalEntry('p-x', { approved: true }),
+    ]);
+    assert.deepEqual(
+      pendingToolCalls(log).map(({ call, approval }) => ({ id: call.id, approval })),
+      [
+        { id: 'a', approval: { approvalId: 'p-a', reason: '要删文件', decision: { approved: false, reason: '不行' } } },
+        { id: 'b', approval: { approvalId: 'p-b' } },
+        { id: 'c', approval: undefined },
+      ],
+    );
+    const decided = stored([
+      ...log,
+      toolResultEntry({ id: 'a', name: 'lookup' }, approvalDeniedOutput({ name: 'lookup' })),
+    ]);
+    assert.deepEqual(
+      pendingToolCalls(decided).map((item) => item.call.id),
+      ['b', 'c'],
+      '有了结果就不再等',
+    );
+  });
+
+  test('toolApprovalEntry 带幂等键；approvalDeniedOutput 带上原因', () => {
+    const entry = toolApprovalEntry('p-a', { approved: true, reason: '可以' });
+    assert.equal(entry.key, 'ctx.tool-approval:p-a');
+    assert.deepEqual(entry.message, {
+      role: 'tool',
+      content: [{ type: 'tool-approval-response', approvalId: 'p-a', approved: true, reason: '可以' }],
+    });
+    assert.deepEqual(approvalDeniedOutput({ name: 'rm' }, '太危险'), {
+      type: 'error',
+      message: 'Tool call "rm" was not approved: 太危险',
+    });
+    assert.deepEqual(approvalDeniedOutput({ name: 'rm' }), {
+      type: 'error',
+      message: 'Tool call "rm" was not approved.',
+    });
+  });
+
+  test('readPendingToolCalls：最后一轮以 requires_action 结束时读它起的条目，否则没有', async () => {
+    const waiting = storeOf([
+      started('r0'),
+      calls('x'),
+      ended('r0', 'requires_action'),
+      started('r1'),
+      calls('a'),
+      ended('r1', 'requires_action'),
+    ]);
+    assert.deepEqual(
+      (await readPendingToolCalls(waiting, 's')).map((item) => item.call.id),
+      ['a'],
+    );
+    const running = storeOf([started('r1'), calls('a'), ended('r1', 'requires_action'), started('r2')]);
+    assert.deepEqual(await readPendingToolCalls(running, 's'), [], '下一轮已经开始了');
   });
 });
 

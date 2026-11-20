@@ -17,11 +17,13 @@ from ctx_pydantic_ai import (
     HARNESS_NAME,
     INTERRUPTED,
     RETRY_EVENT,
+    TOOL_RESULT_KEY_PREFIX,
     AbortSignal,
     FunctionExecutor,
     MemorySessionStore,
     PydanticAIHarness,
     pending_tool_calls,
+    tool_approval_entry,
     tool_result_entry,
 )
 from ctx_pydantic_ai.compact import DEFAULT_SUMMARY_INSTRUCTIONS
@@ -798,9 +800,11 @@ def test_an_external_call_waits_for_its_result_in_the_log() -> None:
         log = await store.list('s')
         assert roles(log) == ['ctx.run.started', 'user', 'assistant', 'ctx.run.ended']
         assert log[-1]['data']['stopReason'] == 'requires_action'
-        assert [(item['call']['id'], item['runId'], item['seq']) for item in pending_tool_calls(log)] == [
-            ('c1', first['runId'], log[2]['seq'])
-        ]
+        # 同参考实现：`ctx.run.ended` 记下它归哪个外部执行环境，执行方按名字领工作。
+        assert log[-1]['data']['executors'] == {'c1': 'worker'}
+        assert [
+            (item['call']['id'], item['runId'], item['seq'], item['executor']) for item in pending_tool_calls(log)
+        ] == [('c1', first['runId'], log[2]['seq'], 'worker')]
         # 执行方追加结果：两个都执行了也只记一条（幂等键）。
         output = {'type': 'text', 'text': '订单 42 已发货'}
         for _ in range(2):
@@ -863,6 +867,7 @@ def test_a_step_with_a_local_and_an_external_call() -> None:
         # 在这里执行的照常记下结果；交给别处的不补「结果未知」。
         assert [part['id'] for part in log[3]['message']['content']] == ['c2']
         assert [item['call']['id'] for item in pending_tool_calls(log)] == ['c1']
+        assert log[-1]['data']['executors'] == {'c1': 'worker'}
         assert len(model.requests) == 1
 
     run(main)
@@ -883,6 +888,10 @@ def test_ask_stops_until_the_app_confirms() -> None:
         assert first['stopReason'] == 'requires_action'
         assert first['pending'] == [{'id': 'c1', 'name': 'echo', 'input': {'text': 'hi'}}]
         assert calls == []
+        # 在这里执行的调用等确认时不记执行环境：确认了由下一轮的 harness 执行，不交给 worker。
+        ended = (await store.list('s'))[-1]
+        assert ended['data']['stopReason'] == 'requires_action'
+        assert 'executors' not in ended['data']
         # 应用确认了：交给执行环境执行，把结果追加进日志，再不带输入跑一轮。
         [call] = first['pending']
         output = await executor.execute(call, {'session': 's', 'runId': first['runId']})
@@ -891,6 +900,139 @@ def test_ask_stops_until_the_app_confirms() -> None:
         assert second['stopReason'] == 'end_turn'
         assert second['text'] == '回显好了'
         assert calls == [{'text': 'hi'}]
+
+    run(main)
+
+
+# ---- 人工确认（对照参考实现的 approval.test.ts）----
+
+ASKING = {**AGENT, 'permissions': {'default': 'ask'}}
+RM = [{'type': 'tool-call', 'id': 'c1', 'input': {'text': 'rm'}}, {'type': 'text', 'text': '好了'}]
+
+
+def counting() -> tuple[FunctionExecutor, list[Any]]:
+    calls: list[Any] = []
+    executor = FunctionExecutor('local').register(
+        ECHO_TOOL, lambda value, context: calls.append(value) or {'type': 'json', 'value': value}
+    )
+    return executor, calls
+
+
+def parts_of(entry: Mapping[str, Any]) -> list[str]:
+    content = entry['message']['content'] if entry['type'] == 'message' else None
+    return [part['type'] for part in content] if isinstance(content, list) else []
+
+
+def test_ask_writes_the_approval_request_next_to_the_call() -> None:
+    async def main() -> None:
+        executor, calls = counting()
+        harness, store, _ = setup(RM, executors=[executor])
+        first = await harness.run({'session': 's', 'agent': ASKING, 'input': '删掉'})
+        assert first['stopReason'] == 'requires_action'
+        assert first['pending'] == [{'id': 'c1', 'name': 'echo', 'input': {'text': 'rm'}}]
+        [approval] = first['approvals']
+        assert approval['callId'] == 'c1'
+        assert calls == []
+        log = await store.list('s')
+        assert roles(log) == ['ctx.run.started', 'user', 'assistant', 'ctx.run.ended']
+        assert parts_of(log[2]) == ['tool-call', 'tool-approval-request']
+        [pending] = pending_tool_calls(log)
+        assert pending['approval'] == {'approvalId': approval['approvalId']}
+        assert approval['approvalId'] in repr(first['messages'])
+
+    run(main)
+
+
+def test_an_approved_call_runs_first_in_the_next_round() -> None:
+    async def main() -> None:
+        executor, calls = counting()
+        harness, store, model = setup(RM, executors=[executor])
+        first = await harness.run({'session': 's', 'agent': ASKING, 'input': '删掉'})
+        await store.append('s', [tool_approval_entry(first['approvals'][0]['approvalId'], {'approved': True})])
+        events: list[dict[str, Any]] = []
+        async for event in harness.stream({'session': 's', 'agent': ASKING}):
+            events.append(event)
+        second = events[-1]['result']
+        assert second['stopReason'] == 'end_turn'
+        assert second['text'] == '好了'
+        assert calls == [{'text': 'rm'}]
+        assert [event['type'] for event in events[:3]] == ['run.started', 'tool.returned', 'model.started']
+        log = await store.list('s')
+        assert roles(log)[-4:] == ['ctx.run.started', 'tool', 'assistant', 'ctx.run.ended']
+        assert log[-3]['key'] == f'{TOOL_RESULT_KEY_PREFIX}c1'
+        assert "'text': 'rm'" in repr(model.requests[1])
+        assert pending_tool_calls(log) == []
+
+    run(main)
+
+
+def test_a_denied_call_is_not_run_and_the_model_sees_why() -> None:
+    async def main() -> None:
+        executor, calls = counting()
+        harness, store, model = setup(RM, executors=[executor])
+        first = await harness.run({'session': 's', 'agent': ASKING, 'input': '删掉'})
+        approval = first['approvals'][0]['approvalId']
+        await store.append('s', [tool_approval_entry(approval, {'approved': False, 'reason': '不行'})])
+        second = await harness.run({'session': 's', 'agent': ASKING})
+        assert second['stopReason'] == 'end_turn'
+        assert calls == []
+        assert 'was not approved: 不行' in repr(model.requests[1])
+
+    run(main)
+
+
+def test_decisions_land_before_the_new_input_and_late_ones_do_not_count() -> None:
+    async def main() -> None:
+        executor, calls = counting()
+        harness, store, model = setup(
+            [*RM, {'type': 'tool-call', 'id': 'c2', 'input': {'text': 'mv'}}, {'type': 'text', 'text': '不动了'}],
+            executors=[executor],
+        )
+        first = await harness.run({'session': 's', 'agent': ASKING, 'input': '删掉'})
+        await store.append('s', [tool_approval_entry(first['approvals'][0]['approvalId'], {'approved': True})])
+        second = await harness.run({'session': 's', 'agent': ASKING, 'input': '删完了吗'})
+        assert roles(second['recorded']) == ['ctx.run.started', 'tool', 'user', 'assistant', 'ctx.run.ended']
+        # 没决定就带着新输入跑：不执行，模型看到缺结果，这一轮结束以后它不再等待，迟到的确认不算数。
+        third = await harness.run({'session': 's', 'agent': ASKING, 'input': '再挪一下'})
+        assert third['stopReason'] == 'requires_action'
+        fourth = await harness.run({'session': 's', 'agent': ASKING, 'input': '算了'})
+        assert fourth['text'] == '不动了'
+        assert MISSING_RESULT in repr(model.requests[3])
+        await store.append('s', [tool_approval_entry(third['approvals'][0]['approvalId'], {'approved': True})])
+        assert pending_tool_calls(await store.list('s')) == []
+        assert calls == [{'text': 'rm'}]
+
+    run(main)
+
+
+def test_deny_still_wins_over_an_approval() -> None:
+    async def main() -> None:
+        executor, calls = counting()
+        harness, store, model = setup(RM, executors=[executor])
+        first = await harness.run({'session': 's', 'agent': ASKING, 'input': '删掉'})
+        await store.append('s', [tool_approval_entry(first['approvals'][0]['approvalId'], {'approved': True})])
+        denied = {**AGENT, 'permissions': {'default': 'deny'}}
+        await harness.run({'session': 's', 'agent': denied})
+        assert calls == []
+        assert "denied by the agent\\'s permissions" in repr(model.requests[1])
+
+    run(main)
+
+
+def test_an_approved_external_call_is_left_to_its_executor() -> None:
+    async def main() -> None:
+        harness, store, _ = external_setup([LOOKUP_CALL, {'type': 'text', 'text': '发货了'}])
+        first = await harness.run({'session': 's', 'agent': ASKING, 'input': '订单 42？'})
+        assert first['approvals'][0]['callId'] == 'c1'
+        await store.append('s', [tool_approval_entry(first['approvals'][0]['approvalId'], {'approved': True})])
+        [waiting] = pending_tool_calls(await store.list('s'))
+        assert waiting['approval']['decision'] == {'approved': True}
+        await store.append(
+            's', [tool_result_entry(waiting['call'], {'type': 'text', 'text': '已发货'}, source='worker')]
+        )
+        second = await harness.run({'session': 's', 'agent': ASKING})
+        assert second['text'] == '发货了'
+        assert roles(second['recorded']) == ['ctx.run.started', 'assistant', 'ctx.run.ended']
 
     run(main)
 

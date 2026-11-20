@@ -17,7 +17,14 @@ import {
   type RunParent,
   type SessionStore,
 } from './session.ts';
-import type { EnvironmentSpec, ExecutionContext, ToolCall, ToolOutput, ToolSelection } from './tools.ts';
+import {
+  errorOutput,
+  type EnvironmentSpec,
+  type ExecutionContext,
+  type ToolCall,
+  type ToolOutput,
+  type ToolSelection,
+} from './tools.ts';
 import { definedFields, isJsonObject, usageFromJson } from './json.ts';
 import type { Awaitable, ErrorInfo, JsonObject, JsonValue } from './types.ts';
 
@@ -260,6 +267,11 @@ export interface RunResult {
   readonly output?: JsonValue;
   /** `stopReason` 是 `requires_action` 时，等着别处执行、还没有结果的工具调用。 */
   readonly pending?: readonly ToolCall[];
+  /**
+   * `pending` 里等确认的调用（`ask` 权限，或者 `beforeTool` 回了 `ask`）：应用决定后追加 `toolApprovalEntry`，再不带
+   * 输入跑一轮，确认了的由 harness 执行，拒绝的模型看到拒绝。
+   */
+  readonly approvals?: readonly ToolApproval[];
   /** `stopReason` 是 `error` 时的原因。 */
   readonly error?: ErrorInfo;
 }
@@ -302,10 +314,14 @@ export interface ModelHookContext {
   readonly signal?: AbortSignal;
 }
 
-/** `beforeTool` 的决定。拒绝时工具结果是一条带原因的错误，模型会看到它，这一轮继续。 */
+/**
+ * `beforeTool` 的决定。拒绝时工具结果是一条带原因的错误，模型会看到它，这一轮继续。`ask` 同 `ask` 权限：这次调用先不执行，
+ * 写下确认请求，这一步走完以 `requires_action` 结束（`RunResult.approvals`）；`reason` 给确认的人看。
+ */
 export type ToolDecision =
   | { readonly allow: true; readonly input?: JsonValue }
-  | { readonly allow: false; readonly reason: string };
+  | { readonly allow: false; readonly reason: string }
+  | { readonly ask: true; readonly reason?: string; readonly allow?: never };
 
 /** harness 给应用的切入点。权限确认、输入改写、输出截断都是钩子，不进协议本体。返回空表示不改。 */
 export interface Hooks {
@@ -333,16 +349,52 @@ export interface PendingToolCall {
   readonly runId: string;
   /** 带这次调用的助手消息的 `seq`。 */
   readonly seq: number;
+  /** 这次调用在等确认：harness 写下的确认请求，和应用已经追加的决定。 */
+  readonly approval?: PendingApproval;
+  /** 留给哪个外部执行环境执行（`RunEndedData.executors`）。在 harness 里执行的调用、日志里没记的时候没有。 */
+  readonly executor?: string;
+}
+
+/**
+ * 一次等确认的工具调用：harness 在这次调用的助手消息里写下 `tool-approval-request`（`approvalId`、`callId`、`reason`），
+ * 不执行它。应用的决定用 `toolApprovalEntry(approvalId, decision)` 追加。
+ */
+export interface ToolApproval {
+  readonly approvalId: string;
+  /** 等确认的那次调用的 `id`。 */
+  readonly callId: string;
+  readonly reason?: string;
+}
+
+/** 应用对一次确认请求的决定（`tool-approval-response`）。 */
+export interface ApprovalDecision {
+  readonly approved: boolean;
+  readonly reason?: string;
+}
+
+export interface PendingApproval {
+  readonly approvalId: string;
+  readonly reason?: string;
+  /** 应用追加的决定；还没决定时没有。同一个请求只认先到的那个。 */
+  readonly decision?: ApprovalDecision;
 }
 
 /**
  * 会话里等着别处执行、还没有结果的工具调用：以 `requires_action` 结束的那一轮留下的调用，去掉后面已经追加了结果的。
  * 之后又有运行以别的原因结束（结果没等来，下一轮照常跑了），之前留下的就不再算等待中。条目按 `seq` 排好。
- * 服务商执行的调用不算。
+ * 服务商执行的调用不算。等确认的调用带着 `approval`：同一条助手消息里的 `tool-approval-request`，和后面追加的决定。
  */
 export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
   let open = new Map<string, PendingToolCall>();
   let run: { runId: string; calls: Map<string, PendingToolCall> } | undefined;
+  /** 确认请求 → 它的调用。 */
+  const requested = new Map<string, string>();
+  const decide = (calls: Map<string, PendingToolCall> | undefined, callId: string, decision: ApprovalDecision) => {
+    const item = calls?.get(callId);
+    if (item?.approval && !item.approval.decision) {
+      calls!.set(callId, { ...item, approval: { ...item.approval, decision } });
+    }
+  };
   for (const entry of entries) {
     if (isEvent(entry, CTX_EVENTS.runStarted) || isEvent(entry, CTX_EVENTS.runEnded)) {
       const runId = runIdOf(entry);
@@ -351,9 +403,12 @@ export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
         run = { runId, calls: new Map() };
         continue;
       }
-      // 这一轮停下来等结果：它留下的调用等待中；别的结束方式让之前等着的都作废。
-      const waiting = ctxEventData(entry, CTX_EVENTS.runEnded)?.stopReason === 'requires_action';
-      open = waiting && run?.runId === runId ? new Map(run.calls) : new Map();
+      // 这一轮停下来等结果：它留下的调用等待中，带上各自归哪个外部执行环境；别的结束方式让之前等着的都作废。
+      const ended = ctxEventData(entry, CTX_EVENTS.runEnded);
+      open =
+        ended?.stopReason === 'requires_action' && run?.runId === runId
+          ? boundTo(run.calls, ended.executors)
+          : new Map();
       run = undefined;
       continue;
     }
@@ -365,6 +420,20 @@ export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
           runId: run.runId,
           seq: entry.seq,
         });
+      } else if (part.type === 'tool-approval-request' && part.isAutomatic !== true && run) {
+        const item = run.calls.get(part.callId);
+        if (!item || item.approval) continue;
+        requested.set(part.approvalId, part.callId);
+        run.calls.set(part.callId, {
+          ...item,
+          approval: { approvalId: part.approvalId, ...(part.reason !== undefined ? { reason: part.reason } : {}) },
+        });
+      } else if (part.type === 'tool-approval-response') {
+        const callId = requested.get(part.approvalId);
+        if (callId === undefined) continue;
+        const decision = { approved: part.approved, ...(part.reason !== undefined ? { reason: part.reason } : {}) };
+        decide(open, callId, decision);
+        decide(run?.calls, callId, decision);
       } else if (part.type === 'tool-result') {
         open.delete(part.id);
         run?.calls.delete(part.id);
@@ -374,8 +443,65 @@ export function pendingToolCalls(entries: readonly Entry[]): PendingToolCall[] {
   return [...open.values()];
 }
 
+/** 等着的调用带上 `ctx.run.ended` 记下的执行环境。 */
+function boundTo(
+  calls: ReadonlyMap<string, PendingToolCall>,
+  executors: Readonly<Record<string, string>> | undefined,
+): Map<string, PendingToolCall> {
+  return new Map(
+    [...calls].map(([id, item]) => {
+      const executor = executors && Object.hasOwn(executors, id) ? executors[id] : undefined;
+      return [id, executor === undefined ? item : { ...item, executor }];
+    }),
+  );
+}
+
+/**
+ * 会话里现在等着的工具调用：最后一个生命周期事件是以 `requires_action` 结束的那一轮时，读它起的条目交给
+ * `pendingToolCalls`；否则没有。执行方（`runPendingTools`）和要给人看确认请求的应用用它。
+ */
+export async function readPendingToolCalls(store: SessionStore, session: string): Promise<PendingToolCall[]> {
+  const [last] = await store.list(session, { kinds: [CTX_EVENTS.runStarted, CTX_EVENTS.runEnded], last: 1 });
+  if (ctxEventData(last, CTX_EVENTS.runEnded)?.stopReason !== 'requires_action') return [];
+  const [started] = await store.list(session, { kinds: [CTX_EVENTS.runStarted], last: 1 });
+  return pendingToolCalls(await store.list(session, { after: (started?.seq ?? 1) - 1 }));
+}
+
 /** `toolResultEntry` 用的幂等键前缀：同一次调用的结果只记一次，两个 worker 都执行了也只留先到的。 */
 export const TOOL_RESULT_KEY_PREFIX = 'ctx.tool-result:';
+
+/** `toolApprovalEntry` 用的幂等键前缀：一次确认请求只记先到的那个决定。 */
+export const TOOL_APPROVAL_KEY_PREFIX = 'ctx.tool-approval:';
+
+/**
+ * 应用对一次确认请求的决定，追加回会话的 `tool` 消息（`tool-approval-response`），带幂等键 `ctx.tool-approval:<approvalId>`。
+ * 之后不带输入跑一轮：harness 先执行确认了的调用、给拒绝的写上 `approvalDeniedOutput`，再调模型。
+ */
+export function toolApprovalEntry(
+  approvalId: string,
+  decision: ApprovalDecision,
+  options: EntryOptions = {},
+): NewMessageEntry {
+  return messageEntry(
+    {
+      role: 'tool',
+      content: [
+        {
+          type: 'tool-approval-response',
+          approvalId,
+          approved: decision.approved,
+          ...(decision.reason !== undefined ? { reason: decision.reason } : {}),
+        },
+      ],
+    },
+    { key: `${TOOL_APPROVAL_KEY_PREFIX}${approvalId}`, ...options },
+  );
+}
+
+/** 没被确认的调用的结果：模型看到它没执行、为什么。 */
+export function approvalDeniedOutput(call: Pick<ToolCall, 'name'>, reason?: string): ToolOutput {
+  return errorOutput(`Tool call "${call.name}" was not approved${reason ? `: ${reason}` : '.'}`);
+}
 
 /** 别处执行完一次工具调用，追加回会话的 `tool` 消息。带幂等键 `ctx.tool-result:<id>`。 */
 export function toolResultEntry(

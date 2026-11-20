@@ -53,12 +53,14 @@ import { CtxError, type JsonValue } from './types.ts';
 const DAY = 86_400_000;
 const NOW = Date.UTC(2026, 9, 27);
 
+/** `at`、`validFrom` 只给一个时，另一个和它一样：那时写下、那时成立。 */
 function fact(id: string, extra: Partial<MemoryFact> = {}): MemoryFact {
   return {
     id,
     subject: 'user',
     text: `事实 ${id}`,
-    validFrom: NOW,
+    at: extra.at ?? extra.validFrom ?? NOW,
+    validFrom: extra.validFrom ?? extra.at ?? NOW,
     confidence: 0.9,
     salience: 0.6,
     sources: [{ session: 's', from: 1, upTo: 1 }],
@@ -72,66 +74,86 @@ function isInvalid(error: unknown): boolean {
 }
 
 describe('activation', () => {
-  test('A = ln Σ (Δt + ε)^(−d) + s，Δt 以天计，t 取 validFrom 和每次召回', () => {
+  test('A = ln Σ (Δt + ε)^(−d) + s，Δt 以天计，t 取写入的时刻和每次召回', () => {
     const fresh = activation(fact('a'), NOW);
     assert.ok(Math.abs(fresh - (Math.log(0.02 ** -0.5) + 0.6)) < 1e-12);
-    const dayOld = activation(fact('a', { validFrom: NOW - DAY }), NOW);
+    const dayOld = activation(fact('a', { at: NOW - DAY }), NOW);
     assert.ok(Math.abs(dayOld - (Math.log(1.02 ** -0.5) + 0.6)) < 1e-12);
-    const recalled = activation(fact('a', { validFrom: NOW - 3 * DAY, recalls: [NOW - DAY / 2] }), NOW);
+    const recalled = activation(fact('a', { at: NOW - 3 * DAY, recalls: [NOW - DAY / 2] }), NOW);
     assert.ok(Math.abs(recalled - (Math.log(3.02 ** -0.5 + 0.52 ** -0.5) + 0.6)) < 1e-12);
   });
 
+  test('从写入算起：早就成立的事实刚写进来也是新的，validFrom 早于写入的不算', () => {
+    for (const days of [1, 30, 3650]) {
+      assert.equal(
+        activation(fact('a', { at: NOW, validFrom: NOW - days * DAY }), NOW),
+        activation(fact('a'), NOW),
+        `${days} 天前成立、刚写进来的和刚成立的一样新`,
+      );
+    }
+    const learned = fact('a', { at: NOW - DAY, validFrom: NOW - 400 * DAY });
+    assert.ok(activation(learned, NOW) > ACTIVATION_DEFAULTS.archiveAt, '写进来第二天还在阈值之上');
+    assert.equal(activation(learned, NOW), activation(fact('a', { at: NOW - DAY }), NOW));
+  });
+
   test('越久越低，召回一次就抬高；显著性是常数偏置', () => {
-    const old = fact('a', { validFrom: NOW - 5 * DAY });
-    assert.ok(activation(old, NOW) < activation(fact('a', { validFrom: NOW - DAY }), NOW));
+    const old = fact('a', { at: NOW - 5 * DAY });
+    assert.ok(activation(old, NOW) < activation(fact('a', { at: NOW - DAY }), NOW));
     assert.ok(activation({ ...old, recalls: [NOW - DAY] }, NOW) > activation(old, NOW));
     const diff = activation({ ...old, salience: 0.9 }, NOW) - activation({ ...old, salience: 0.1 }, NOW);
     assert.ok(Math.abs(diff - 0.8) < 1e-12);
   });
 
   test('d、epsilon 可调', () => {
-    const f = fact('a', { validFrom: NOW - 2 * DAY });
+    const f = fact('a', { at: NOW - 2 * DAY });
     assert.ok(Math.abs(activation(f, NOW, { d: 1 }) - (Math.log(1 / 2.02) + 0.6)) < 1e-12);
     assert.ok(Math.abs(activation(f, NOW, { epsilon: 0 }) - (Math.log(2 ** -0.5) + 0.6)) < 1e-12);
   });
 
-  test('晚于 now 的时刻按离 now 多远算：未来才生效的事实也衰减，临近时回升', () => {
+  test('写的时候还没成立的，成立那天也算一次：晚于 now 的按离 now 多远算，临近时回升，成立以后再衰减', () => {
+    const at = NOW - 10 * DAY;
     for (const days of [0.5, 1, 10, 400]) {
       assert.equal(
-        activation(fact('a', { validFrom: NOW + days * DAY }), NOW),
-        activation(fact('a', { validFrom: NOW - days * DAY }), NOW),
-        `${days} 天后生效和 ${days} 天前生效一样`,
+        activation(fact('a', { at, validFrom: NOW + days * DAY }), NOW),
+        activation(fact('a', { at, recalls: [NOW - days * DAY] }), NOW),
+        `${days} 天后成立的和 ${days} 天前召回过一次的一样`,
       );
     }
-    const far = fact('a', { validFrom: NOW + 365 * DAY });
-    assert.ok(activation(far, NOW) < ACTIVATION_DEFAULTS.archiveAt, '一年后才生效的事实不会一直顶着最高的激活度');
+    const far = fact('a', { at: NOW, validFrom: NOW + 365 * DAY });
+    assert.ok(activation(far, NOW) > ACTIVATION_DEFAULTS.archiveAt, '刚写下的远期事实是新的');
+    assert.ok(activation(far, NOW + 100 * DAY) < ACTIVATION_DEFAULTS.archiveAt, '不会一直顶着最高的激活度');
     assert.ok(activation(far, NOW + 364 * DAY) > activation(far, NOW + 300 * DAY), '越临近越高');
+    assert.ok(activation(far, NOW + 400 * DAY) < activation(far, NOW + 366 * DAY), '成立以后再衰减');
     assert.ok(
-      activation(fact('a', { validFrom: NOW - 3 * DAY, recalls: [NOW + DAY] }), NOW) ===
-        activation(fact('a', { validFrom: NOW - 3 * DAY, recalls: [NOW - DAY] }), NOW),
+      activation(fact('a', { at: NOW - 3 * DAY, recalls: [NOW + DAY] }), NOW) ===
+        activation(fact('a', { at: NOW - 3 * DAY, recalls: [NOW - DAY] }), NOW),
       '召回时刻也一样',
     );
   });
 
-  test(`只看最近 ${MAX_FACT_RECALLS} 次召回，所以有上界：ln((N + 1) · ε^(−d)) + s`, () => {
-    const bound = Math.log((MAX_FACT_RECALLS + 1) * 0.02 ** -0.5) + 0.6;
+  test(`只看最近 ${MAX_FACT_RECALLS} 次召回，所以有上界：ln((N + 2) · ε^(−d)) + s`, () => {
     const many = Array.from({ length: 20_000 }, () => NOW);
     const flooded = activation(fact('a', { recalls: many }), NOW);
-    assert.ok(Math.abs(flooded - bound) < 1e-9, `两万次刚发生的召回也只到 ${bound}，实际 ${flooded}`);
-    assert.ok(bound < 6.06);
+    const once = Math.log((MAX_FACT_RECALLS + 1) * 0.02 ** -0.5) + 0.6;
+    assert.ok(Math.abs(flooded - once) < 1e-9, `两万次刚发生的召回也只到 ${once}，实际 ${flooded}`);
+    // 写入和成立各算一次，都刚发生时最高。
+    const bound = Math.log((MAX_FACT_RECALLS + 2) * 0.02 ** -0.5) + 0.6;
+    const both = activation(fact('a', { at: NOW - 1, validFrom: NOW, recalls: many }), NOW);
+    assert.ok(both < bound && bound - both < 1e-6, `上界 ${bound}，实际 ${both}`);
+    assert.ok(bound < 6.09);
     const old = Array.from({ length: 1000 }, () => NOW - 300 * DAY);
     const recent = Array.from({ length: MAX_FACT_RECALLS }, (_, i) => NOW - i * DAY);
     assert.equal(
-      activation(fact('a', { validFrom: NOW - 400 * DAY, recalls: [...old, ...recent.toReversed()] }), NOW),
-      activation(fact('a', { validFrom: NOW - 400 * DAY, recalls: recent.toReversed() }), NOW),
+      activation(fact('a', { at: NOW - 400 * DAY, recalls: [...old, ...recent.toReversed()] }), NOW),
+      activation(fact('a', { at: NOW - 400 * DAY, recalls: recent.toReversed() }), NOW),
       '更早的召回不算',
     );
   });
 
-  test('缺省参数：s = 0.6、从未召回的事实约一天后低于归档阈值', () => {
+  test('缺省参数：s = 0.6、从未召回的事实写入约一天后低于归档阈值', () => {
     assert.deepEqual(ACTIVATION_DEFAULTS, { d: 0.5, epsilon: 0.02, archiveAt: 0.55 });
-    assert.ok(activation(fact('a', { validFrom: NOW - DAY }), NOW) > ACTIVATION_DEFAULTS.archiveAt);
-    assert.ok(activation(fact('a', { validFrom: NOW - 1.2 * DAY }), NOW) < ACTIVATION_DEFAULTS.archiveAt);
+    assert.ok(activation(fact('a', { at: NOW - DAY }), NOW) > ACTIVATION_DEFAULTS.archiveAt);
+    assert.ok(activation(fact('a', { at: NOW - 1.2 * DAY }), NOW) < ACTIVATION_DEFAULTS.archiveAt);
   });
 });
 
@@ -140,15 +162,18 @@ describe('retrievability', () => {
     const fresh = retrievability(fact('a'), NOW);
     assert.ok(Math.abs(fresh - 1 / (1 + Math.exp(0.55 - activation(fact('a'), NOW)))) < 1e-12);
     assert.ok(fresh > 0.88 && fresh < 0.89, `刚写的事实约 0.88：${fresh}`);
-    const month = retrievability(fact('a', { validFrom: NOW - 30 * DAY }), NOW);
+    const month = retrievability(fact('a', { at: NOW - 30 * DAY }), NOW);
     assert.ok(month > 0.15 && month < 0.17, `一个月没动的约 0.16：${month}`);
     // 取一个激活度正好等于阈值的事实：ln((Δt + ε)^(−d)) + s = archiveAt。
-    const at = fact('a', { validFrom: NOW - (Math.exp((0.6 - 0.55) / 0.5) - 0.02) * DAY });
-    assert.ok(Math.abs(retrievability(at, NOW) - 0.5) < 1e-9);
-    assert.ok(Math.abs(retrievability(at, NOW, { archiveAt: 0 }) - 1 / (1 + Math.exp(-0.55))) < 1e-9, 'archiveAt 可调');
+    const edge = fact('a', { at: NOW - (Math.exp((0.6 - 0.55) / 0.5) - 0.02) * DAY });
+    assert.ok(Math.abs(retrievability(edge, NOW) - 0.5) < 1e-9);
+    assert.ok(
+      Math.abs(retrievability(edge, NOW, { archiveAt: 0 }) - 1 / (1 + Math.exp(-0.55))) < 1e-9,
+      'archiveAt 可调',
+    );
     const flooded = retrievability(fact('a', { recalls: Array.from({ length: 20_000 }, () => NOW) }), NOW);
     assert.ok(flooded > fresh && flooded < 1, `召回再多也到不了 1：${flooded}`);
-    const ancient = retrievability(fact('a', { validFrom: NOW - 3650 * DAY, salience: 0 }), NOW);
+    const ancient = retrievability(fact('a', { at: NOW - 3650 * DAY, salience: 0 }), NOW);
     assert.ok(ancient > 0 && ancient < 0.02);
   });
 });
@@ -526,7 +551,7 @@ function fakeScope(scopeOf: (name: string) => MemoryStore, counter: { next: numb
   const keyed = (key: string | undefined): MemoryFact | undefined =>
     key === undefined ? undefined : [...facts.values()].find((found) => found.key === key);
   const write = (draft: NewMemoryFact): MemoryFact => {
-    const written: MemoryFact = { ...draft, id: newId('f'), recalls: [] };
+    const written: MemoryFact = { ...draft, at: draft.at ?? draft.validFrom, id: newId('f'), recalls: [] };
     facts.set(written.id, written);
     return written;
   };
@@ -883,6 +908,7 @@ function fakeMemory(options: {
             const added = await store.facts.add({
               subject: 'user',
               text: text.value,
+              at,
               validFrom: entries[0]?.at ?? at,
               confidence: text.confidence,
               salience: note.salience,

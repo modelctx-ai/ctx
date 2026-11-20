@@ -276,6 +276,22 @@ export function describeMemoryContract(
       });
     });
 
+    test('consolidate：写下的事实记着写入的时刻（这次的 now），不是原文的时刻', async () => {
+      await withMemory(factory, { decision: KEEP, extraction: EXTRACT }, async ({ memory, store, sessions, now }) => {
+        await sessions.append('s', [userEntry('项目的数据库换成 PostgreSQL 了，记住'), assistantEntry('记下了')]);
+        await memory.gate('s');
+        // 十天后才整理：事实十天前就成立了，可它是现在才记下的。
+        const later = now + 10 * 86_400_000;
+        checkReport(await memory.consolidate({ now: later }));
+        const facts = await store.facts.list();
+        assert.ok(facts.length > 0, '提取出的事实写进去了');
+        for (const fact of facts) {
+          assert.equal(fact.at, later, `事实 ${fact.text} 的 at 是整理的时刻`);
+          assert.ok(fact.validFrom <= fact.at, `事实 ${fact.text} 在记下之前就成立了`);
+        }
+      });
+    });
+
     test('consolidate 幂等：再跑一次不再处理笔记，事实和程序都不变', async () => {
       await withMemory(factory, { decision: KEEP, extraction: EXTRACT }, async ({ memory, store, sessions, now }) => {
         await sessions.append('s', [userEntry('项目的数据库换成 PostgreSQL 了，记住'), assistantEntry('记下了')]);

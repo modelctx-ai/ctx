@@ -4,7 +4,30 @@
 
 ## 2026-11-20
 
-- **更新** [实践：yoyo](repos.md)：`yoyo.db` 契约里 `memory_` 表的结构版本从 1 改成 4（`ctx-sqlite` 的记忆存储在 #55、#61 里升到了 2、3、4，这里没跟上），写明新版本打开旧库就地升级、升级后旧版本打不开；yoyo 不用的包加上 `ctx-pi`，依赖图下面「图里没画」的那几个包跟契约表对齐。
+- **更新** [实践：yoyo](repos.md)：yoyo 不用的包加上 `ctx-pi`、`ctx-managed-agents`，依赖图下面「图里没画」的那几个包跟契约表对齐；`yoyo.db` 契约写明新版本的 `ctx-sqlite` 打开旧库就地升级、升级后旧版本打不开。
+
+## 2026-11-19
+
+- **新增** [`ctx-managed-agents`](../packages/managed-agents/README.md) 的 README：安装、用法、怎么对上（会话身份、模型和指令、轨迹、断线、ctx 的工具、内置工具和 MCP、停下等的、停着等时又说了话、没发出去的输入、重试、取消、续接之前、上下文、子线程）、日志里一轮的样子、`AgentSpec` 和 `stopReason` 的映射、选项、一致性等级、验证（没有对真实服务验证）、导出。
+- **更新** [架构](architecture.md)：加「外部 harness：Managed Agents」一节；实现约束里 Node 专属的一行加 ctx-managed-agents 的 `node:crypto` 和假服务端的 `node:http`，依赖的一行加它把 `@anthropic-ai/sdk` 当 peer。
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：托管矩阵里 harness 的第三方托管从「Managed Agents（之后）」改成 `ctx-managed-agents`；「外部 harness 的身份」的 `name` 和已有的适配器加上它，写明它还过 `approval`。
+- **更新** [ADR 0010](adr/0010-external-harness-adapters.md)：头部的实施状态和范围、`tags`、实施状态加 Managed Agents，决定记录加一条：和决定二到决定八的关系（工具不经 MCP 而是自定义工具、会话退不回去、模型和指令定在会话上、`ask` 和外部执行环境映射得上、没发出去的输入补发）和代价。[ADR 0002](adr/0002-packages.md)：拆分表和依赖关系表加第十三个包，决定记录加一条：为什么单独成包、SDK 为什么是 peer。
+- **更新** [概念](concepts.md)：和 Anthropic 实践的对照之后那句改成 Managed Agents 已经接进来了。[文档索引](index.md)的「包」、[实践：yoyo](repos.md)的包数和包名、根目录的 [README](../README.md) 和[英文译本](../README.en.md)的包表和 `overrides`（译本的同步日期改成今天）、[例子](../examples/README.md)加 `managed-agents.ts` 和怎么对真实服务跑。
+
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`MemoryFact` 加 `at`（写入的时刻），`NewMemoryFact` 里可选；存储的规则加「写进来的时刻和成立的时刻分开」；激活度一节的 `t_i` 换成 `at`、晚于 `at` 的 `validFrom` 和召回，上界改成 34 个时刻，加「从写进来算起」一条，「未来的时刻」「归档看 `A`」跟上；契约测试的覆盖写上 `at`。
+- **更新** [记忆](memory.md)：「归档不能只看时间」写时间从写入算起，失败模式加「早就成立的事实一写进来就忘」。[架构](architecture.md)：巩固的提取和衰减两条写 `at` 怎么记、怎么算，删掉「没有写入时间」那句；SQLite 的结构版本改成 5，加版本 5 的迁移。[概念](concepts.md)的术语表：事实带 `at`，激活度从写入算起。[ADR 0006](adr/0006-memory.md)：决定记录补一条，2026-10-27 的待办第三条做了。
+- **更新** [`ctx-memory`](../packages/memory/README.md)、[`ctx-sqlite`](../packages/sqlite/README.md)、[协议包](../packages/protocol/README.md)的 README：`at` 怎么记、遗忘从写入算起、`facts` 表的 `at` 列、结构版本 5 和它的迁移。[实践：yoyo](repos.md)：yoyo 库里记忆存储的结构版本从早就过时的 1 改成 5。
+
+- **更新** [`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：加「事实和投影」一节和例子；「怎么对上」的上下文一行、`AgentSpec` 的 `instructions`、`context` 两行写事实和投影怎么映射，选项加 `projection`、`projections`、`sources`、`source_timeout_ms`、`facts_placement`，导出加 `ContextSource`、`EventRule`、`ProjectionOptions` 和 `ctx_pydantic_ai.context`，「还没做的」去掉事件规则、别的投影和事实来源，测试一节加对照 builder 的 `build`。
+- **更新** [架构](architecture.md)：「外部 harness：pydantic-ai」的签名和第三步写怎么选投影、收事实、把 system 文字和事实接进指令。[ADR 0010](adr/0010-external-harness-adapters.md)：实施状态和「没做」跟上，决定记录补一条：和决定四的关系、规则只按名字选、事实每轮只收一次、空输入的认法。[记忆](memory.md)：pydantic-ai 那一句改成它也收来源，但 `memory.source()` 交不过去。
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#21](https://github.com/modelctx-ai/ctx/issues/21)）：`RunEndedData` 加 `executors`，`PendingToolCall` 加 `executor`，「工具调用经日志往返」加「按名字领工作」；线上形态加 `POST /work/:executor/claim` 一行和它的规则（扫哪些会话、租约、长轮询、`limit`），主体、重试两条跟上；执行环境的两种接法和托管矩阵改成两种都有，「worker 拉取模式之后加」删掉。
+- **更新** [架构](architecture.md)：harness 一节写 `finish` 怎么记 `executors`，`createRemoteWorker` 的一步和循环，服务端怎么扫会话、记租约、长轮询，扫描的代价。[概念](concepts.md)的术语表加「领工作」。
+- **更新** [ADR 0008](adr/0008-tool-calls-through-the-log.md)：头部的实施状态和范围跟上，「还没做」的领工作路由挪到已做，决定记录加一条：为什么名字记在日志里、服务端内存里的租约做到了哪一步。
+- **更新** [`ctx-remote`](../packages/remote/README.md) 的 README：加「在内网的 worker」一节（例子、`createRemoteWorker` 的三个方法、租约），选项加 `workLeaseMs`，线上形态加领工作的路径和说明，主体、重试两条跟上，「之后」删掉 worker 拉取模式。[核心包](../packages/core/README.md)、[协议包](../packages/protocol/README.md)、[`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README 写明 `executors` 和 `PendingToolCall.executor`，指向领工作。
+- **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)（[#21](https://github.com/modelctx-ai/ctx/issues/21)）：Harness 一节加「人工确认」：`ask` 权限的调用和 `beforeTool` 回了 `{ ask: true }` 的调用怎么写确认请求、应用怎么追加决定（`toolApprovalEntry`）、下一轮开头怎么处理、执行方只执行确认了的；`RunResult` 加 `approvals`（`ToolApproval`），`ToolDecision` 加 `ask`，`permissions` 那一条改成指向人工确认；投影一节写明确认部件不交给模型（`withoutApprovals`）；一致性等级加 `approval`，契约测试表跟上。译本的 `synced` 改成今天。
+- **更新** [架构](architecture.md)：harness 一节写参考实现怎么用 AI SDK 的 `toolApproval` 停下、每次调用的处置只判一次、确认请求写进工具执行前的助手消息、下一轮开头怎么执行确认了的；`runPendingTools` 写明跳过等确认的；pydantic-ai 一节跟上。[概念](concepts.md)的术语表加「人工确认、确认请求」，一致性等级加 `approval`。
+- **更新** [ADR 0008](adr/0008-tool-calls-through-the-log.md)：实施状态把人工确认从「还没做」挪到已做，决定记录加一条：为什么改成经确认请求和决定往返、`runPendingTools` 的不兼容。
+- **更新** [协议包](../packages/protocol/README.md)、[核心包](../packages/core/README.md)、[`ctx-pydantic-ai`](../python/pydantic-ai/README.md) 的 README：导出加确认的几个函数和类型；核心包加「人工确认」一节和例子；pydantic-ai 的例子改成追加决定，一致性等级改成六级。[`ctx-claude-code`](../packages/claude-code/README.md)、[`ctx-pi`](../packages/pi/README.md) 写明不跑 `approval`。
 
 ## 2026-11-18
 

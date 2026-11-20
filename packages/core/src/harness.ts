@@ -1,12 +1,15 @@
 import {
   afterConflict,
   agentSpecToJson,
+  approvalDeniedOutput,
   CONTEXT_OVERFLOW,
   CTX_EVENTS,
   checkJsonSchema,
   createSessionQueue,
   CtxError,
   ctxErrorEntry,
+  ctxEventData,
+  DEFAULT_MAX_TOOL_OUTPUT_CHARS,
   endedInFailure,
   estimateTextTokens,
   estimateTokens,
@@ -15,7 +18,9 @@ import {
   isEvent,
   errorOutput,
   executorMap,
+  limitToolOutput,
   messageEntry,
+  pendingToolCalls,
   runEndedEntry,
   runIdOf,
   runParentProblem,
@@ -24,12 +29,15 @@ import {
   silentLogger,
   stepMetaToJson,
   toolPermission,
+  toolResultEntry,
   userEntry,
+  withoutApprovals,
   type BuildRequest,
   type CompactOptions,
   type ContextBuilder,
   type Entry,
   type ErrorInfo,
+  type ExecutionContext,
   type Executors,
   type Harness,
   type Hooks,
@@ -50,7 +58,9 @@ import {
   type SessionStore,
   type StepMeta,
   type StopReason,
+  type ToolApproval,
   type ToolCall,
+  type ToolDecision,
   type ToolDefinition,
   type ToolOutput,
   type ToolRegistry,
@@ -76,7 +86,7 @@ import {
 import { isEmptyContent, resolveModel } from './builder.ts';
 import { isContextOverflowError } from './errors.ts';
 import { fromModelMessages, toModelMessages } from './messages.ts';
-import { dispatchTo, toToolSet, type LocalToolRegistry, type ToolDispatch } from './tools.ts';
+import { dispatchTo, invalidInput, toToolSet, type LocalToolRegistry } from './tools.ts';
 
 export type GenerateTextResult = Awaited<ReturnType<typeof generateText>>;
 export type StreamTextResult = ReturnType<typeof streamText>;
@@ -138,6 +148,8 @@ export interface StartedStream {
   stepSeq?(step: number): Promise<number | undefined>;
   /** 组装失败时没有流，`done()` 直接给出结果。 */
   readonly result?: StreamTextResult;
+  /** 这一轮开头补上的工具结果：上一轮等确认的调用，确认了的执行了，拒绝的写了拒绝。 */
+  readonly resolved?: readonly { readonly callId: string; readonly output: ToolOutput }[];
   /** 产出写进日志以后给出结果；第一次调用时才开始等（等的时候会让流跑完）。只在写日志失败时 reject。 */
   done(): Promise<RunOutcome>;
 }
@@ -182,6 +194,26 @@ interface RunState {
   overBudget: boolean;
   /** 每一步写完时日志的末尾 `seq`，流式的 `model.ended` 等它；这一步没写下（不记录、出错）时是 `undefined`。 */
   readonly stepSeqs: Map<number, PromiseWithResolvers<number | undefined>>;
+  /**
+   * 这一轮每次工具调用的处置（按调用 `id`）：AI SDK 问要不要确认、工具执行前写助手消息、执行时都用它，
+   * `beforeTool` 对同一次调用只问一次。
+   */
+  readonly verdicts: Map<string, Promise<Verdict>>;
+  /** 这一轮发出的确认请求（按调用 `id`）。 */
+  readonly approvals: Map<string, ToolApproval>;
+  /** 上一轮以 `requires_action` 结束时，它的 `ctx.run.started` 的 `seq`：这一轮开头先处理它留下的确认。 */
+  waiting?: number;
+  /** 这一轮开头补上的工具结果（确认了的执行了，拒绝的写了拒绝），流式在 `run.started` 之后报 `tool.returned`。 */
+  readonly resolved: { readonly callId: string; readonly output: ToolOutput }[];
+}
+
+/**
+ * 一次工具调用的处置。`approval`：要等人确认，不执行，确认请求写进这次调用的助手消息。否则照常执行，`decision` 是
+ * 已经问过的 `beforeTool`（钩子抛错时 reject，执行时照旧变成工具错误）；没问钩子（拒绝、输入不合、外部执行）时没有。
+ */
+interface Verdict {
+  readonly approval?: ToolApproval;
+  readonly decision?: Promise<ToolDecision | void>;
 }
 
 /** 第 `index` 步写完时的末尾 `seq`。 */
@@ -200,6 +232,10 @@ interface Setup {
   readonly tools: ToolSet;
   readonly toolCount: number;
   readonly maxSteps: number;
+  /** 这一轮怎么处置一次工具调用（`Verdict`），同一次调用只判一次。 */
+  readonly verdict: (call: ToolCall) => Promise<Verdict>;
+  /** 这个工具的调用留给哪个外部执行环境；在这里执行的（包括等确认的）没有。 */
+  readonly executorOf: (name: string) => string | undefined;
 }
 
 interface Produced {
@@ -229,6 +265,13 @@ function budgetStop(state: RunState, budget: RunBudget) {
 
 const PERMISSIONS = new Set(['allow', 'ask', 'deny']);
 
+function checkPermissions(permissions: RunRequest['agent']['permissions']): void {
+  const values = [permissions?.default, ...Object.values(permissions?.tools ?? {})];
+  if (values.some((value) => value !== undefined && !PERMISSIONS.has(value))) {
+    throw new CtxError('invalid_request', 'AgentSpec.permissions values must be "allow", "ask" or "deny".');
+  }
+}
+
 /** 线上来的 `AgentSpec` 字段：形状不对就当请求不对，不猜。 */
 function checkAgentExtras(agent: RunRequest['agent'], offered: readonly string[]): void {
   const { budget, permissions, toolChoice, output } = agent;
@@ -238,10 +281,7 @@ function checkAgentExtras(agent: RunRequest['agent'], offered: readonly string[]
       throw new CtxError('invalid_request', `AgentSpec.budget.${key} must be a positive number.`);
     }
   }
-  const values = [permissions?.default, ...Object.values(permissions?.tools ?? {})];
-  if (values.some((value) => value !== undefined && !PERMISSIONS.has(value))) {
-    throw new CtxError('invalid_request', 'AgentSpec.permissions values must be "allow", "ask" or "deny".');
-  }
+  checkPermissions(permissions);
   if (typeof toolChoice === 'object' && !offered.includes(toolChoice.tool)) {
     throw new CtxError(
       'invalid_request',
@@ -295,6 +335,56 @@ function pendingOf(content: ReadonlyArray<ContentPart<ToolSet>> | undefined): To
       ? [{ id: part.toolCallId, name: part.toolName, input: (part.input ?? null) as ToolCall['input'] }]
       : [],
   );
+}
+
+/** `beforeTool` 要人确认这次调用。 */
+function asks(decision: ToolDecision | void): decision is Extract<ToolDecision, { readonly ask: true }> {
+  return typeof decision === 'object' && decision !== null && 'ask' in decision && decision.ask;
+}
+
+/** 一次确认请求的部件，写进那次调用的助手消息。 */
+function approvalPart(approval: ToolApproval) {
+  return {
+    type: 'tool-approval-request' as const,
+    approvalId: approval.approvalId,
+    callId: approval.callId,
+    ...(approval.reason !== undefined ? { reason: approval.reason } : {}),
+  };
+}
+
+/** 给助手消息接上这些确认请求。 */
+function withApprovalRequests(message: Message, approvals: readonly ToolApproval[]): Message {
+  if (approvals.length === 0 || message.role !== 'assistant') return message;
+  const content =
+    typeof message.content === 'string' ? [{ type: 'text' as const, text: message.content }] : message.content;
+  return { ...message, content: [...content, ...approvals.map(approvalPart)] };
+}
+
+/** 交给模型的消息不带确认部件（`withoutApprovals`）：确认由 harness 处理，AI SDK 看到它们会自己去执行或报错。 */
+function forModel(messages: readonly Message[]): Message[] {
+  return messages.flatMap((message) => {
+    const kept = withoutApprovals(message);
+    return kept ? [kept] : [];
+  });
+}
+
+/**
+ * AI SDK 自己给等确认的调用生成了确认请求（`approvalId` 是它的）：换成这一轮写进日志的那个，`RunResult.messages`
+ * 和日志对得上。
+ */
+function ownApprovals(messages: readonly Message[], approvals: ReadonlyMap<string, ToolApproval>): Message[] {
+  return messages.map((message) => {
+    if (message.role !== 'assistant' || typeof message.content === 'string') return message;
+    if (!message.content.some((part) => part.type === 'tool-approval-request')) return message;
+    return {
+      ...message,
+      content: message.content.map((part) => {
+        if (part.type !== 'tool-approval-request') return part;
+        const own = approvals.get(part.callId);
+        return own ? approvalPart(own) : part;
+      }),
+    };
+  });
 }
 
 /**
@@ -425,6 +515,9 @@ function begin(request: RunRequest): RunState {
     stepSeqs: new Map(),
     startedAt: Date.now(),
     overBudget: false,
+    verdicts: new Map(),
+    approvals: new Map(),
+    resolved: [],
   };
 }
 
@@ -551,18 +644,30 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     }
   }
 
-  const dispatch: ToolDispatch = async (call, definition, execution) => {
+  /**
+   * `beforeTool` → 绑定的执行环境 → `afterTool`。`decided` 是已经问过的 `beforeTool`：这一轮判断要不要确认时问的
+   * （同一次调用只问一次），人确认过的调用给空的决定，不再问钩子。
+   */
+  async function dispatch(
+    call: ToolCall,
+    definition: ToolDefinition,
+    execution: ExecutionContext,
+    decided?: Promise<ToolDecision | void>,
+  ): Promise<ToolOutput> {
     let actual: ToolCall = call;
-    const decision = await hooks.beforeTool?.(call, execution);
+    const decision = await (decided ?? hooks.beforeTool?.(call, execution));
     let output: ToolOutput;
-    if (decision && !decision.allow) {
+    if (asks(decision)) {
+      // 等确认的调用 AI SDK 不执行；只有绕过了这一轮的判断才会走到这里。
+      output = errorOutput(`Tool call "${call.name}" needs approval and was not run.`);
+    } else if (decision && !decision.allow) {
       output = errorOutput(`Tool call "${call.name}" was not allowed: ${decision.reason}`);
     } else {
       if (decision?.input !== undefined) actual = { ...call, input: decision.input };
       output = await base(actual, definition, execution);
     }
     return (await hooks.afterTool?.(actual, output, execution)) ?? output;
-  };
+  }
 
   /** 追加并记下新的末尾。 */
   async function append(state: RunState, entries: readonly NewEntry[], expectSeq: number | undefined) {
@@ -636,6 +741,12 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         const last = lifecycle.at(-1);
         if (last?.type === 'event' && last.kind === CTX_EVENTS.runStarted) return false;
         state.afterFailure = endedInFailure(lifecycle);
+        // 上一轮停下等结果或确认：记下它从哪开始，`setup` 先处理应用追加的确认。
+        state.waiting = undefined;
+        if (ctxEventData(last, CTX_EVENTS.runEnded)?.stopReason === 'requires_action') {
+          const [waiting] = await store.list(session, { kinds: [CTX_EVENTS.runStarted], last: 1 });
+          state.waiting = waiting?.seq;
+        }
         try {
           await append(state, [started], head);
           state.started = state.recorded.at(-1)?.seq;
@@ -737,9 +848,98 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     return prepared;
   }
 
+  /**
+   * 这一轮的分发链：第一次交给某个执行环境之前 `open` 这个会话（ADR 0009；打不开时这个执行环境的调用都回错误，模型
+   * 看得到原因），`deny` 的不执行、回拒绝，其余交给 `dispatch`。
+   */
+  function toolChain(state: RunState, signal: AbortSignal) {
+    const { agent, session } = state.request;
+    const { permissions, environment } = agent;
+    const opened = new Map<string, Promise<void>>();
+    const openFor = (definition: ToolDefinition): Promise<void> | undefined => {
+      const executor = executors.get(definition.executor);
+      if (!executor?.open) return undefined;
+      let opening = opened.get(definition.executor);
+      if (!opening) {
+        opening = executor.open(session, { ...(environment ? { environment } : {}), signal });
+        opened.set(definition.executor, opening);
+      }
+      return opening;
+    };
+    return async (
+      call: ToolCall,
+      definition: ToolDefinition,
+      execution: ExecutionContext,
+      decided?: Promise<ToolDecision | void>,
+    ): Promise<ToolOutput> => {
+      try {
+        await openFor(definition);
+      } catch (error) {
+        return errorOutput(
+          `Executor "${definition.executor}" could not prepare session "${session}" for tool "${call.name}": ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      if (toolPermission(permissions, call.name) === 'deny') {
+        return errorOutput(`Tool call "${call.name}" was denied by the agent's permissions.`);
+      }
+      return dispatch(call, definition, execution, decided);
+    };
+  }
+
+  /** 这个工具的输入要不要在执行前按 `inputSchema` 查（`HarnessOptions.validateToolInput`）。 */
+  const validates = (definition: ToolDefinition): boolean =>
+    options.validateToolInput ?? !selfValidated(definition.name);
+
+  /**
+   * 上一轮停下等确认（`state.waiting`）：记这一轮的输入之前，先把应用追加的决定落成结果。确认了的、在这里执行的调用
+   * 照常执行（不再问 `beforeTool`，`deny` 仍然优先），拒绝的写上 `approvalDeniedOutput`；确认了、绑到外部执行环境的
+   * 留给执行方（`runPendingTools`），还没决定的不动。每个结果一条 `toolResultEntry`（带幂等键），一次写下。
+   */
+  async function resolveApprovals(
+    state: RunState,
+    execute: (call: ToolCall, definition: ToolDefinition) => Promise<ToolOutput>,
+  ): Promise<void> {
+    if (state.waiting === undefined || !state.record) return;
+    const { session, agent } = state.request;
+    const entries = await store.list(session, { after: state.waiting - 1 });
+    const decided = pendingToolCalls(entries).flatMap((item) =>
+      item.approval?.decision ? [{ call: item.call, decision: item.approval.decision }] : [],
+    );
+    if (decided.length === 0) return;
+    checkPermissions(agent.permissions);
+    const outputs = await Promise.all(
+      decided.map(async ({ call, decision }): Promise<ToolOutput | undefined> => {
+        if (!decision.approved) return approvalDeniedOutput(call, decision.reason);
+        const definition = tools?.get(call.name);
+        if (!definition) return errorOutput(`Tool "${call.name}" is not available.`);
+        if (toolPermission(agent.permissions, call.name) !== 'deny' && external.has(definition.executor)) {
+          return undefined;
+        }
+        return execute(call, definition);
+      }),
+    );
+    const results = decided.flatMap(({ call }, index) => {
+      const output = outputs[index];
+      return output ? [{ call, output }] : [];
+    });
+    await write(
+      state,
+      results.map(({ call, output }) => toolResultEntry(call, output, { source: 'harness' })),
+    );
+    state.resolved.push(...results.map(({ call, output }) => ({ callId: call.id, output })));
+  }
+
   async function setup(state: RunState, extras: RunExtras, signal: AbortSignal): Promise<Setup> {
     const { request } = state;
     const { agent, session } = request;
+    const chain = toolChain(state, signal);
+    const maxOutputChars = options.maxToolOutputChars ?? DEFAULT_MAX_TOOL_OUTPUT_CHARS;
+    await resolveApprovals(state, async (call, definition) => {
+      const invalid = validates(definition) ? invalidInput(definition, call.input) : undefined;
+      if (invalid) return invalid;
+      const execution: ExecutionContext = { session, runId: state.runId, signal };
+      return limitToolOutput(await chain(call, definition, execution, Promise.resolve()), maxOutputChars);
+    });
     const input = isEmptyContent(request.input) ? undefined : request.input;
     if (state.record && input !== undefined) {
       const source = options.source !== undefined ? { source: options.source } : {};
@@ -792,40 +992,46 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       definitions.filter((definition) => toolPermission(agent.permissions, definition.name) !== 'ask'),
     );
     const { permissions } = agent;
-    // `deny` 的不执行，模型看到拒绝；`ask` 的和外部执行环境的一样不在这里执行，这一轮以 `requires_action` 停下。
-    const runDispatch: typeof dispatch = permissions
-      ? async (call, definition, execution) =>
-          toolPermission(permissions, call.name) === 'deny'
-            ? errorOutput(`Tool call "${call.name}" was denied by the agent's permissions.`)
-            : dispatch(call, definition, execution)
-      : dispatch;
-    // 一轮里第一次交给某个执行环境之前 `open` 这个会话（ADR 0009）；打不开时这个执行环境的调用都回错误，模型看得到原因。
-    const opened = new Map<string, Promise<void>>();
-    const environment = agent.environment;
-    const openFor = (definition: ToolDefinition): Promise<void> | undefined => {
-      const executor = executors.get(definition.executor);
-      if (!executor?.open) return undefined;
-      let opening = opened.get(definition.executor);
-      if (!opening) {
-        opening = executor.open(session, { ...(environment ? { environment } : {}), signal });
-        opened.set(definition.executor, opening);
-      }
-      return opening;
-    };
-    const sessionDispatch: typeof dispatch = async (call, definition, execution) => {
-      try {
-        await openFor(definition);
-      } catch (error) {
-        return errorOutput(
-          `Executor "${definition.executor}" could not prepare session "${session}" for tool "${call.name}": ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      return runDispatch(call, definition, execution);
-    };
-    // `deny` 优先：绑到外部执行环境的工具被拒绝时也在这里回拒绝，不等别处执行。
+    // `deny` 优先：绑到外部执行环境的工具被拒绝时也在这里回拒绝，不等别处执行。`ask` 的不在这里执行。
     const deferred = (definition: ToolDefinition): boolean => {
       const permission = toolPermission(permissions, definition.name);
       return permission === 'ask' || (permission !== 'deny' && external.has(definition.executor));
+    };
+    const offered = new Map(definitions.map((definition) => [definition.name, definition]));
+    const toolContext: ExecutionContext = { session, runId: state.runId, signal };
+    const ask = (call: ToolCall, reason?: string): Verdict => {
+      const approval: ToolApproval = {
+        approvalId: crypto.randomUUID(),
+        callId: call.id,
+        ...(reason !== undefined ? { reason } : {}),
+      };
+      state.approvals.set(call.id, approval);
+      return { approval };
+    };
+    // `ask` 权限的直接等确认；在这里执行、输入合 schema 的问 `beforeTool`，它回 `ask` 的也等确认。
+    const judge = async (call: ToolCall): Promise<Verdict> => {
+      const definition = offered.get(call.name);
+      if (!definition) return {};
+      const permission = toolPermission(permissions, call.name);
+      if (permission === 'ask') return ask(call);
+      if (permission === 'deny' || external.has(definition.executor) || !hooks.beforeTool) return {};
+      if (validates(definition) && invalidInput(definition, call.input)) return {};
+      const decision = (async () => hooks.beforeTool!(call, toolContext))();
+      try {
+        const decided = await decision;
+        if (asks(decided)) return ask(call, decided.reason);
+      } catch {
+        // 钩子抛错：照常交给执行，`dispatch` 等它时抛出，模型看到工具错误。
+      }
+      return { decision };
+    };
+    const verdict = (call: ToolCall): Promise<Verdict> => {
+      let found = state.verdicts.get(call.id);
+      if (!found) {
+        found = judge(call);
+        state.verdicts.set(call.id, found);
+      }
+      return found;
     };
     return {
       model,
@@ -833,22 +1039,31 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       tools: toToolSet(definitions, undefined, {
         session,
         runId: state.runId,
-        dispatch: sessionDispatch,
-        validateInput: options.validateToolInput ?? ((definition) => !selfValidated(definition.name)),
-        ...(options.maxToolOutputChars !== undefined ? { maxOutputChars: options.maxToolOutputChars } : {}),
+        dispatch: async (call, definition, execution) =>
+          chain(call, definition, execution, (await verdict(call)).decision),
+        validateInput: validates,
+        maxOutputChars,
         ...(external.size > 0 || permissions ? { external: deferred } : {}),
       }),
       toolCount: definitions.length,
       maxSteps: agent.maxSteps ?? (definitions.length > 0 ? 5 : 1),
+      verdict,
+      executorOf: (name) => {
+        const definition = offered.get(name);
+        return definition && external.has(definition.executor) && toolPermission(permissions, name) !== 'deny'
+          ? definition.executor
+          : undefined;
+      },
     };
   }
 
   /**
    * 每一步即时落日志：模型这一步要在本地执行工具时，模型调用一结束（工具执行前）先写助手消息，崩溃后日志里至少有
-   * 「调用已发出、结果未知」；步骤结束时写这一步剩下的（工具结果，或者没有工具调用时的助手消息）。
-   * AI SDK 等这两个回调写完才执行工具、才走下一步，但吞掉回调的异常：写失败或被围栏时记进 `stepError`，再中止这一轮。
+   * 「调用已发出、结果未知」；等确认的调用的确认请求写在同一条消息里。步骤结束时写这一步剩下的（工具结果，或者没有
+   * 工具调用时的助手消息）。AI SDK 等这两个回调写完才执行工具、才走下一步，但吞掉回调的异常：写失败或被围栏时记进
+   * `stepError`，再中止这一轮。
    */
-  function stepLogging(state: RunState, abort: (reason: unknown) => void) {
+  function stepLogging(state: RunState, ready: Setup, abort: (reason: unknown) => void) {
     const stop = (error: unknown): void => {
       state.stepError ??= error;
       abort(error);
@@ -870,9 +1085,24 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         const draft = assistantBefore(content);
         if (!draft) return;
         try {
+          // 每次调用先判处置（同一次调用只判一次，AI SDK 问确认时用同一个结果）。
+          const verdicts = await Promise.all(
+            calls
+              .filter((call) => call.invalid !== true)
+              .map((call) =>
+                ready.verdict({
+                  id: call.toolCallId,
+                  name: call.toolName,
+                  input: (call.input ?? null) as ToolCall['input'],
+                }),
+              ),
+          );
+          const approvals = verdicts.flatMap((verdict) => (verdict.approval ? [verdict.approval] : []));
           // 子集之外的部件在这里抛 `unsupported_part`：这一轮以 `error` 结束，工具不执行。
           const [message] = fromModelMessages([draft]);
-          await write(state, [messageEntry(message!, { source: 'model', meta: stepMeta(state, event) })]);
+          await write(state, [
+            messageEntry(withApprovalRequests(message!, approvals), { source: 'model', meta: stepMeta(state, event) }),
+          ]);
           state.early = true;
           for (const call of calls) state.open.set(call.toolCallId, call.toolName);
         } catch (error) {
@@ -890,7 +1120,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         const done = stepSeq(state, index);
         if (!state.record || state.stepError !== undefined) return done.resolve(undefined);
         try {
-          const messages = fromModelMessages(step.response.messages);
+          const messages = ownApprovals(fromModelMessages(step.response.messages), state.approvals);
           const skip = state.early && messages[0]?.role === 'assistant';
           const meta = stepMeta(
             { ...state, step: index },
@@ -934,11 +1164,32 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
     const { prepared } = ready;
     const beforeModel = hooks.beforeModel?.bind(hooks);
     return {
-      ...stepLogging(state, (reason) => controller.abort(reason)),
+      ...stepLogging(state, ready, (reason) => controller.abort(reason)),
       model: ready.model,
       ...(prepared.instructions ? { instructions: prepared.instructions } : {}),
-      messages: toModelMessages(prepared.messages),
-      ...(ready.toolCount > 0 ? { tools: ready.tools } : {}),
+      messages: toModelMessages(forModel(prepared.messages)),
+      ...(ready.toolCount > 0
+        ? {
+            tools: ready.tools,
+            // 等确认的调用不执行：AI SDK 停下这一轮，调用留在 `pending`，确认请求是 harness 写下的那个。
+            toolApproval: async ({
+              toolCall,
+            }: {
+              readonly toolCall: { toolCallId: string; toolName: string; input: unknown };
+            }) => {
+              const { approval } = await ready.verdict({
+                id: toolCall.toolCallId,
+                name: toolCall.toolName,
+                input: (toolCall.input ?? null) as ToolCall['input'],
+              });
+              if (!approval) return 'not-applicable' as const;
+              return {
+                type: 'user-approval' as const,
+                ...(approval.reason !== undefined ? { reason: approval.reason } : {}),
+              };
+            },
+          }
+        : {}),
       stopWhen: state.request.agent.budget
         ? [stepCountIs(ready.maxSteps), budgetStop(state, state.request.agent.budget)]
         : stepCountIs(ready.maxSteps),
@@ -990,7 +1241,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
               });
               if (!changed || changed === call) return undefined;
               return {
-                messages: toModelMessages(changed.messages),
+                messages: toModelMessages(forModel(changed.messages)),
                 ...(changed.instructions !== undefined ? { instructions: changed.instructions } : {}),
               };
             },
@@ -1003,8 +1254,12 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
   async function finish(state: RunState, ready: Setup, produced: Produced, signal: AbortSignal): Promise<RunResult> {
     await state.writing;
     if (state.stepError !== undefined) return fail(state, state.stepError, signal);
-    const messages = [...produced.messages];
+    const messages = ownApprovals(produced.messages, state.approvals);
     const { pending } = produced;
+    const approvals = pending.flatMap((call) => {
+      const approval = state.approvals.get(call.id);
+      return approval ? [approval] : [];
+    });
     const stopReason: StopReason =
       pending.length > 0
         ? 'requires_action'
@@ -1021,9 +1276,24 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       }
     }
     const usage = usageOf(produced.usage);
+    // 留给外部执行环境的调用记下归谁：执行方按名字领工作。
+    const bound = Object.fromEntries(
+      pending.flatMap((call) => {
+        const executor = ready.executorOf(call.name);
+        return executor === undefined ? [] : [[call.id, executor] as const];
+      }),
+    );
     await write(state, [
       ...messages.slice(state.logged).map((message) => messageEntry(message, { source: 'model' })),
-      runEndedEntry({ runId: state.runId, stopReason, ...(usage ? { usage } : {}) }, { source: 'harness' }),
+      runEndedEntry(
+        {
+          runId: state.runId,
+          stopReason,
+          ...(usage ? { usage } : {}),
+          ...(Object.keys(bound).length > 0 ? { executors: bound } : {}),
+        },
+        { source: 'harness' },
+      ),
     ]);
     return {
       runId: state.runId,
@@ -1034,6 +1304,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       ...(usage ? { usage } : {}),
       ...(output !== undefined ? { output } : {}),
       ...(pending.length > 0 ? { pending } : {}),
+      ...(approvals.length > 0 ? { approvals } : {}),
     };
   }
 
@@ -1165,6 +1436,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       return {
         runId: state.runId,
         ...(state.started !== undefined ? { seq: state.started } : {}),
+        resolved: state.resolved,
         done: () => outcome,
       };
     }
@@ -1237,6 +1509,7 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
       runId: state.runId,
       ...(state.started !== undefined ? { seq: state.started } : {}),
       stepSeq: (step) => stepSeq(state, step).promise,
+      resolved: state.resolved,
       result,
       done() {
         if (!watched) {
@@ -1269,6 +1542,8 @@ export function createHarnessRuntime(options: HarnessOptions): HarnessRuntime {
         session: request.session,
         ...(started.seq !== undefined ? { seq: started.seq } : {}),
       };
+      // 上一轮等确认的调用：这一轮开头执行了（或写了拒绝）。调用本身在上一轮的流里报过。
+      for (const { callId, output } of started.resolved ?? []) yield { type: 'tool.returned', runId, callId, output };
       if (started.result) {
         let step = 0;
         try {

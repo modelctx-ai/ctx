@@ -753,6 +753,67 @@
         }
       }
     },
+    "/work/{executor}/claim": {
+      "post": {
+        "tags": ["执行环境"],
+        "summary": "按执行环境的名字领等着的调用，领到的占一段租约；一个都没有时长轮询到 waitMs",
+        "parameters": [
+          {
+            "name": "executor",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "limit": {
+                    "type": "integer"
+                  },
+                  "waitMs": {
+                    "type": "integer"
+                  },
+                  "leaseMs": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "calls": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ClaimedToolCall"
+                      }
+                    }
+                  },
+                  "required": ["calls"]
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/runs": {
       "post": {
         "tags": ["Harness"],
@@ -3793,6 +3854,12 @@
               "$ref": "#/components/schemas/ToolCall"
             }
           },
+          "approvals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ToolApproval"
+            }
+          },
           "error": {
             "$ref": "#/components/schemas/ErrorInfo"
           }
@@ -3834,11 +3901,89 @@
               "$ref": "#/components/schemas/ToolCall"
             }
           },
+          "approvals": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ToolApproval"
+            }
+          },
           "error": {
             "$ref": "#/components/schemas/ErrorInfo"
           }
         },
         "required": ["runId", "text", "messages", "recorded", "stopReason"],
+        "additionalProperties": false
+      },
+      "ToolApproval": {
+        "type": "object",
+        "description": "等确认的一次工具调用（`RunResult.approvals`）",
+        "properties": {
+          "approvalId": {
+            "type": "string"
+          },
+          "callId": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": ["approvalId", "callId"],
+        "additionalProperties": false
+      },
+      "ApprovalDecision": {
+        "type": "object",
+        "properties": {
+          "approved": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": ["approved"],
+        "additionalProperties": false
+      },
+      "PendingApproval": {
+        "type": "object",
+        "properties": {
+          "approvalId": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "decision": {
+            "$ref": "#/components/schemas/ApprovalDecision"
+          }
+        },
+        "required": ["approvalId"],
+        "additionalProperties": false
+      },
+      "ClaimedToolCall": {
+        "type": "object",
+        "description": "`POST /work/:executor/claim` 领到的一次调用：等着的调用（`PendingToolCall`）加上它所在的会话",
+        "properties": {
+          "session": {
+            "type": "string"
+          },
+          "runId": {
+            "type": "string"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "call": {
+            "$ref": "#/components/schemas/ToolCall"
+          },
+          "approval": {
+            "$ref": "#/components/schemas/PendingApproval"
+          },
+          "executor": {
+            "type": "string"
+          }
+        },
+        "required": ["session", "runId", "seq", "call"],
         "additionalProperties": false
       },
       "RunEvent": {
@@ -4230,6 +4375,9 @@
               "$ref": "#/components/schemas/SourceRef"
             }
           },
+          "at": {
+            "type": "number"
+          },
           "recalls": {
             "type": "array",
             "items": {
@@ -4255,7 +4403,7 @@
             "type": "number"
           }
         },
-        "required": ["id", "subject", "text", "validFrom", "confidence", "salience", "sources", "recalls"],
+        "required": ["id", "subject", "text", "validFrom", "confidence", "salience", "sources", "at", "recalls"],
         "additionalProperties": false
       },
       "NewMemoryFact": {
@@ -4290,6 +4438,9 @@
           },
           "topic": {
             "type": "string"
+          },
+          "at": {
+            "type": "number"
           }
         },
         "required": ["subject", "text", "validFrom", "confidence", "salience", "sources"],

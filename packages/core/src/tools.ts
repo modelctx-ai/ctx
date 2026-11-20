@@ -55,6 +55,15 @@ export interface ToolSetOptions {
   readonly external?: (definition: ToolDefinition) => boolean;
 }
 
+/** 按工具的 `inputSchema` 查一次调用的输入：不合时是给模型看的错误结果，合就是 `undefined`。 */
+export function invalidInput(definition: ToolDefinition, input: JsonValue): ToolOutput | undefined {
+  const issues = checkJsonSchema(definition.inputSchema, input);
+  if (issues.length === 0) return undefined;
+  return errorOutput(
+    `Invalid input for tool "${definition.name}": ${issues.join('; ')}. Fix the input and call the tool again.`,
+  );
+}
+
 /** 不在这里执行的工具的输出结构：别处执行，结果经日志回来，这里不校验。 */
 const EXTERNAL_OUTPUT = jsonSchema({});
 
@@ -111,14 +120,8 @@ export function toToolSet(
           ...(options.runId !== undefined ? { runId: options.runId } : {}),
           ...(execution.abortSignal ? { signal: execution.abortSignal } : {}),
         };
-        if (validates(definition)) {
-          const issues = checkJsonSchema(definition.inputSchema, call.input);
-          if (issues.length > 0) {
-            return errorOutput(
-              `Invalid input for tool "${definition.name}": ${issues.join('; ')}. Fix the input and call the tool again.`,
-            );
-          }
-        }
+        const invalid = validates(definition) ? invalidInput(definition, call.input) : undefined;
+        if (invalid) return invalid;
         return limitToolOutput(await dispatch(call, definition, context), maxOutputChars);
       },
       toModelOutput: ({ output }) => toolOutputToAiSdk(output as ToolOutput) as ToolResultPart['output'],

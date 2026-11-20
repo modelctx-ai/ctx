@@ -249,7 +249,13 @@ const defs: Record<string, Schema> = {
   ),
   RunResultSummary: obj(
     { runId: str, text: str, stopReason: ref('StopReason') },
-    { usage: ref('Usage'), output: any, pending: arrayOf(ref('ToolCall')), error: ref('ErrorInfo') },
+    {
+      usage: ref('Usage'),
+      output: any,
+      pending: arrayOf(ref('ToolCall')),
+      approvals: arrayOf(ref('ToolApproval')),
+      error: ref('ErrorInfo'),
+    },
     '`RunResult` 去掉 `messages`、`recorded`：`run.ended` 事件和编排器的结果',
   ),
   RunResult: obj(
@@ -260,7 +266,21 @@ const defs: Record<string, Schema> = {
       recorded: arrayOf(ref('Entry')),
       stopReason: ref('StopReason'),
     },
-    { usage: ref('Usage'), output: any, pending: arrayOf(ref('ToolCall')), error: ref('ErrorInfo') },
+    {
+      usage: ref('Usage'),
+      output: any,
+      pending: arrayOf(ref('ToolCall')),
+      approvals: arrayOf(ref('ToolApproval')),
+      error: ref('ErrorInfo'),
+    },
+  ),
+  ToolApproval: obj({ approvalId: str, callId: str }, { reason: str }, '等确认的一次工具调用（`RunResult.approvals`）'),
+  ApprovalDecision: obj({ approved: bool }, { reason: str }),
+  PendingApproval: obj({ approvalId: str }, { reason: str, decision: ref('ApprovalDecision') }),
+  ClaimedToolCall: obj(
+    { session: str, runId: str, seq: int, call: ref('ToolCall') },
+    { approval: ref('PendingApproval'), executor: str },
+    '`POST /work/:executor/claim` 领到的一次调用：等着的调用（`PendingToolCall`）加上它所在的会话',
   ),
   RunEvent: oneOf(
     obj({ type: literal('run.started'), runId: str, session: str }, { seq: int }),
@@ -303,10 +323,10 @@ const defs: Record<string, Schema> = {
   Note: obj({ id: str, ...note }, { ...noteOptional, attempts: int, error: str, failedAt: num }),
   NewNote: obj(note, noteOptional),
   MemoryFact: obj(
-    { id: str, ...fact, recalls: arrayOf(num) },
+    { id: str, ...fact, at: num, recalls: arrayOf(num) },
     { ...factOptional, validTo: num, supersededBy: str, archivedAt: num },
   ),
-  NewMemoryFact: obj(fact, factOptional),
+  NewMemoryFact: obj(fact, { ...factOptional, at: num }),
   FactHit: obj({ fact: ref('MemoryFact'), score: num }),
   SearchQuery: obj({ text: str }, { topic: str, k: int, open: bool, archived: bool }),
   Procedure: obj({ id: str, ...procedure, confirmations: int }, { topic: str, retiredAt: num }),
