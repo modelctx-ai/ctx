@@ -2,6 +2,10 @@
 
 只记文档本身的变更。代码的变更在根目录的 [CHANGELOG.md](../CHANGELOG.md)。
 
+## 2026-11-20
+
+- **更新** [实践：yoyo](repos.md)：`yoyo.db` 契约里 `memory_` 表的结构版本从 1 改成 4（`ctx-sqlite` 的记忆存储在 #55、#61 里升到了 2、3、4，这里没跟上），写明新版本打开旧库就地升级、升级后旧版本打不开；yoyo 不用的包加上 `ctx-pi`，依赖图下面「图里没画」的那几个包跟契约表对齐。
+
 ## 2026-11-18
 
 - **更新** [协议层](protocol.md)和[英文译本](en/protocol.md)：`ToolRegistry` 加 `executor?`；执行环境一节加 `Executors`、`executorMap`、`executorTools`，写明 `createMcpServer` 那一侧做的事（`open`、`permissions`）和 `listenMcpHttp`；来源的 `collectFacts` 加 `only`、`logger`；harness 一节加 `streamRun`；「失败的重试不让历史变长」末尾写明 `endedInFailure`、`repeatsFailedInput`，「一个会话最多一个未结束的运行」第 3 条末尾写明 `createSessionQueue`。这些都是从适配器里收进协议包的函数，规则本身不变。
